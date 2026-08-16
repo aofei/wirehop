@@ -887,15 +887,14 @@ func TestLanePathGroupIsStable(t *testing.T) {
 }
 
 func TestRawJoinRejectionUsesLaneScope(t *testing.T) {
-	target, stopTarget := startSessionEchoTarget(t)
-	defer stopTarget()
-	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
+	instance := newSessionTestServer(t, []byte("test-token"), targetpkg.MustParse("192.0.2.1:51820"), time.Second)
+	receiveMicros := instance.config.Clock.NowMicros()
 	serverConnection, clientConnection := net.Pipe()
 	defer clientConnection.Close()
 	result := make(chan error, 1)
 	go func() {
 		defer serverConnection.Close()
-		result <- instance.rejectWithKey(serverConnection, 1, protocol.Nonce{1}, protocol.ErrorStaleGeneration,
+		result <- instance.rejectWithKey(serverConnection, receiveMicros, protocol.Nonce{1}, protocol.ErrorStaleGeneration,
 			protocol.ErrorLaneRejected, protocol.ErrorScopeLane, "lane generation rejected", []byte("join-secret"))
 	}()
 	response, err := protocol.ReadServerHello(clientConnection)
