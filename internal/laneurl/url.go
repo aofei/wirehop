@@ -86,6 +86,9 @@ func ParseListen(value string) (URL, error) {
 
 // parse validates a dial or listen lane URL.
 func parse(value string, listen bool) (URL, error) {
+	if hasUnbracketedIPv6Authority(value) {
+		return URL{}, newInvalidError("IPv6 host must be enclosed in brackets", nil)
+	}
 	parsed, err := url.Parse(value)
 	if err != nil {
 		if parseError, ok := errors.AsType[*url.Error](err); ok {
@@ -161,6 +164,23 @@ func parse(value string, listen bool) (URL, error) {
 	return URL{value: parsed, scheme: scheme}, nil
 }
 
+// hasUnbracketedIPv6Authority reports whether value contains a bare IPv6 address where a URL authority requires
+// brackets.
+func hasUnbracketedIPv6Authority(value string) bool {
+	scheme, remainder, ok := strings.Cut(value, "://")
+	if !ok || !Scheme(strings.ToLower(scheme)).Valid() {
+		return false
+	}
+	if index := strings.IndexAny(remainder, "/?#"); index >= 0 {
+		remainder = remainder[:index]
+	}
+	if remainder == "" || remainder[0] == '[' || strings.Contains(remainder, "@") {
+		return false
+	}
+	address, err := netip.ParseAddr(remainder)
+	return err == nil && address.Is6()
+}
+
 // ValidDialIP reports whether address can identify one unicast carrier destination.
 func ValidDialIP(address netip.Addr) bool {
 	if !address.IsValid() || address.IsUnspecified() || address.IsMulticast() {
@@ -193,9 +213,6 @@ func splitAuthority(authority string, scheme Scheme) (string, string, error) {
 		default:
 			return "", "", newInvalidError(fmt.Sprintf("%s URLs require an explicit port", scheme), nil)
 		}
-	}
-	if address, parseErr := netip.ParseAddr(authority); parseErr == nil && address.Is6() {
-		return "", "", newInvalidError("IPv6 host must be enclosed in brackets", nil)
 	}
 	return "", "", newInvalidError(fmt.Sprintf("invalid host or port: %v", err), err)
 }

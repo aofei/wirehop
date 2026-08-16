@@ -82,15 +82,28 @@ func TestParseDialErrors(t *testing.T) {
 }
 
 func TestParseDialSyntaxErrors(t *testing.T) {
-	_, err := ParseDial("wss://example.com:invalid/_wirehop")
-	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "malformed URL: invalid port") ||
-		strings.Contains(err.Error(), "wss://") {
-		t.Fatalf("ParseDial() error = %v", err)
-	}
-	_, err = ParseDial("wss://2001:db8::1/_wirehop")
-	want := "IPv6 host must be enclosed in brackets"
-	if !errors.Is(err, ErrInvalid) || err.Error() != want {
-		t.Fatalf("ParseDial() error = %v, want %q", err, want)
+	t.Run("InvalidPort", func(t *testing.T) {
+		_, err := ParseDial("wss://example.com:invalid/_wirehop")
+		if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "malformed URL: invalid port") ||
+			strings.Contains(err.Error(), "wss://") {
+			t.Fatalf("ParseDial() error = %v", err)
+		}
+	})
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "IPv6Address", value: "wss://2001:db8::1/_wirehop"},
+		{name: "IPv6AddressWithApparentPort", value: "tls://2001:db8::1:443"},
+		{name: "ZonedIPv6Address", value: "wss://fe80::1%25en0/_wirehop"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ParseDial(test.value)
+			want := "IPv6 host must be enclosed in brackets"
+			if !errors.Is(err, ErrInvalid) || err.Error() != want {
+				t.Fatalf("ParseDial(%q) error = %v, want %q", test.value, err, want)
+			}
+		})
 	}
 }
 
