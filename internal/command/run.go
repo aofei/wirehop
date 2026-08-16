@@ -37,6 +37,8 @@ import (
 var (
 	// ErrUsage indicates missing or inconsistent invocation configuration.
 	ErrUsage = errors.New("invalid command usage")
+	// versionOverride is set by the linker for release builds.
+	versionOverride string
 )
 
 const (
@@ -261,11 +263,14 @@ func runVersion(args []string, stdout io.Writer) error {
 	return newUsageError("version", fmt.Sprintf("unexpected argument %q", args[0]), nil)
 }
 
-// writeVersion writes the module version embedded by the Go toolchain.
+// writeVersion writes the effective build version.
 func writeVersion(output io.Writer) error {
-	version := "devel"
-	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
-		version = info.Main.Version
+	version := versionOverride
+	if version == "" {
+		version = "devel"
+		if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			version = info.Main.Version
+		}
 	}
 	_, err := fmt.Fprintf(output, "wirehop %s\n", version)
 	return err

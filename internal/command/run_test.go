@@ -615,6 +615,19 @@ func TestVersion(t *testing.T) {
 	}
 }
 
+func TestVersionOverride(t *testing.T) {
+	original := versionOverride
+	versionOverride = "v1.2.3"
+	t.Cleanup(func() { versionOverride = original })
+	var output bytes.Buffer
+	if err := writeVersion(&output); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); got != "wirehop v1.2.3\n" {
+		t.Fatalf("writeVersion() = %q", got)
+	}
+}
+
 func TestRootHelp(t *testing.T) {
 	for _, argument := range []string{"help", "-h", "--help"} {
 		var stdout bytes.Buffer

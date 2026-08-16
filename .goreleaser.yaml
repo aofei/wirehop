@@ -1,0 +1,72 @@
+version: 2
+
+env:
+  - DOCKER_IMAGE_REPO={{envOrDefault "DOCKER_IMAGE_REPO" "wirehop"}}
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: wirehop
+    main: ./cmd/wirehop
+    binary: bin/wirehop
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/aofei/wirehop/internal/command.versionOverride=v{{.Version}}
+    env:
+      - CGO_ENABLED=0
+    targets:
+      - darwin_amd64
+      - darwin_arm64
+      - linux_386
+      - linux_amd64
+      - linux_arm64
+      - linux_arm_6
+      - linux_arm_7
+      - linux_ppc64le
+      - linux_riscv64
+      - linux_s390x
+      - windows_386
+      - windows_amd64
+      - windows_arm64
+    mod_timestamp: "{{.CommitTimestamp}}"
+
+dockers_v2:
+  - id: wirehop
+    dockerfile: Dockerfile
+    images:
+      - "{{.Env.DOCKER_IMAGE_REPO}}"
+    tags:
+      - "{{.Version}}"
+      - "{{if and (not .IsSnapshot) (not .Prerelease)}}{{.Major}}.{{.Minor}}{{end}}"
+      - "{{if and (not .IsSnapshot) (not .Prerelease)}}{{.Major}}{{end}}"
+      - "{{if and (not .IsSnapshot) (not .Prerelease)}}latest{{end}}"
+    labels:
+      org.opencontainers.image.title: WireHop
+      org.opencontainers.image.description: A multipath relay for WireGuard over TCP-based transports.
+      org.opencontainers.image.source: https://github.com/aofei/wirehop
+      org.opencontainers.image.licenses: MIT
+      org.opencontainers.image.version: "{{.Version}}"
+      org.opencontainers.image.revision: "{{.FullCommit}}"
+      org.opencontainers.image.created: "{{.Date}}"
+    platforms:
+      - linux/386
+      - linux/amd64
+      - linux/arm64
+      - linux/arm/v6
+      - linux/arm/v7
+      - linux/ppc64le
+      - linux/riscv64
+      - linux/s390x
+    build_args:
+      USE_GORELEASER_ARTIFACTS: "1"
+
+snapshot:
+  version_template: '{{trimprefix .Summary "v"}}'
+
+release:
+  use_existing_draft: true
+  prerelease: auto

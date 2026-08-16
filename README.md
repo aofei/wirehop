@@ -1,5 +1,9 @@
 # WireHop
 
+[![Test](https://github.com/aofei/wirehop/actions/workflows/test.yaml/badge.svg)](https://github.com/aofei/wirehop/actions/workflows/test.yaml)
+[![codecov](https://codecov.io/gh/aofei/wirehop/branch/master/graph/badge.svg)](https://codecov.io/gh/aofei/wirehop)
+[![Go Reference](https://pkg.go.dev/badge/github.com/aofei/wirehop.svg)](https://pkg.go.dev/github.com/aofei/wirehop)
+
 A multipath relay for WireGuard over TCP-based transports.
 
 WireHop carries WireGuard UDP packets across one or more long-lived TCP, TLS, WebSocket, or secure WebSocket lanes. It
