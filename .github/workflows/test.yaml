@@ -1,0 +1,49 @@
+name: Test
+on:
+  push:
+  pull_request:
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Fuzz input boundaries
+        run: |
+          go test ./internal/laneurl -run '^$' -fuzz '^FuzzParseDial$' -fuzztime 1000000x
+          go test ./internal/laneurl -run '^$' -fuzz '^FuzzParseListen$' -fuzztime 1000000x
+          go test ./internal/lanespec -run '^$' -fuzz '^FuzzParse$' -fuzztime 1000000x
+          go test ./internal/target -run '^$' -fuzz '^FuzzParse$' -fuzztime 1000000x
+          go test ./internal/wgpacket -run '^$' -fuzz '^FuzzClassify$' -fuzztime 1000000x
+          go test ./internal/wgpacket -run '^$' -fuzz '^FuzzReservedText$' -fuzztime 1000000x
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzParseFrames$' -fuzztime 1000000x
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzParseData$' -fuzztime 1000000x
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzParseClientHello$' -fuzztime 1000000x
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzParseServerHello$' -fuzztime 1000000x
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzParseControlFrame$' -fuzztime 1000000x
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Vet Go code
+        run: go vet ./...
+      - name: Test Go code
+        run: go test -race -cover ./...
