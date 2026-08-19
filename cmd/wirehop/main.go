@@ -1,4 +1,4 @@
-// Command wirehop runs the WireHop client and server.
+// Command wirehop runs the WireHop client, server, and direct forwarder.
 package main
 
 import (

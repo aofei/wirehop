@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/aofei/wirehop/internal/relay"
 	"github.com/aofei/wirehop/internal/retention"
 	"github.com/aofei/wirehop/internal/server"
+	"github.com/aofei/wirehop/internal/socketopts"
 	targetpkg "github.com/aofei/wirehop/internal/target"
 	"github.com/aofei/wirehop/internal/wsheader"
 )
@@ -129,7 +131,7 @@ func TestExecuteUsageError(t *testing.T) {
 	}{
 		{
 			name: "MissingSubcommand",
-			wantStderr: "wirehop: expected client, server, or version subcommand\n" +
+			wantStderr: "wirehop: expected client, server, forward, or version subcommand\n" +
 				"Try 'wirehop --help' for more information.\n",
 		},
 		{
@@ -185,6 +187,27 @@ func TestExecuteUsageError(t *testing.T) {
 			args: []string{"server", "help"},
 			wantStderr: "wirehop: unexpected argument \"help\"\n" +
 				"Try 'wirehop server --help' for more information.\n",
+		},
+		{
+			name: "ForwardInvalidReservedValue",
+			args: []string{"forward", "--reserved", "invalid"},
+			wantStderr: "wirehop: invalid value \"invalid\" for --reserved: expected canonical Base64 encoding of exactly three bytes\n" +
+				"Try 'wirehop forward --help' for more information.\n",
+		},
+		{
+			name: "ForwardMissingRequiredOptions",
+			args: []string{"forward"},
+			wantStderr: "wirehop: required options are missing: --listen, --target\n" +
+				"Try 'wirehop forward --help' for more information.\n",
+		},
+		{
+			name: "ForwardFirewallMarkOverflow",
+			args: []string{
+				"forward", "--listen", "127.0.0.1:51820", "--target", "127.0.0.1:51820",
+				"--fwmark", "4294967296",
+			},
+			wantStderr: "wirehop: --fwmark exceeds 32 bits\n" +
+				"Try 'wirehop forward --help' for more information.\n",
 		},
 		{
 			name: "VersionUnexpectedArgument",
@@ -271,24 +294,21 @@ func TestRunValidatesArgumentsBeforeToken(t *testing.T) {
 	}
 }
 
-func TestAddressRejectionReasons(t *testing.T) {
-	t.Run("ClientListen", func(t *testing.T) {
-		for _, test := range []struct {
-			address string
-			want    string
-		}{
-			{address: "127.0.0.1:0"},
-			{address: "[fe80::1%en0]:51820"},
-			{address: "[::ffff:127.0.0.1]:51820", want: "IPv4-mapped IPv6 addresses are not allowed"},
-			{address: "[ff02::1]:51820", want: "multicast addresses are not allowed"},
-		} {
-			address := netip.MustParseAddrPort(test.address)
-			if got := invalidClientListenReason(address); got != test.want {
-				t.Errorf("invalidClientListenReason(%s) = %q, want %q", address, got, test.want)
-			}
+func TestInvalidLocalListenReason(t *testing.T) {
+	for _, test := range []struct {
+		address string
+		want    string
+	}{
+		{address: "127.0.0.1:0"},
+		{address: "[fe80::1%en0]:51820"},
+		{address: "[::ffff:127.0.0.1]:51820", want: "IPv4-mapped IPv6 addresses are not allowed"},
+		{address: "[ff02::1]:51820", want: "multicast addresses are not allowed"},
+	} {
+		address := netip.MustParseAddrPort(test.address)
+		if got := invalidLocalListenReason(address); got != test.want {
+			t.Errorf("invalidLocalListenReason(%s) = %q, want %q", address, got, test.want)
 		}
-	})
-
+	}
 }
 
 func TestRunRejectsExcessLanes(t *testing.T) {
@@ -305,6 +325,20 @@ func TestRunRejectsExcessLanes(t *testing.T) {
 		"Try 'wirehop client --help' for more information.\n"
 	if code != 2 || stdout.Len() != 0 || stderr.String() != want {
 		t.Fatalf("Execute() = %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestRunForwardRejectsUnsupportedFirewallMark(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux supports socket firewall marks")
+	}
+	var output bytes.Buffer
+	err := Run(context.Background(), []string{
+		"forward", "--listen", "127.0.0.1:51820", "--target", "127.0.0.1:51820", "--fwmark", "1",
+	}, func(string) string { return "" }, &output, &output)
+	if !errors.Is(err, ErrUsage) || !errors.Is(err, socketopts.ErrUnsupportedMark) ||
+		err.Error() != "--fwmark is supported only on Linux" {
+		t.Fatalf("Run() error = %v", err)
 	}
 }
 
@@ -342,6 +376,18 @@ func TestRunRejectsRepeatedSingleValueOptions(t *testing.T) {
 		{name: "ServerAllowInsecure", command: "server", args: []string{
 			"server", "--allow-insecure", "--allow-insecure",
 		}, want: "--allow-insecure may be specified only once"},
+		{name: "ForwardListen", command: "forward", args: []string{
+			"forward", "--listen", "127.0.0.1:1", "--listen", "127.0.0.1:2",
+		}, want: "--listen may be specified only once"},
+		{name: "ForwardTarget", command: "forward", args: []string{
+			"forward", "--target=127.0.0.1:1", "--target=127.0.0.1:2",
+		}, want: "--target may be specified only once"},
+		{name: "ForwardReserved", command: "forward", args: []string{
+			"forward", "--reserved", "AQID", "--reserved", "BAUG",
+		}, want: "--reserved may be specified only once"},
+		{name: "ForwardFirewallMark", command: "forward", args: []string{
+			"forward", "--fwmark", "1", "--fwmark", "2",
+		}, want: "--fwmark may be specified only once"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var output bytes.Buffer
@@ -588,6 +634,9 @@ func TestSubcommandHelp(t *testing.T) {
 		{name: "ServerFlag", args: []string{"server", "--help"}, want: serverUsage},
 		{name: "ServerShortFlag", args: []string{"server", "-h"}, want: serverUsage},
 		{name: "ServerTopic", args: []string{"help", "server"}, want: serverUsage},
+		{name: "ForwardFlag", args: []string{"forward", "--help"}, want: forwardUsage},
+		{name: "ForwardShortFlag", args: []string{"forward", "-h"}, want: forwardUsage},
+		{name: "ForwardTopic", args: []string{"help", "forward"}, want: forwardUsage},
 		{name: "VersionFlag", args: []string{"version", "--help"}, want: versionUsage},
 		{name: "VersionShortFlag", args: []string{"version", "-h"}, want: versionUsage},
 		{name: "VersionTopic", args: []string{"help", "version"}, want: versionUsage},
@@ -761,6 +810,126 @@ func TestServerStartupAndCancellationAreSilent(t *testing.T) {
 	}
 }
 
+func TestForwardListenAddressWriteFailure(t *testing.T) {
+	targetConnection, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(
+		netip.MustParseAddrPort("127.0.0.1:0"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetConnection.Close()
+	var stderr bytes.Buffer
+	err = Run(context.Background(), []string{
+		"forward", "--listen", "127.0.0.1:0", "--target", targetConnection.LocalAddr().String(),
+	}, func(string) string { return "" }, errorWriter{}, &stderr)
+	if !errors.Is(err, errTestWrite) {
+		t.Fatalf("Run() error = %v, want %v", err, errTestWrite)
+	}
+}
+
+func TestForwardOutput(t *testing.T) {
+	targetConnection, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(
+		netip.MustParseAddrPort("127.0.0.1:0"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetConnection.Close()
+	targetAddress := targetConnection.LocalAddr().String()
+
+	t.Run("FixedListenAddressIsSilent", func(t *testing.T) {
+		listen := reserveUDPAddress(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		result := make(chan int, 1)
+		go func() {
+			result <- Execute(ctx, []string{
+				"forward", "--listen", listen, "--target", targetAddress,
+			}, func(string) string { return "" }, &stdout, &stderr)
+		}()
+		waitForUDPBind(t, listen)
+		cancel()
+		code := waitForCommandCode(t, result)
+		if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+			t.Fatalf("Execute() = %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+		}
+	})
+
+	t.Run("DynamicListenAddress", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		stdout := channelWriter{values: make(chan string, 2)}
+		var stderr bytes.Buffer
+		result := make(chan int, 1)
+		go func() {
+			result <- Execute(ctx, []string{
+				"forward", "--listen", "127.0.0.1:0", "--target", targetAddress,
+			}, func(string) string { return "" }, stdout, &stderr)
+		}()
+		var output string
+		select {
+		case output = <-stdout.values:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for the dynamic listen address")
+		}
+		address, err := netip.ParseAddrPort(output)
+		if err != nil || address.Port() == 0 {
+			t.Fatalf("forward listen address = %q", output)
+		}
+		cancel()
+		code := waitForCommandCode(t, result)
+		if code != 0 || stderr.Len() != 0 {
+			t.Fatalf("Execute() = %d, stderr %q", code, stderr.String())
+		}
+		select {
+		case extra := <-stdout.values:
+			t.Fatalf("Execute() printed extra output %q", extra)
+		default:
+		}
+	})
+}
+
+func TestRunForwardDoesNotReadEnvironment(t *testing.T) {
+	targetConnection, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(
+		netip.MustParseAddrPort("127.0.0.1:0"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetConnection.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdout := channelWriter{values: make(chan string, 1)}
+	var stderr bytes.Buffer
+	environmentReads := 0
+	result := make(chan error, 1)
+	go func() {
+		result <- Run(ctx, []string{
+			"forward", "--listen", "127.0.0.1:0", "--target", targetConnection.LocalAddr().String(),
+		}, func(string) string {
+			environmentReads++
+			return ""
+		}, stdout, &stderr)
+	}()
+	select {
+	case <-stdout.values:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for forward startup")
+	}
+	cancel()
+	var runErr error
+	select {
+	case runErr = <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for forward shutdown")
+	}
+	if runErr != nil || environmentReads != 0 || stderr.Len() != 0 {
+		t.Fatalf("Run() error = %v, environment reads %d, stderr %q", runErr, environmentReads, stderr.String())
+	}
+}
+
 func TestCanceledCommandsSkipRuntimeStartup(t *testing.T) {
 	t.Run("Client", func(t *testing.T) {
 		listener, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
@@ -790,6 +959,23 @@ func TestCanceledCommandsSkipRuntimeStartup(t *testing.T) {
 			"--allow-target", "wg.example.com:51820",
 			"--tls-cert", "/definitely/missing/server.crt", "--tls-key", "/definitely/missing/server.key",
 		}, func(string) string { return "test-token" }, &stdout, &stderr)
+		if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+			t.Fatalf("Execute() = %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+		}
+	})
+	t.Run("Forward", func(t *testing.T) {
+		listener, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := Execute(ctx, []string{
+			"forward", "--listen", listener.LocalAddr().String(), "--target", "wg.example.com:51820",
+		}, func(string) string { return "" }, &stdout, &stderr)
 		if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
 			t.Fatalf("Execute() = %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
 		}

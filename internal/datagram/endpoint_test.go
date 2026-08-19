@@ -56,7 +56,7 @@ func TestRemote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote, err := OpenRemote(context.Background(), endpoint, nil)
+	remote, err := OpenRemote(context.Background(), endpoint, RemoteConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestRemotePreservesReserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote, err := OpenRemote(context.Background(), endpoint, nil)
+	remote, err := OpenRemote(context.Background(), endpoint, RemoteConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,19 +113,41 @@ func TestRemotePreservesReserved(t *testing.T) {
 func TestOpenRemoteRejectsCanceledParent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := OpenRemote(ctx, targetpkg.MustParse("127.0.0.1:51820"), nil)
+	_, err := OpenRemote(ctx, targetpkg.MustParse("127.0.0.1:51820"), RemoteConfig{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("OpenRemote() error = %v, want %v", err, context.Canceled)
 	}
 }
 
-func TestRemoteRejectsUnresolvedSource(t *testing.T) {
+func TestOpenRemoteUsesListenConfig(t *testing.T) {
 	peer := listenUDP(t)
 	endpoint, err := targetpkg.FromAddrPort(peer.LocalAddr().(*net.UDPAddr).AddrPort())
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote, err := OpenRemote(context.Background(), endpoint, nil)
+	var observedNetwork string
+	remote, err := OpenRemote(context.Background(), endpoint, RemoteConfig{ListenConfig: net.ListenConfig{
+		Control: func(network, _ string, _ syscall.RawConn) error {
+			observedNetwork = network
+			return nil
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { remote.Close() })
+	if observedNetwork != "udp4" {
+		t.Fatalf("target socket network = %q, want udp4", observedNetwork)
+	}
+}
+
+func TestRemoteRejectsUnknownSource(t *testing.T) {
+	peer := listenUDP(t)
+	endpoint, err := targetpkg.FromAddrPort(peer.LocalAddr().(*net.UDPAddr).AddrPort())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote, err := OpenRemote(context.Background(), endpoint, RemoteConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,8 +158,8 @@ func TestRemoteRejectsUnresolvedSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	remoteAddress := readUDPFrom(t, peer, len(initiation))
-	unauthorized := listenUDP(t)
-	writeUDP(t, unauthorized, remoteAddress, indexedWireGuardPacket(2, 92, 21, 11))
+	unknown := listenUDP(t)
+	writeUDP(t, unknown, remoteAddress, indexedWireGuardPacket(2, 92, 21, 11))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if _, err := remote.Read(ctx); !errors.Is(err, context.DeadlineExceeded) {
@@ -156,7 +178,7 @@ func TestRemoteDropsResponseWithoutIndexRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote, err := OpenRemote(context.Background(), endpoint, nil)
+	remote, err := OpenRemote(context.Background(), endpoint, RemoteConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +198,8 @@ func TestRemoteRoutesWireGuardIndexesAcrossCandidates(t *testing.T) {
 		second.LocalAddr().(*net.UDPAddr).AddrPort().Addr(),
 	}}
 	remote, err := openRemote(context.Background(), targetpkg.MustParse("wg.example.com:"+
-		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), resolver, time.Second, time.Millisecond)
+		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), RemoteConfig{Resolver: resolver}, time.Second,
+		time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +246,8 @@ func TestRemoteRoutesResponderTransportAcrossCandidates(t *testing.T) {
 		second.LocalAddr().(*net.UDPAddr).AddrPort().Addr(),
 	}}
 	remote, err := openRemote(context.Background(), targetpkg.MustParse("wg.example.com:"+
-		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), resolver, time.Second, time.Millisecond)
+		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), RemoteConfig{Resolver: resolver}, time.Second,
+		time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,17 +293,30 @@ func TestRemoteRoutesResponderTransportAcrossCandidates(t *testing.T) {
 func TestRemoteRefreshesDomainCandidates(t *testing.T) {
 	first, second := listenCandidatePair(t)
 	resolver := &mutableResolver{addresses: []netip.Addr{first.LocalAddr().(*net.UDPAddr).AddrPort().Addr()}}
+	observedNetworks := make(chan string, 2)
 	remote, err := openRemote(context.Background(), targetpkg.MustParse("wg.example.com:"+
-		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), resolver, time.Second, time.Millisecond)
+		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), RemoteConfig{
+		Resolver: resolver,
+		ListenConfig: net.ListenConfig{Control: func(network, _ string, _ syscall.RawConn) error {
+			observedNetworks <- network
+			return nil
+		}},
+	}, time.Second, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { remote.Close() })
+	if network := <-observedNetworks; network != "udp4" {
+		t.Fatalf("initial target socket network = %q, want udp4", network)
+	}
 
 	resolver.set([]netip.Addr{second.LocalAddr().(*net.UDPAddr).AddrPort().Addr()}, nil)
 	time.Sleep(2 * time.Millisecond)
 	remote.triggerRefresh()
 	waitRemoteRefresh(t, remote)
+	if network := <-observedNetworks; network != "udp6" {
+		t.Fatalf("refreshed target socket network = %q, want udp6", network)
+	}
 	initiation := indexedWireGuardPacket(1, 148, 11, 0)
 	if err := remote.Write(context.Background(), initiation, time.Time{}); err != nil {
 		t.Fatal(err)
@@ -302,7 +339,7 @@ func TestRemoteInitiationTriggersRefresh(t *testing.T) {
 	address := peer.LocalAddr().(*net.UDPAddr).AddrPort()
 	resolver := &mutableResolver{addresses: []netip.Addr{address.Addr()}}
 	remote, err := openRemote(context.Background(), targetpkg.MustParse("wg.example.com:"+
-		strconv.Itoa(int(address.Port()))), resolver, time.Second, time.Millisecond)
+		strconv.Itoa(int(address.Port()))), RemoteConfig{Resolver: resolver}, time.Second, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +359,8 @@ func TestRemoteMovesTransportAfterCandidateFailover(t *testing.T) {
 	first, second := listenCandidatePair(t)
 	resolver := &mutableResolver{addresses: []netip.Addr{first.LocalAddr().(*net.UDPAddr).AddrPort().Addr()}}
 	remote, err := openRemote(context.Background(), targetpkg.MustParse("wg.example.com:"+
-		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), resolver, time.Second, time.Millisecond)
+		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), RemoteConfig{Resolver: resolver}, time.Second,
+		time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +415,8 @@ func TestRemoteAcceptsResponseFromRecentlyReplacedCandidate(t *testing.T) {
 		second.LocalAddr().(*net.UDPAddr).AddrPort().Addr(),
 	}}
 	remote, err := openRemote(context.Background(), targetpkg.MustParse("wg.example.com:"+
-		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), resolver, time.Second, time.Millisecond)
+		strconv.Itoa(first.LocalAddr().(*net.UDPAddr).Port)), RemoteConfig{Resolver: resolver}, time.Second,
+		time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +479,7 @@ func TestRemoteCloseCancelsRefresh(t *testing.T) {
 	address := peer.LocalAddr().(*net.UDPAddr).AddrPort()
 	resolver := &blockingRefreshResolver{address: address.Addr(), started: make(chan struct{})}
 	remote, err := openRemote(context.Background(), targetpkg.MustParse("wg.example.com:"+
-		strconv.Itoa(int(address.Port()))), resolver, time.Second, time.Millisecond)
+		strconv.Itoa(int(address.Port()))), RemoteConfig{Resolver: resolver}, time.Second, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,6 +719,8 @@ func assertNoUDP(t *testing.T, conn *net.UDPConn) {
 	}
 	if _, err := conn.Read(make([]byte, protocol.MaxPacketSize)); err == nil {
 		t.Fatal("unexpected UDP datagram")
+	} else if networkError, ok := errors.AsType[net.Error](err); !ok || !networkError.Timeout() {
+		t.Fatalf("UDP read error = %v, want timeout", err)
 	}
 }
 

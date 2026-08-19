@@ -12,7 +12,7 @@ import (
 	"github.com/aofei/wirehop/internal/protocol"
 )
 
-// Local is a client UDP listener that tracks the latest valid local WireGuard source.
+// Local is a UDP listener that tracks the latest valid local WireGuard source.
 type Local struct {
 	conn          *net.UDPConn
 	readInterrupt readInterrupt
@@ -20,7 +20,7 @@ type Local struct {
 	peer          netip.AddrPort
 }
 
-// ListenLocal binds a client UDP listener.
+// ListenLocal binds a local WireGuard UDP listener.
 func ListenLocal(address netip.AddrPort) (*Local, error) {
 	conn, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(address))
 	if err != nil {
@@ -29,7 +29,7 @@ func ListenLocal(address netip.AddrPort) (*Local, error) {
 	return &Local{conn: conn}, nil
 }
 
-// NewLocal wraps an already bound client UDP listener.
+// NewLocal wraps an already bound local WireGuard UDP listener.
 func NewLocal(conn *net.UDPConn) *Local {
 	return &Local{conn: conn}
 }
@@ -91,12 +91,12 @@ func (e *Local) Write(ctx context.Context, payload []byte, deadline time.Time) e
 	return nil
 }
 
-// LocalAddr returns the bound client UDP listener endpoint.
+// LocalAddr returns the bound local WireGuard UDP listener endpoint.
 func (e *Local) LocalAddr() netip.AddrPort {
 	return e.conn.LocalAddr().(*net.UDPAddr).AddrPort()
 }
 
-// Close closes the client UDP listener.
+// Close closes the local WireGuard UDP listener.
 func (e *Local) Close() error {
 	e.readInterrupt.close()
 	return e.conn.Close()

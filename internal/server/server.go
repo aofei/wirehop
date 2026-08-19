@@ -273,7 +273,7 @@ func (s *Server) createSession(ctx context.Context, endpointTarget target.Endpoi
 			s.mu.Unlock()
 		}
 	}()
-	endpoint, err := datagram.OpenRemote(ctx, endpointTarget, s.config.Resolver)
+	endpoint, err := datagram.OpenRemote(ctx, endpointTarget, datagram.RemoteConfig{Resolver: s.config.Resolver})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", relay.ErrEndpointFailure, err)
 	}

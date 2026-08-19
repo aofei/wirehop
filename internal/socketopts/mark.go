@@ -1,4 +1,4 @@
-// Package socketopts configures carrier sockets before connection establishment.
+// Package socketopts configures network socket options before use.
 package socketopts
 
 import (
@@ -14,7 +14,7 @@ var (
 	ErrUnsupportedMark = errors.New("socket firewall mark is unsupported")
 )
 
-// NewDialer clones base and applies mark before every carrier and resolver socket connection.
+// NewDialer clones base and applies mark before every outbound and resolver socket connection.
 func NewDialer(base *net.Dialer, mark uint32) (*net.Dialer, error) {
 	var dialer net.Dialer
 	if base != nil {
@@ -37,6 +37,22 @@ func NewDialer(base *net.Dialer, mark uint32) (*net.Dialer, error) {
 		Dial:     resolverDialer.DialContext,
 	}
 	return &dialer, nil
+}
+
+// NewListenConfig clones base and applies mark before every socket bind.
+func NewListenConfig(base *net.ListenConfig, mark uint32) (*net.ListenConfig, error) {
+	var listenConfig net.ListenConfig
+	if base != nil {
+		listenConfig = *base
+	}
+	if mark == 0 {
+		return &listenConfig, nil
+	}
+	if !markSupported() {
+		return nil, ErrUnsupportedMark
+	}
+	listenConfig.Control = markedControl(listenConfig.Control, mark)
+	return &listenConfig, nil
 }
 
 // markedControl composes an existing socket control hook with one SO_MARK operation.

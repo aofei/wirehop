@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	// targetResolveTimeout bounds one server-side DNS refresh.
+	// targetResolveTimeout bounds one target DNS refresh.
 	targetResolveTimeout = 5 * time.Second
 	// targetRefreshInterval bounds DNS query frequency during WireGuard handshake retries.
 	targetRefreshInterval = 5 * time.Second
@@ -25,7 +25,7 @@ const (
 	targetCandidateGrace = 15 * time.Second
 	// targetRouteLifetime retains public WireGuard index affinity for one key lifetime.
 	targetRouteLifetime = 3 * time.Minute
-	// maximumTargetRoutes bounds unauthenticated public index state for one authorized session.
+	// maximumTargetRoutes bounds unauthenticated public index state for one target endpoint.
 	maximumTargetRoutes = 1024
 )
 
@@ -41,10 +41,17 @@ type remoteRead struct {
 	err    error
 }
 
-// Remote is a server-side logical target with DNS candidates and WireGuard index affinity.
+// RemoteConfig defines target resolution and upstream UDP socket creation.
+type RemoteConfig struct {
+	Resolver     target.Resolver
+	ListenConfig net.ListenConfig
+}
+
+// Remote is an upstream logical target with DNS candidates and WireGuard index affinity.
 type Remote struct {
 	target          target.Endpoint
 	resolver        target.Resolver
+	listenConfig    net.ListenConfig
 	resolveTimeout  time.Duration
 	refreshInterval time.Duration
 	ctx             context.Context
@@ -66,12 +73,13 @@ type Remote struct {
 	workers         sync.WaitGroup
 }
 
-// OpenRemote resolves target and opens the required per-family UDP sockets.
-func OpenRemote(parent context.Context, endpoint target.Endpoint, resolver target.Resolver) (*Remote, error) {
-	return openRemote(parent, endpoint, resolver, targetResolveTimeout, targetRefreshInterval)
+// OpenRemote resolves target and attempts to open its per-family UDP sockets.
+func OpenRemote(parent context.Context, endpoint target.Endpoint, config RemoteConfig) (*Remote, error) {
+	return openRemote(parent, endpoint, config, targetResolveTimeout, targetRefreshInterval)
 }
 
-func openRemote(parent context.Context, endpoint target.Endpoint, resolver target.Resolver,
+// openRemote opens a target endpoint with injectable resolution timings for tests.
+func openRemote(parent context.Context, endpoint target.Endpoint, config RemoteConfig,
 	resolveTimeout, refreshInterval time.Duration) (*Remote, error) {
 	if parent == nil || resolveTimeout <= 0 || refreshInterval <= 0 {
 		return nil, target.ErrInvalid
@@ -79,11 +87,11 @@ func openRemote(parent context.Context, endpoint target.Endpoint, resolver targe
 	if err := parent.Err(); err != nil {
 		return nil, err
 	}
-	if resolver == nil {
-		resolver = net.DefaultResolver
+	if config.Resolver == nil {
+		config.Resolver = net.DefaultResolver
 	}
 	resolveContext, cancelResolve := context.WithTimeout(parent, resolveTimeout)
-	addresses, err := target.Resolve(resolveContext, resolver, endpoint)
+	addresses, err := target.Resolve(resolveContext, config.Resolver, endpoint)
 	cancelResolve()
 	if err != nil {
 		return nil, err
@@ -93,7 +101,8 @@ func openRemote(parent context.Context, endpoint target.Endpoint, resolver targe
 	}
 	ctx, cancel := context.WithCancel(parent)
 	remote := &Remote{
-		target: endpoint, resolver: resolver, resolveTimeout: resolveTimeout, refreshInterval: refreshInterval,
+		target: endpoint, resolver: config.Resolver, listenConfig: config.ListenConfig,
+		resolveTimeout: resolveTimeout, refreshInterval: refreshInterval,
 		ctx: ctx, cancel: cancel, reads: make(chan remoteRead),
 		recent:          make(map[netip.AddrPort]time.Time),
 		retained:        make(map[netip.AddrPort]int),
@@ -108,7 +117,7 @@ func openRemote(parent context.Context, endpoint target.Endpoint, resolver targe
 	return remote, nil
 }
 
-// Read returns the next structurally valid WireGuard datagram from an authorized target candidate.
+// Read returns the next structurally valid WireGuard datagram from an accepted target candidate.
 func (e *Remote) Read(ctx context.Context) (Packet, error) {
 	select {
 	case result := <-e.reads:
@@ -202,7 +211,7 @@ func (e *Remote) Close() error {
 	return errors.Join(errs...)
 }
 
-// ensureSockets opens one source socket for each candidate address family not already represented.
+// ensureSockets attempts to open one source socket for each candidate address family not already represented.
 func (e *Remote) ensureSockets(addresses []netip.AddrPort) error {
 	var required [2]bool
 	for _, address := range addresses {
@@ -229,13 +238,14 @@ func (e *Remote) ensureSockets(addresses []netip.AddrPort) error {
 			network = "udp6"
 			address = &net.UDPAddr{IP: net.IPv6unspecified}
 		}
-		connection, err := net.ListenUDP(network, address)
+		packetConnection, err := e.listenConfig.ListenPacket(e.ctx, network, address.String())
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("open %s target UDP socket: %w", network, err)
 			}
 			continue
 		}
+		connection := packetConnection.(*net.UDPConn)
 		e.mu.Lock()
 		if e.closed {
 			e.mu.Unlock()

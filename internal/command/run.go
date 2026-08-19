@@ -21,6 +21,7 @@ import (
 
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/client"
+	"github.com/aofei/wirehop/internal/forward"
 	"github.com/aofei/wirehop/internal/lanespec"
 	"github.com/aofei/wirehop/internal/laneurl"
 	"github.com/aofei/wirehop/internal/packetqueue"
@@ -82,12 +83,14 @@ const (
 	rootUsage = `Usage:
   wirehop client [options]
   wirehop server [options]
+  wirehop forward [options]
   wirehop version
-  wirehop help [client|server|version]
+  wirehop help [client|server|forward|version]
 
 Commands:
   client   Run a local WireGuard relay client
   server   Run a WireGuard relay server
+  forward  Run a direct WireGuard UDP forwarder
   version  Print the WireHop version
 
 Options:
@@ -128,6 +131,17 @@ Options:
 
 Environment:
   WIREHOP_TOKEN             Shared authentication token (required)
+`
+	// forwardUsage describes the forward command and its complete option surface.
+	forwardUsage = `Usage:
+  wirehop forward --listen IP:PORT --target HOST:PORT [options]
+
+Options:
+  --listen IP:PORT    Local WireGuard UDP listen address (required)
+  --target HOST:PORT  Remote WireGuard UDP target (required)
+  --reserved BASE64   Apply a fixed nonzero three-byte WireGuard reserved value
+  --fwmark UINT32     Linux upstream UDP and DNS socket firewall mark
+  -h, --help          Show this help
 `
 	// versionUsage describes the version command.
 	versionUsage = `Usage:
@@ -235,7 +249,7 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return writeVersion(stdout)
 	}
 	if len(args) == 0 {
-		return newUsageError("", "expected client, server, or version subcommand", nil)
+		return newUsageError("", "expected client, server, forward, or version subcommand", nil)
 	}
 	switch args[0] {
 	case "help":
@@ -244,6 +258,8 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return runClient(ctx, args[1:], getenv, stdout, stderr)
 	case "server":
 		return runServer(ctx, args[1:], getenv, stdout, stderr)
+	case "forward":
+		return runForward(ctx, args[1:], stdout)
 	case "version":
 		return runVersion(args[1:], stdout)
 	default:
@@ -289,6 +305,9 @@ func runHelp(args []string, stdout io.Writer) error {
 			return err
 		case "server":
 			_, err := io.WriteString(stdout, serverUsage)
+			return err
+		case "forward":
+			_, err := io.WriteString(stdout, forwardUsage)
 			return err
 		case "version":
 			_, err := io.WriteString(stdout, versionUsage)
@@ -358,7 +377,7 @@ func runClient(ctx context.Context, args []string, getenv func(string) string, s
 		return newUsageError("client",
 			fmt.Sprintf("invalid client listen address %q: expected an IP literal and port", listenValue), err)
 	}
-	if reason := invalidClientListenReason(listen); reason != "" {
+	if reason := invalidLocalListenReason(listen); reason != "" {
 		return newUsageError("client", fmt.Sprintf("invalid client listen address %q: %s", listenValue, reason), nil)
 	}
 	remoteTarget, err := target.Parse(targetValue)
@@ -573,6 +592,101 @@ func runServer(ctx context.Context, args []string, getenv func(string) string, s
 		certificate = loaded
 	}
 	return serveListeners(ctx, instance, listeners, certificate, logger)
+}
+
+// runForward parses and runs one direct WireGuard UDP forwarding path.
+func runForward(ctx context.Context, args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("wirehop forward", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.Usage = func() {}
+	var listenValue string
+	var targetValue string
+	var reserved wgpacket.Reserved
+	var firewallMark uint64
+	flags.StringVar(&listenValue, "listen", "", "local WireGuard UDP listen address")
+	flags.StringVar(&targetValue, "target", "", "remote WireGuard UDP target")
+	flags.TextVar(&reserved, "reserved", wgpacket.Reserved{}, "fixed nonzero three-byte WireGuard reserved value")
+	flags.Uint64Var(&firewallMark, "fwmark", 0, "Linux upstream UDP and DNS socket firewall mark")
+	singleOptions := trackSingleOptions(flags, "listen", "target", "reserved", "fwmark")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			_, writeErr := io.WriteString(stdout, forwardUsage)
+			return writeErr
+		}
+		return newUsageError("forward", formatFlagError(err), err)
+	}
+	if err := rejectRepeatedOptions("forward", singleOptions); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return newUsageError("forward", fmt.Sprintf("unexpected argument %q", flags.Arg(0)), nil)
+	}
+	var missing []string
+	if listenValue == "" {
+		missing = append(missing, "--listen")
+	}
+	if targetValue == "" {
+		missing = append(missing, "--target")
+	}
+	if len(missing) != 0 {
+		return missingOptionsError("forward", missing)
+	}
+	listen, err := netip.ParseAddrPort(listenValue)
+	if err != nil {
+		return newUsageError("forward",
+			fmt.Sprintf("invalid forward listen address %q: expected an IP literal and port", listenValue), err)
+	}
+	if reason := invalidLocalListenReason(listen); reason != "" {
+		return newUsageError("forward", fmt.Sprintf("invalid forward listen address %q: %s", listenValue, reason), nil)
+	}
+	remoteTarget, err := target.Parse(targetValue)
+	if err != nil {
+		return newUsageError("forward", fmt.Sprintf("invalid WireGuard target %q: %v", targetValue, err), err)
+	}
+	if firewallMark > uint64(^uint32(0)) {
+		return newUsageError("forward", "--fwmark exceeds 32 bits", nil)
+	}
+	dialer, err := socketopts.NewDialer(nil, uint32(firewallMark))
+	if err != nil {
+		if errors.Is(err, socketopts.ErrUnsupportedMark) {
+			return newUsageError("forward", "--fwmark is supported only on Linux", err)
+		}
+		return err
+	}
+	listenConfig, err := socketopts.NewListenConfig(nil, uint32(firewallMark))
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	instance, err := forward.Start(ctx, forward.Config{
+		Listen: listen, Target: remoteTarget, Reserved: reserved, Resolver: dialer.Resolver,
+		TargetListenConfig: *listenConfig,
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if errors.Is(err, forward.ErrInvalidConfig) {
+			return newUsageError("forward", err.Error(), err)
+		}
+		return err
+	}
+	defer instance.Close()
+	if ctx.Err() != nil {
+		return nil
+	}
+	if listen.Port() == 0 {
+		if _, err := fmt.Fprintln(stdout, instance.LocalAddr()); err != nil {
+			return fmt.Errorf("write forward listen address: %w", err)
+		}
+	}
+	err = instance.Wait()
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 // newUsageError constructs a classified usage error with a clean display message.
@@ -814,8 +928,8 @@ func exactPathHandler(path string, next http.Handler) http.Handler {
 	})
 }
 
-// invalidClientListenReason describes a parsed address rejected by the client UDP bind policy.
-func invalidClientListenReason(address netip.AddrPort) string {
+// invalidLocalListenReason describes a parsed address rejected by the local UDP bind policy.
+func invalidLocalListenReason(address netip.AddrPort) string {
 	if address.Addr() != address.Addr().Unmap() {
 		return "IPv4-mapped IPv6 addresses are not allowed"
 	}

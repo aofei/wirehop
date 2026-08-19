@@ -12,8 +12,7 @@ TCP paths.
 
 WireHop is WireGuard-aware but is not a WireGuard peer. It classifies public WireGuard message structures so it can
 prioritize handshake traffic, duplicate control packets, enforce short packet deadlines, and schedule transport data. It
-never decrypts or authenticates WireGuard cryptographic content. WireHop preserves complete datagrams unless the client
-is configured to translate the public three-byte WireGuard reserved field for a standard local WireGuard implementation.
+never decrypts or authenticates WireGuard cryptographic content and preserves complete datagrams by default.
 
 ## Carrier schemes
 
@@ -95,42 +94,19 @@ server, and the server resolves and reaches it from the server network.
 
 When the requested `--listen` port is `0`, the client prints the selected UDP address to standard output as soon as the
 socket is ready. Carrier establishment continues asynchronously, and fresh WireGuard packets remain in a bounded
-priority queue while the first lane is starting. Successful fixed-port client startup, server startup, and graceful
-shutdown are silent.
+priority queue while the first lane is starting. The `forward` command prints a dynamic address only after its target is
+also ready. Successful startup is silent for a fixed-port client, a server, and a fixed-port direct forwarder. Graceful
+shutdown is also silent.
 
 Help is written to standard output. Diagnostics and warning logs are written to standard error. Command-line and
 environment validation errors exit with status `2`, runtime failures exit with status `1`, and help or signal-driven
 graceful shutdown exits with status `0`.
 
-## Reserved field translation
-
-WireHop recognizes the one-byte WireGuard message type independently from the following three-byte reserved field. When
-`--reserved` is omitted, it preserves all three reserved bytes in both directions. A WireGuard implementation that
-already handles a nonzero reserved value therefore uses WireHop transparently and must leave `--reserved` unset.
-
-The client can instead translate between a standard local WireGuard implementation and a remote endpoint that applies
-the inverse boundary translation for one fixed nonzero reserved value. `--reserved` accepts the canonical Base64
-encoding of exactly three bytes and rejects the all-zero value. For example, `AQID` represents the bytes `01 02 03`:
-
-```sh
-wirehop client \
-  --listen 127.0.0.1:51821 \
-  --target wg.example.com:51820 \
-  --lane wss://relay.example.com/_wirehop \
-  --reserved AQID
-```
-
-In this mode, the local WireGuard implementation must use the standard zero reserved field. The client overwrites that
-field on packets read from the local endpoint. On packets returning from the target, it requires the configured value
-and clears the field before local UDP delivery. A mismatch is dropped as an invalid target datagram. The server remains
-unaware of the configured value and relays the complete on-wire packet unchanged. The reserved field is public header
-metadata rather than authentication material.
-
 ## Target resolution and failover
 
-`--target` and `--allow-target` accept an IP literal or ASCII DNS hostname with an explicit, nonzero UDP port. The
-server authorizes the canonical logical target before resolving it. Resolution uses only the server's name service and
-network view.
+`--target` and `--allow-target` accept an IP literal or ASCII DNS hostname with an explicit, nonzero UDP port. For a
+client session, the server authorizes the canonical logical target before resolving it through the server's name service
+and network view. The `forward` command resolves its target locally and has no target allowlist.
 
 A DNS target may return multiple IPv4 and IPv6 addresses. All records must represent the same logical WireGuard peer,
 whether they reach one dual-stack server or multiple servers configured with the same WireGuard identity. WireHop sends
@@ -141,7 +117,7 @@ is never sprayed across candidates.
 Handshake Initiation packets and target-side UDP errors request rate-limited DNS refreshes without delaying the current
 packet. A successful refresh replaces the handshake fan-out set, while a temporary lookup failure retains the last
 successful result. Transport affinity moves only after a successful WireGuard handshake with another candidate. Target
-address changes do not replace the WireHop session or reconnect its carrier lanes.
+address changes do not replace a WireHop session, reconnect carrier lanes, or restart a direct forwarder.
 
 ## Multipath lanes
 
@@ -182,8 +158,22 @@ wirehop client \
   --fwmark 51820
 ```
 
+The `forward` command has the same route-exclusion requirement when the local WireGuard configuration captures the
+default route. The kernel knows only the local forwarding address, so the forwarder's real target traffic must bypass
+that tunnel. Its `--fwmark` applies to upstream UDP sockets and DNS resolver sockets:
+
+```sh
+wirehop forward \
+  --listen 127.0.0.1:51821 \
+  --target wg.example.com:51820 \
+  --fwmark 51820
+```
+
+Ensure the target never resolves to an address and port covered by the forwarder's own listener. Otherwise, outbound
+datagrams re-enter the listener and form a local UDP feedback loop.
+
 The corresponding policy-routing rule is deployment-specific. On other platforms, deployments require external routes
-that exclude carrier endpoints, forward proxies, and the DNS path used to resolve their hostnames.
+that exclude carrier endpoints, direct forwarding targets, forward proxies, and the DNS paths used to resolve them.
 
 ## Overhead and MTU
 
@@ -197,6 +187,46 @@ IP family, TCP options, the 21-byte WireHop frame overhead, WireGuard's own tran
 framing. Correctness does not depend on one frame fitting one TCP segment, but a conservative MTU reduces TCP segment
 loss amplification and head-of-line delay.
 
+The `forward` command uses direct UDP and adds no WireHop framing or packet-length overhead. Reserved translation does
+not change the WireGuard datagram length.
+
+## Reserved field translation
+
+WireHop recognizes the one-byte WireGuard message type independently from the following three-byte reserved field. When
+`--reserved` is omitted, it preserves all three reserved bytes in both directions. A WireGuard implementation that
+already handles a nonzero reserved value therefore uses WireHop transparently and must leave `--reserved` unset.
+
+The client and direct forwarder can instead translate between a standard local WireGuard implementation and a remote
+endpoint that applies the inverse boundary translation for one fixed nonzero reserved value. `--reserved` accepts the
+canonical Base64 encoding of exactly three bytes and rejects the all-zero value. For example, `AQID` represents the
+bytes `01 02 03`:
+
+```sh
+wirehop client \
+  --listen 127.0.0.1:51821 \
+  --target wg.example.com:51820 \
+  --lane wss://relay.example.com/_wirehop \
+  --reserved AQID
+```
+
+When no WireHop carrier is needed, the same translation can run as a direct WireGuard UDP forwarding path:
+
+```sh
+wirehop forward \
+  --listen 127.0.0.1:51821 \
+  --target wg.example.com:51820 \
+  --reserved AQID
+```
+
+This command does not use lanes, WireHop framing, or `WIREHOP_TOKEN`. It resolves and reaches the target from the local
+network. Without `--reserved`, it remains a transparent WireGuard-aware UDP forwarder.
+
+In this mode, the local WireGuard implementation must use the standard zero reserved field. The client or forwarder
+overwrites that field on packets read from the local endpoint. On packets returning from the target, it requires the
+configured value and clears the field before local UDP delivery. A mismatch is dropped as an invalid target datagram. A
+WireHop server remains unaware of a client's configured value and relays the complete on-wire packet unchanged. The
+reserved field is public header metadata rather than authentication material.
+
 ## Security model
 
 The server permits only exact canonical `--allow-target` host and port entries. Authorizing a DNS target delegates its
@@ -207,9 +237,11 @@ caches, stable lane identifiers, and strictly increasing connection generations.
 request nonce and server time. If an otherwise authenticated request falls outside the timestamp window, the client
 learns the server time and retries without changing the system clock.
 
-The client UDP listener has no WireHop authentication. Bind it to loopback or another protected interface unless
-deliberately serving trusted hosts. A reachable sender can consume relay capacity with structurally valid WireGuard
-packets even though the remote WireGuard endpoint still authenticates and rejects forged ciphertext.
+The client and forward UDP listeners have no WireHop authentication. Bind them to loopback or another protected
+interface unless deliberately serving trusted hosts. A reachable sender can consume forwarding capacity with
+structurally valid WireGuard packets even though the remote WireGuard endpoint still authenticates and rejects forged
+ciphertext. Direct forwarding relies only on WireGuard for remote packet authentication and does not use the WireHop
+admission protocol.
 
 WireGuard packets are already encrypted, but TLS still protects authorization material, target metadata, session
 secrets, lifecycle controls, timing information, and the carrier against observable manipulation. TLS carriers require

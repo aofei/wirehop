@@ -28,7 +28,7 @@ type Packet struct {
 	Payload []byte
 }
 
-// Endpoint reads and writes one side of a WireHop UDP relay session.
+// Endpoint reads and writes one side of a WireGuard UDP data path.
 type Endpoint interface {
 	// Read returns one accepted packet with a caller-owned payload. Read calls on the same endpoint must not overlap.
 	Read(context.Context) (Packet, error)

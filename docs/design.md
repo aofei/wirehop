@@ -25,10 +25,11 @@ validation matrix are guidance rather than runtime requirements.
 
 WireHop remains transparent to WireGuard cryptography. It inspects the outer WireGuard packet type and public structural
 fields without decrypting or authenticating WireGuard cryptographic content. Complete datagrams are preserved unless the
-client is configured to translate the public three-byte reserved field at its local UDP boundary.
+client or direct forwarder is configured to translate the public three-byte reserved field at its local UDP boundary.
 
 WireHop is an application-layer packet relay rather than a WireGuard peer or VPN implementation. Each relay session
-carries WireGuard packets for exactly one remote WireGuard endpoint.
+carries WireGuard packets for exactly one remote WireGuard endpoint. The direct forwarding mode connects one local UDP
+listener to one logical target without creating a WireHop session.
 
 ## Supported scope
 
@@ -41,10 +42,15 @@ The CLI supports these carrier schemes:
 | `ws://` | Insecure WebSocket stream | No, local tests and trusted networks only |
 | `wss://` | WebSocket over TLS | Yes |
 
-UDP ingress on both the client listener and the server target endpoint accepts only WireGuard-looking datagrams. The
-message type is the first byte. The following three reserved bytes are opaque to classification. Datagrams that fail
-public WireGuard type and length classification are dropped before scheduling. Each client session binds one local
-listener to one logical remote WireGuard endpoint through one or more carrier lanes.
+UDP ingress accepts only WireGuard-looking datagrams at the client listener, server target endpoint, and forward
+listener. The message type is the first byte. The following three reserved bytes are opaque to classification. Datagrams
+that fail public WireGuard type and length classification are dropped before scheduling or direct forwarding. Each
+client session binds one local listener to one logical remote WireGuard endpoint through one or more carrier lanes.
+
+The `forward` command provides a separate direct UDP path for deployments that need WireGuard packet filtering, target
+resolution, or reserved field translation without a TCP-based carrier. It accepts the same WireGuard-looking datagrams
+as a client, connects one local listener to one logical target, and uses no WireHop framing, lane, session, or
+authentication state.
 
 ## Basic architecture
 
@@ -92,6 +98,10 @@ flowchart TB
 
 The path groups and lanes are illustrative. Each lane-to-listener edge is an independent full-duplex carrier stream.
 Forward and reverse proxies may appear on that edge without changing the session topology.
+
+Direct forwarding uses the simpler topology `Local WireGuard <-> forward listener <-> target endpoint`. The target
+endpoint retains the DNS candidate and WireGuard index affinity behavior described below, but the two UDP directions
+otherwise forward synchronously without a queue or scheduler.
 
 ## Lane model
 
@@ -540,8 +550,8 @@ nonzero and do not change packet lengths or public sender and receiver index off
 The real WireGuard endpoint remains responsible for authentication, MAC checks, decryption, replay protection, and peer
 selection.
 
-Classification drives datagram admission, control priority, duplication, packet lifetime, and control-versus-transport
-scheduling.
+Classification drives datagram admission in every mode and drives control priority, duplication, packet lifetime, and
+control-versus-transport scheduling in relay sessions.
 
 ### Reserved field handling
 
@@ -549,23 +559,23 @@ When `--reserved` is omitted, the data path treats the complete three-byte reser
 both directions. A local WireGuard implementation that already applies a nonzero reserved value must therefore leave
 `--reserved` unset. The server never assigns, validates, clears, or otherwise interprets the value.
 
-The client optionally translates one fixed nonzero value at its local UDP boundary. The remote endpoint must apply the
-inverse translation outside standard WireGuard cryptographic processing. The value is configured as the canonical Base64
-encoding of exactly three bytes and is not carried separately in the WireHop wire protocol. Translation follows these
-rules:
+The client and direct forwarder optionally translate one fixed nonzero value at their local UDP boundary. The remote
+endpoint must apply the inverse translation outside standard WireGuard cryptographic processing. The value is configured
+as the canonical Base64 encoding of exactly three bytes and is not carried separately in the WireHop wire protocol.
+Translation follows these rules:
 
-- A locally produced packet has byte offsets 1 through 3 overwritten with the configured value before scheduling
+- A locally produced packet has byte offsets 1 through 3 overwritten before scheduling or direct upstream delivery
 - A returning packet must carry the configured value or it is dropped as an invalid target datagram
 - A matching returning packet has byte offsets 1 through 3 cleared for synchronous local UDP delivery
 - The original returning payload is restored after the UDP write, preserving caller ownership
 
-The client endpoint wrapper adds no per-packet allocation. Read payloads are caller-owned and inbound UDP writes are
+The local endpoint wrapper adds no per-packet allocation. Read payloads are caller-owned and inbound UDP writes are
 serialized, so both transformations run in place while preserving ownership. Translation does not change a datagram
-length, WireHop framing overhead, packet ID, deadline, or scheduling class.
+length. In a relay session it also does not change WireHop framing overhead, packet ID, deadline, or scheduling class.
 
 The CLI rejects an explicitly configured all-zero value because it would have no effect. The fixed-value adapter
-intentionally does not model per-peer, per-direction, negotiated, or rotating reserved schemes. A separate client
-process and WireHop session are required when local peers need different fixed values.
+intentionally does not model per-peer, per-direction, negotiated, or rotating reserved schemes. Local peers that need
+different fixed values require separate client sessions or direct forwarder processes.
 
 ## Packet duplication policy
 
@@ -756,15 +766,15 @@ retry and reconnect policies. Other individual in-session control frames are bes
 general control-message retransmission service. The one-time migration of an unexpired packet from an abandoned
 connection is a bounded stale-queue escape mechanism, not a reliable delivery service.
 
-## Server target policy
+## Target policy
 
 The server is not an open UDP relay. It requires an explicit target allowlist, and a client can create a session only
 for an allowed target.
 
-Both `--target` and `--allow-target` accept an IP literal or ASCII RFC 1123 hostname with an explicit, nonzero UDP port.
-Hostnames are lowercased and a trailing DNS root label is removed. IP literals and decimal ports use their canonical
-text forms. IPv4-mapped IPv6 addresses, unspecified addresses, multicast addresses, the IPv4 limited broadcast address,
-IPv6 link-local addresses, and IPv6 zone identifiers are rejected.
+The `client --target`, `server --allow-target`, and `forward --target` options accept an IP literal or ASCII RFC 1123
+hostname with an explicit, nonzero UDP port. Hostnames are lowercased and a trailing DNS root label is removed. IP
+literals and decimal ports use their canonical text forms. IPv4-mapped IPv6 addresses, unspecified addresses, multicast
+addresses, the IPv4 limited broadcast address, IPv6 link-local addresses, and IPv6 zone identifiers are rejected.
 
 A hostname consisting only of decimal digits and dots is rejected because it is ambiguous with noncanonical IPv4
 notation. DNS lookups use the canonical hostname as an absolute name, so resolver search suffixes do not change the
@@ -774,9 +784,10 @@ Authorization compares the complete canonical logical target, including its host
 never authorizes a hostname by comparing one transient resolution result with an IP-literal allowlist entry. CNAMEs and
 returned addresses do not replace the authorized identity. Wildcards and service-name ports are not supported.
 
-Authorizing a DNS target delegates address selection to the server's configured name service. The operator must trust
-that hostname's DNS authority and every returned address. All records must represent the same logical WireGuard peer.
-They may reach one dual-stack server or multiple servers configured with the same WireGuard identity. This invariant is
+Authorizing a DNS target delegates address selection to the server's configured name service. A direct forwarder instead
+delegates selection to its local name service without an allowlist. In either case, the operator must trust that
+hostname's DNS authority and every returned address. All records must represent the same logical WireGuard peer. They
+may reach one dual-stack server or multiple servers configured with the same WireGuard identity. This invariant is
 required because WireHop may send one handshake initiation to every current candidate and later move transport affinity
 between them.
 
@@ -788,27 +799,28 @@ wg.example.com:51820
 
 ## Target resolution and socket model
 
-The server creates one target endpoint per session. An IP-literal target produces one candidate without invoking the
-resolver. A DNS target is resolved by the server's local resolver during session creation. The result combines A and
-AAAA addresses, converts IPv4-mapped results to canonical IPv4, removes duplicates and disallowed addresses, and retains
-at most 16 candidates in resolver order. Session creation requires at least one usable candidate and one usable UDP
-address family. Resolution or socket setup failure is a retryable creation failure.
+The server creates one target endpoint per session, while a direct forwarder creates one for its process lifetime. An
+IP-literal target produces one candidate without invoking the resolver. A DNS target uses the server's resolver during
+session creation or the forwarder's local resolver during startup. The result combines A and AAAA addresses, converts
+IPv4-mapped results to canonical IPv4, removes duplicates and disallowed addresses, and retains at most 16 candidates in
+resolver order. Startup requires at least one usable candidate and one usable UDP address family. A server reports a
+resolution or socket setup error as a retryable creation failure, while a direct forwarder exits with a runtime error.
 
 Each target endpoint owns at most one unconnected IPv4 UDP socket and one unconnected IPv6 UDP socket. Candidates in the
-same family share the session's source socket and port. Replies are accepted only from the current DNS candidates, the
+same family share the endpoint's source socket and port. Replies are accepted only from the current DNS candidates, the
 current transport candidate, candidates retained by unexpired WireGuard index affinity, or recently replaced candidates
 completing an in-flight handshake. A replaced candidate remains eligible to reply for 15 seconds but no longer receives
-new handshake fan-out. Multiple WireHop sessions may use the same logical target without sharing target sockets or
-routing state.
+new handshake fan-out. Multiple WireHop sessions and forwarder processes may use the same logical target without sharing
+target sockets or routing state.
 
 The standard resolver does not expose DNS TTL values. WireHop therefore refreshes a DNS target when a WireGuard
 handshake initiation or a concrete UDP network error arrives, with at most one lookup every five seconds and one lookup
-in flight per session. A lookup has a five-second deadline. Successful resolution atomically replaces the handshake
-fan-out set. Failure retains the last successful set and established affinity, so a temporary resolver outage does not
-break an otherwise usable WireGuard session.
+in flight per target endpoint. A lookup has a five-second deadline. Successful resolution atomically replaces the
+handshake fan-out set. Failure retains the last successful set and established affinity, so a temporary resolver outage
+does not break an otherwise usable path.
 
-Target address changes remain internal to the server endpoint. They do not replace the WireHop session, reset packet IDs
-or deduplication state, or reconnect carrier lanes.
+Target address changes remain internal to the target endpoint. They do not replace a WireHop session, reset packet IDs
+or deduplication state, reconnect carrier lanes, or restart a direct forwarder.
 
 ## WireGuard candidate affinity
 
@@ -829,11 +841,11 @@ Routing follows these rules:
 - Transport Data with no retained index route uses the current candidate and is never fanned out
 
 The local WireGuard implementation emits Transport Data only after authenticating the corresponding handshake exchange.
-When the client UDP listener is restricted to that implementation or another trusted boundary, its receiver index
-therefore provides the relay with an indirect selection signal grounded in WireGuard authentication without giving
-WireHop access to any key material. Multiple candidates may answer one initiation, but the first candidate whose
-response the local peer accepts gains transport affinity. An address that remains in DNS but stops responding is
-bypassed by the next successful handshake with another candidate.
+When the client or forward UDP listener is restricted to that implementation or another trusted boundary, its receiver
+index provides WireHop with an indirect selection signal grounded in WireGuard authentication without exposing any key
+material. Multiple candidates may answer one initiation, but the first candidate whose response the local peer accepts
+gains transport affinity. An address that remains in DNS but stops responding is bypassed by the next successful
+handshake with another candidate.
 
 ```mermaid
 sequenceDiagram
@@ -855,12 +867,16 @@ sequenceDiagram
   W->>B: Route transport to selected candidate
 ```
 
-The client tracks the local UDP source address that sent packets to the WireHop listener and writes replies back to that
-address. In the normal case this is stable because one WireGuard interface uses one local UDP socket, but the relay
-tolerates a source address change after a local WireGuard restart. Because the latest structurally valid local packet
-selects that return address, binding the client listener to loopback or another trusted local network boundary is an
-operational security requirement. A target reply received before any valid local packet establishes this return address
-is dropped.
+The client and direct forwarder track the local UDP source address that sent packets to their listener and write replies
+back to that address. In the normal case this is stable because one WireGuard interface uses one local UDP socket, but
+the process tolerates a source address change after a local WireGuard restart. Because the latest structurally valid
+local packet selects that return address, binding the listener to loopback or another trusted local network boundary is
+an operational security requirement. A target reply received before any valid local packet establishes this return
+address is dropped.
+
+The direct forwarder runs one synchronous worker in each UDP direction. It has no intermediate packet queue and bounds
+each UDP write to one second. A per-datagram drop does not stop forwarding. Cancellation or a terminal endpoint read or
+write failure closes both endpoints, waits for both workers, and terminates the command.
 
 While a session is detached, the server continues draining its target sockets so their kernel receive buffers cannot
 grow without bound. It drops replies that cannot meet a packet deadline because no lane is available. On either UDP
@@ -1101,6 +1117,20 @@ sockets used by the Go resolver. Deployments on other platforms must provide ext
 and every actual first hop, including a selected forward proxy. Every lane and every replacement connection generation
 applies the same route-exclusion policy independently.
 
+### Direct forwarding route exclusion
+
+A direct forwarder's upstream UDP traffic must also avoid the local WireGuard tunnel when that tunnel captures its
+target route. The kernel WireGuard peer knows only the forwarder's local listen address and cannot automatically exclude
+the real target. On Linux, forward `--fwmark` applies `SO_MARK` before binding every upstream IPv4 and IPv6 UDP socket
+and to DNS sockets used to resolve a target hostname. The local WireGuard-facing listener remains unmarked.
+
+The mark does not create a policy-routing rule. Deployments must provide the corresponding rule, or equivalent explicit
+target and DNS routes on platforms without `SO_MARK`. Every target socket opened after a DNS refresh receives the same
+socket policy.
+
+The logical target must not resolve to an address and port covered by the forwarder's local listener. Otherwise,
+outbound datagrams re-enter local ingress and form a UDP feedback loop.
+
 ### Carrier overhead and MTU
 
 WireHop does not modify a WireGuard interface MTU. It documents the carrier overhead needed to choose one. Each datagram
@@ -1111,6 +1141,10 @@ The forwarding protocol remains correct when one WireHop frame spans several TCP
 is still desirable because fitting a normal WireGuard transport packet within one carrier segment reduces segment count,
 loss amplification, and head-of-line delay. Mixed-lane deployments should use the most restrictive active carrier path
 when choosing an MTU.
+
+Direct forwarding adds no WireHop framing and does not change the WireGuard datagram length. It still crosses a
+userspace UDP boundary, but its MTU requirement is the native IP and UDP path to the target rather than a TCP-based
+carrier path.
 
 ## Frame protocol
 
@@ -1457,11 +1491,22 @@ detached session cannot escape the server resource bound.
 
 ## CLI model
 
-WireHop receives runtime configuration from command-line flags. Authentication tokens are read from the `WIREHOP_TOKEN`
-environment variable so that they do not need to appear in process arguments.
+WireHop receives runtime configuration from command-line flags. The client and server read authentication tokens from
+the `WIREHOP_TOKEN` environment variable so that they do not need to appear in process arguments. Direct forwarding does
+not use the WireHop admission protocol and therefore does not read a token.
 
 `wirehop version` and `wirehop --version` write the Go toolchain-embedded module version, or `devel` for an unversioned
 local build, to standard output and exit with status `0`.
+
+Client flags:
+
+- `--listen` local UDP address
+- `--target` remote WireGuard endpoint
+- Repeatable `--lane` carrier declaration
+- Optional `--reserved` canonical Base64 value for client-side reserved field translation
+- Optional `--tls-server-name` override when connecting by IP address
+- Optional Linux `--fwmark` for carrier route exclusion
+- `--allow-insecure` when a plaintext lane is configured
 
 Server flags:
 
@@ -1479,22 +1524,20 @@ remaining listeners and the server process. One configured TLS key pair serves a
 Listener URLs may omit the host to bind a wildcard address, but they still require an effective nonzero port. Shutdown
 cancels and waits for active raw-stream and hijacked WebSocket handlers before the command returns.
 
-Client flags:
+Forward flags:
 
 - `--listen` local UDP address
 - `--target` remote WireGuard endpoint
-- Repeatable `--lane` carrier declaration
-- Optional `--reserved` canonical Base64 value for client-side reserved field translation
-- Optional `--tls-server-name` override when connecting by IP address
-- Optional Linux `--fwmark` for carrier route exclusion
-- `--allow-insecure` when a plaintext lane is configured
+- Optional `--reserved` canonical Base64 value for local reserved field translation
+- Optional Linux `--fwmark` for upstream target and DNS route exclusion
 
 Every configuration option other than `--lane`, server `--listen`, and `--allow-target` may appear at most once.
 
-The client `--listen` value is an IP-literal endpoint with an explicit port. Port `0` requests a dynamic port.
-IPv4-mapped IPv6 and multicast listen addresses are rejected. Client `--target` and server `--allow-target` values use
-the canonical logical target policy and may contain an IP literal or ASCII hostname with an explicit, nonzero port. The
-client `--reserved` value decodes to exactly three bytes, must not be all zero, and affects only the local UDP boundary.
+The client and forward `--listen` values are IP-literal endpoints with an explicit port. Port `0` requests a dynamic
+port. IPv4-mapped IPv6 and multicast listen addresses are rejected. The `client --target`, `server --allow-target`, and
+`forward --target` values use the canonical logical target policy and may contain an IP literal or ASCII hostname with
+an explicit, nonzero port. The client and forward `--reserved` values decode to exactly three bytes, must not be all
+zero, and affect only the local UDP boundary.
 
 A lane declaration is either a carrier URL or a structured fixed-resolution declaration:
 
@@ -1513,10 +1556,14 @@ requires a nonempty host. A structured declaration requires that host to be a ho
 the socket destination port. The fixed IP does not replace the HTTP Host, TLS SNI, certificate hostname, scheme, or
 WebSocket path.
 
-Both commands require `WIREHOP_TOKEN` in their environment. Repeating `--listen` on the server enables multiple carrier
-listeners. Every `--lane` occurrence creates an independent lane and TCP connection in the same session. The CLI
+The client and server require `WIREHOP_TOKEN` in their environment. Repeating `--listen` on the server enables multiple
+carrier listeners. Every `--lane` occurrence creates an independent lane and TCP connection in the same session. The CLI
 preserves identical declarations. Identical canonical URLs with the same resolution belong to one path group, while
 different fixed resolutions belong to different groups.
+
+The forwarder binds its local listener and then performs initial target resolution and opens UDP sockets for the usable
+target address families before it begins forwarding. Any startup failure closes the local listener. A fixed-port startup
+is silent. With port `0`, the selected address is printed only after the target endpoint is ready.
 
 ## IPv4 and IPv6 policy
 
@@ -1549,14 +1596,17 @@ The command follows a quiet-by-default output contract:
 - Help is written to standard output and exits with status `0`
 - A client whose requested `--listen` port is `0` writes the selected UDP address to standard output immediately after
   the UDP bind succeeds
-- Successful fixed-port client startup, server startup, ordinary operation, and graceful signal-driven shutdown produce
-  no output
+- A direct forwarder whose requested port is `0` writes the selected UDP address after initial target resolution and
+  target socket creation succeed
+- Successful startup for a fixed-port client, a server, and a fixed-port direct forwarder, ordinary operation, and
+  graceful signal-driven shutdown produce no output
 - Command-line and environment validation errors write one diagnostic and a command-specific help hint to standard
   error, then exit with status `2`
 - Runtime failures write one diagnostic to standard error and exit with status `1`
 
-The dynamic UDP address is a bind result rather than a readiness signal. Carrier establishment continues concurrently
-after it is emitted.
+The client's dynamic UDP address is a bind result rather than a readiness signal. Carrier establishment continues
+concurrently after it is emitted. A forwarder's dynamic address is a readiness signal for both local bind and initial
+target preparation.
 
 The client writes one timestamped structured warning when a permanently failed lane is disabled while another supervisor
 keeps the client running. The warning identifies the lane occurrence, canonical URL, optional fixed resolution, and
@@ -1571,6 +1621,10 @@ failures are returned to the command layer and printed once instead of also bein
 received after admission are logged by stable code, class, and scope without their peer-controlled diagnostic text.
 Client and server logs never include peer-controlled diagnostics, tokens, session secrets, or packet payloads.
 
+The direct forwarder emits no warning log. A terminal endpoint failure is returned to the command layer and printed
+once. Structurally invalid packets, reserved mismatches, unavailable local peers, and per-datagram network errors that
+leave the UDP socket reusable are silent drops.
+
 WireHop exposes no network metrics endpoint or stable telemetry schema. Any telemetry interface must exclude tokens,
 session secrets, packet payloads, and identifying target metadata by default.
 
@@ -1582,6 +1636,7 @@ below.
 ### Comparisons
 
 - Native WireGuard UDP
+- Direct `forward` UDP
 - Single `tcp://` lane
 - Single `tls://` lane
 - Single `ws://` lane
@@ -1597,7 +1652,7 @@ below.
 - Handshake and idle keepalive traffic
 - Standard zero-reserved packets
 - Transparent nonzero reserved packets
-- Client-side fixed reserved translation and mismatched return packets
+- Client and forward fixed reserved translation and mismatched return packets
 - Latency-sensitive small UDP traffic inside WireGuard
 - One long-lived TCP flow inside WireGuard
 - Multiple concurrent TCP flows inside WireGuard
@@ -1703,7 +1758,9 @@ WireGuard protects its payload, not the WireHop control plane or exposed relay r
 | Unauthorized target selection | Canonical logical target allowlist checked before server-side resolution |
 | DNS target rebinding or compromise | Explicit operator trust in the allowed hostname and WireGuard authentication at every candidate |
 | Flooding an allowed target | Authentication, bounded ingress, and deployment-level rate limits when required |
-| Injection through the client UDP listener | Bind to loopback or another trusted local interface |
+| Injection through a client or forward UDP listener | Bind to loopback or another trusted local interface |
+| Direct target traffic entering its local WireGuard tunnel | Forward socket mark or explicit target and DNS routes |
+| Direct target overlapping its local listener | Keep every target candidate outside the listener's bound address and port |
 | Token, metadata, or control exposure | TLS in production and explicit opt-in for plaintext carriers |
 | Connection and admission exhaustion | Global bounds plus deployment admission rate limits when required |
 | Packet-retention exhaustion | Per-queue limits, shared process budgets, deadlines, and one migration per packet |
@@ -1711,4 +1768,5 @@ WireGuard protects its payload, not the WireHop control plane or exposed relay r
 | Reconnect storms | Capped exponential backoff with full jitter |
 
 The WireGuard reserved field is public header metadata. Its value is neither a secret nor an authentication mechanism.
-Reserved translation does not replace WireGuard peer authentication or the WireHop admission token.
+Reserved translation does not replace WireGuard peer authentication or, when a carrier relay is used, the WireHop
+admission token.

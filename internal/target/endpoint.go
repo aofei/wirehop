@@ -1,4 +1,4 @@
-// Package target defines canonical WireGuard target identities and resolves their server-side addresses.
+// Package target defines canonical WireGuard target identities and resolves their network addresses.
 package target
 
 import (
@@ -27,7 +27,7 @@ var (
 	ErrNoAddresses = errors.New("target has no usable addresses")
 )
 
-// Resolver resolves target hostnames through the server's local name service.
+// Resolver resolves target hostnames through the owning process's name service.
 type Resolver interface {
 	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
 }
@@ -108,7 +108,7 @@ func (e Endpoint) Address() netip.Addr {
 	return e.addr
 }
 
-// IsDomain reports whether endpoint requires server-side DNS resolution.
+// IsDomain reports whether endpoint requires DNS resolution.
 func (e Endpoint) IsDomain() bool {
 	return e.Valid() && !e.addr.IsValid()
 }
