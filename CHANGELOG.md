@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/aofei/wirehop/compare/v0.1.0...v0.1.1) (2026-08-19)
+
+
+### Features
+
+* add direct WireGuard UDP forwarding ([7ad5ad4](https://github.com/aofei/wirehop/commit/7ad5ad42c7f07d81b6531b5adc1ba96cde42eb14))
+
 ## 0.1.0 (2026-08-16)
 
 
