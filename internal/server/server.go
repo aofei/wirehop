@@ -18,6 +18,7 @@ import (
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/monotime"
+	"github.com/aofei/wirehop/internal/netsetup"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/policy"
 	"github.com/aofei/wirehop/internal/protocol"
@@ -256,8 +257,8 @@ func (s *Server) WebSocketConnContext(parent context.Context, connection net.Con
 	return parent
 }
 
-// createSession reserves capacity and creates one target-owning relay session.
-func (s *Server) createSession(ctx context.Context, endpointTarget target.Endpoint) (*serverSession, error) {
+// createSession reserves capacity and prepares a target under ctx. The retained session belongs to parent.
+func (s *Server) createSession(ctx, parent context.Context, endpointTarget target.Endpoint) (*serverSession, error) {
 	s.mu.Lock()
 	if len(s.sessions)+s.creating >= s.config.MaxSessions {
 		s.mu.Unlock()
@@ -279,7 +280,7 @@ func (s *Server) createSession(ctx context.Context, endpointTarget target.Endpoi
 	}
 	sessionID := protocol.NewSessionID()
 	sessionSecret := protocol.NewSessionSecret()
-	session, err := newServerSession(ctx, s, sessionID, sessionSecret, endpoint)
+	session, err := newServerSession(parent, s, sessionID, sessionSecret, endpoint)
 	if err != nil {
 		endpoint.Close()
 		return nil, err
@@ -441,7 +442,10 @@ func (s *Server) serveRawCreate(ctx context.Context, connection net.Conn, hello 
 			"target is not allowed")
 		return policy.ErrInvalidTarget
 	}
-	session, err := s.createSession(ctx, hello.Target)
+	if err := connection.SetDeadline(operationDeadline(ctx, netsetup.ResolveTimeout+s.config.HandshakeTimeout)); err != nil {
+		return err
+	}
+	session, err := s.prepareRawSession(ctx, connection, hello.Target)
 	if err != nil {
 		code := protocol.ErrorUnavailable
 		if errors.Is(err, ErrSessionLimit) {
@@ -453,6 +457,7 @@ func (s *Server) serveRawCreate(ctx context.Context, connection net.Conn, hello 
 		}
 		return err
 	}
+	defer session.closeUnconfirmed()
 	if err := session.reserveLane(hello.LaneID, hello.Generation, hello.PathGroupID); err != nil {
 		session.close()
 		code, class, scope := reservationRejection(err)
@@ -484,6 +489,46 @@ func (s *Server) serveRawCreate(ctx context.Context, connection net.Conn, hello 
 	}
 	releaseAdmission()
 	return session.runLane(carrier.NewStreamConn(connection), hello.LaneID, hello.Generation, hello.PathGroupID)
+}
+
+// prepareRawSession cancels target preparation when the creator disconnects or sends premature data. The stream has
+// no valid inbound bytes until the server sends its creation response, so this reader never consumes a valid frame.
+func (s *Server) prepareRawSession(parent context.Context, connection net.Conn, endpointTarget target.Endpoint) (*serverSession, error) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	readDone := make(chan error, 1)
+	go func() {
+		var buffer [1]byte
+		count, err := connection.Read(buffer[:])
+		if count != 0 {
+			err = relay.ErrUnexpectedFrame
+		}
+		cancel()
+		readDone <- err
+	}()
+	session, err := s.createSession(ctx, parent, endpointTarget)
+	deadlineErr := connection.SetReadDeadline(time.Now())
+	if deadlineErr != nil {
+		connection.Close()
+	}
+	readErr := <-readDone
+	if networkErr, ok := errors.AsType[net.Error](readErr); !ok || !networkErr.Timeout() {
+		if errors.Is(readErr, relay.ErrUnexpectedFrame) {
+			err = readErr
+		} else {
+			err = context.Canceled
+		}
+	}
+	if deadlineErr != nil {
+		err = deadlineErr
+	}
+	if err != nil {
+		if session != nil {
+			session.close()
+		}
+		return nil, err
+	}
+	return session, nil
 }
 
 // serveRawJoin authenticates and attaches one generation to a retained session.
@@ -706,7 +751,15 @@ func (s *Server) serveWebSocketCreate(ctx context.Context, writer http.ResponseW
 			protocol.ErrorSessionRejected, protocol.ErrorScopeSession, "target is not allowed", s.config.Token,
 			policy.ErrInvalidTarget)
 	}
-	session, err := s.createSession(ctx, creation.Target)
+	deadline := operationDeadline(ctx, netsetup.ResolveTimeout+s.config.HandshakeTimeout)
+	if err := http.NewResponseController(writer).SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	preparationContext, cancelPreparation := context.WithCancel(ctx)
+	stopRequestCancellation := context.AfterFunc(request.Context(), cancelPreparation)
+	session, err := s.createSession(preparationContext, ctx, creation.Target)
+	stopRequestCancellation()
+	cancelPreparation()
 	if err != nil {
 		code := protocol.ErrorUnavailable
 		cause := err
@@ -718,6 +771,7 @@ func (s *Server) serveWebSocketCreate(ctx context.Context, writer http.ResponseW
 		return s.rejectWebSocket(writer, receiveMicros, creation.Nonce, code, protocol.ErrorRetryable,
 			protocol.ErrorScopeSession, "session unavailable", s.config.Token, cause)
 	}
+	defer session.closeUnconfirmed()
 	if err := session.reserveLane(creation.LaneID, creation.Generation, creation.PathGroupID); err != nil {
 		session.close()
 		code, class, scope := reservationRejection(err)
@@ -902,7 +956,7 @@ func acceptWebSocket(writer http.ResponseWriter, request *http.Request) (*carrie
 		return nil, wsheader.ErrInvalid
 	}
 	connection := carrier.NewWebSocketConn(webSocket)
-	connection.SetAbortConnection(networkConnection)
+	connection.SetNetworkConnection(networkConnection)
 	return connection, nil
 }
 

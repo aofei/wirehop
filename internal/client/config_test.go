@@ -91,6 +91,36 @@ func TestStartOwnsMutableConfig(t *testing.T) {
 	}
 }
 
+func TestStartSessionAttemptTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{name: "Default", want: 62 * time.Second},
+		{name: "Explicit", timeout: time.Second, want: time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			instance, err := Start(context.Background(), Config{
+				Lanes: testLaneSpecs(t, "tcp://127.0.0.1:1"), Listen: netip.MustParseAddrPort("127.0.0.1:0"),
+				Target: target.MustParse("127.0.0.1:51820"), Token: []byte("test-token"),
+				HandshakeTimeout: time.Second, SessionAttemptTimeout: test.timeout, MaxLanes: 1,
+				IngressLimits:       packetqueue.Limits{Packets: 1, Bytes: 2048},
+				LaneLimits:          packetqueue.Limits{Packets: 1, Bytes: 2048},
+				Deadlines:           relay.DeadlinePolicy{Control: time.Second, Transport: time.Second},
+				DeduplicationWindow: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer instance.Close()
+			if instance.config.SessionAttemptTimeout != test.want {
+				t.Fatalf("session attempt timeout = %v, want %v", instance.config.SessionAttemptTimeout, test.want)
+			}
+		})
+	}
+}
+
 func TestClientPreservesIngressFailure(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -103,7 +133,7 @@ func TestClientPreservesIngressFailure(t *testing.T) {
 	instance, err := Start(context.Background(), Config{
 		Lanes: testLaneSpecs(t, "tcp://"+address), Listen: netip.MustParseAddrPort("127.0.0.1:0"),
 		Target: target.MustParse("127.0.0.1:51820"), Token: []byte("test-token"),
-		HandshakeTimeout: time.Second, StartupTimeout: time.Second, MaxLanes: 1,
+		HandshakeTimeout: time.Second, SessionAttemptTimeout: time.Second, MaxLanes: 1,
 		IngressLimits:       packetqueue.Limits{Packets: 1, Bytes: 2048},
 		LaneLimits:          packetqueue.Limits{Packets: 1, Bytes: 2048},
 		Deadlines:           relay.DeadlinePolicy{Control: time.Second, Transport: time.Second},
@@ -247,7 +277,7 @@ func TestResolvedWSPreservesLogicalIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection, response, _, cancel, err := instance.dialWebSocket(
-		context.Background(), spec.URL(), make(http.Header), prepared,
+		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
 	if err != nil {
@@ -307,7 +337,7 @@ func TestResolvedWSSPreservesLogicalIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection, response, _, cancel, err := instance.dialWebSocket(
-		context.Background(), spec.URL(), make(http.Header), prepared,
+		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
 	if err != nil {
@@ -353,7 +383,7 @@ func TestDialWebSocketRejectsMissingSubprotocolPromptly(t *testing.T) {
 	}
 	started := time.Now()
 	connection, response, _, cancel, err := instance.dialWebSocket(
-		context.Background(), spec.URL(), make(http.Header), prepared,
+		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
 	if connection != nil || !errors.Is(err, ErrUnexpectedServerResponse) {
@@ -422,7 +452,7 @@ func TestDialWebSocketRejectsRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection, response, _, cancel, err := instance.dialWebSocket(
-		context.Background(), url, make(http.Header), prepared,
+		context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
 	if connection != nil || err == nil || response == nil || response.StatusCode != http.StatusFound {
@@ -447,7 +477,7 @@ func TestDialWebSocketBoundsResponseHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, _, _, cancel, err := instance.dialWebSocket(context.Background(), url, make(http.Header), prepared)
+	connection, _, _, cancel, err := instance.dialWebSocket(context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout)
 	cancel()
 	if connection != nil || err == nil || !strings.Contains(err.Error(), "response headers exceeded") {
 		t.Fatalf("dialWebSocket() = %v, %v", connection, err)
@@ -496,7 +526,7 @@ func TestPreparedWebSocketRetainsProxySelection(t *testing.T) {
 			preparedWebSocket.firstHopAddress, preparedWebSocket.targetAddress, wantEndpoint)
 	}
 	connection, _, _, cancel, err := instance.dialWebSocket(
-		context.Background(), url, make(http.Header), prepared,
+		context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
 	if err != nil {
@@ -510,43 +540,77 @@ func TestPreparedWebSocketRetainsProxySelection(t *testing.T) {
 	}
 }
 
-func TestPreparedWebSocketClosesOnHeaderError(t *testing.T) {
-	url := testLaneSpec(t, "ws://relay.example/_wirehop").URL()
-	attempt := creationAttempt{
-		laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1}, generation: 1,
-		nonce: protocol.Nonce{1},
-	}
-	instance := &Client{config: Config{
-		Token: []byte("test-token"), Target: target.MustParse("127.0.0.1:51820"),
-	}}
-	for _, test := range []struct {
-		name string
-		open func(net.Conn) error
-	}{
-		{name: "Create", open: func(connection net.Conn) error {
-			_, _, err := instance.openPreparedCreation(context.Background(), url, attempt, connection)
-			return err
-		}},
-		{name: "Join", open: func(connection net.Conn) error {
-			_, err := instance.openPreparedJoin(context.Background(), url, attempt, creationResult{
-				sessionID: protocol.SessionID{1}, sessionSecret: protocol.SessionSecret{1},
-			}, connection)
-			return err
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			connection, peer := net.Pipe()
-			defer peer.Close()
-			if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-				t.Fatal(err)
-			}
-			if err := test.open(connection); err == nil {
-				t.Fatal("WebSocket admission succeeded with an invalid timestamp")
-			}
-			if _, err := peer.Read(make([]byte, 1)); err == nil {
-				t.Fatal("prepared connection remained open after admission header failure")
+func TestPreparedWebSocketClosesOnAdmissionFailure(t *testing.T) {
+	for _, mode := range []string{"Create", "Join"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, scheme := range []string{"WS", "WSS"} {
+				t.Run(scheme, func(t *testing.T) {
+					for _, failure := range []string{"InvalidHeaders", "CanceledBeforeDial", "CanceledDuringHandshake"} {
+						t.Run(failure, func(t *testing.T) {
+							testPreparedWebSocketClosesOnAdmissionFailure(t, mode, scheme, failure)
+						})
+					}
+				})
 			}
 		})
+	}
+}
+
+func testPreparedWebSocketClosesOnAdmissionFailure(t *testing.T, mode, scheme, failure string) {
+	t.Helper()
+	url := testLaneSpec(t, strings.ToLower(scheme)+"://relay.example/_wirehop").URL()
+	attempt := creationAttempt{
+		laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1}, generation: 1,
+		nonce: protocol.Nonce{1}, unixSeconds: time.Now().Unix(),
+	}
+	instance := &Client{config: Config{
+		Token: []byte("test-token"), Target: target.MustParse("127.0.0.1:51820"), HandshakeTimeout: time.Second,
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	connection, peer := net.Pipe()
+	defer connection.Close()
+	defer peer.Close()
+	if err := peer.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var started chan error
+	switch failure {
+	case "InvalidHeaders":
+		attempt.unixSeconds = 0
+	case "CanceledBeforeDial":
+		cancel()
+	case "CanceledDuringHandshake":
+		started = make(chan error, 1)
+		go func() {
+			var buffer [1]byte
+			_, err := peer.Read(buffer[:])
+			cancel()
+			started <- err
+		}()
+	}
+	prepared := &preparedWebSocketConnection{Conn: connection, targetAddress: url.Address()}
+	var err error
+	if mode == "Create" {
+		_, _, err = instance.openPreparedCreation(ctx, url, attempt, prepared)
+	} else {
+		_, err = instance.openPreparedJoin(ctx, url, attempt, creationResult{
+			sessionID: protocol.SessionID{1}, sessionSecret: protocol.SessionSecret{1},
+		}, prepared)
+	}
+	if started != nil {
+		if err := <-started; err != nil {
+			t.Fatalf("handshake did not start before cancellation: %v", err)
+		}
+	}
+	if err == nil {
+		t.Fatal("WebSocket admission succeeded")
+	}
+	if failure != "InvalidHeaders" && !errors.Is(err, context.Canceled) {
+		t.Fatalf("admission error = %v, want context cancellation", err)
+	}
+	if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("prepared connection read = %v, want EOF after admission failure", err)
 	}
 }
 
@@ -623,7 +687,7 @@ func TestDialWebSocketThroughHTTPSProxy(t *testing.T) {
 			t.Fatal(err)
 		}
 		connection, response, _, cancel, err := instance.dialWebSocket(
-			context.Background(), url, make(http.Header), prepared,
+			context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout,
 		)
 		cancel()
 		if err != nil {
@@ -680,7 +744,7 @@ func TestDialWebSocketThroughSOCKS5Proxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection, response, _, cancel, err := instance.dialWebSocket(
-		context.Background(), spec.URL(), make(http.Header), prepared,
+		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
 	if err != nil {
@@ -872,27 +936,6 @@ func TestBuildLanesGroupsCanonicalRoutes(t *testing.T) {
 	}
 	if lanes[3].pathGroupID != lanes[5].pathGroupID {
 		t.Fatal("canonical-equivalent fixed resolutions received different path groups")
-	}
-}
-
-func TestCloseUnusedPreparations(t *testing.T) {
-	connection, peer := net.Pipe()
-	defer peer.Close()
-	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	prepared := make(chan preparationResult, 1)
-	prepared <- preparationResult{connection: connection}
-	failed := make(chan preparationResult, 1)
-	failed <- preparationResult{err: errors.New("preparation failed")}
-
-	closeUnusedPreparations([]chan preparationResult{nil, prepared, failed, make(chan preparationResult, 1)})
-
-	if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
-		t.Fatalf("unused prepared connection read error = %v, want %v", err, io.EOF)
-	}
-	if len(prepared) != 0 || len(failed) != 0 {
-		t.Fatalf("preparation channels retained %d and %d results", len(prepared), len(failed))
 	}
 }
 

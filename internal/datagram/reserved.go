@@ -31,6 +31,15 @@ func (e *reservedEndpoint) Read(ctx context.Context) (Packet, error) {
 	return packet, nil
 }
 
+// ReadBatch injects the configured reserved value into an accepted packet vector.
+func (e *reservedEndpoint) ReadBatch(ctx context.Context, packets []Packet) (int, error) {
+	count, err := ReadBatch(ctx, e.Endpoint, packets)
+	for index := range count {
+		copy(packets[index].Payload[1:4], e.reserved[:])
+	}
+	return count, err
+}
+
 // Write validates and clears the configured reserved value before local UDP delivery.
 func (e *reservedEndpoint) Write(ctx context.Context, payload []byte, deadline time.Time) error {
 	if wgpacket.Reserved(payload[1:4]) != e.reserved {
@@ -40,4 +49,24 @@ func (e *reservedEndpoint) Write(ctx context.Context, payload []byte, deadline t
 	err := e.Endpoint.Write(ctx, payload, deadline)
 	copy(payload[1:4], e.reserved[:])
 	return err
+}
+
+// WriteBatch validates, clears, and restores reserved bytes around one ordered vector write.
+func (e *reservedEndpoint) WriteBatch(ctx context.Context, payloads [][]byte, deadline time.Time) (int, error) {
+	valid := 0
+	for valid < len(payloads) && wgpacket.Reserved(payloads[valid][1:4]) == e.reserved {
+		clear(payloads[valid][1:4])
+		valid++
+	}
+	written, err := WriteBatch(ctx, e.Endpoint, payloads[:valid], deadline)
+	for index := range valid {
+		copy(payloads[index][1:4], e.reserved[:])
+	}
+	if err != nil {
+		return written, err
+	}
+	if valid < len(payloads) {
+		return valid, ErrDatagramDropped
+	}
+	return valid, nil
 }

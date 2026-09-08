@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -19,12 +18,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aofei/backoff"
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/lanespec"
 	"github.com/aofei/wirehop/internal/laneurl"
 	"github.com/aofei/wirehop/internal/monotime"
+	"github.com/aofei/wirehop/internal/netsetup"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/relay"
@@ -42,8 +43,8 @@ var (
 	ErrUnexpectedServerResponse = errors.New("unexpected server response")
 	// ErrSessionGone indicates that the server no longer retains a session being joined.
 	ErrSessionGone = errors.New("relay session is gone")
-	// ErrStartupTimeout indicates that no configured lane created a session within the startup budget.
-	ErrStartupTimeout = errors.New("relay session startup timed out")
+	// ErrSessionAttemptTimeout indicates that one lane's session creation attempt exhausted its operation budget.
+	ErrSessionAttemptTimeout = errors.New("relay session creation timed out")
 	// ErrLaneRejected indicates a permanent carrier-specific admission rejection.
 	ErrLaneRejected = errors.New("relay lane rejected")
 )
@@ -63,24 +64,24 @@ func (e *RejectionError) Error() string {
 
 // Config defines the carrier lanes and local WireGuard listener for one relay session.
 type Config struct {
-	Lanes               []lanespec.Spec
-	Listen              netip.AddrPort
-	Target              target.Endpoint
-	Reserved            wgpacket.Reserved
-	Token               []byte
-	Clock               relay.Clock
-	WallClock           func() time.Time
-	Dialer              *net.Dialer
-	Proxy               func(*http.Request) (*neturl.URL, error)
-	TLSConfig           *tls.Config
-	Logger              *slog.Logger
-	HandshakeTimeout    time.Duration
-	StartupTimeout      time.Duration
-	MaxLanes            int
-	IngressLimits       packetqueue.Limits
-	LaneLimits          packetqueue.Limits
-	Deadlines           relay.DeadlinePolicy
-	DeduplicationWindow int
+	Lanes                 []lanespec.Spec
+	Listen                netip.AddrPort
+	Target                target.Endpoint
+	Reserved              wgpacket.Reserved
+	Token                 []byte
+	Clock                 relay.Clock
+	WallClock             func() time.Time
+	Dialer                *net.Dialer
+	Proxy                 func(*http.Request) (*neturl.URL, error)
+	TLSConfig             *tls.Config
+	Logger                *slog.Logger
+	HandshakeTimeout      time.Duration
+	SessionAttemptTimeout time.Duration
+	MaxLanes              int
+	IngressLimits         packetqueue.Limits
+	LaneLimits            packetqueue.Limits
+	Deadlines             relay.DeadlinePolicy
+	DeduplicationWindow   int
 }
 
 // Client owns the early-bound local UDP socket and asynchronous relay session.
@@ -119,8 +120,8 @@ type pathGroupKey struct {
 
 // Start validates config, binds UDP immediately, and starts carrier session establishment.
 func Start(parent context.Context, config Config) (*Client, error) {
-	if config.StartupTimeout == 0 {
-		config.StartupTimeout = defaultStartupTimeout
+	if config.SessionAttemptTimeout == 0 {
+		config.SessionAttemptTimeout = netsetup.DialTimeout + netsetup.ResolveTimeout + 2*config.HandshakeTimeout
 	}
 	if config.MaxLanes == 0 {
 		config.MaxLanes = defaultMaxLanes
@@ -260,11 +261,12 @@ type acceptedLane struct {
 	initialFrame protocol.Frame
 }
 
-// preparationResult is one concurrently prepared first-hop carrier connection.
-type preparationResult struct {
-	index      int
-	connection net.Conn
-	err        error
+// candidateResult is one completed session admission that has not sent in-session frames.
+type candidateResult struct {
+	index    int
+	accepted acceptedLane
+	session  creationResult
+	err      error
 }
 
 // webSocketRoute binds one WebSocket attempt to its selected first hop and proxy policy.
@@ -320,6 +322,11 @@ type configuredLaneError struct {
 	err   error
 }
 
+// unattachedSessionGoneError marks a session absence reported before one configured lane ever joined it.
+type unattachedSessionGoneError struct {
+	cause error
+}
+
 // Error returns the lane declaration and underlying failure.
 func (e *configuredLaneError) Error() string {
 	if resolveIP := e.spec.ResolveIP(); resolveIP.IsValid() {
@@ -331,6 +338,16 @@ func (e *configuredLaneError) Error() string {
 // Unwrap returns the underlying lane failure.
 func (e *configuredLaneError) Unwrap() error {
 	return e.err
+}
+
+// Error returns the original authenticated session-absence diagnostic.
+func (e *unattachedSessionGoneError) Error() string {
+	return e.cause.Error()
+}
+
+// Unwrap preserves the session failure if this becomes the final configured lane.
+func (e *unattachedSessionGoneError) Unwrap() error {
+	return e.cause
 }
 
 // failureDisposition determines the ownership scope of one lane failure.
@@ -346,12 +363,10 @@ const (
 )
 
 const (
-	// initialReconnectDelay is the first per-lane retry delay.
+	// initialReconnectDelay is the first reconnect retry ceiling.
 	initialReconnectDelay = 100 * time.Millisecond
-	// maximumReconnectDelay bounds per-lane retry backoff.
+	// maximumReconnectDelay bounds reconnect retry backoff.
 	maximumReconnectDelay = 5 * time.Second
-	// defaultStartupTimeout bounds one complete session-creation attempt across all configured lanes.
-	defaultStartupTimeout = 15 * time.Second
 	// reconnectStabilityInterval resets backoff after sustained healthy service.
 	reconnectStabilityInterval = 30 * time.Second
 	// defaultMaxLanes bounds concurrent carrier preparation and session membership.
@@ -385,62 +400,29 @@ func (c *Client) run() error {
 		cancel(context.Canceled)
 		<-ingressDone
 	}()
-	startupDeadline := time.Now().Add(c.config.StartupTimeout)
-	everEstablished := false
-	retryDelay := initialReconnectDelay
-	var lastStartupFailure error
+	retryAttempt := 0
+	notice := netsetup.NewRetryNotice(c.config.Logger, "relay session")
 	for {
-		startupBudget := c.config.StartupTimeout
-		if !everEstablished {
-			startupBudget = time.Until(startupDeadline)
-			if startupBudget <= 0 {
-				if lastStartupFailure != nil {
-					return fmt.Errorf("%w: %w", ErrStartupTimeout, lastStartupFailure)
-				}
-				return ErrStartupTimeout
-			}
-		}
-		activeFor, err := c.runSession(ctx, ingressResult, startupBudget)
+		activeFor, err := c.runSession(ctx, ingressResult, notice)
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
 		}
-		hasSession := !c.SessionID().IsZero()
-		if hasSession {
-			everEstablished = true
-			retryDelay = reconnectDelayAfterUptime(retryDelay, activeFor)
-		} else if !everEstablished {
-			lastStartupFailure = err
+		if c.SessionID().IsZero() || !sessionReplacementFailure(err) {
+			return err
 		}
-		if hasSession && sessionReplacementFailure(err) {
-			c.clearSession()
-			if err := waitReconnect(ctx, retryDelay); err != nil {
-				return err
-			}
-			retryDelay = nextReconnectDelay(retryDelay)
-			continue
+		retryAttempt = reconnectAttemptAfterUptime(retryAttempt, activeFor)
+		notice = netsetup.NewRetryNotice(c.config.Logger, "relay session")
+		c.clearSession()
+		if err := waitReconnect(ctx, retryAttempt); err != nil {
+			return err
 		}
-		if !hasSession && (classifyLaneFailure(err) == failureRetry || retryableSessionFailure(err)) {
-			delay := retryDelay
-			if !everEstablished {
-				remaining := time.Until(startupDeadline)
-				if remaining <= 0 {
-					return fmt.Errorf("%w: %w", ErrStartupTimeout, err)
-				}
-				delay = min(delay, remaining)
-			}
-			if err := waitReconnect(ctx, delay); err != nil {
-				return err
-			}
-			retryDelay = nextReconnectDelay(retryDelay)
-			continue
-		}
-		return err
+		retryAttempt++
 	}
 }
 
 // runSession creates one session, supervises its lanes, and reports established uptime.
 func (c *Client) runSession(ctx context.Context, ingressResult <-chan error,
-	startupTimeout time.Duration) (time.Duration, error) {
+	notice *netsetup.RetryNotice) (time.Duration, error) {
 	scheduler, err := relay.NewScheduler(c.queue)
 	if err != nil {
 		return 0, err
@@ -456,123 +438,98 @@ func (c *Client) runSession(ctx context.Context, ingressResult <-chan error,
 		c.mu.Unlock()
 	}()
 	sessionContext, cancel := context.WithCancel(ctx)
-	defer cancel()
 	schedulerResult := make(chan error, 1)
+	schedulerConsumed := false
 	go func() { schedulerResult <- scheduler.Run(sessionContext) }()
+	defer func() {
+		cancel()
+		if !schedulerConsumed {
+			<-schedulerResult
+		}
+	}()
 	receiver, err := relay.NewReceiver(relay.ReceiverConfig{
 		Endpoint: c.endpoint, Clock: c.config.Clock, DeduplicationSize: c.config.DeduplicationWindow,
 	})
 	if err != nil {
 		return 0, err
 	}
-	startupContext, startupCancel := context.WithTimeout(sessionContext, startupTimeout)
-	startupDeadline, _ := startupContext.Deadline()
-	preparations := make(chan preparationResult, len(c.lanes))
-	for index, configured := range c.lanes {
+	creationContext, creationCancel := context.WithCancel(sessionContext)
+	candidates := make(chan candidateResult, len(c.lanes))
+	failures := make(chan laneResult, len(c.lanes))
+	finished := make([]chan struct{}, len(c.lanes))
+	for index := range c.lanes {
+		finished[index] = make(chan struct{})
 		go func() {
-			connection, err := c.prepareLane(startupContext, configured.spec)
-			preparations <- preparationResult{index: index, connection: connection, err: err}
+			defer close(finished[index])
+			candidates <- c.retryCandidate(creationContext, index, failures)
 		}()
 	}
 	var accepted acceptedLane
 	var result creationResult
 	creatorIndex := -1
 	var creationError error
-	var retryableCreationError error
-	consumed := make([]bool, len(c.lanes))
-	receivedPreparations := 0
-	cleanupPreparations := true
+	remainingCandidates := len(c.lanes)
+	candidatesDone := make(chan struct{})
 	defer func() {
-		startupCancel()
-		if !cleanupPreparations {
-			return
+		creationCancel()
+		<-candidatesDone
+	}()
+	for remainingCandidates > 0 {
+		var candidate candidateResult
+		select {
+		case failure := <-failures:
+			if sessionContext.Err() == nil {
+				notice.Failed(laneFailureAttributes(c.configuredLaneError(failure.index, failure.err))...)
+			}
+			continue
+		case candidate = <-candidates:
 		}
-		for receivedPreparations < len(c.lanes) {
-			prepared := <-preparations
-			receivedPreparations++
-			if prepared.connection != nil {
-				prepared.connection.Close()
+		remainingCandidates--
+		if candidate.err == nil {
+			creatorIndex = candidate.index
+			accepted, result = candidate.accepted, candidate.session
+			break
+		}
+		creationError = c.configuredLaneError(candidate.index, candidate.err)
+	}
+	creationCancel()
+	go func() {
+		defer close(candidatesDone)
+		for range remainingCandidates {
+			candidate := <-candidates
+			if candidate.err == nil {
+				candidate.accepted.connection.Close()
 			}
 		}
 	}()
-	for receivedPreparations < len(c.lanes) {
-		prepared := <-preparations
-		receivedPreparations++
-		consumed[prepared.index] = true
-		if prepared.err != nil {
-			failure := c.configuredLaneError(prepared.index, prepared.err)
-			creationError = failure
-			if classifyLaneFailure(failure) == failureRetry {
-				retryableCreationError = failure
-			}
-			continue
-		}
-		creator := c.lanes[prepared.index]
-		attempt := c.newCreationAttempt(creator, 1)
-		accepted, result, err = c.openPreparedCreation(
-			startupContext, creator.spec.URL(), attempt, prepared.connection,
-		)
-		if err == nil {
-			creatorIndex = prepared.index
-			break
-		}
-		failure := c.configuredLaneError(prepared.index, err)
-		creationError = failure
-		if classifyLaneFailure(failure) == failureRetry {
-			retryableCreationError = failure
-		}
-	}
 	if creatorIndex < 0 {
-		startupError := startupContext.Err()
-		if startupError != nil || !time.Now().Before(startupDeadline) {
-			if startupError == nil {
-				startupError = context.DeadlineExceeded
-			}
-			if creationError != nil {
-				return 0, fmt.Errorf("%w: %w", ErrStartupTimeout, creationError)
-			}
-			return 0, fmt.Errorf("%w: %w", ErrStartupTimeout, startupError)
-		}
-		if retryableCreationError != nil {
-			return 0, retryableCreationError
-		}
 		return 0, creationError
 	}
-	preparedLanes := make([]chan preparationResult, len(c.lanes))
-	for index := range preparedLanes {
-		if index != creatorIndex && !consumed[index] {
-			preparedLanes[index] = make(chan preparationResult, 1)
-		}
-	}
-	var preparationsDone <-chan struct{}
-	if remaining := len(c.lanes) - receivedPreparations; remaining > 0 {
-		done := make(chan struct{})
-		preparationsDone = done
-		go func() {
-			defer close(done)
-			defer startupCancel()
-			c.distributePreparations(sessionContext, preparations, preparedLanes, remaining)
-		}()
-	} else {
-		startupCancel()
-	}
-	cleanupPreparations = false
-	receiver.UpdateClock(accepted.mapping.Inverse())
 	c.mu.Lock()
-	c.sessionID = result.sessionID
-	c.sessionSecret = result.sessionSecret
+	cancellationErr := sessionContext.Err()
+	if cancellationErr == nil {
+		c.sessionID = result.sessionID
+		c.sessionSecret = result.sessionSecret
+	}
 	c.mu.Unlock()
+	if cancellationErr != nil {
+		accepted.connection.Close()
+		return 0, cancellationErr
+	}
+	notice.Recovered()
+	receiver.UpdateClock(accepted.mapping.Inverse())
 	establishedAt := time.Now()
 	laneResults := make(chan laneResult, len(c.lanes))
 	var laneWait sync.WaitGroup
 	for index, configured := range c.lanes {
 		laneWait.Go(func() {
+			<-finished[index]
 			var initial *acceptedLane
 			if index == creatorIndex {
 				initial = &accepted
 			}
 			if err := c.superviseLane(
-				sessionContext, configured, result, initial, preparedLanes[index], receiver, scheduler,
+				sessionContext, configured, result, initial, receiver, scheduler,
 			); err != nil {
 				select {
 				case laneResults <- laneResult{index: index, err: err}:
@@ -582,7 +539,6 @@ func (c *Client) runSession(ctx context.Context, ingressResult <-chan error,
 		})
 	}
 	var resultError error
-	schedulerConsumed := false
 	remainingLanes := len(c.lanes)
 	for resultError == nil {
 		select {
@@ -605,14 +561,52 @@ func (c *Client) runSession(ctx context.Context, ingressResult <-chan error,
 	}
 	cancel()
 	laneWait.Wait()
-	if preparationsDone != nil {
-		<-preparationsDone
-	}
-	closeUnusedPreparations(preparedLanes)
-	if !schedulerConsumed {
-		<-schedulerResult
-	}
 	return time.Since(establishedAt), resultError
+}
+
+// retryCandidate independently retries one lane's creation until admission, terminal rejection, or cancellation.
+func (c *Client) retryCandidate(ctx context.Context, index int, failures chan<- laneResult) candidateResult {
+	for retryAttempt := 0; ; retryAttempt++ {
+		candidate := c.createCandidate(ctx, index)
+		if candidate.err == nil {
+			return candidate
+		}
+		if ctx.Err() != nil {
+			candidate.err = context.Cause(ctx)
+			return candidate
+		}
+		if classifyLaneFailure(candidate.err) != failureRetry && !retryableSessionFailure(candidate.err) {
+			return candidate
+		}
+		select {
+		case failures <- laneResult{index: index, err: candidate.err}:
+		case <-ctx.Done():
+			candidate.err = context.Cause(ctx)
+			return candidate
+		}
+		if err := waitReconnect(ctx, retryAttempt); err != nil {
+			candidate.err = err
+			return candidate
+		}
+	}
+}
+
+// createCandidate bounds one lane's preparation and authenticated session creation without sending in-session frames.
+func (c *Client) createCandidate(ctx context.Context, index int) candidateResult {
+	attemptContext, cancel := context.WithTimeout(ctx, c.config.SessionAttemptTimeout)
+	defer cancel()
+	configured := c.lanes[index]
+	connection, err := c.prepareLane(attemptContext, configured.spec)
+	candidate := candidateResult{index: index, err: err}
+	if err == nil {
+		candidate.accepted, candidate.session, candidate.err = c.openPreparedCreation(
+			attemptContext, configured.spec.URL(), c.newCreationAttempt(configured, 1), connection,
+		)
+	}
+	if candidate.err != nil && ctx.Err() == nil && errors.Is(attemptContext.Err(), context.DeadlineExceeded) {
+		candidate.err = fmt.Errorf("%w: %w", ErrSessionAttemptTimeout, candidate.err)
+	}
+	return candidate
 }
 
 // configuredLaneError wraps one failure with its stable command-line declaration.
@@ -625,10 +619,17 @@ func (c *Client) logDisabledLane(index int, err error) {
 	if c.config.Logger == nil {
 		return
 	}
-	lane := c.lanes[index]
-	attributes := []any{"lane", index + 1, "url", lane.spec.URL()}
-	if resolveIP := lane.spec.ResolveIP(); resolveIP.IsValid() {
-		attributes = append(attributes, "resolve", resolveIP)
+	c.config.Logger.Warn("relay lane disabled", laneFailureAttributes(c.configuredLaneError(index, err))...)
+}
+
+// laneFailureAttributes describes a failed lane without including authenticated peer-controlled diagnostics.
+func laneFailureAttributes(err error) []any {
+	var attributes []any
+	if lane, ok := errors.AsType[*configuredLaneError](err); ok {
+		attributes = append(attributes, "lane", lane.index+1, "url", lane.spec.URL())
+		if resolveIP := lane.spec.ResolveIP(); resolveIP.IsValid() {
+			attributes = append(attributes, "resolve", resolveIP)
+		}
 	}
 	if rejection, ok := errors.AsType[*RejectionError](err); ok {
 		attributes = append(attributes,
@@ -639,14 +640,11 @@ func (c *Client) logDisabledLane(index int, err error) {
 	} else {
 		attributes = append(attributes, "error", err)
 	}
-	c.config.Logger.Warn("relay lane disabled", attributes...)
+	return attributes
 }
 
 // laneFailureEndsSession reports whether one ended supervisor invalidates the shared session.
 func laneFailureEndsSession(err error, remainingLanes int) bool {
-	if sessionGoneFailure(err) {
-		return remainingLanes == 0
-	}
 	return classifyLaneFailure(err) == failureCloseSession || remainingLanes == 0
 }
 
@@ -675,38 +673,6 @@ func sessionGoneFailure(err error) bool {
 		remote.Value.Scope == protocol.ErrorScopeSession
 }
 
-// distributePreparations routes outstanding first-hop results to their stable lane supervisors.
-func (c *Client) distributePreparations(ctx context.Context, input <-chan preparationResult,
-	outputs []chan preparationResult, remaining int) {
-	for range remaining {
-		prepared := <-input
-		output := outputs[prepared.index]
-		if output == nil || ctx.Err() != nil {
-			if prepared.connection != nil {
-				prepared.connection.Close()
-			}
-			continue
-		}
-		output <- prepared
-	}
-}
-
-// closeUnusedPreparations releases first-hop connections not claimed before session shutdown.
-func closeUnusedPreparations(preparations []chan preparationResult) {
-	for _, preparation := range preparations {
-		if preparation == nil {
-			continue
-		}
-		select {
-		case prepared := <-preparation:
-			if prepared.connection != nil {
-				prepared.connection.Close()
-			}
-		default:
-		}
-	}
-}
-
 // clearSession erases client-held ephemeral credentials between session generations.
 func (c *Client) clearSession() {
 	c.mu.Lock()
@@ -728,52 +694,39 @@ func (c *Client) newCreationAttempt(lane clientLane, generation uint64) creation
 
 // superviseLane keeps one stable lane identifier attached with increasing generations.
 func (c *Client) superviseLane(ctx context.Context, configured clientLane, session creationResult,
-	initial *acceptedLane, preparation <-chan preparationResult, receiver *relay.Receiver,
+	initial *acceptedLane, receiver *relay.Receiver,
 	scheduler *relay.Scheduler) error {
 	generation := uint64(1)
-	delay := initialReconnectDelay
+	retryAttempt := 0
+	attached := initial != nil
 	for {
 		accepted := initial
 		initial = nil
 		if accepted == nil {
-			var connection net.Conn
-			var err error
-			if preparation != nil {
-				var prepared preparationResult
-				select {
-				case prepared = <-preparation:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-				preparation = nil
-				connection = prepared.connection
-				err = prepared.err
-				if err == nil && ctx.Err() != nil {
-					prepared.connection.Close()
-					return ctx.Err()
-				}
-			} else {
-				connection, err = c.prepareLane(ctx, configured.spec)
-			}
+			connection, err := c.prepareLane(ctx, configured.spec)
 			var joined acceptedLane
 			if err == nil {
 				attempt := c.newCreationAttempt(configured, generation)
 				joined, err = c.openPreparedJoin(ctx, configured.spec.URL(), attempt, session, connection)
 			}
 			if err != nil {
+				if !attached && sessionGoneFailure(err) {
+					return &unattachedSessionGoneError{cause: err}
+				}
 				if classifyLaneFailure(err) != failureRetry {
 					return err
 				}
 				if err := advanceGeneration(&generation); err != nil {
 					return err
 				}
-				if err := waitReconnect(ctx, delay); err != nil {
+				if err := waitReconnect(ctx, retryAttempt); err != nil {
 					return err
 				}
-				delay = nextReconnectDelay(delay)
+				retryAttempt++
 				continue
 			}
 			accepted = &joined
+			attached = true
 		}
 		receiver.UpdateClock(accepted.mapping.Inverse())
 		started := time.Now()
@@ -784,14 +737,14 @@ func (c *Client) superviseLane(ctx context.Context, configured clientLane, sessi
 		if classifyLaneFailure(err) != failureRetry {
 			return err
 		}
-		delay = reconnectDelayAfterUptime(delay, time.Since(started))
+		retryAttempt = reconnectAttemptAfterUptime(retryAttempt, time.Since(started))
 		if err := advanceGeneration(&generation); err != nil {
 			return err
 		}
-		if err := waitReconnect(ctx, delay); err != nil {
+		if err := waitReconnect(ctx, retryAttempt); err != nil {
 			return err
 		}
-		delay = nextReconnectDelay(delay)
+		retryAttempt++
 	}
 }
 
@@ -847,9 +800,9 @@ func (c *Client) prepareLane(ctx context.Context, spec lanespec.Spec) (net.Conn,
 	if err != nil {
 		return nil, err
 	}
-	handshakeContext, cancel := context.WithTimeout(ctx, c.config.HandshakeTimeout)
+	dialContext, cancel := context.WithTimeout(ctx, netsetup.DialTimeout)
 	defer cancel()
-	connection, err := c.config.Dialer.DialContext(handshakeContext, "tcp", route.address)
+	connection, err := c.config.Dialer.DialContext(dialContext, "tcp", route.address)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s lane first hop: %w", url.Scheme(), err)
 	}
@@ -920,9 +873,9 @@ func (c *Client) openPreparedJoin(ctx context.Context, url laneurl.URL, attempt 
 // dialStream connects and prepares one raw TCP or TLS stream in route-safe order.
 func (c *Client) dialStream(ctx context.Context, spec lanespec.Spec) (net.Conn, error) {
 	url := spec.URL()
-	handshakeContext, cancel := context.WithTimeout(ctx, c.config.HandshakeTimeout)
-	defer cancel()
-	connection, err := c.config.Dialer.DialContext(handshakeContext, "tcp", spec.DialAddress())
+	dialContext, cancelDial := context.WithTimeout(ctx, netsetup.DialTimeout)
+	connection, err := c.config.Dialer.DialContext(dialContext, "tcp", spec.DialAddress())
+	cancelDial()
 	if err != nil {
 		return nil, fmt.Errorf("dial %s lane: %w", url.Scheme(), err)
 	}
@@ -936,6 +889,8 @@ func (c *Client) dialStream(ctx context.Context, spec lanespec.Spec) (net.Conn, 
 		return connection, nil
 	}
 	secure := tls.Client(connection, c.tlsConfig(url, connection.RemoteAddr().String()))
+	handshakeContext, cancel := context.WithTimeout(ctx, c.config.HandshakeTimeout)
+	defer cancel()
 	if err := secure.HandshakeContext(handshakeContext); err != nil {
 		connection.Close()
 		return nil, fmt.Errorf("perform TLS lane handshake: %w", err)
@@ -958,6 +913,9 @@ func (c *Client) createRawSession(ctx context.Context, connection net.Conn,
 		return creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
 	}
 	if err := protocol.WriteClientHello(connection, hello); err != nil {
+		return creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
+	}
+	if err := connection.SetReadDeadline(operationDeadline(ctx, netsetup.ResolveTimeout+c.config.HandshakeTimeout)); err != nil {
 		return creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
 	}
 	response, err := protocol.ReadServerHello(connection)
@@ -1066,7 +1024,7 @@ func (c *Client) createWebSocketSession(ctx context.Context,
 	if err != nil {
 		return nil, creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
 	}
-	connection, response, handshakeContext, cancel, err := c.dialWebSocket(ctx, url, headers, prepared)
+	connection, response, handshakeContext, cancel, err := c.dialWebSocket(ctx, url, headers, prepared, netsetup.ResolveTimeout+c.config.HandshakeTimeout)
 	defer cancel()
 	if err != nil {
 		if response != nil {
@@ -1123,7 +1081,7 @@ func (c *Client) joinWebSocketSession(ctx context.Context, url laneurl.URL, atte
 	if err != nil {
 		return acceptedLane{}, err
 	}
-	connection, response, handshakeContext, cancel, err := c.dialWebSocket(ctx, url, headers, prepared)
+	connection, response, handshakeContext, cancel, err := c.dialWebSocket(ctx, url, headers, prepared, c.config.HandshakeTimeout)
 	defer cancel()
 	if err != nil {
 		if response != nil {
@@ -1131,9 +1089,6 @@ func (c *Client) joinWebSocketSession(ctx context.Context, url laneurl.URL, atte
 				response, attempt, session.sessionSecret[:], c.config.Token,
 			); rejection != nil {
 				return acceptedLane{}, rejection
-			}
-			if response.StatusCode == http.StatusGone {
-				return acceptedLane{}, ErrSessionGone
 			}
 			if permanentHTTPRejection(response.StatusCode) {
 				return acceptedLane{}, fmt.Errorf("%w: WebSocket join returned HTTP %d: %v", ErrLaneRejected,
@@ -1195,11 +1150,12 @@ func authenticatedWebSocketRejection(response *http.Response, attempt creationAt
 	return rejectionError
 }
 
-// dialWebSocket performs an HTTP/1.1 binary WebSocket handshake over a configured TCP socket.
+// dialWebSocket performs an HTTP/1.1 binary WebSocket handshake over a configured TCP socket. The admission owner closes
+// prepared on failure, even if the HTTP transport has not consumed it.
 func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
-	headers http.Header, prepared net.Conn) (carrier.Conn, *http.Response, context.Context, context.CancelFunc, error) {
+	headers http.Header, prepared net.Conn, timeout time.Duration) (carrier.Conn, *http.Response, context.Context, context.CancelFunc, error) {
 	preparedWebSocket := prepared.(*preparedWebSocketConnection)
-	handshakeContext, cancel := context.WithTimeout(ctx, c.config.HandshakeTimeout)
+	handshakeContext, cancel := context.WithTimeout(ctx, timeout)
 	proxyURL := preparedWebSocket.proxy
 	httpTransport := &http.Transport{
 		Proxy: http.ProxyURL(proxyURL), ForceAttemptHTTP2: false,
@@ -1229,7 +1185,9 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 				return nil, err
 			}
 			secure := tls.Client(connection, c.proxyTLSConfig(proxyURL.Hostname(), preparedWebSocket.firstHopAddress))
-			if err := secure.HandshakeContext(ctx); err != nil {
+			tlsContext, cancelTLS := context.WithTimeout(ctx, c.config.HandshakeTimeout)
+			defer cancelTLS()
+			if err := secure.HandshakeContext(tlsContext); err != nil {
 				connection.Close()
 				return nil, fmt.Errorf("perform HTTPS proxy TLS handshake: %w", err)
 			}
@@ -1246,9 +1204,6 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 	})
 	httpTransport.CloseIdleConnections()
 	if err != nil {
-		if availableConnection != nil {
-			availableConnection.Close()
-		}
 		return nil, response, handshakeContext, cancel, err
 	}
 	if webSocket.Subprotocol() != wsheader.Subprotocol {
@@ -1256,7 +1211,7 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 		return nil, response, handshakeContext, cancel, ErrUnexpectedServerResponse
 	}
 	connection := carrier.NewWebSocketConn(webSocket)
-	connection.SetAbortConnection(preparedWebSocket)
+	connection.SetNetworkConnection(preparedWebSocket)
 	return connection, response, handshakeContext, cancel, nil
 }
 
@@ -1411,6 +1366,9 @@ func (c *Client) baseTLSConfig() *tls.Config {
 
 // classifyLaneFailure maps one error to retry, lane, or session scope.
 func classifyLaneFailure(err error) failureDisposition {
+	if _, ok := errors.AsType[*unattachedSessionGoneError](err); ok {
+		return failureCloseLane
+	}
 	if errors.Is(err, ErrSessionGone) || errors.Is(err, relay.ErrCounterExhausted) ||
 		errors.Is(err, relay.ErrEndpointFailure) {
 		return failureCloseSession
@@ -1460,10 +1418,10 @@ func classifyLaneFailure(err error) failureDisposition {
 	return failureRetry
 }
 
-// waitReconnect waits for one per-lane retry delay or cancellation.
-func waitReconnect(ctx context.Context, delay time.Duration) error {
-	jitter := rand.N(delay + 1)
-	timer := time.NewTimer(jitter)
+// waitReconnect waits for one full-jitter reconnect delay or cancellation.
+func waitReconnect(ctx context.Context, attempt int) error {
+	delay := backoff.Duration(initialReconnectDelay, maximumReconnectDelay, attempt)
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -1473,20 +1431,12 @@ func waitReconnect(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-// nextReconnectDelay doubles delay up to the reconnect maximum.
-func nextReconnectDelay(delay time.Duration) time.Duration {
-	if delay >= maximumReconnectDelay/2 {
-		return maximumReconnectDelay
-	}
-	return delay * 2
-}
-
-// reconnectDelayAfterUptime resets retry history only after sustained healthy service.
-func reconnectDelayAfterUptime(delay, uptime time.Duration) time.Duration {
+// reconnectAttemptAfterUptime resets retry history only after sustained healthy service.
+func reconnectAttemptAfterUptime(attempt int, uptime time.Duration) int {
 	if uptime >= reconnectStabilityInterval {
-		return initialReconnectDelay
+		return 0
 	}
-	return delay
+	return attempt
 }
 
 // observeServerHello accepts one authenticated time sample bound to attempt.
@@ -1558,7 +1508,7 @@ func validateConfig(config Config) ([]lanespec.Spec, error) {
 		!validListenAddress(config.Listen) || !config.Target.Valid() ||
 		config.HandshakeTimeout <= 0 || config.IngressLimits.Packets <= 0 ||
 		config.IngressLimits.Bytes <= 0 || config.LaneLimits.Packets <= 0 || config.LaneLimits.Bytes <= 0 ||
-		config.DeduplicationWindow <= 0 || config.StartupTimeout < 0 {
+		config.DeduplicationWindow <= 0 || config.SessionAttemptTimeout < 0 {
 		return nil, ErrInvalidConfig
 	}
 	if err := config.Deadlines.Validate(); err != nil {

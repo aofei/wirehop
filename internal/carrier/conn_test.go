@@ -66,6 +66,34 @@ func TestStreamConn(t *testing.T) {
 	}
 }
 
+func TestStreamConnFrameBatch(t *testing.T) {
+	leftStream, rightStream := net.Pipe()
+	left := NewStreamConn(leftStream)
+	right := NewStreamConn(rightStream)
+	t.Cleanup(func() {
+		left.Close()
+		right.Close()
+	})
+	want := []protocol.Frame{
+		{Type: protocol.FramePing, Payload: []byte{1}},
+		{Type: protocol.FrameProbe, Payload: []byte{2, 3}},
+		{Type: protocol.FramePong, Payload: []byte{4, 5, 6}},
+	}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- left.WriteFrames(context.Background(), want) }()
+	var got [maximumStreamReadBatchFrames]protocol.Frame
+	count, err := right.ReadFrames(context.Background(), got[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got[:count], want) {
+		t.Fatalf("ReadFrames() = %#v, want %#v", got[:count], want)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStreamConnDeadline(t *testing.T) {
 	leftStream, rightStream := net.Pipe()
 	left := NewStreamConn(leftStream)
@@ -77,10 +105,7 @@ func TestStreamConnDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
 	_, err := left.ReadFrame(ctx)
-	networkError, ok := errors.AsType[net.Error](err)
-	if !ok || !networkError.Timeout() {
-		t.Fatalf("ReadFrame() error = %v", err)
-	}
+	assertNetworkTimeout(t, err)
 }
 
 func TestStreamConnClosedContext(t *testing.T) {
@@ -97,6 +122,39 @@ func TestStreamConnClosedContext(t *testing.T) {
 	}
 	if err := left.WriteFrames(ctx, []protocol.Frame{{Type: protocol.FramePing}}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("WriteFrames() error = %v", err)
+	}
+}
+
+func TestWriteFramesWithin(t *testing.T) {
+	leftStream, rightStream := net.Pipe()
+	stream := NewStreamConn(leftStream)
+	t.Cleanup(func() {
+		stream.Close()
+		rightStream.Close()
+	})
+	err := WriteFramesWithin(context.Background(), stream, []protocol.Frame{{Type: protocol.FramePing}},
+		time.Millisecond)
+	assertNetworkTimeout(t, err)
+}
+
+func TestWriteDataBatchWithin(t *testing.T) {
+	leftStream, rightStream := net.Pipe()
+	stream := NewStreamConn(leftStream)
+	t.Cleanup(func() {
+		stream.Close()
+		rightStream.Close()
+	})
+	err := WriteDataBatchWithin(context.Background(), stream, []protocol.Data{{
+		PacketID: 1, DeadlineMicros: 1, Payload: []byte{4, 0, 0, 0},
+	}}, time.Millisecond)
+	assertNetworkTimeout(t, err)
+}
+
+func assertNetworkTimeout(t *testing.T, err error) {
+	t.Helper()
+	networkError, ok := errors.AsType[net.Error](err)
+	if !ok || !networkError.Timeout() {
+		t.Fatalf("error = %v, want network timeout", err)
 	}
 }
 
@@ -170,7 +228,7 @@ func TestWebSocketConnAbort(t *testing.T) {
 		t.Fatal(err)
 	}
 	stream := NewWebSocketConn(connection)
-	stream.SetAbortConnection(<-rawConnections)
+	stream.SetNetworkConnection(<-rawConnections)
 	<-accepted
 	if err := stream.Abort(); err != nil {
 		t.Fatal(err)
@@ -188,6 +246,78 @@ func TestWebSocketConnAbort(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("peer read remained blocked after abortive close")
+	}
+}
+
+func TestWebSocketConnBoundedWritesPreserveControlFrames(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		secure bool
+		data   bool
+	}{
+		{name: "Frames"},
+		{name: "Data", data: true},
+		{name: "SecureFrames", secure: true},
+		{name: "SecureData", secure: true, data: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			const timeout = 100 * time.Millisecond
+			type connectionKey struct{}
+			written := make(chan error, 1)
+			done := make(chan struct{})
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				defer close(done)
+				connection, err := websocket.Accept(writer, request, nil)
+				if err != nil {
+					written <- err
+					return
+				}
+				defer connection.CloseNow()
+				stream := NewWebSocketConn(connection)
+				stream.SetNetworkConnection(request.Context().Value(connectionKey{}).(net.Conn))
+				if tt.data {
+					err = WriteDataBatchWithin(ctx, stream, []protocol.Data{{
+						PacketID: 1, DeadlineMicros: 1, Payload: []byte{4, 0, 0, 0},
+					}}, timeout)
+				} else {
+					err = WriteFramesWithin(ctx, stream, []protocol.Frame{{Type: protocol.FramePing}}, timeout)
+				}
+				written <- err
+				stream.ReadFrame(ctx)
+			}))
+			server.Config.ConnContext = func(ctx context.Context, connection net.Conn) context.Context {
+				return context.WithValue(ctx, connectionKey{}, connection)
+			}
+			if tt.secure {
+				server.StartTLS()
+			} else {
+				server.Start()
+			}
+			defer server.Close()
+			connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
+				HTTPClient: server.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				connection.CloseNow()
+				<-done
+			}()
+			if _, _, err := connection.Read(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-written; err != nil {
+				t.Fatal(err)
+			}
+			connection.CloseRead(ctx)
+			time.Sleep(timeout)
+			if err := connection.Ping(ctx); err != nil {
+				t.Fatalf("Ping() after the completed write deadline expired: %v", err)
+			}
+		})
 	}
 }
 
@@ -330,6 +460,38 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 				}
 			}
 			result <- nil
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.CloseNow()
+		if err := connection.Write(ctx, websocket.MessageBinary, encoded); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("FrameBatch", func(t *testing.T) {
+		result := make(chan error, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			connection, err := websocket.Accept(writer, request, nil)
+			if err != nil {
+				result <- err
+				return
+			}
+			defer connection.CloseNow()
+			var received [4]protocol.Frame
+			count, err := NewWebSocketConn(connection).ReadFrames(request.Context(), received[:])
+			if err == nil && (count != len(frames) || !reflect.DeepEqual(received[:count], frames)) {
+				err = errors.New("decoded WebSocket frame batch mismatch")
+			}
+			result <- err
 		}))
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

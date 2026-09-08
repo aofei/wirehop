@@ -83,6 +83,30 @@ type deadlineEndpoint struct {
 	deadlines chan time.Time
 }
 
+type recordingBatchEndpoint struct {
+	*testEndpoint
+	mu        sync.Mutex
+	calls     []int
+	dropFirst bool
+}
+
+func (e *recordingBatchEndpoint) WriteBatch(ctx context.Context, payloads [][]byte, deadline time.Time) (int, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, len(payloads))
+	drop := e.dropFirst
+	e.dropFirst = false
+	e.mu.Unlock()
+	if drop {
+		return 0, datagram.ErrDatagramDropped
+	}
+	for index, payload := range payloads {
+		if err := e.testEndpoint.Write(ctx, payload, deadline); err != nil {
+			return index, err
+		}
+	}
+	return len(payloads), nil
+}
+
 func (e *deadlineEndpoint) Write(ctx context.Context, payload []byte, deadline time.Time) error {
 	e.deadlines <- deadline
 	return e.testEndpoint.Write(ctx, payload, deadline)
@@ -711,6 +735,68 @@ func TestReceiverFailedHighPacketIDDoesNotAdvanceWindow(t *testing.T) {
 	}
 }
 
+func TestReceiverDeliverBatch(t *testing.T) {
+	t.Run("PreservesPacketIDOrder", func(t *testing.T) {
+		endpoint := &recordingBatchEndpoint{testEndpoint: newTestEndpoint()}
+		receiver, err := NewReceiver(ReceiverConfig{
+			Endpoint: endpoint, Clock: &testClock{now: 1000}, DeduplicationSize: 64,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		packetIDs := []uint64{2, 1, 3}
+		data := make([]protocol.Data, len(packetIDs))
+		for index, packetID := range packetIDs {
+			payload := relayWireGuardPacket(wgpacket.TransportData)
+			payload[4] = byte(packetID)
+			data[index] = protocol.Data{PacketID: packetID, DeadlineMicros: 100_900, Payload: payload}
+		}
+		if err := receiver.deliverBatch(context.Background(), data); err != nil {
+			t.Fatal(err)
+		}
+		if len(endpoint.calls) != 2 || endpoint.calls[0] != 1 || endpoint.calls[1] != 2 {
+			t.Fatalf("UDP batch sizes = %v, want [1 2]", endpoint.calls)
+		}
+		for _, packetID := range packetIDs {
+			payload := <-endpoint.writes
+			if payload[4] != byte(packetID) {
+				t.Fatalf("delivered payload marker = %d, want %d", payload[4], packetID)
+			}
+		}
+	})
+
+	t.Run("ReclassifiesAfterDatagramDrop", func(t *testing.T) {
+		endpoint := &recordingBatchEndpoint{testEndpoint: newTestEndpoint(), dropFirst: true}
+		receiver, err := NewReceiver(ReceiverConfig{
+			Endpoint: endpoint, Clock: &testClock{now: 1000}, DeduplicationSize: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		high := relayWireGuardPacket(wgpacket.TransportData)
+		high[4] = 100
+		low := relayWireGuardPacket(wgpacket.TransportData)
+		low[4] = 1
+		if err := receiver.deliverBatch(context.Background(), []protocol.Data{
+			{PacketID: 100, DeadlineMicros: 100_900, Payload: high},
+			{PacketID: 1, DeadlineMicros: 100_900, Payload: low},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(endpoint.calls) != 2 || endpoint.calls[0] != 1 || endpoint.calls[1] != 1 {
+			t.Fatalf("UDP batch sizes = %v, want [1 1]", endpoint.calls)
+		}
+		select {
+		case payload := <-endpoint.writes:
+			if payload[4] != 1 {
+				t.Fatalf("delivered payload marker = %d, want 1", payload[4])
+			}
+		default:
+			t.Fatal("lower PacketID was not delivered after the higher PacketID dropped")
+		}
+	})
+}
+
 func TestReceiverSerializesUDPWrites(t *testing.T) {
 	endpoint := &blockingWriteEndpoint{
 		testEndpoint: newTestEndpoint(), entered: make(chan byte), release: make(chan struct{}),
@@ -999,7 +1085,7 @@ func TestLaneRequiresInitialClockSync(t *testing.T) {
 	}
 	lane, err := newObservedLane(LaneConfig{
 		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
-		Generation: 1, RequireClockSync: true,
+		Generation: 1, ClockSyncTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1027,16 +1113,16 @@ func TestLaneRejectsUnexpectedClockSync(t *testing.T) {
 	}
 	for _, test := range []struct {
 		name             string
-		requireClockSync bool
+		clockSyncTimeout time.Duration
 		frames           int
 	}{
 		{name: "ClientDirection", frames: 1},
-		{name: "RepeatedServerSync", requireClockSync: true, frames: 2},
+		{name: "RepeatedServerSync", clockSyncTimeout: time.Second, frames: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			carrier := newTestCarrier()
 			lane := newTestLane(t, carrier, newTestEndpoint())
-			lane.requireClockSync = test.requireClockSync
+			lane.clockSyncTimeout = test.clockSyncTimeout
 			result := make(chan error, 1)
 			go func() { result <- lane.Run(context.Background()) }()
 			for range test.frames {

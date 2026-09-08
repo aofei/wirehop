@@ -59,6 +59,7 @@ type serverSession struct {
 	history      map[protocol.LaneID]laneHistory
 	lanes        map[protocol.LaneID]sessionLane
 	reservations int
+	confirmed    bool
 	joinNonces   *auth.ReplayCache
 	detach       *detachState
 }
@@ -192,7 +193,7 @@ func (s *serverSession) runLane(connection carrier.Conn, laneID protocol.LaneID,
 		Carrier: connection, Receiver: s.receiver, Store: store, Clock: s.owner.config.Clock,
 		Observer: s.scheduler, SessionClose: func(protocol.CloseReason) { s.close() }, SessionFailure: s.close,
 		LaneID: laneID, Generation: generation,
-		RequireClockSync: true,
+		ClockSyncTimeout: s.owner.config.HandshakeTimeout, ClockSynced: s.confirm,
 	})
 	if err != nil {
 		cancelLane(context.Canceled)
@@ -240,6 +241,26 @@ func (s *serverSession) runLane(connection carrier.Conn, laneID protocol.LaneID,
 		s.close()
 	}
 	return &activeLaneError{cause: err}
+}
+
+// confirm retains a session after a lane receives the client's valid first clock-sync frame.
+func (s *serverSession) confirm() {
+	s.mu.Lock()
+	s.confirmed = true
+	s.mu.Unlock()
+}
+
+// closeUnconfirmed releases an abandoned creator without granting an unused session reconnect grace.
+func (s *serverSession) closeUnconfirmed() {
+	s.mu.Lock()
+	confirmed := s.confirmed
+	if !confirmed {
+		s.cancel()
+	}
+	s.mu.Unlock()
+	if !confirmed {
+		s.close()
+	}
 }
 
 // startDetachTimerLocked starts grace expiry when no active lane remains.

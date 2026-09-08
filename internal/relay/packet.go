@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
@@ -51,6 +52,26 @@ type Packet struct {
 	Kind           wgpacket.Kind
 	Payload        []byte
 	DeadlineMicros uint64
+	datagram       datagram.Packet
+}
+
+// newPacket transfers ownership of packet into relay scheduling metadata.
+func newPacket(packet datagram.Packet, deadlineMicros uint64) Packet {
+	return Packet{
+		Kind: packet.Kind, Payload: packet.Payload, DeadlineMicros: deadlineMicros, datagram: packet,
+	}
+}
+
+// Retain returns another ownership reference to p.
+func (p Packet) Retain() Packet {
+	p.datagram = p.datagram.Retain()
+	return p
+}
+
+// Release relinquishes p's owned datagram reference and clears p.
+func (p *Packet) Release() {
+	p.datagram.Release()
+	*p = Packet{}
 }
 
 // Validate verifies the packet classification, payload, and lifetime metadata.

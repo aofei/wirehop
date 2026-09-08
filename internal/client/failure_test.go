@@ -7,10 +7,13 @@ import (
 	"errors"
 	"log/slog"
 	"math"
+	"net"
 	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aofei/wirehop/internal/lanespec"
@@ -35,7 +38,7 @@ func TestLaneFailureEndsSession(t *testing.T) {
 		remaining int
 		want      bool
 	}{
-		{name: "SessionGoneWithPeer", err: ErrSessionGone, remaining: 1},
+		{name: "SessionGoneWithPeer", err: ErrSessionGone, remaining: 1, want: true},
 		{name: "SessionGoneLastLane", err: ErrSessionGone, want: true},
 		{name: "LaneFailureWithPeer", err: ErrUnexpectedServerResponse, remaining: 1},
 		{name: "CounterExhausted", err: relay.ErrCounterExhausted, remaining: 1, want: true},
@@ -48,17 +51,21 @@ func TestLaneFailureEndsSession(t *testing.T) {
 		})
 	}
 	wrapped := errors.Join(errors.New("join failed"), ErrSessionGone)
-	if laneFailureEndsSession(wrapped, 1) {
-		t.Fatal("wrapped session-gone error ended a session with another lane")
+	if !laneFailureEndsSession(wrapped, 1) {
+		t.Fatal("wrapped session-gone error did not end the session")
 	}
 	remoteGone := &relay.RemoteError{Value: protocol.ErrorFrame{
 		Code: protocol.ErrorSessionNotFound, Class: protocol.ErrorSessionGone, Scope: protocol.ErrorScopeSession,
 	}}
-	if !sessionGoneFailure(remoteGone) || laneFailureEndsSession(remoteGone, 1) {
-		t.Fatal("typed remote session-gone error was not isolated while another lane remained")
+	if !sessionGoneFailure(remoteGone) || !laneFailureEndsSession(remoteGone, 1) {
+		t.Fatal("typed remote session-gone error did not end the session")
+	}
+	unattached := &unattachedSessionGoneError{cause: remoteGone}
+	if laneFailureEndsSession(unattached, 1) || !laneFailureEndsSession(unattached, 0) {
+		t.Fatal("unattached session-gone error did not remain lane-scoped while another lane survived")
 	}
 	if !sessionReplacementFailure(relay.ErrCounterExhausted) ||
-		sessionReplacementFailure(protocol.ErrAuthenticationFailed) {
+		!sessionReplacementFailure(unattached) || sessionReplacementFailure(protocol.ErrAuthenticationFailed) {
 		t.Fatal("session replacement failures were classified incorrectly")
 	}
 	remoteLane := &relay.RemoteError{Value: protocol.ErrorFrame{
@@ -96,6 +103,20 @@ func TestLaneFailureEndsSession(t *testing.T) {
 		classifyLaneFailure(relay.ErrPingTimeout) != failureRetry ||
 		classifyLaneFailure(relay.ErrEndpointFailure) != failureCloseSession {
 		t.Fatal("protocol and transport failures received incorrect retry dispositions")
+	}
+	for _, test := range []struct {
+		name string
+		err  *net.DNSError
+	}{
+		{name: "TemporaryDNS", err: &net.DNSError{Err: "temporary", IsTemporary: true}},
+		{name: "MissingDNS", err: &net.DNSError{Err: "no such host", IsNotFound: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := &net.OpError{Op: "dial", Net: "tcp", Err: test.err}
+			if classifyLaneFailure(err) != failureRetry {
+				t.Fatalf("classifyLaneFailure(%v) did not allow retry", err)
+			}
+		})
 	}
 }
 
@@ -202,64 +223,47 @@ func TestWaitReconnectPreservesCancellationCause(t *testing.T) {
 	want := errors.New("terminal failure")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(want)
-	if err := waitReconnect(ctx, time.Hour); !errors.Is(err, want) {
+	if err := waitReconnect(ctx, 0); !errors.Is(err, want) {
 		t.Fatalf("waitReconnect() error = %v, want %v", err, want)
 	}
 }
 
-func TestReconnectDelay(t *testing.T) {
+func TestReconnectAttemptAfterUptime(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		delay     time.Duration
-		uptime    time.Duration
-		wantDelay time.Duration
-		wantNext  time.Duration
+		name    string
+		attempt int
+		uptime  time.Duration
+		want    int
 	}{
 		{
-			name: "Unstable", delay: 2 * time.Second, uptime: reconnectStabilityInterval - time.Nanosecond,
-			wantDelay: 2 * time.Second, wantNext: 4 * time.Second,
+			name: "Unstable", attempt: 5, uptime: reconnectStabilityInterval - time.Nanosecond, want: 5,
 		},
 		{
-			name: "Stable", delay: maximumReconnectDelay, uptime: reconnectStabilityInterval,
-			wantDelay: initialReconnectDelay, wantNext: 2 * initialReconnectDelay,
-		},
-		{
-			name: "Capped", delay: maximumReconnectDelay, wantDelay: maximumReconnectDelay,
-			wantNext: maximumReconnectDelay,
+			name: "Stable", attempt: 63, uptime: reconnectStabilityInterval,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			delay := reconnectDelayAfterUptime(test.delay, test.uptime)
-			if delay != test.wantDelay {
-				t.Fatalf("reconnectDelayAfterUptime() = %v, want %v", delay, test.wantDelay)
-			}
-			if next := nextReconnectDelay(delay); next != test.wantNext {
-				t.Fatalf("nextReconnectDelay() = %v, want %v", next, test.wantNext)
+			if got := reconnectAttemptAfterUptime(test.attempt, test.uptime); got != test.want {
+				t.Fatalf("reconnectAttemptAfterUptime() = %d, want %d", got, test.want)
 			}
 		})
 	}
 }
 
 func TestSuperviseLaneTimestampsAfterPreparation(t *testing.T) {
-	clock := &notifyingClock{called: make(chan struct{})}
-	instance := &Client{config: Config{Clock: clock}}
-	preparation := make(chan preparationResult)
-	result := make(chan error, 1)
-	go func() {
-		result <- instance.superviseLane(context.Background(), clientLane{
-			laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1},
-		}, creationResult{}, nil, preparation, nil, nil)
-	}()
+	clock := &notifyingClock{called: make(chan struct{}, 1)}
+	instance := &Client{config: Config{Clock: clock, Dialer: &net.Dialer{
+		ControlContext: func(context.Context, string, string, syscall.RawConn) error { return ErrLaneRejected },
+	}}}
+	err := instance.superviseLane(t.Context(), clientLane{
+		spec: testLaneSpec(t, "tcp://127.0.0.1:51820"), laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1},
+	}, creationResult{}, nil, nil, nil)
 	select {
 	case <-clock.called:
-		preparation <- preparationResult{err: ErrLaneRejected}
-		<-result
 		t.Fatal("join timestamp was observed before carrier preparation completed")
-	case preparation <- preparationResult{err: ErrLaneRejected}:
-	case <-time.After(time.Second):
-		t.Fatal("superviseLane() did not wait for carrier preparation")
+	default:
 	}
-	if err := <-result; !errors.Is(err, ErrLaneRejected) {
+	if !errors.Is(err, ErrLaneRejected) {
 		t.Fatalf("superviseLane() error = %v, want %v", err, ErrLaneRejected)
 	}
 }
@@ -267,11 +271,11 @@ func TestSuperviseLaneTimestampsAfterPreparation(t *testing.T) {
 func TestSuperviseLanePreparationCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	instance := &Client{}
+	instance := &Client{config: Config{Dialer: &net.Dialer{}}}
+	configured := clientLane{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}
 	result := make(chan error, 1)
 	go func() {
-		result <- instance.superviseLane(ctx, clientLane{}, creationResult{}, nil,
-			make(chan preparationResult), nil, nil)
+		result <- instance.superviseLane(ctx, configured, creationResult{}, nil, nil, nil)
 	}()
 	select {
 	case err := <-result:
@@ -280,5 +284,92 @@ func TestSuperviseLanePreparationCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("superviseLane() remained blocked on preparation after cancellation")
+	}
+}
+
+func TestClientRetryCandidate(t *testing.T) {
+	t.Run("TerminalRejection", func(t *testing.T) {
+		attempts := 0
+		instance := &Client{
+			config: Config{
+				SessionAttemptTimeout: time.Second,
+				Dialer: &net.Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
+					attempts++
+					return ErrLaneRejected
+				}},
+			},
+			lanes: []clientLane{{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}},
+		}
+		failures := make(chan laneResult, 1)
+		candidate := instance.retryCandidate(t.Context(), 0, failures)
+		if !errors.Is(candidate.err, ErrLaneRejected) || attempts != 1 || len(failures) != 0 {
+			t.Fatalf("terminal candidate = %v, attempts = %d, retry notices = %d", candidate.err, attempts, len(failures))
+		}
+	})
+	t.Run("CancellationWhileReporting", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			attempts := 0
+			instance := &Client{
+				config: Config{
+					SessionAttemptTimeout: time.Second,
+					Dialer: &net.Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
+						attempts++
+						return syscall.ECONNREFUSED
+					}},
+				},
+				lanes: []clientLane{{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}},
+			}
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(context.Canceled)
+			failures := make(chan laneResult)
+			results := make(chan candidateResult, 1)
+			go func() { results <- instance.retryCandidate(ctx, 0, failures) }()
+			synctest.Wait()
+			if attempts != 1 {
+				t.Fatalf("blocked candidate attempts = %d, want 1", attempts)
+			}
+			cause := errors.New("candidate selection canceled")
+			cancel(cause)
+			candidate := <-results
+			if !errors.Is(candidate.err, cause) || attempts != 1 {
+				t.Fatalf("canceled candidate = %v, attempts = %d", candidate.err, attempts)
+			}
+		})
+	})
+}
+
+func TestClientCreateCandidate(t *testing.T) {
+	for _, parentCanceled := range []bool{false, true} {
+		name := "AttemptTimeout"
+		if parentCanceled {
+			name = "ParentCancellation"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				instance := &Client{
+					config: Config{
+						SessionAttemptTimeout: time.Second,
+						Dialer: &net.Dialer{ControlContext: func(ctx context.Context, _, _ string, _ syscall.RawConn) error {
+							<-ctx.Done()
+							return ctx.Err()
+						}},
+					},
+					lanes: []clientLane{{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}},
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				if parentCanceled {
+					cancel()
+				}
+				candidate := instance.createCandidate(ctx, 0)
+				if parentCanceled {
+					if !errors.Is(candidate.err, context.Canceled) || errors.Is(candidate.err, ErrSessionAttemptTimeout) {
+						t.Fatalf("canceled candidate = %v, want parent cancellation without attempt timeout", candidate.err)
+					}
+				} else if !errors.Is(candidate.err, context.DeadlineExceeded) || !errors.Is(candidate.err, ErrSessionAttemptTimeout) {
+					t.Fatalf("timed-out candidate = %v, want the attempt timeout and underlying deadline", candidate.err)
+				}
+			})
+		})
 	}
 }

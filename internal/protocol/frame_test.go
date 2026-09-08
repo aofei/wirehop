@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -180,6 +181,39 @@ func TestFrameReaderReleasesLargeBuffer(t *testing.T) {
 	}
 	if !bytes.Equal(frame.Payload, []byte{1}) || cap(frameReader.content) > maximumRetainedFrameContentCapacity {
 		t.Fatalf("small frame = %#v, buffer capacity = %d", frame, cap(frameReader.content))
+	}
+}
+
+func TestFrameReaderReadBuffered(t *testing.T) {
+	encoded, err := MarshalFrame(Frame{Type: FramePing, Payload: []byte{1, 2, 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name      string
+		encoded   []byte
+		buffered  int
+		available bool
+		wantErr   error
+	}{
+		{name: "Complete", encoded: encoded, buffered: len(encoded), available: true},
+		{name: "ShortHeader", encoded: encoded[:4], buffered: 4},
+		{name: "ShortContent", encoded: encoded[:len(encoded)-1], buffered: len(encoded) - 1},
+		{name: "TooLarge", encoded: []byte{byte(FramePing), 0, 1, 0, 16}, buffered: 5, wantErr: ErrFrameTooLarge},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := bufio.NewReaderSize(bytes.NewReader(tt.encoded), len(encoded))
+			reader.Peek(tt.buffered)
+			var frameReader FrameReader
+			frame, available, err := frameReader.ReadBuffered(reader)
+			if !errors.Is(err, tt.wantErr) || available != tt.available {
+				t.Fatalf("ReadBuffered() = %#v, %t, %v, want availability %t and error %v", frame, available,
+					err, tt.available, tt.wantErr)
+			}
+			if available && (frame.Type != FramePing || !bytes.Equal(frame.Payload, []byte{1, 2, 3})) {
+				t.Fatalf("ReadBuffered() frame = %#v", frame)
+			}
+		})
 	}
 }
 

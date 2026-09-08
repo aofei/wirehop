@@ -589,7 +589,7 @@ func TestClientTLSLaneReconnectResumesSession(t *testing.T) {
 		Lanes: []lanespec.Spec{spec}, Listen: netip.MustParseAddrPort("127.0.0.1:0"),
 		Target: commandTestTarget(t, targetAddress),
 		Token:  []byte("test-token"), TLSConfig: clientTLS, HandshakeTimeout: time.Second,
-		StartupTimeout: 3 * time.Second, MaxLanes: 1,
+		SessionAttemptTimeout: 3 * time.Second, MaxLanes: 1,
 		IngressLimits:       packetqueue.Limits{Packets: 4, Bytes: 8192},
 		LaneLimits:          packetqueue.Limits{Packets: 4, Bytes: 8192},
 		Deadlines:           relay.DeadlinePolicy{Control: time.Second, Transport: time.Second},
@@ -733,6 +733,14 @@ func TestClientListenAddressWriteFailure(t *testing.T) {
 }
 
 func TestClientFixedListenAddressIsSilent(t *testing.T) {
+	listener, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := listener.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	listen := reserveUDPAddress(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -741,10 +749,14 @@ func TestClientFixedListenAddressIsSilent(t *testing.T) {
 	go func() {
 		result <- Execute(ctx, []string{
 			"client", "--listen", listen, "--target", "127.0.0.1:51820",
-			"--lane", "tcp://127.0.0.1:1", "--allow-insecure",
+			"--lane", "tcp://" + listener.Addr().String(), "--allow-insecure",
 		}, func(string) string { return "test-token" }, errorWriter{}, &stderr)
 	}()
-	waitForUDPBind(t, listen)
+	connection, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
 	cancel()
 	code := waitForCommandCode(t, result)
 	if code != 0 || stderr.Len() != 0 {
@@ -838,6 +850,11 @@ func TestForwardOutput(t *testing.T) {
 	targetAddress := targetConnection.LocalAddr().String()
 
 	t.Run("FixedListenAddressIsSilent", func(t *testing.T) {
+		peer, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer peer.Close()
 		listen := reserveUDPAddress(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -849,7 +866,29 @@ func TestForwardOutput(t *testing.T) {
 				"forward", "--listen", listen, "--target", targetAddress,
 			}, func(string) string { return "" }, &stdout, &stderr)
 		}()
-		waitForUDPBind(t, listen)
+		packet := make([]byte, 148)
+		packet[0] = 1
+		buffer := make([]byte, 2048)
+		address := netip.MustParseAddrPort(listen)
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			if _, err := peer.WriteToUDPAddrPort(packet, address); err != nil {
+				t.Fatal(err)
+			}
+			if err := targetConnection.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			count, _, err := targetConnection.ReadFromUDPAddrPort(buffer)
+			if err == nil {
+				if !bytes.Equal(buffer[:count], packet) {
+					t.Fatalf("forwarded packet = %x, want %x", buffer[:count], packet)
+				}
+				break
+			}
+			if timeout, ok := errors.AsType[net.Error](err); !ok || !timeout.Timeout() || time.Now().After(deadline) {
+				t.Fatalf("read forwarded packet: %v", err)
+			}
+		}
 		cancel()
 		code := waitForCommandCode(t, result)
 		if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
@@ -1264,7 +1303,7 @@ func TestServeListenersWSS(t *testing.T) {
 		Lanes: []lanespec.Spec{spec}, Listen: netip.MustParseAddrPort("127.0.0.1:0"),
 		Target: commandTestTarget(t, targetAddress),
 		Token:  []byte("test-token"), TLSConfig: &tls.Config{RootCAs: roots}, HandshakeTimeout: time.Second,
-		StartupTimeout: 3 * time.Second, MaxLanes: 1,
+		SessionAttemptTimeout: 3 * time.Second, MaxLanes: 1,
 		IngressLimits:       packetqueue.Limits{Packets: 4, Bytes: 8192},
 		LaneLimits:          packetqueue.Limits{Packets: 4, Bytes: 8192},
 		Deadlines:           relay.DeadlinePolicy{Control: time.Second, Transport: time.Second},
@@ -1312,7 +1351,7 @@ func TestServeListenersWebSocketAdmissionBoundary(t *testing.T) {
 	relayClient, err := client.Start(context.Background(), client.Config{
 		Lanes: []lanespec.Spec{spec}, Listen: netip.MustParseAddrPort("127.0.0.1:0"),
 		Target: commandTestTarget(t, target),
-		Token:  []byte(token), HandshakeTimeout: time.Second, StartupTimeout: 3 * time.Second, MaxLanes: 1,
+		Token:  []byte(token), HandshakeTimeout: time.Second, SessionAttemptTimeout: 3 * time.Second, MaxLanes: 1,
 		IngressLimits:       packetqueue.Limits{Packets: 4, Bytes: 8192},
 		LaneLimits:          packetqueue.Limits{Packets: 4, Bytes: 8192},
 		Deadlines:           relay.DeadlinePolicy{Control: time.Second, Transport: time.Second},
@@ -1440,25 +1479,6 @@ func reserveUDPAddress(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return address
-}
-
-func waitForUDPBind(t *testing.T, address string) {
-	t.Helper()
-	parsed := netip.MustParseAddrPort(address)
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		listener, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(parsed))
-		if err != nil {
-			return
-		}
-		if err := listener.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("UDP address %s was not bound", address)
-		}
-		time.Sleep(time.Millisecond)
-	}
 }
 
 func waitForCommandCode(t *testing.T, result <-chan int) int {

@@ -35,19 +35,34 @@ func TestLocal(t *testing.T) {
 	if err != nil || packet.Kind.String() != "handshake_initiation" {
 		t.Fatalf("Read() = %#v, %v", packet, err)
 	}
+	packet.Release()
 	if err := local.Write(context.Background(), wireGuardPacket(2, 92), time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	readUDP(t, first, 92)
 
 	writeUDP(t, second, local.LocalAddr(), wireGuardPacket(4, 32))
-	if _, err := local.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, local)
 	if err := local.Write(context.Background(), wireGuardPacket(3, 64), time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	readUDP(t, second, 64)
+}
+
+func TestLocalReadBatchIgnoresSoftDrainError(t *testing.T) {
+	listener := listenUDP(t)
+	local := NewLocal(listener)
+	local.batch = stubUDPBatchConn{readErr: syscall.ENOBUFS}
+	t.Cleanup(func() { local.Close() })
+	peer := listenUDP(t)
+	writeUDP(t, peer, local.LocalAddr(), wireGuardPacket(4, 32))
+
+	var packets [MaximumBatchSize]Packet
+	count, err := local.ReadBatch(context.Background(), packets[:])
+	if err != nil || count != 1 {
+		t.Fatalf("ReadBatch() = %d, %v, want 1, nil", count, err)
+	}
+	packets[0].Release()
 }
 
 func TestRemote(t *testing.T) {
@@ -76,6 +91,7 @@ func TestRemote(t *testing.T) {
 	if err != nil || len(packet.Payload) != 92 {
 		t.Fatalf("Read() = %#v, %v", packet, err)
 	}
+	packet.Release()
 }
 
 func TestRemotePreservesReserved(t *testing.T) {
@@ -108,6 +124,7 @@ func TestRemotePreservesReserved(t *testing.T) {
 	if err != nil || string(packet.Payload) != string(response) {
 		t.Fatalf("Read() = %#v, %v", packet, err)
 	}
+	packet.Release()
 }
 
 func TestOpenRemoteRejectsCanceledParent(t *testing.T) {
@@ -117,6 +134,36 @@ func TestOpenRemoteRejectsCanceledParent(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("OpenRemote() error = %v, want %v", err, context.Canceled)
 	}
+}
+
+func TestOpenRemotePreparationContextDoesNotOwnSocket(t *testing.T) {
+	peer := listenUDP(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	remote, err := OpenRemote(ctx, targetpkg.MustParse(peer.LocalAddr().String()), RemoteConfig{})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	payload := indexedWireGuardPacket(1, 148, 11, 0)
+	if err := remote.Write(t.Context(), payload, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("Write() after preparation cancellation = %v", err)
+	}
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	buffer := make([]byte, len(payload))
+	_, source, err := peer.ReadFromUDPAddrPort(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := indexedWireGuardPacket(2, 92, 21, 11)
+	writeUDP(t, peer, source, response)
+	readContext, cancelRead := context.WithTimeout(t.Context(), time.Second)
+	defer cancelRead()
+	packet, err := remote.Read(readContext)
+	if err != nil {
+		t.Fatalf("Read() after preparation cancellation = %v", err)
+	}
+	packet.Release()
 }
 
 func TestOpenRemoteUsesListenConfig(t *testing.T) {
@@ -167,9 +214,7 @@ func TestRemoteRejectsUnknownSource(t *testing.T) {
 	}
 
 	writeUDP(t, peer, remoteAddress, indexedWireGuardPacket(2, 92, 21, 11))
-	if _, err := remote.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, remote)
 }
 
 func TestRemoteDropsResponseWithoutIndexRoute(t *testing.T) {
@@ -218,6 +263,7 @@ func TestRemoteRoutesWireGuardIndexesAcrossCandidates(t *testing.T) {
 		if err != nil || packet.Kind.String() != "handshake_response" {
 			t.Fatalf("Read() = %#v, %v", packet, err)
 		}
+		packet.Release()
 	}
 
 	transport := indexedWireGuardPacket(4, 32, 0, 22)
@@ -228,9 +274,7 @@ func TestRemoteRoutesWireGuardIndexesAcrossCandidates(t *testing.T) {
 	assertNoUDP(t, first)
 
 	writeUDP(t, first, firstSource, indexedWireGuardPacket(1, 148, 31, 0))
-	if _, err := remote.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, remote)
 	response := indexedWireGuardPacket(2, 92, 41, 31)
 	if err := remote.Write(context.Background(), response, time.Time{}); err != nil {
 		t.Fatal(err)
@@ -262,9 +306,7 @@ func TestRemoteRoutesResponderTransportAcrossCandidates(t *testing.T) {
 
 	firstInitiation := indexedWireGuardPacket(1, 148, 31, 0)
 	writeUDP(t, first, firstSource, firstInitiation)
-	if _, err := remote.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, remote)
 	firstResponse := indexedWireGuardPacket(2, 92, 41, 31)
 	if err := remote.Write(context.Background(), firstResponse, time.Time{}); err != nil {
 		t.Fatal(err)
@@ -273,9 +315,7 @@ func TestRemoteRoutesResponderTransportAcrossCandidates(t *testing.T) {
 
 	secondInitiation := indexedWireGuardPacket(1, 148, 32, 0)
 	writeUDP(t, second, secondSource, secondInitiation)
-	if _, err := remote.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, remote)
 	secondResponse := indexedWireGuardPacket(2, 92, 42, 32)
 	if err := remote.Write(context.Background(), secondResponse, time.Time{}); err != nil {
 		t.Fatal(err)
@@ -355,6 +395,41 @@ func TestRemoteInitiationTriggersRefresh(t *testing.T) {
 	}
 }
 
+func TestRemoteSoftBatchDrainErrorTriggersRefresh(t *testing.T) {
+	peer := listenUDP(t)
+	peerAddress := peer.LocalAddr().(*net.UDPAddr).AddrPort()
+	connection := listenUDP(t)
+	resolver := &mutableResolver{addresses: []netip.Addr{peerAddress.Addr()}}
+	ctx, cancel := context.WithCancel(context.Background())
+	remote := &Remote{
+		target:   targetpkg.MustParse("wg.example.com:" + strconv.Itoa(int(peerAddress.Port()))),
+		resolver: resolver, resolveTimeout: time.Second, refreshInterval: time.Nanosecond,
+		ctx: ctx, cancel: cancel, reads: make(chan remoteRead, 1),
+		recent: make(map[netip.AddrPort]time.Time), retained: make(map[netip.AddrPort]int),
+		handshakeRoutes: make(map[uint32]targetRoute), transportRoutes: make(map[uint32]targetRoute),
+		candidates: []netip.AddrPort{peerAddress},
+	}
+	remote.sockets[0] = connection
+	remote.workers.Add(1)
+	go remote.readSocket(connection, stubUDPBatchConn{readErr: syscall.ENOBUFS})
+	t.Cleanup(func() { remote.Close() })
+
+	writeUDP(t, peer, connection.LocalAddr().(*net.UDPAddr).AddrPort(), indexedWireGuardPacket(1, 148, 11, 0))
+	select {
+	case result := <-remote.reads:
+		result.release()
+	case <-time.After(time.Second):
+		t.Fatal("target packet was not delivered")
+	}
+	deadline := time.Now().Add(time.Second)
+	for resolver.callCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("soft batch drain error did not trigger target refresh")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestRemoteMovesTransportAfterCandidateFailover(t *testing.T) {
 	first, second := listenCandidatePair(t)
 	resolver := &mutableResolver{addresses: []netip.Addr{first.LocalAddr().(*net.UDPAddr).AddrPort().Addr()}}
@@ -372,9 +447,7 @@ func TestRemoteMovesTransportAfterCandidateFailover(t *testing.T) {
 	}
 	firstSource := readUDPFrom(t, first, len(firstInitiation))
 	writeUDP(t, first, firstSource, indexedWireGuardPacket(2, 92, 21, 11))
-	if _, err := remote.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, remote)
 	firstTransport := indexedWireGuardPacket(4, 32, 0, 21)
 	if err := remote.Write(context.Background(), firstTransport, time.Time{}); err != nil {
 		t.Fatal(err)
@@ -385,6 +458,12 @@ func TestRemoteMovesTransportAfterCandidateFailover(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 	remote.triggerRefresh()
 	waitRemoteRefresh(t, remote)
+	if err := remote.Write(context.Background(), firstTransport, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	readUDP(t, first, len(firstTransport))
+	assertNoUDP(t, second)
+
 	secondInitiation := indexedWireGuardPacket(1, 148, 12, 0)
 	if err := remote.Write(context.Background(), secondInitiation, time.Time{}); err != nil {
 		t.Fatal(err)
@@ -392,20 +471,21 @@ func TestRemoteMovesTransportAfterCandidateFailover(t *testing.T) {
 	secondSource := readUDPFrom(t, second, len(secondInitiation))
 	assertNoUDP(t, first)
 	writeUDP(t, second, secondSource, indexedWireGuardPacket(2, 92, 22, 12))
-	if _, err := remote.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, remote)
 	secondTransport := indexedWireGuardPacket(4, 32, 0, 22)
 	if err := remote.Write(context.Background(), secondTransport, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	readUDP(t, second, len(secondTransport))
 	assertNoUDP(t, first)
-
-	writeUDP(t, first, firstSource, indexedWireGuardPacket(4, 32, 0, 31))
-	if _, err := remote.Read(context.Background()); err != nil {
+	if err := remote.Write(context.Background(), firstTransport, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
+	readUDP(t, first, len(firstTransport))
+	assertNoUDP(t, second)
+
+	writeUDP(t, first, firstSource, indexedWireGuardPacket(4, 32, 0, 31))
+	readAndRelease(t, remote)
 }
 
 func TestRemoteAcceptsResponseFromRecentlyReplacedCandidate(t *testing.T) {
@@ -434,9 +514,7 @@ func TestRemoteAcceptsResponseFromRecentlyReplacedCandidate(t *testing.T) {
 	waitRemoteRefresh(t, remote)
 
 	writeUDP(t, second, secondSource, indexedWireGuardPacket(2, 92, 22, 11))
-	if _, err := remote.Read(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	readAndRelease(t, remote)
 	transport := indexedWireGuardPacket(4, 32, 0, 22)
 	if err := remote.Write(context.Background(), transport, time.Time{}); err != nil {
 		t.Fatal(err)
@@ -523,9 +601,11 @@ func TestReadCancellation(t *testing.T) {
 	ctx, cancel = context.WithCancel(context.Background())
 	for range 2 {
 		writeUDP(t, peer, local.LocalAddr(), wireGuardPacket(4, 32))
-		if _, err := local.Read(ctx); err != nil {
+		packet, err := local.Read(ctx)
+		if err != nil {
 			t.Fatalf("Read() with reused context = %v", err)
 		}
+		packet.Release()
 	}
 	result := make(chan error, 1)
 	go func() {
@@ -542,9 +622,7 @@ func TestReadCancellation(t *testing.T) {
 		t.Fatal("Read() did not observe reused-context cancellation")
 	}
 	writeUDP(t, peer, local.LocalAddr(), wireGuardPacket(4, 32))
-	if _, err := local.Read(context.Background()); err != nil {
-		t.Fatalf("Read() after cancellation = %v", err)
-	}
+	readAndRelease(t, local)
 }
 
 func TestReadInterruptReusesContextRegistration(t *testing.T) {
@@ -630,10 +708,57 @@ func TestCopyAcceptedPacket(t *testing.T) {
 	if valid[4] != 0 {
 		t.Fatal("accepted packet did not own its payload")
 	}
+	packet.Release()
 
 	oversized := wireGuardPacket(4, protocol.MaxPacketSize+1)
 	if packet, ok := copyAcceptedPacket(oversized, len(oversized)); ok {
 		t.Fatalf("oversized copyAcceptedPacket() = %#v, true", packet)
+	}
+}
+
+func TestPacketOwnership(t *testing.T) {
+	packet := ownPacket(4, wireGuardPacket(4, 1420))
+	buffer := packet.buffer
+	if cap(packet.Payload) != 1536 {
+		t.Fatalf("packet capacity = %d, want 1536", cap(packet.Payload))
+	}
+	retained := packet.Retain()
+	if refs := buffer.refs.Load(); refs != 2 {
+		t.Fatalf("retained references = %d, want 2", refs)
+	}
+	packet.Release()
+	if refs := buffer.refs.Load(); refs != 1 {
+		t.Fatalf("references after first release = %d, want 1", refs)
+	}
+	if len(retained.Payload) != 1420 || retained.Payload[0] != 4 {
+		t.Fatal("retained packet payload changed before final release")
+	}
+	retained.Release()
+	if refs := buffer.refs.Load(); refs != 0 {
+		t.Fatalf("references after final release = %d, want 0", refs)
+	}
+}
+
+func TestPacketBufferClass(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		size int
+		want int
+	}{
+		{name: "FirstClassMaximum", size: 64, want: 0},
+		{name: "SecondClassMinimum", size: 65, want: 1},
+		{name: "SecondClassMaximum", size: 96, want: 1},
+		{name: "HandshakeInitiation", size: 148, want: 2},
+		{name: "MTUClassMaximum", size: 1536, want: 6},
+		{name: "NextClassMinimum", size: 1537, want: 7},
+		{name: "PooledMaximum", size: 32768, want: 11},
+		{name: "UnpooledMinimum", size: 32769, want: -1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := packetBufferClass(tt.size); got != tt.want {
+				t.Fatalf("packetBufferClass(%d) = %d, want %d", tt.size, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -664,6 +789,15 @@ func listenUDP(t *testing.T) *net.UDPConn {
 	}
 	t.Cleanup(func() { conn.Close() })
 	return conn
+}
+
+func readAndRelease(t *testing.T, endpoint Endpoint) {
+	t.Helper()
+	packet, err := endpoint.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet.Release()
 }
 
 func listenCandidatePair(t *testing.T) (*net.UDPConn, *net.UDPConn) {
@@ -755,6 +889,18 @@ type blockingRefreshResolver struct {
 	address netip.Addr
 	started chan struct{}
 	calls   int
+}
+
+type stubUDPBatchConn struct {
+	readErr error
+}
+
+func (c stubUDPBatchConn) readAvailable(int) (udpReadBatch, error) {
+	return nil, c.readErr
+}
+
+func (stubUDPBatchConn) write(messages []udpMessage) (int, error) {
+	return len(messages), nil
 }
 
 func (r *blockingRefreshResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {

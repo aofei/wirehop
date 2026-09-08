@@ -1,11 +1,15 @@
 package relay
 
 import (
+	"context"
 	"errors"
 	"math"
+	"net"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -55,6 +59,52 @@ func TestTransmissionStoreValidation(t *testing.T) {
 	}
 }
 
+func TestTransmissionStorePreservesWriteViewThroughDrain(t *testing.T) {
+	store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
+	transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
+	local, err := datagram.ListenLocal(netip.MustParseAddrPort("127.0.0.1:0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	peer, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	if _, err := peer.WriteToUDPAddrPort(transmission.data.Payload, local.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	packet, err := local.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transmission.data.Payload = packet.Payload
+	transmission.packet = newPacket(packet, transmission.data.DeadlineMicros)
+	wantPayload := string(transmission.data.Payload)
+	if err := store.push(transmission); err != nil {
+		t.Fatal(err)
+	}
+	var batch [1]protocol.Data
+	var ownership [1]Packet
+	count, err := store.takeBatch(batch[:], ownership[:], 4096)
+	if err != nil || count != 1 {
+		t.Fatalf("takeBatch() = %d, %v", count, err)
+	}
+	defer ownership[0].Release()
+	releaseTransmissions(store.drain())
+	if err := ownership[0].Validate(); err != nil {
+		t.Fatalf("write ownership after drain is invalid: %v", err)
+	}
+	if got := string(batch[0].Payload); got != wantPayload {
+		t.Fatalf("payload after drain = %q, want %q", got, wantPayload)
+	}
+	retained := ownership[0].Retain()
+	retained.Release()
+}
+
 func TestTransmissionStoreAggregateBudget(t *testing.T) {
 	budget, err := retention.NewBudget(retention.Limits{Packets: 1, Bytes: 300})
 	if err != nil {
@@ -78,9 +128,12 @@ func TestTransmissionStoreAggregateBudget(t *testing.T) {
 		t.Fatalf("push() error = %v, want %v", err, packetqueue.ErrFull)
 	}
 	var batch [1]protocol.Data
-	if _, err := first.takeBatch(batch[:], 4096); err != nil {
+	var ownership [1]Packet
+	count, err := first.takeBatch(batch[:], ownership[:], 4096)
+	if err != nil {
 		t.Fatal(err)
 	}
+	releaseBatchOwnership(ownership[:count])
 	if _, _, err := first.acknowledge(1, uint64(first.sentBytes)); err != nil {
 		t.Fatal(err)
 	}
@@ -143,10 +196,12 @@ func TestTransmissionStoreCarrierOrderAndAcknowledgement(t *testing.T) {
 	}
 
 	var batch [3]protocol.Data
-	count, err := store.takeBatch(batch[:], 4096)
+	var ownership [3]Packet
+	count, err := store.takeBatch(batch[:], ownership[:], 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseBatchOwnership(ownership[:count])
 	if count != 3 || batch[0].PacketID != 2 || batch[1].PacketID != 1 || batch[2].PacketID != 3 {
 		t.Fatalf("carrier PacketIDs = %d, %d, %d", batch[0].PacketID, batch[1].PacketID, batch[2].PacketID)
 	}
@@ -265,10 +320,12 @@ func TestTransmissionStoreTakeBatchSkipsExpiredWork(t *testing.T) {
 	}
 	now = now.Add(2 * time.Millisecond)
 	var batch [4]protocol.Data
-	count, err := store.takeBatch(batch[:], 4096)
+	var ownership [4]Packet
+	count, err := store.takeBatch(batch[:], ownership[:], 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseBatchOwnership(ownership[:count])
 	if count != 2 || batch[0].PacketID != 2 || batch[1].PacketID != 4 {
 		t.Fatalf("takeBatch() returned %d packets with IDs %d and %d", count, batch[0].PacketID, batch[1].PacketID)
 	}
@@ -348,7 +405,8 @@ func TestTransmissionStoreCounterExhaustionDoesNotConsumeQueue(t *testing.T) {
 	}
 	store.sentPackets = math.MaxUint64
 	var batch [1]protocol.Data
-	if _, err := store.takeBatch(batch[:], 4096); !errors.Is(err, ErrCounterExhausted) {
+	var ownership [1]Packet
+	if _, err := store.takeBatch(batch[:], ownership[:], 4096); !errors.Is(err, ErrCounterExhausted) {
 		t.Fatalf("takeBatch() error = %v, want %v", err, ErrCounterExhausted)
 	}
 	if packets, bytes := store.backlog(); packets != 1 || bytes != uint64(transmission.size) {
@@ -510,7 +568,9 @@ func testTransmissionStoreStateMachine(t *testing.T, budget *retention.Budget) {
 			}
 		case 2:
 			var batch [8]protocol.Data
-			_, err := store.takeBatch(batch[:], int(next()%1024+1))
+			var ownership [8]Packet
+			count, err := store.takeBatch(batch[:], ownership[:], int(next()%1024+1))
+			releaseBatchOwnership(ownership[:count])
 			if err != nil && !errors.Is(err, packetqueue.ErrEmpty) {
 				t.Fatalf("takeBatch() error = %v", err)
 			}
@@ -622,5 +682,11 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 	if store.sentBytes < store.reportedBytes || store.sentBytes-store.reportedBytes != sentBytes {
 		t.Fatalf("sent byte counters = %d sent and %d reported for %d retained",
 			store.sentBytes, store.reportedBytes, sentBytes)
+	}
+}
+
+func releaseBatchOwnership(packets []Packet) {
+	for index := range packets {
+		packets[index].Release()
 	}
 }

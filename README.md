@@ -98,6 +98,13 @@ priority queue while the first lane is starting. The `forward` command prints a 
 also ready. Successful startup is silent for a fixed-port client, a server, and a fixed-port direct forwarder. Graceful
 shutdown is also silent.
 
+The client independently retries recoverable connection and session-creation failures on each lane, including DNS
+failures, without an overall startup deadline. The direct forwarder likewise keeps retrying target DNS failures. Each
+attempt is bounded and retries use jittered backoff. Prolonged preparation failures produce rate-limited warnings, with
+one recovery message if a warning was emitted. Invalid options, local bind failures, and terminal rejections are not
+treated as transient DNS failures. Server listeners must all be prepared within a shared 30-second budget before any
+begin serving.
+
 Help is written to standard output. Diagnostics and warning logs are written to standard error. Command-line and
 environment validation errors exit with status `2`, runtime failures exit with status `1`, and help or signal-driven
 graceful shutdown exits with status `0`.
@@ -115,9 +122,14 @@ responses and subsequent transport data to the candidate selected by the local W
 is never sprayed across candidates.
 
 Handshake Initiation packets and target-side UDP errors request rate-limited DNS refreshes without delaying the current
-packet. A successful refresh replaces the handshake fan-out set, while a temporary lookup failure retains the last
-successful result. Transport affinity moves only after a successful WireGuard handshake with another candidate. Target
-address changes do not replace a WireHop session, reconnect carrier lanes, or restart a direct forwarder.
+packet. A successful refresh replaces the handshake fan-out set, while a lookup failure retains the last successful
+result. Established transport traffic keeps its selected candidate across answer reordering and rotating subsets. A
+later successful WireGuard handshake may select another candidate.
+
+The direct forwarder binds its local listener immediately and discards packets while waiting for initial target
+resolution. Missing records and answers containing no usable target addresses remain retryable. Target socket
+preparation errors are fatal. Target address changes do not replace a WireHop session, reconnect carrier lanes, or
+restart a direct forwarder.
 
 ## Multipath lanes
 
@@ -138,12 +150,13 @@ group. WireHop prefers a stable low-delay lane for sparse transport traffic, spi
 another lane faster, and sends at most two copies of a WireGuard control packet. The second copy prefers another path
 group.
 
-The client prepares all configured first-hop connections concurrently. Only one prepared lane may create the session.
-The remaining prepared lanes join that session concurrently. Lane-scoped rejections close only the affected lane while
-healthy lanes continue. Session-scoped failures coordinate complete session replacement or termination. Retryable lane
-failures reconnect independently with increasing generations and full-jitter backoff. After the first session succeeds,
-retryable session replacement continues without an overall recovery deadline. A permanent lane failure writes one
-warning when another lane supervisor keeps the client running. Retryable connection failures remain silent.
+The client races carrier preparation and session admission across configured lanes, selects the first successful
+candidate, and cancels the others. Only the selected session carries WireGuard packets. The remaining lanes reconnect
+and join that session concurrently. Lane-scoped rejections close only the affected lane while healthy lanes continue.
+Session-scoped failures coordinate complete session replacement or termination. Retryable lane failures reconnect
+independently with increasing generations and full-jitter backoff. After the first session succeeds, retryable session
+replacement continues without an overall recovery deadline. A permanent lane failure writes one warning when another
+lane supervisor keeps the client running. Individual lane reconnects remain silent.
 
 ## Route exclusion
 
@@ -221,7 +234,7 @@ wirehop forward \
 This command does not use lanes, WireHop framing, or `WIREHOP_TOKEN`. It resolves and reaches the target from the local
 network. Without `--reserved`, it remains a transparent WireGuard-aware UDP forwarder.
 
-In this mode, the local WireGuard implementation must use the standard zero reserved field. The client or forwarder
+With `--reserved`, the local WireGuard implementation must use the standard zero reserved field. The client or forwarder
 overwrites that field on packets read from the local endpoint. On packets returning from the target, it requires the
 configured value and clears the field before local UDP delivery. A mismatch is dropped as an invalid target datagram. A
 WireHop server remains unaware of a client's configured value and relays the complete on-wire packet unchanged. The

@@ -10,6 +10,7 @@ import (
 
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/clockmap"
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
@@ -97,7 +98,8 @@ type LaneConfig struct {
 	LaneID           protocol.LaneID
 	Generation       uint64
 	InitialFrames    []protocol.Frame
-	RequireClockSync bool
+	ClockSyncTimeout time.Duration
+	ClockSynced      func()
 	ControlCapacity  int
 	ReportInterval   time.Duration
 	PingInterval     time.Duration
@@ -119,7 +121,8 @@ type Lane struct {
 	laneID            protocol.LaneID
 	generation        uint64
 	initialFrames     []protocol.Frame
-	requireClockSync  bool
+	clockSyncTimeout  time.Duration
+	clockSynced       func()
 	control           chan controlWrite
 	reportInterval    time.Duration
 	pingInterval      time.Duration
@@ -129,6 +132,8 @@ type Lane struct {
 	probeSize         int
 	dataWrites        atomic.Uint64
 	probeWrites       atomic.Uint64
+	dataBatch         [maximumDataBatchFrames]protocol.Data
+	dataOwnership     [maximumDataBatchFrames]Packet
 	progress          deliveryProgress
 	pingMu            sync.Mutex
 	pendingPingID     uint64
@@ -187,7 +192,7 @@ func NewLane(config LaneConfig) (*Lane, error) {
 		config.ProbeSize = defaultProbeSize
 	}
 	if config.ControlCapacity < 1 || config.ReportInterval <= 0 || config.PingInterval <= 0 ||
-		config.PingTimeout <= config.PingInterval || config.WriteTimeout <= 0 ||
+		config.PingTimeout <= config.PingInterval || config.WriteTimeout <= 0 || config.ClockSyncTimeout < 0 ||
 		config.ProbeInterval <= 0 || config.ProbeSize < 0 || config.ProbeSize > protocol.MaxProbePayloadSize {
 		return nil, ErrInvalidLane
 	}
@@ -196,8 +201,8 @@ func NewLane(config LaneConfig) (*Lane, error) {
 		carrier: config.Carrier, receiver: config.Receiver, store: config.Store, clock: config.Clock,
 		observer: config.Observer, sessionClose: config.SessionClose, sessionFailure: config.SessionFailure,
 		laneID: config.LaneID, generation: config.Generation, initialFrames: initialFrames,
-		requireClockSync: config.RequireClockSync,
-		control:          make(chan controlWrite, config.ControlCapacity), reportInterval: config.ReportInterval,
+		clockSyncTimeout: config.ClockSyncTimeout, clockSynced: config.ClockSynced,
+		control: make(chan controlWrite, config.ControlCapacity), reportInterval: config.ReportInterval,
 		pingInterval: config.PingInterval, pingTimeout: config.PingTimeout, writeTimeout: config.WriteTimeout,
 		probeInterval: config.ProbeInterval, probeSize: config.ProbeSize,
 		progress: deliveryProgress{notify: make(chan struct{}, 1)}, pingChanged: make(chan struct{}, 1),
@@ -492,8 +497,9 @@ func lanePhase(laneID protocol.LaneID, generation uint64, spread time.Duration) 
 
 // write serializes initial, control, and data frames onto the carrier.
 func (l *Lane) write(ctx context.Context) error {
+	carrierContext := context.WithoutCancel(ctx)
 	if len(l.initialFrames) > 0 {
-		if err := l.writeFrames(ctx, l.initialFrames); err != nil {
+		if err := l.writeFrames(carrierContext, l.initialFrames); err != nil {
 			return err
 		}
 	}
@@ -502,7 +508,7 @@ func (l *Lane) write(ctx context.Context) error {
 		if controlWrites == maximumConsecutiveControlWrites {
 			select {
 			case <-l.store.Ready():
-				if err := l.writeReadyData(ctx); err != nil {
+				if err := l.writeReadyData(carrierContext); err != nil {
 					return err
 				}
 				controlWrites = 0
@@ -513,19 +519,19 @@ func (l *Lane) write(ctx context.Context) error {
 		}
 		select {
 		case request := <-l.control:
-			if err := l.writeControl(ctx, request); err != nil {
+			if err := l.writeControl(carrierContext, request); err != nil {
 				return err
 			}
 			controlWrites++
 		default:
 			select {
 			case request := <-l.control:
-				if err := l.writeControl(ctx, request); err != nil {
+				if err := l.writeControl(carrierContext, request); err != nil {
 					return err
 				}
 				controlWrites++
 			case <-l.store.Ready():
-				if err := l.writeReadyData(ctx); err != nil {
+				if err := l.writeReadyData(carrierContext); err != nil {
 					return err
 				}
 				controlWrites = 0
@@ -552,12 +558,16 @@ func (l *Lane) writeReadyData(ctx context.Context) error {
 
 // writeDataBatch coalesces only data already available without introducing a batching delay.
 func (l *Lane) writeDataBatch(ctx context.Context) error {
-	var batch [maximumDataBatchFrames]protocol.Data
-	count, err := l.store.takeBatch(batch[:], targetDataBatchBytes)
+	count, err := l.store.takeBatch(l.dataBatch[:], l.dataOwnership[:], targetDataBatchBytes)
 	if err != nil {
 		return err
 	}
-	return l.writeDataFrames(ctx, batch[:count])
+	err = l.writeDataFrames(ctx, l.dataBatch[:count])
+	clear(l.dataBatch[:count])
+	for index := range count {
+		l.dataOwnership[index].Release()
+	}
+	return err
 }
 
 // writeControl builds and writes one control frame.
@@ -583,16 +593,12 @@ func (l *Lane) writeFrames(ctx context.Context, frames []protocol.Frame) error {
 			l.probeWrites.Add(1)
 		}
 	}
-	writeContext, cancel := context.WithTimeout(ctx, l.writeTimeout)
-	defer cancel()
-	return l.carrier.WriteFrames(writeContext, frames)
+	return carrier.WriteFramesWithin(ctx, l.carrier, frames, l.writeTimeout)
 }
 
 // writeDataFrames writes one data batch within the carrier stall budget.
 func (l *Lane) writeDataFrames(ctx context.Context, data []protocol.Data) error {
-	writeContext, cancel := context.WithTimeout(ctx, l.writeTimeout)
-	defer cancel()
-	if err := l.carrier.WriteDataBatch(writeContext, data); err != nil {
+	if err := carrier.WriteDataBatchWithin(ctx, l.carrier, data, l.writeTimeout); err != nil {
 		return err
 	}
 	l.dataWrites.Add(1)
@@ -622,124 +628,161 @@ func (l *Lane) ValidateProbeProgress(packets, bytes uint64) bool {
 
 // read parses incoming frames and delivers accepted data to the UDP endpoint.
 func (l *Lane) read(ctx context.Context) error {
-	clockSyncPending := l.requireClockSync
+	carrierContext := context.WithoutCancel(ctx)
+	clockSyncPending := l.clockSyncTimeout > 0
+	readContext := carrierContext
+	var cancelSync context.CancelFunc
+	if clockSyncPending {
+		readContext, cancelSync = context.WithTimeout(ctx, l.clockSyncTimeout)
+		defer cancelSync()
+	}
+	var frames [datagram.MaximumBatchSize]protocol.Frame
 	for {
-		frame, err := l.carrier.ReadFrame(ctx)
+		count, err := carrier.ReadFrames(readContext, l.carrier, frames[:])
 		if err != nil {
 			return err
 		}
-		if clockSyncPending && frame.Type != protocol.FrameClockSync {
-			return ErrClockSyncRequired
+		for index := 0; index < count; {
+			frame := frames[index]
+			if clockSyncPending && frame.Type != protocol.FrameClockSync {
+				return ErrClockSyncRequired
+			}
+			if frame.Type == protocol.FrameData {
+				end := index + 1
+				for end < count && frames[end].Type == protocol.FrameData {
+					end++
+				}
+				if err := l.readDataBatch(ctx, frames[index:end]); err != nil {
+					return err
+				}
+				index = end
+				continue
+			}
+			if err := l.readControl(ctx, frame, &clockSyncPending); err != nil {
+				return err
+			}
+			if readContext != carrierContext && !clockSyncPending {
+				cancelSync()
+				readContext = carrierContext
+				if l.clockSynced != nil {
+					l.clockSynced()
+				}
+			}
+			index++
 		}
-		switch frame.Type {
-		case protocol.FrameData:
-			if err := l.readData(ctx, frame); err != nil {
-				return err
-			}
-		case protocol.FramePing:
-			if err := l.readPing(frame); err != nil {
-				return err
-			}
-		case protocol.FramePong:
-			pong, err := protocol.ParseTimingPong(frame)
-			if err != nil {
-				return err
-			}
-			if !l.completePing(pong.ID, pong.PingSendMicros) {
-				return ErrUnexpectedPong
-			}
-			receiveMicros := l.clock.NowMicros()
-			mapping, err := clockmap.Estimate(clockmap.Sample{
-				LocalSendMicros: pong.PingSendMicros, RemoteReceiveMicros: pong.ReceiveMicros,
-				RemoteSendMicros: pong.SendMicros, LocalReceiveMicros: receiveMicros,
-			})
-			if err != nil {
-				return err
-			}
-			l.receiver.UpdateClock(mapping.Inverse())
-			l.observer.ObserveTiming(l.laneID, l.generation, pong, receiveMicros)
-		case protocol.FrameClockSync:
-			if !clockSyncPending {
-				return ErrUnexpectedFrame
-			}
-			if err := l.readClockSync(frame); err != nil {
-				return err
-			}
-			clockSyncPending = false
-		case protocol.FrameProbe:
-			probe, err := protocol.ParseProbe(frame)
-			if err != nil {
-				return err
-			}
-			if err := l.progress.addProbe(len(probe.Payload) + protocol.ProbeFrameOverhead); err != nil {
-				return err
-			}
-		case protocol.FrameDeliveryReport:
-			report, err := protocol.ParseDeliveryReport(frame)
-			if err != nil {
-				return err
-			}
-			if err := l.observer.ObserveDeliveryReport(ctx, report, l.clock.NowMicros()); err != nil {
-				return err
-			}
-		case protocol.FrameSessionClose:
-			reason, err := protocol.ParseSessionClose(frame)
-			if err != nil {
-				return err
-			}
-			if l.sessionClose == nil {
-				return ErrUnexpectedFrame
-			}
-			l.sessionClose(reason)
-			return ErrRemoteClosed
-		case protocol.FrameLaneAbandon:
-			generation, err := protocol.ParseLaneAbandon(frame)
-			if err != nil {
-				return err
-			}
-			if err := l.observer.ObserveLaneAbandon(ctx, generation); err != nil {
-				return err
-			}
-		case protocol.FrameError:
-			value, err := protocol.ParseErrorFrame(frame)
-			if err != nil {
-				return err
-			}
-			if value.Scope == protocol.ErrorScopeLane &&
-				(value.LaneID != l.laneID || value.Generation != l.generation) {
-				return ErrUnexpectedFrame
-			}
-			if value.Scope == protocol.ErrorScopeSession && l.sessionFailure != nil {
-				l.sessionFailure()
-			}
-			return &RemoteError{Value: value}
-		default:
-			return fmt.Errorf("%w: type %d", ErrUnexpectedFrame, frame.Type)
-		}
+		clear(frames[:count])
 	}
 }
 
-// readData validates and passes one WireGuard packet to the session receiver.
-func (l *Lane) readData(ctx context.Context, frame protocol.Frame) error {
-	data, err := protocol.ParseData(frame)
-	if err != nil {
+// readDataBatch validates, acknowledges, and delivers one consecutive data-frame vector.
+func (l *Lane) readDataBatch(ctx context.Context, frames []protocol.Frame) error {
+	var data [datagram.MaximumBatchSize]protocol.Data
+	var deadlines [datagram.MaximumBatchSize]uint64
+	var sizes [datagram.MaximumBatchSize]int
+	for index, frame := range frames {
+		packet, err := protocol.ParseData(frame)
+		if err != nil {
+			return err
+		}
+		if !wgpacket.Classify(packet.Payload).Accepted() {
+			return ErrInvalidWireGuardPacket
+		}
+		frameSize, err := protocol.DataFrameSize(packet)
+		if err != nil {
+			return err
+		}
+		data[index] = packet
+		deadlines[index] = packet.DeadlineMicros
+		sizes[index] = frameSize
+	}
+	if err := l.receiver.ValidateDeadlines(deadlines[:len(frames)]); err != nil {
 		return err
 	}
-	kind := wgpacket.Classify(data.Payload)
-	if !kind.Accepted() {
-		return ErrInvalidWireGuardPacket
+	for _, frameSize := range sizes[:len(frames)] {
+		if err := l.progress.addData(frameSize); err != nil {
+			return err
+		}
 	}
-	if err := l.receiver.ValidateDeadline(data.DeadlineMicros); err != nil {
-		return err
+	return l.receiver.deliverBatch(ctx, data[:len(frames)])
+}
+
+// readControl processes one non-data frame and updates clock-sync admission state.
+func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncPending *bool) error {
+	switch frame.Type {
+	case protocol.FramePing:
+		return l.readPing(frame)
+	case protocol.FramePong:
+		pong, err := protocol.ParseTimingPong(frame)
+		if err != nil {
+			return err
+		}
+		if !l.completePing(pong.ID, pong.PingSendMicros) {
+			return ErrUnexpectedPong
+		}
+		receiveMicros := l.clock.NowMicros()
+		mapping, err := clockmap.Estimate(clockmap.Sample{
+			LocalSendMicros: pong.PingSendMicros, RemoteReceiveMicros: pong.ReceiveMicros,
+			RemoteSendMicros: pong.SendMicros, LocalReceiveMicros: receiveMicros,
+		})
+		if err != nil {
+			return err
+		}
+		l.receiver.UpdateClock(mapping.Inverse())
+		l.observer.ObserveTiming(l.laneID, l.generation, pong, receiveMicros)
+		return nil
+	case protocol.FrameClockSync:
+		if !*clockSyncPending {
+			return ErrUnexpectedFrame
+		}
+		if err := l.readClockSync(frame); err != nil {
+			return err
+		}
+		*clockSyncPending = false
+		return nil
+	case protocol.FrameProbe:
+		probe, err := protocol.ParseProbe(frame)
+		if err != nil {
+			return err
+		}
+		return l.progress.addProbe(len(probe.Payload) + protocol.ProbeFrameOverhead)
+	case protocol.FrameDeliveryReport:
+		report, err := protocol.ParseDeliveryReport(frame)
+		if err != nil {
+			return err
+		}
+		return l.observer.ObserveDeliveryReport(ctx, report, l.clock.NowMicros())
+	case protocol.FrameSessionClose:
+		reason, err := protocol.ParseSessionClose(frame)
+		if err != nil {
+			return err
+		}
+		if l.sessionClose == nil {
+			return ErrUnexpectedFrame
+		}
+		l.sessionClose(reason)
+		return ErrRemoteClosed
+	case protocol.FrameLaneAbandon:
+		generation, err := protocol.ParseLaneAbandon(frame)
+		if err != nil {
+			return err
+		}
+		return l.observer.ObserveLaneAbandon(ctx, generation)
+	case protocol.FrameError:
+		value, err := protocol.ParseErrorFrame(frame)
+		if err != nil {
+			return err
+		}
+		if value.Scope == protocol.ErrorScopeLane &&
+			(value.LaneID != l.laneID || value.Generation != l.generation) {
+			return ErrUnexpectedFrame
+		}
+		if value.Scope == protocol.ErrorScopeSession && l.sessionFailure != nil {
+			l.sessionFailure()
+		}
+		return &RemoteError{Value: value}
+	default:
+		return fmt.Errorf("%w: type %d", ErrUnexpectedFrame, frame.Type)
 	}
-	frameSize, err := protocol.DataFrameSize(data)
-	if err != nil {
-		return err
-	}
-	if err := l.progress.addData(frameSize); err != nil {
-		return err
-	}
-	return l.receiver.deliver(ctx, data)
 }
 
 // readClockSync updates the sender-to-receiver monotonic clock mapping.

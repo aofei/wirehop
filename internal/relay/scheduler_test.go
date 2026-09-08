@@ -140,7 +140,8 @@ func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	item, err := ingress.TryPop()
+	var item packetqueue.Item[Packet]
+	err = ingress.TryPop(&item)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,6 +325,7 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 	}
 
 	var received [2]protocol.Data
+	var ownership [2]Packet
 	count := 0
 	for count < len(received) {
 		select {
@@ -331,12 +333,13 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("timed out waiting for scheduled packets")
 		}
-		added, err := store.takeBatch(received[count:], 8192)
+		added, err := store.takeBatch(received[count:], ownership[count:], 8192)
 		if err != nil {
 			t.Fatal(err)
 		}
 		count += added
 	}
+	defer releaseBatchOwnership(ownership[:count])
 	for index := range received {
 		want := uint64(index + 1)
 		if received[index].PacketID != want || received[index].Payload[4] != byte(want) {
@@ -472,11 +475,13 @@ func TestSchedulerRestoresHeldPackets(t *testing.T) {
 	if ingress.Len() != 2 {
 		t.Fatalf("restored ingress length = %d, want 2", ingress.Len())
 	}
-	first, err := ingress.TryPop()
+	var first packetqueue.Item[Packet]
+	err = ingress.TryPop(&first)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := ingress.TryPop()
+	var second packetqueue.Item[Packet]
+	err = ingress.TryPop(&second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,9 +564,12 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var batch [2]protocol.Data
-	if count, err := store.takeBatch(batch[:], 4096); err != nil || count != 2 {
+	var ownership [2]Packet
+	count, err := store.takeBatch(batch[:], ownership[:], 4096)
+	if err != nil || count != 2 {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
+	releaseBatchOwnership(ownership[:count])
 	firstSize := uint64(first.size)
 	report := protocol.DeliveryReport{
 		LaneID: registration.LaneID, Generation: registration.Generation, DataPackets: 1,
@@ -682,6 +690,7 @@ func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T
 		Bytes:   64 * 1024,
 	})
 	var batch [transmissionCount]protocol.Data
+	var ownership [transmissionCount]Packet
 	var dataBytes uint64
 	for packetID := uint64(1); packetID <= transmissionCount; packetID++ {
 		transmission := schedulerTransmission(packetID, wgpacket.TransportData, time.Now().Add(time.Second))
@@ -690,9 +699,11 @@ func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T
 		}
 		dataBytes += uint64(transmission.size)
 	}
-	if count, err := lane.registration.Store.takeBatch(batch[:], math.MaxInt); err != nil || count != transmissionCount {
+	count, err := lane.registration.Store.takeBatch(batch[:], ownership[:], math.MaxInt)
+	if err != nil || count != transmissionCount {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
+	releaseBatchOwnership(ownership[:count])
 	lane.lastReportMicros = 1000
 	lane.rateSampleStartMicros = 1000
 	report := protocol.DeliveryReport{
@@ -826,12 +837,13 @@ func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			item, err := ingress.TryPop()
+			var item packetqueue.Item[Packet]
+			err = ingress.TryPop(&item)
 			if err != nil {
 				t.Fatal(err)
 			}
 			lane := &scheduledLane{registration: LaneRegistration{Store: store}}
-			if queued := lane.enqueue(&item, 1); queued != test.wantQueued {
+			if queued := lane.enqueue(&item, 1, time.Now()); queued != test.wantQueued {
 				t.Fatalf("enqueue() = %t, want %t", queued, test.wantQueued)
 			}
 			if test.wantQueued {
@@ -884,10 +896,12 @@ func TestSchedulerMigratesTransportOnce(t *testing.T) {
 	scheduler.migrateTransmissions(lanes, source)
 
 	var migrated [2]protocol.Data
-	count, err := destination.registration.Store.takeBatch(migrated[:], 4096)
+	var ownership [2]Packet
+	count, err := destination.registration.Store.takeBatch(migrated[:], ownership[:], 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseBatchOwnership(ownership[:count])
 	if count != 2 || migrated[0].PacketID != 9 || migrated[1].PacketID != 7 {
 		t.Fatalf("migrated PacketIDs = %d, %d", migrated[0].PacketID, migrated[1].PacketID)
 	}
@@ -1285,14 +1299,18 @@ func schedulerTransmission(packetID uint64, kind wgpacket.Kind, deadline time.Ti
 func takeOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data {
 	t.Helper()
 	var batch [1]protocol.Data
-	count, err := store.takeBatch(batch[:], protocol.MaxEncodedFrameSize)
+	var ownership [1]Packet
+	count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
 		t.Fatalf("takeBatch() count = %d, want 1", count)
 	}
-	return batch[0]
+	data := batch[0]
+	data.Payload = bytes.Clone(data.Payload)
+	releaseBatchOwnership(ownership[:count])
+	return data
 }
 
 func awaitOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data {
@@ -1301,10 +1319,14 @@ func awaitOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data 
 	defer timeout.Stop()
 	for {
 		var batch [1]protocol.Data
-		count, err := store.takeBatch(batch[:], protocol.MaxEncodedFrameSize)
+		var ownership [1]Packet
+		count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize)
 		switch {
 		case err == nil && count == 1:
-			return batch[0]
+			data := batch[0]
+			data.Payload = bytes.Clone(data.Payload)
+			releaseBatchOwnership(ownership[:count])
+			return data
 		case errors.Is(err, packetqueue.ErrEmpty):
 		default:
 			t.Fatalf("takeBatch() = %d, %v", count, err)

@@ -96,6 +96,21 @@ func (i *Item[T]) ReleaseRetention() {
 	i.retentionBytes = 0
 }
 
+// Release relinquishes both aggregate retention and releasable value ownership.
+func (i *Item[T]) Release() {
+	i.ReleaseRetention()
+	i.releaseValue()
+}
+
+// releaseValue relinquishes value ownership when its pointer implements a Release method.
+func (i *Item[T]) releaseValue() {
+	if releasable, ok := any(&i.Value).(interface{ Release() }); ok {
+		releasable.Release()
+	}
+	var zero T
+	i.Value = zero
+}
+
 // deque is a compacting first-in, first-out item sequence.
 type deque[T any] struct {
 	items []Item[T]
@@ -107,21 +122,21 @@ func (d *deque[T]) push(item Item[T]) {
 	d.items = append(d.items, item)
 }
 
-// pop removes the oldest item from the deque.
-func (d *deque[T]) pop() (Item[T], bool) {
+// pop transfers the oldest item from the deque into destination.
+func (d *deque[T]) pop(destination *Item[T]) bool {
 	if d.head == len(d.items) {
-		return Item[T]{}, false
+		return false
 	}
-	item := d.items[d.head]
+	*destination = d.items[d.head]
 	var zero Item[T]
 	d.items[d.head] = zero
 	d.head++
 	if d.head == len(d.items) {
 		d.resetEmpty()
-		return item, true
+		return true
 	}
 	d.compact()
-	return item, true
+	return true
 }
 
 // resetEmpty preserves ordinary reusable capacity while releasing an exceptional historical peak.
@@ -160,8 +175,11 @@ func (d *deque[T]) shrink() {
 	d.items = items
 }
 
-// clear releases every retained item reference and resets the deque.
+// clear releases every retained value and resets the deque.
 func (d *deque[T]) clear() {
+	for index := d.head; index < len(d.items); index++ {
+		d.items[index].releaseValue()
+	}
 	clear(d.items)
 	d.items = nil
 	d.head = 0
@@ -177,6 +195,7 @@ func (d *deque[T]) removeExpired(now time.Time) (int, int) {
 		if !now.Before(item.Deadline) {
 			removedPackets++
 			removedBytes += item.Size
+			item.releaseValue()
 			continue
 		}
 		d.items[write] = item
@@ -242,16 +261,54 @@ func newQueue[T any](limits Limits, now func() time.Time, budget *retention.Budg
 
 // Push transfers ownership of item to the queue when all limits permit it.
 func (q *Queue[T]) Push(item Item[T]) error {
-	if item.Size <= 0 || !item.Priority.Valid() || item.Deadline.IsZero() ||
-		item.retention != nil && (item.retention != q.budget || item.retentionBytes != item.Size) {
+	if !q.validItem(item) {
 		return ErrInvalidItem
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	err := q.pushLocked(item, q.now())
+	q.notifyLocked(err == nil)
+	return err
+}
+
+// PushBatch transfers the longest accepted item prefix with one queue lock and one readiness notification.
+func (q *Queue[T]) PushBatch(items []Item[T]) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := q.now()
+	written := 0
+	for _, item := range items {
+		if !q.validItem(item) {
+			q.notifyLocked(written > 0)
+			return written, ErrInvalidItem
+		}
+		if err := q.pushLocked(item, now); err != nil {
+			q.notifyLocked(written > 0)
+			return written, err
+		}
+		written++
+	}
+	q.notifyLocked(true)
+	return written, nil
+}
+
+// validItem reports whether item can participate in this queue's ownership contract.
+func (q *Queue[T]) validItem(item Item[T]) bool {
+	if item.Size <= 0 || !item.Priority.Valid() || item.Deadline.IsZero() ||
+		item.retention != nil && (item.retention != q.budget || item.retentionBytes != item.Size) {
+		return false
+	}
+	return true
+}
+
+// pushLocked transfers one prevalidated item at now while q.mu is held.
+func (q *Queue[T]) pushLocked(item Item[T], now time.Time) error {
 	if q.closed {
 		return ErrClosed
 	}
-	now := q.now()
 	if !now.Before(item.Deadline) {
 		return ErrExpired
 	}
@@ -294,11 +351,18 @@ func (q *Queue[T]) Push(item Item[T]) error {
 	}
 	q.packets++
 	q.bytes += item.Size
+	return nil
+}
+
+// notifyLocked publishes nonempty readiness after a completed ownership transfer.
+func (q *Queue[T]) notifyLocked(changed bool) {
+	if !changed {
+		return
+	}
 	select {
 	case q.notify <- struct{}{}:
 	default:
 	}
-	return nil
 }
 
 // removeExpiredLocked releases expired capacity from both priority queues.
@@ -312,9 +376,11 @@ func (q *Queue[T]) removeExpiredLocked(now time.Time) {
 
 // evictNormalLocked evicts the oldest normal item and reports whether one existed.
 func (q *Queue[T]) evictNormalLocked() bool {
-	item, ok := q.normal.pop()
+	var item Item[T]
+	ok := q.normal.pop(&item)
 	if ok {
 		q.releaseLocked(1, item.Size)
+		item.releaseValue()
 	}
 	return ok
 }
@@ -329,7 +395,8 @@ func (q *Queue[T]) Pop(ctx context.Context) (Item[T], error) {
 		}
 		now := q.now()
 		for {
-			item, ok := q.popLocked()
+			var item Item[T]
+			ok := q.popLocked(&item)
 			if !ok {
 				break
 			}
@@ -337,7 +404,7 @@ func (q *Queue[T]) Pop(ctx context.Context) (Item[T], error) {
 				q.mu.Unlock()
 				return item, nil
 			}
-			item.ReleaseRetention()
+			item.Release()
 		}
 		q.mu.Unlock()
 
@@ -351,46 +418,49 @@ func (q *Queue[T]) Pop(ctx context.Context) (Item[T], error) {
 	}
 }
 
-// TryPop transfers ownership of the next unexpired item without blocking.
-func (q *Queue[T]) TryPop() (Item[T], error) {
+// TryPop transfers ownership of the next unexpired item into an unowned destination without blocking.
+func (q *Queue[T]) TryPop(destination *Item[T]) error {
+	*destination = Item[T]{}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
-		return Item[T]{}, ErrClosed
+		return ErrClosed
 	}
 	now := q.now()
 	for {
-		item, ok := q.popLocked()
+		ok := q.popLocked(destination)
 		if !ok {
-			return Item[T]{}, ErrEmpty
+			return ErrEmpty
 		}
-		if now.Before(item.Deadline) {
-			return item, nil
+		if now.Before(destination.Deadline) {
+			return nil
 		}
-		item.ReleaseRetention()
+		destination.Release()
 	}
 }
 
-// TryPopPriority transfers the next unexpired item at priority without considering the other priority.
-func (q *Queue[T]) TryPopPriority(priority Priority) (Item[T], error) {
+// TryPopPriority transfers the next unexpired item at priority into an unowned destination without considering other
+// priorities.
+func (q *Queue[T]) TryPopPriority(priority Priority, destination *Item[T]) error {
+	*destination = Item[T]{}
 	if !priority.Valid() {
-		return Item[T]{}, ErrInvalidItem
+		return ErrInvalidItem
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
-		return Item[T]{}, ErrClosed
+		return ErrClosed
 	}
 	now := q.now()
 	for {
-		item, ok := q.popPriorityLocked(priority)
+		ok := q.popPriorityLocked(priority, destination)
 		if !ok {
-			return Item[T]{}, ErrEmpty
+			return ErrEmpty
 		}
-		if now.Before(item.Deadline) {
-			return item, nil
+		if now.Before(destination.Deadline) {
+			return nil
 		}
-		item.ReleaseRetention()
+		destination.Release()
 	}
 }
 
@@ -426,29 +496,28 @@ func (q *Queue[T]) Close() {
 	}
 }
 
-// popLocked removes one item according to priority and updates queue accounting.
-func (q *Queue[T]) popLocked() (Item[T], bool) {
-	item, ok := q.popPriorityLocked(PriorityControl)
+// popLocked transfers one item according to priority and updates queue accounting.
+func (q *Queue[T]) popLocked(destination *Item[T]) bool {
+	ok := q.popPriorityLocked(PriorityControl, destination)
 	if !ok {
-		item, ok = q.popPriorityLocked(PriorityNormal)
+		ok = q.popPriorityLocked(PriorityNormal, destination)
 	}
-	return item, ok
+	return ok
 }
 
-// popPriorityLocked removes one item at priority while transferring aggregate retention to the caller.
-func (q *Queue[T]) popPriorityLocked(priority Priority) (Item[T], bool) {
-	var item Item[T]
+// popPriorityLocked transfers one item at priority into destination with aggregate retention.
+func (q *Queue[T]) popPriorityLocked(priority Priority, destination *Item[T]) bool {
 	var ok bool
 	if priority == PriorityControl {
-		item, ok = q.control.pop()
+		ok = q.control.pop(destination)
 	} else {
-		item, ok = q.normal.pop()
+		ok = q.normal.pop(destination)
 	}
 	if ok {
 		q.packets--
-		q.bytes -= item.Size
+		q.bytes -= destination.Size
 	}
-	return item, ok
+	return ok
 }
 
 // releaseLocked updates local accounting and releases optional aggregate capacity.

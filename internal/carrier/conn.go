@@ -2,6 +2,7 @@
 package carrier
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -20,6 +21,10 @@ const (
 	WebSocketReadLimit = 2 * protocol.MaxEncodedFrameSize
 	// maximumRetainedBufferCapacity preserves ordinary batches without retaining exceptional carrier high-water marks.
 	maximumRetainedBufferCapacity = 32 * 1024
+	// streamReadBufferSize captures one ordinary data batch from an ordered byte stream.
+	streamReadBufferSize = 32 * 1024
+	// maximumStreamReadBatchFrames matches the relay's bounded carrier read vector.
+	maximumStreamReadBatchFrames = 16
 )
 
 var (
@@ -29,8 +34,8 @@ var (
 	ErrWebSocketMessageTooLarge = errors.New("WebSocket carrier message too large")
 )
 
-// Conn is one full-duplex framed carrier connection for exactly one lane. ReadFrame calls must not overlap. A frame
-// payload remains valid until the next ReadFrame call on the same connection.
+// Conn is one full-duplex framed carrier connection for exactly one lane. Read calls must not overlap. Returned frame
+// payloads remain valid until the next read call on the same connection.
 type Conn interface {
 	ReadFrame(context.Context) (protocol.Frame, error)
 	WriteFrames(context.Context, []protocol.Frame) error
@@ -38,14 +43,62 @@ type Conn interface {
 	Close() error
 }
 
+// frameBatchReader extends [Conn] with ordered frames already available at one message boundary.
+type frameBatchReader interface {
+	ReadFrames(context.Context, []protocol.Frame) (int, error)
+}
+
+// boundedWriter lets a carrier enforce write timeouts directly on its network connection when possible.
+type boundedWriter interface {
+	writeFramesWithin(context.Context, []protocol.Frame, time.Duration) error
+	writeDataBatchWithin(context.Context, []protocol.Data, time.Duration) error
+}
+
+// ReadFrames reads one or more immediately available frames while preserving scalar fallback behavior.
+func ReadFrames(ctx context.Context, connection Conn, frames []protocol.Frame) (int, error) {
+	if len(frames) == 0 {
+		return 0, nil
+	}
+	if batch, ok := connection.(frameBatchReader); ok {
+		return batch.ReadFrames(ctx, frames)
+	}
+	frame, err := connection.ReadFrame(ctx)
+	if err != nil {
+		return 0, err
+	}
+	frames[0] = frame
+	return 1, nil
+}
+
+// WriteFramesWithin writes one frame batch with a maximum blocking duration.
+func WriteFramesWithin(ctx context.Context, connection Conn, frames []protocol.Frame, timeout time.Duration) error {
+	if writer, ok := connection.(boundedWriter); ok {
+		return writer.writeFramesWithin(ctx, frames, timeout)
+	}
+	writeContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return connection.WriteFrames(writeContext, frames)
+}
+
+// WriteDataBatchWithin writes one data batch with a maximum blocking duration.
+func WriteDataBatchWithin(ctx context.Context, connection Conn, data []protocol.Data, timeout time.Duration) error {
+	if writer, ok := connection.(boundedWriter); ok {
+		return writer.writeDataBatchWithin(ctx, data, timeout)
+	}
+	writeContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return connection.WriteDataBatch(writeContext, data)
+}
+
 // StreamConn carries WireHop frames over one ordered byte stream.
 type StreamConn struct {
-	conn        net.Conn
-	frameReader protocol.FrameReader
-	writeBuffer []byte
-	writeMu     sync.Mutex
-	closeOnce   sync.Once
-	closeErr    error
+	conn         net.Conn
+	reader       *bufio.Reader
+	frameReaders [maximumStreamReadBatchFrames]protocol.FrameReader
+	writeBuffer  []byte
+	writeMu      sync.Mutex
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 // TCPOptionsListener applies WireHop TCP options before returning accepted sockets.
@@ -78,19 +131,19 @@ func (l *TCPOptionsListener) Accept() (net.Conn, error) {
 
 // NewStreamConn wraps one connected TCP or TLS stream.
 func NewStreamConn(conn net.Conn) *StreamConn {
-	return &StreamConn{conn: conn}
+	return &StreamConn{conn: conn, reader: bufio.NewReaderSize(conn, streamReadBufferSize)}
 }
 
 // WebSocketConn carries complete WireHop frames in bounded binary WebSocket messages.
 type WebSocketConn struct {
-	conn            *websocket.Conn
-	abortConnection net.Conn
-	readBuffer      bytes.Buffer
-	readSequence    protocol.FrameSequence
-	writeBuffer     []byte
-	writeMu         sync.Mutex
-	closeOnce       sync.Once
-	closeErr        error
+	conn              *websocket.Conn
+	networkConnection net.Conn
+	readBuffer        bytes.Buffer
+	readSequence      protocol.FrameSequence
+	writeBuffer       []byte
+	writeMu           sync.Mutex
+	closeOnce         sync.Once
+	closeErr          error
 }
 
 // NewWebSocketConn wraps one WebSocket while preserving its message boundaries.
@@ -99,54 +152,98 @@ func NewWebSocketConn(connection *websocket.Conn) *WebSocketConn {
 	return &WebSocketConn{conn: connection}
 }
 
-// SetAbortConnection retains the underlying TCP connection for a later abortive close.
-func (c *WebSocketConn) SetAbortConnection(connection net.Conn) {
-	c.abortConnection = connection
+// SetNetworkConnection retains the underlying connection for direct deadlines and abortive teardown.
+func (c *WebSocketConn) SetNetworkConnection(connection net.Conn) {
+	c.networkConnection = connection
 }
 
 // ReadFrame returns the next frame from one complete binary WebSocket message.
 func (c *WebSocketConn) ReadFrame(ctx context.Context) (protocol.Frame, error) {
+	var frames [1]protocol.Frame
+	count, err := c.ReadFrames(ctx, frames[:])
+	if count > 0 {
+		return frames[0], nil
+	}
+	return protocol.Frame{}, err
+}
+
+// ReadFrames returns one blocking frame plus the rest of its current WebSocket message.
+func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame) (int, error) {
+	if len(frames) == 0 {
+		return 0, nil
+	}
 	if err := ctx.Err(); err != nil {
-		return protocol.Frame{}, err
+		return 0, err
 	}
-	if frame, ok := c.readSequence.Next(); ok {
-		return frame, nil
+	count := 0
+	for count < len(frames) {
+		frame, ok := c.readSequence.Next()
+		if ok {
+			frames[count] = frame
+			count++
+			continue
+		}
+		if count > 0 {
+			return count, nil
+		}
+		if err := c.readMessage(ctx); err != nil {
+			return 0, err
+		}
 	}
+	return count, nil
+}
+
+// readMessage reads and parses the next complete binary WebSocket message.
+func (c *WebSocketConn) readMessage(ctx context.Context) error {
 	c.readSequence = protocol.FrameSequence{}
 	c.resetReadBuffer()
 	messageType, reader, err := c.conn.Reader(ctx)
 	if err != nil {
 		if errors.Is(err, websocket.ErrMessageTooBig) {
-			return protocol.Frame{}, fmt.Errorf("%w: %v", ErrInvalidWebSocketMessage, err)
+			return fmt.Errorf("%w: %v", ErrInvalidWebSocketMessage, err)
 		}
-		return protocol.Frame{}, fmt.Errorf("read WebSocket carrier message: %w", err)
+		return fmt.Errorf("read WebSocket carrier message: %w", err)
 	}
 	if messageType != websocket.MessageBinary {
-		return protocol.Frame{}, ErrInvalidWebSocketMessage
+		return ErrInvalidWebSocketMessage
 	}
 	if _, err := c.readBuffer.ReadFrom(reader); err != nil {
 		c.resetReadBuffer()
 		if errors.Is(err, websocket.ErrMessageTooBig) {
-			return protocol.Frame{}, fmt.Errorf("%w: %v", ErrInvalidWebSocketMessage, err)
+			return fmt.Errorf("%w: %v", ErrInvalidWebSocketMessage, err)
 		}
-		return protocol.Frame{}, fmt.Errorf("read WebSocket carrier message: %w", err)
+		return fmt.Errorf("read WebSocket carrier message: %w", err)
 	}
 	message := c.readBuffer.Bytes()
 	if len(message) == 0 {
 		c.resetReadBuffer()
-		return protocol.Frame{}, ErrInvalidWebSocketMessage
+		return ErrInvalidWebSocketMessage
 	}
 	c.readSequence, err = protocol.ParseFrameSequence(message)
 	if err != nil {
 		c.resetReadBuffer()
-		return protocol.Frame{}, fmt.Errorf("parse WebSocket carrier message: %w", err)
+		return fmt.Errorf("parse WebSocket carrier message: %w", err)
 	}
-	frame, _ := c.readSequence.Next()
-	return frame, nil
+	return nil
 }
 
 // WriteFrames writes one nonempty sequence as one binary WebSocket message.
 func (c *WebSocketConn) WriteFrames(ctx context.Context, frames []protocol.Frame) error {
+	return c.writeFrames(ctx, frames, time.Time{})
+}
+
+// writeFramesWithin writes one frame batch with a direct network deadline when the underlying connection is known.
+func (c *WebSocketConn) writeFramesWithin(ctx context.Context, frames []protocol.Frame, timeout time.Duration) error {
+	if c.networkConnection != nil {
+		return c.writeFrames(ctx, frames, boundedDeadline(ctx, timeout))
+	}
+	writeContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.WriteFrames(writeContext, frames)
+}
+
+// writeFrames encodes and writes one WebSocket frame batch with an optional direct network deadline.
+func (c *WebSocketConn) writeFrames(ctx context.Context, frames []protocol.Frame, deadline time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -164,11 +261,26 @@ func (c *WebSocketConn) WriteFrames(ctx context.Context, frames []protocol.Frame
 			return err
 		}
 	}
-	return c.writeLocked(ctx, encoded)
+	return c.writeLocked(ctx, encoded, deadline)
 }
 
 // WriteDataBatch writes one nonempty data batch as one binary WebSocket message.
 func (c *WebSocketConn) WriteDataBatch(ctx context.Context, data []protocol.Data) error {
+	return c.writeDataBatch(ctx, data, time.Time{})
+}
+
+// writeDataBatchWithin writes one data batch with a direct network deadline when the underlying connection is known.
+func (c *WebSocketConn) writeDataBatchWithin(ctx context.Context, data []protocol.Data, timeout time.Duration) error {
+	if c.networkConnection != nil {
+		return c.writeDataBatch(ctx, data, boundedDeadline(ctx, timeout))
+	}
+	writeContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.WriteDataBatch(writeContext, data)
+}
+
+// writeDataBatch encodes and writes one WebSocket data batch with an optional direct network deadline.
+func (c *WebSocketConn) writeDataBatch(ctx context.Context, data []protocol.Data, deadline time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -186,13 +298,36 @@ func (c *WebSocketConn) WriteDataBatch(ctx context.Context, data []protocol.Data
 			return err
 		}
 	}
-	return c.writeLocked(ctx, encoded)
+	return c.writeLocked(ctx, encoded, deadline)
 }
 
-// writeLocked writes one complete binary WebSocket message while writeMu is held.
-func (c *WebSocketConn) writeLocked(ctx context.Context, encoded []byte) error {
+// setWriteDeadline applies or clears the direct deadline on the retained network connection.
+func (c *WebSocketConn) setWriteDeadline(deadline time.Time) error {
+	if c.networkConnection == nil {
+		return nil
+	}
+	if err := c.networkConnection.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("set WebSocket carrier write deadline: %w", err)
+	}
+	return nil
+}
+
+// writeLocked writes one complete binary WebSocket message while writeMu is held and clears its operation deadline.
+func (c *WebSocketConn) writeLocked(ctx context.Context, encoded []byte, deadline time.Time) (err error) {
 	if len(encoded) > WebSocketReadLimit {
 		return ErrWebSocketMessageTooLarge
+	}
+	if err := c.setWriteDeadline(deadline); err != nil {
+		return err
+	}
+	if !deadline.IsZero() {
+		// The reader may write WebSocket control frames between application writes.
+		defer func() {
+			resetErr := c.setWriteDeadline(time.Time{})
+			if err == nil {
+				err = resetErr
+			}
+		}()
 	}
 	if err := c.conn.Write(ctx, websocket.MessageBinary, encoded); err != nil {
 		return fmt.Errorf("write WebSocket carrier message: %w", err)
@@ -211,7 +346,7 @@ func (c *WebSocketConn) Close() error {
 // Abort discards unacknowledged carrier bytes and closes the WebSocket without a close handshake.
 func (c *WebSocketConn) Abort() error {
 	c.closeOnce.Do(func() {
-		lingerErr := setAbortiveClose(c.abortConnection)
+		lingerErr := setAbortiveClose(c.networkConnection)
 		c.closeErr = errors.Join(lingerErr, c.conn.CloseNow())
 	})
 	return c.closeErr
@@ -219,21 +354,58 @@ func (c *WebSocketConn) Abort() error {
 
 // ReadFrame reads one complete frame with the context deadline applied to the stream.
 func (c *StreamConn) ReadFrame(ctx context.Context) (protocol.Frame, error) {
+	var frames [1]protocol.Frame
+	count, err := c.ReadFrames(ctx, frames[:])
+	if count > 0 {
+		return frames[0], nil
+	}
+	return protocol.Frame{}, err
+}
+
+// ReadFrames returns one blocking frame plus complete frames already buffered from the stream.
+func (c *StreamConn) ReadFrames(ctx context.Context, frames []protocol.Frame) (int, error) {
+	if len(frames) == 0 {
+		return 0, nil
+	}
 	if err := ctx.Err(); err != nil {
-		return protocol.Frame{}, err
+		return 0, err
 	}
 	if err := c.conn.SetReadDeadline(contextDeadline(ctx)); err != nil {
-		return protocol.Frame{}, fmt.Errorf("set carrier read deadline: %w", err)
+		return 0, fmt.Errorf("set carrier read deadline: %w", err)
 	}
-	frame, err := c.frameReader.Read(c.conn)
+	frame, err := c.frameReaders[0].Read(c.reader)
 	if err != nil {
-		return protocol.Frame{}, fmt.Errorf("read carrier frame: %w", err)
+		return 0, fmt.Errorf("read carrier frame: %w", err)
 	}
-	return frame, nil
+	frames[0] = frame
+	count := 1
+	limit := min(len(frames), len(c.frameReaders))
+	for count < limit {
+		frame, available, err := c.frameReaders[count].ReadBuffered(c.reader)
+		if err != nil {
+			return count, fmt.Errorf("read buffered carrier frame: %w", err)
+		}
+		if !available {
+			break
+		}
+		frames[count] = frame
+		count++
+	}
+	return count, nil
 }
 
 // WriteFrames writes one nonempty frame batch without interleaving another writer.
 func (c *StreamConn) WriteFrames(ctx context.Context, frames []protocol.Frame) error {
+	return c.writeFrames(ctx, frames, contextDeadline(ctx))
+}
+
+// writeFramesWithin writes one frame batch with a direct stream deadline.
+func (c *StreamConn) writeFramesWithin(ctx context.Context, frames []protocol.Frame, timeout time.Duration) error {
+	return c.writeFrames(ctx, frames, boundedDeadline(ctx, timeout))
+}
+
+// writeFrames encodes and writes one frame batch with deadline.
+func (c *StreamConn) writeFrames(ctx context.Context, frames []protocol.Frame, deadline time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -252,11 +424,21 @@ func (c *StreamConn) WriteFrames(ctx context.Context, frames []protocol.Frame) e
 		}
 	}
 
-	return c.writeLocked(ctx, encoded)
+	return c.writeLocked(deadline, encoded)
 }
 
 // WriteDataBatch writes a nonempty data-frame batch using connection-local reusable storage.
 func (c *StreamConn) WriteDataBatch(ctx context.Context, data []protocol.Data) error {
+	return c.writeDataBatch(ctx, data, contextDeadline(ctx))
+}
+
+// writeDataBatchWithin writes one data batch with a direct stream deadline.
+func (c *StreamConn) writeDataBatchWithin(ctx context.Context, data []protocol.Data, timeout time.Duration) error {
+	return c.writeDataBatch(ctx, data, boundedDeadline(ctx, timeout))
+}
+
+// writeDataBatch encodes and writes one data batch with deadline.
+func (c *StreamConn) writeDataBatch(ctx context.Context, data []protocol.Data, deadline time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -274,12 +456,12 @@ func (c *StreamConn) WriteDataBatch(ctx context.Context, data []protocol.Data) e
 			return err
 		}
 	}
-	return c.writeLocked(ctx, encoded)
+	return c.writeLocked(deadline, encoded)
 }
 
 // writeLocked writes one complete encoded frame sequence while writeMu is held.
-func (c *StreamConn) writeLocked(ctx context.Context, encoded []byte) error {
-	if err := c.conn.SetWriteDeadline(contextDeadline(ctx)); err != nil {
+func (c *StreamConn) writeLocked(deadline time.Time, encoded []byte) error {
+	if err := c.conn.SetWriteDeadline(deadline); err != nil {
 		return fmt.Errorf("set carrier write deadline: %w", err)
 	}
 	for len(encoded) > 0 {
@@ -358,5 +540,14 @@ func ConfigureTCP(conn *net.TCPConn) error {
 // contextDeadline returns the context deadline or a zero deadline when none exists.
 func contextDeadline(ctx context.Context) time.Time {
 	deadline, _ := ctx.Deadline()
+	return deadline
+}
+
+// boundedDeadline returns the earlier context deadline or timeout boundary.
+func boundedDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if contextValue, ok := ctx.Deadline(); ok && contextValue.Before(deadline) {
+		return contextValue
+	}
 	return deadline
 }

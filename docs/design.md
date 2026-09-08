@@ -15,12 +15,6 @@ WireHop combines WireGuard-aware packet handling with independently measured car
 - Independent connections to one carrier endpoint when a single TCP stream is insufficient
 - Continued forwarding and bounded recovery when one lane stalls or fails
 
-## Document status
-
-This document defines WireHop's product behavior and technical design. Present-tense statements describe supported
-behavior. Protocol requirements define the version 1 wire contract. Deployment recommendations and the performance
-validation matrix are guidance rather than runtime requirements.
-
 ## Design boundary
 
 WireHop remains transparent to WireGuard cryptography. It inspects the outer WireGuard packet type and public structural
@@ -168,9 +162,8 @@ A terminal security, policy, or protocol rejection moves a lane from `connecting
 terminal states end the current supervisor and never reconnect within that session. A replacement session starts new
 supervisors from the complete configured lane set.
 
-These names describe lifecycle behavior. An `active` lane is not necessarily scheduling-eligible because eligibility
-also depends on the path-group limit, retained-store capacity, deadline risk, and abandonment state. It is not a second
-user-configurable mode.
+An `active` lane is not necessarily scheduling-eligible because eligibility also depends on the path-group limit,
+retained-store capacity, deadline risk, and abandonment state.
 
 ## Path group model
 
@@ -264,16 +257,25 @@ Upgrade request itself, so the initial mapping conservatively includes those sta
 Local validation enforces the configured per-session lane limit before this concurrent work begins. Carrier preparation
 is therefore concurrent across the accepted configuration while remaining bounded by explicit resource policy.
 
-Session creation itself is single-flight. At most one candidate lane sends a session creation request at a time.
+Each prepared lane immediately attempts authenticated session creation, without waiting for another candidate's
+admission response. Each candidate independently retries recoverable preparation and creation failures with full-jitter
+backoff. Its next attempt does not wait for other candidates to finish, and each attempt receives its own preparation
+and admission deadline. The coordinator selects the first successful result and cancels all remaining creation attempts
+and retry waits. No candidate sends in-session frames before selection. Only the selected session receives clock sync
+and WireGuard data. Slow TLS, proxy negotiation, admission, or target resolution on another candidate cannot delay that
+selection or a healthy candidate's retry.
 
-The creator is selected from transport-ready candidates and is not fixed to the first `--lane` occurrence. A creation
-attempt has a bounded deadline. If it fails, the client classifies the failure and selects another eligible candidate.
-Once one creation request succeeds, all other lanes join the resulting session instead of creating their own sessions.
-This prevents duplicate sessions while allowing a bad first lane to be bypassed.
+Concurrent admission may temporarily allocate several candidate sessions and target sockets. These allocations count
+against the server's existing admission and session limits. A candidate becomes eligible for reconnect retention only
+after a lane receives a valid first clock-sync frame. An abandoned unconfirmed creator releases its session immediately
+instead of retaining unused target sockets for reconnect grace. Each accepted lane must supply its first clock-sync
+frame within the handshake timeout.
 
-After session creation, all prepared lanes start their authenticated joins concurrently. Configured lanes whose carrier
-preparation finishes later join as soon as they are ready. Background ping and probe timers use stable lane-based phase
-offsets so concurrent lane startup does not create a synchronized control burst.
+Other lanes wait for their canceled candidate attempts to finish, then establish fresh connections and join the selected
+session concurrently. Candidate connections are not reused for joins because they may already have sent a creation
+request or expired during admission. Cleanup of other candidates does not gate forwarding on the selected lane.
+Background ping and probe timers use stable lane-based phase offsets so concurrent lane startup does not create a
+synchronized control burst.
 
 ### Data-plane activation
 
@@ -305,19 +307,18 @@ sequenceDiagram
 
   C->>C: Validate, bind UDP, and start bounded ingress
 
-  par Start creator candidate preparation
-    C->>A: Prepare first hop
-    A-->>C: Transport ready
-  and Start all other preparations
-    C->>N: Start first hop preparation
+  par Attempt creator candidate
+    C->>A: Prepare carrier and authenticate
+    A->>S: Authenticated create
+    S->>S: Authorize and resolve target, then open UDP sockets
+    S-->>A: Session created with clock timestamps
+    A-->>C: Session identity, secret, and clock sample
+  and Attempt other candidates
+    C->>N: Prepare carriers and authenticate
   end
 
-  Note over C,N: Creator chosen dynamically from ready lanes
-  C->>A: Begin serialized session creation
-  A->>S: Authenticated create
-  S->>S: Authorize and resolve target, then open UDP sockets
-  S-->>A: Session created with clock timestamps
-  A-->>C: Session identity, secret, and clock sample
+  Note over C,N: First successful admission wins without waiting for other candidates
+  C->>N: Cancel candidates and reconnect to join selected session
   C->>C: Install the initial clock mapping
   C->>A: Register active generation
   A->>S: Clock sync before data
@@ -332,16 +333,16 @@ gate with conservative RTT and delivery-rate estimates. It does not wait for a p
 
 ### Availability behavior
 
-Initial session creation has a bounded startup deadline. The process exits with a nonzero status when local validation
-fails, no candidate creates a session within that deadline, or all candidates finish with terminal rejections. Startup
-failures identify the configured lane occurrence and declaration that supplied the retained cause. A startup timeout
-includes the most recent actionable lane failure when one is available.
+Recoverable creation failures retry without an overall startup or recovery deadline. Each lane has at most one creation
+attempt in progress. The coordinator aggregates retry warnings through one rate-limited notice, so concurrent failures
+do not multiply log volume. The process exits with a nonzero status when local validation fails or all candidates finish
+with terminal rejections. Failures identify the configured lane occurrence and declaration that supplied the cause.
 
 After a session has existed, retryable lane failures reconnect independently. If all current generations are down, the
 client remains alive while their supervisors retry. The already-bound UDP socket and bounded ingress queue remain in
 place. Fresh packets may survive a short outage. Expired packets are discarded on dequeue and reclaimed under capacity
-pressure before they can make the queue reject fresh ingress. If the retained session is gone, each replacement creation
-round remains bounded, but retryable rounds continue without an overall recovery deadline.
+pressure before they can make the queue reject fresh ingress. If the retained session is gone, its replacement uses the
+same independent candidate retries without an overall recovery deadline.
 
 A single terminal lane rejection never terminates a client that still has another active or retryable lane. A client
 with no remaining lane supervisor exits because the session can no longer make progress. When another lane preserves the
@@ -354,7 +355,7 @@ Every connection, handshake, and control-plane failure maps to one stable error 
 | Class | Examples | Behavior |
 | --- | --- | --- |
 | `configuration` | Malformed URL, unsupported scheme, missing token, invalid TLS option | Fail before network startup |
-| `retryable` | Network failure, timeout, clock skew, HTTP 408, 429, or 5xx | Reconnect with backoff |
+| `retryable` | DNS failure including missing records, network failure, timeout, clock skew, HTTP 408, 429, or 5xx | Reconnect with backoff |
 | `lane_rejected` | Certificate validation failure, authentication rejection, incompatible protocol | Reject that lane |
 | `session_gone` | Join refers to an unknown, closed, or expired session | Coordinate session replacement |
 | `session_rejected` | All viable endpoints reject the credentials, target, or protocol | Terminate the client |
@@ -365,14 +366,18 @@ Before session establishment, the client treats a remote `session_rejected` resp
 promotes it to a process-level terminal result only after every viable candidate has failed terminally. An in-session
 `session_rejected` control received on an admitted lane and scoped to the current session is terminal immediately.
 
-A `session_gone` response from one lane never replaces a session that still has another accepted lane. In that case the
-response is isolated to the failed lane as an endpoint inconsistency. Session replacement starts only after no remaining
-lane supervisor can preserve the old session.
+A `session_gone` response from a lane that was previously admitted to the current session invalidates the shared session
+and starts coordinated replacement immediately. Waiting for every other lane supervisor could block recovery
+indefinitely when another carrier path is unreachable and remains in retryable backoff. When a configured lane receives
+`session_gone` on its first join while another lane already preserves the session, the client disables only that lane. A
+never-admitted endpoint has not established authority over the existing session, but its failure still initiates
+replacement if it becomes the final configured lane.
 
-After a session is established, a rejected lane supervisor does not participate in reconnect backoff. During the bounded
-initial bootstrap, complete candidate rounds may re-evaluate declarations while another candidate still has a retryable
-failure. Changing a certificate, credential, URL, or incompatible protocol deployment requires restarting the client
-after the startup budget is exhausted.
+A terminal creation rejection stops that lane's creation attempts while other candidates continue. Once a session is
+selected, other lanes attempt authenticated joins using its credentials. A rejected join or established-lane supervisor
+is disabled for that session and does not participate in reconnect backoff. Session replacement evaluates the configured
+lanes again. A client that terminated after all candidates were rejected requires a restart after its configuration or
+remote deployment is corrected.
 
 Raw-stream responses, WebSocket rejections, and in-session error frames carry machine-readable error classes. A
 WebSocket rejection that follows successful request parsing carries an authenticated binary rejection in the
@@ -382,9 +387,8 @@ depends on free-form diagnostic text. The `lane_rejected` class always has lane 
 `session_rejected` classes always have session scope. A `retryable` error may use either scope according to the resource
 that failed. A lane-scoped retryable error reconnects only that stable lane identity. A session-scoped retryable error
 replaces the complete session after bounded backoff. An in-session `session_rejected` or session-scoped `retryable`
-error received on an admitted lane applies to the complete session rather than only its carrying lane. A `session_gone`
-error follows the multi-lane preservation rule above. Raw servers return an HMAC-authenticated terminal rejection when
-the client hello uses an unsupported WireHop version.
+error received on an admitted lane applies to the complete session rather than only its carrying lane. Raw servers
+return an HMAC-authenticated terminal rejection when the client hello uses an unsupported WireHop version.
 
 ### Reconnection policy
 
@@ -637,7 +641,9 @@ entry cannot be removed from the middle of an ordered TCP stream. Its expiry ins
 after which the complete retained state is drained.
 
 Before exposing any bytes to a potentially partial carrier write, the writer moves the complete batch into the sent
-prefix. Neither this ownership transition nor local write success releases retained capacity.
+prefix. The active write holds an independent packet-buffer reference until encoding and carrier I/O finish, so draining
+an abandoned generation cannot recycle payload memory still in use. Neither the ownership transition nor local write
+success releases retained capacity.
 
 Queued expiry reclaims its retained capacity. Once an entry enters the sent prefix, only a valid cumulative delivery
 report or complete generation drain can release it. The transmission store is therefore also a per-lane feedback window.
@@ -681,8 +687,14 @@ The command uses these time and traffic limits:
 | Policy | Default |
 | --- | ---: |
 | Authentication timestamp skew | 2 minutes |
-| Carrier handshake | 5 seconds |
-| Initial session startup | 15 seconds |
+| First-hop DNS and TCP connection establishment | 30 seconds |
+| TLS handshake and ordinary carrier admission | 5 seconds |
+| Authenticated session creation including target preparation | 30-second target lookup plus 5-second admission budget |
+| Session creation attempt per candidate lane | 70 seconds, derived from dial, target lookup, and two handshake budgets |
+| Server listener preparation, shared across all listeners | 30 seconds |
+| Initial and runtime target DNS lookup | 30 seconds |
+| Initial DNS backoff for server listeners and forward targets | 1 s initial ceiling, 5 s maximum ceiling, full jitter |
+| Preparation failure reporting | 30-second quiet window, then at most one warning per minute on failed attempts |
 | Detached-session reconnect grace | 30 seconds |
 | WireGuard handshake and cookie packet lifetime | 2 seconds |
 | WireGuard transport packet lifetime | 1 second |
@@ -695,6 +707,20 @@ The command uses these time and traffic limits:
 | Initial lane RTT and delivery rate | 100 milliseconds and 1,000,000 bytes per second |
 | Reconnect backoff and stability reset | 100 ms initial, 5 s maximum, reset after 30 s healthy |
 | Graceful client session-close attempt | 200 milliseconds |
+
+DNS and TCP dialing use the standard resolver and dialer, preserving configured nameserver fallback and dual-stack
+connection racing. Their budgets are independent of the short protocol-handshake limit. A five-second total lookup
+deadline could expire just as a resolver begins trying its second nameserver. The lookup budget permits common fallback
+sequences, but does not guarantee completion for arbitrary resolver configurations. Server listener lookups are bounded
+by their shared preparation deadline instead of receiving a fresh budget for each listener.
+
+Unauthenticated raw requests, HTTP headers, and TLS handshakes retain their short limits. Only after authentication,
+replay checks, and target authorization does the server extend the raw connection or HTTP response deadline for target
+preparation. The client likewise allows this longer creation response. Joins do not resolve a target and retain the
+ordinary admission budget. An abandoned HTTP request cancels its target preparation. During raw-stream preparation, a
+dedicated reader detects creator disconnection or premature data before the creation response. The reader is stopped and
+joined before normal frame reading begins. Attempt contexts bound preparation work without becoming the lifetime of a
+successful connection, listener, or retained target endpoint.
 
 ## Connection abandonment and packet migration
 
@@ -803,8 +829,20 @@ The server creates one target endpoint per session, while a direct forwarder cre
 IP-literal target produces one candidate without invoking the resolver. A DNS target uses the server's resolver during
 session creation or the forwarder's local resolver during startup. The result combines A and AAAA addresses, converts
 IPv4-mapped results to canonical IPv4, removes duplicates and disallowed addresses, and retains at most 16 candidates in
-resolver order. Startup requires at least one usable candidate and one usable UDP address family. A server reports a
-resolution or socket setup error as a retryable creation failure, while a direct forwarder exits with a runtime error.
+resolver order. Target readiness requires at least one usable candidate and one usable UDP address family. A server
+reports a resolution or socket setup error as a retryable creation failure. A direct forwarder applies the startup
+policy below.
+
+The direct forwarder binds its local UDP listener before resolving the target. Initial lookup failures, including
+timeouts, missing records, and answers without usable addresses, retry until cancellation. Negative answers can change
+and are not permanent configuration errors. Retries use full-jitter exponential backoff with the limits in the timing
+table and honor system resolver caching. Invalid options and local bind failures are immediately fatal. Non-DNS target
+socket preparation failures terminate the forwarder and release the local port.
+
+While target preparation is pending, the forwarder drains and discards local packets instead of accumulating a startup
+queue. Once the target is prepared, it switches to direct bidirectional batch forwarding without readiness checks in the
+steady-state loop. Readiness requires both the local bind and target preparation. Cancellation interrupts an active
+lookup or backoff, closes the local socket, and waits for forwarding workers to exit.
 
 Each target endpoint owns at most one unconnected IPv4 UDP socket and one unconnected IPv6 UDP socket. Candidates in the
 same family share the endpoint's source socket and port. Replies are accepted only from the current DNS candidates, the
@@ -815,12 +853,19 @@ target sockets or routing state.
 
 The standard resolver does not expose DNS TTL values. WireHop therefore refreshes a DNS target when a WireGuard
 handshake initiation or a concrete UDP network error arrives, with at most one lookup every five seconds and one lookup
-in flight per target endpoint. A lookup has a five-second deadline. Successful resolution atomically replaces the
+in flight per target endpoint. A lookup has a 30-second deadline. Successful resolution atomically replaces the
 handshake fan-out set. Failure retains the last successful set and established affinity, so a temporary resolver outage
 does not break an otherwise usable path.
 
 Target address changes remain internal to the target endpoint. They do not replace a WireHop session, reset packet IDs
 or deduplication state, reconnect carrier lanes, or restart a direct forwarder.
+
+Each successful DNS answer is authoritative for subsequent handshake fan-out. WireHop does not accumulate a union of
+rotating answers because doing so would retain addresses deliberately removed from DNS. Answer reordering or a changed
+subset does not move established transport traffic. Existing public-index affinity remains attached to its recorded
+source candidate, while a later WireGuard handshake may select any candidate in the latest answer. A direct forwarder
+uses one unconnected UDP socket per address family rather than one connection per candidate, so this selection does not
+incur an upstream connection teardown.
 
 ## WireGuard candidate affinity
 
@@ -976,9 +1021,9 @@ the authentication clock.
 
 The client does not follow HTTP redirects during WebSocket admission. A lane URL is an exact admission endpoint, and
 forwarding bearer or join headers to a redirected URL would weaken that boundary. For an unsigned intermediary response,
-HTTP 408, 429, and 5xx are retryable. During a join, HTTP 410 means that the referenced session is gone and enters the
-coordinated session-recovery path. Every other unsigned non-upgrade HTTP response permanently rejects that lane
-candidate.
+HTTP 408, 429, and 5xx are retryable. Every other unsigned non-upgrade HTTP response permanently rejects only that lane
+candidate. In particular, HTTP 410 triggers session replacement only when its rejection metadata authenticates a
+`session_gone` result.
 
 ## Authentication for TCP and TLS lanes
 
@@ -1062,11 +1107,37 @@ Fast-path behavior:
 - Bound one data batch to 16 frames and a target of 64 KiB before the final admitted frame
 - Keep application queues and unconfirmed retention bounded independently from kernel socket buffers
 - Use an abortive TCP close for an abandoned generation so unacknowledged stale bytes are discarded
-- Reuse maximum-sized UDP receive buffers and copy accepted datagrams into exact owned queue storage
 - Bound each WebSocket binary message to two maximum encoded frames, or 131,112 bytes, on receipt
 
 Socket write success only means that the local kernel or TLS stack accepted bytes. It never counts as peer delivery or
 as permission to release retained backlog and packet state.
+
+### UDP batching and buffer ownership
+
+Each UDP reader waits for one datagram, then opportunistically drains up to 15 additional ready datagrams on Linux with
+`recvmmsg`. Writers submit ready datagrams with `sendmmsg` and combine compatible same-destination runs with
+`UDP_SEGMENT` when supported. Other platforms and sockets without batch access use scalar UDP I/O. Neither path waits
+for a batch to fill.
+
+A GSO size rejection retries only the unsent datagrams without segmentation, preserving ordinary UDP fragmentation
+behavior. It does not disable GSO for later batches. An offload capability failure disables GSO on that socket and
+retries its unsent datagrams with `sendmmsg`. Per-datagram failures after fallback follow the normal UDP error policy.
+
+Linux 7.0 and Linux 7.1 release candidates before rc5 receive an equal-tail GSO workaround. Batches smaller than eight
+datagrams use `sendmmsg` without GSO. Larger batches append a one-byte invalid WireGuard datagram to an otherwise
+equal-sized GSO run, avoiding the kernel's final-segment length defect. This extra datagram is not relay data and does
+not enter WireHop packet or delivery counters.
+
+Accepted UDP payloads are copied into reference-counted buffers. Queue admission, control duplication, carrier writes,
+and migration transfer or retain explicit ownership. A buffer returns to its pool only after the final owner releases
+it. Size classes retain buffers up to 32 KiB, and larger payload allocations are not pooled.
+
+Linux receive staging uses a process-wide pool of 15-datagram vectors. Its capacity is chosen from `GOMAXPROCS` at
+initialization, with a minimum of two vectors and a maximum of 16. At the maximum, payload storage occupies 15 MiB plus
+vector metadata. A reader that cannot borrow a vector continues with scalar reads. Carrier frame and encoding buffers
+reuse capacities up to 32 KiB. Larger encoding buffers are discarded after writing, and larger read buffers are
+discarded before reading the next frame or message. These scratch buffers, size-class overhead, and kernel socket
+buffers are separate from the retained relay-work budget.
 
 ### WebSocket transport
 
@@ -1087,6 +1158,9 @@ subprotocol rejects the lane.
 
 WebSocket compression is disabled because encrypted WireGuard payloads are effectively incompressible.
 
+WebSocket control frames are handled by the carrier library. Direct write deadlines are cleared after each operation so
+an idle lane can still answer WebSocket Ping frames.
+
 WebSocket lanes honor `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`. Proxy selection maps `ws://` to HTTP policy and
 `wss://` to HTTPS policy. Secure WebSocket lanes use CONNECT through selected HTTP or HTTPS proxies. Selected `socks5`
 and `socks5h` proxies use their native TCP tunneling behavior.
@@ -1103,14 +1177,12 @@ fails before binding the local UDP socket. Operators use `NO_PROXY` to select di
 Carrier route exclusion is a deployment invariant. A client carrier connection and any DNS lookup needed to establish it
 cannot depend on the WireGuard tunnel that it carries. Every carrier dial follows this order:
 
-```text
 1. Resolve the first-hop hostname through a route-excluded resolver socket when resolution is required
 2. Create the TCP socket
 3. Apply route-exclusion and interface policy
 4. Connect the socket
 5. Apply connected-socket TCP options
 6. Perform TLS or WebSocket handshakes
-```
 
 On Linux, an optional `--fwmark` value applies `SO_MARK` to carrier TCP sockets before `connect` and to local DNS
 sockets used by the Go resolver. Deployments on other platforms must provide external routes that exclude the DNS path
@@ -1133,9 +1205,8 @@ outbound datagrams re-enter local ingress and form a UDP feedback loop.
 
 ### Carrier overhead and MTU
 
-WireHop does not modify a WireGuard interface MTU. It documents the carrier overhead needed to choose one. Each datagram
-adds exactly 21 bytes of WireHop framing. TCP/IP, TLS, and WebSocket overhead depends on IP family, TCP options, record
-boundaries, and write coalescing, so deployment guidance describes those parts as a range.
+Each datagram adds exactly 21 bytes of WireHop framing. TCP/IP, TLS, and WebSocket overhead depends on IP family, TCP
+options, record boundaries, and write coalescing. WireHop does not modify the WireGuard interface MTU.
 
 The forwarding protocol remains correct when one WireHop frame spans several TCP segments. A conservative WireGuard MTU
 is still desirable because fitting a normal WireGuard transport packet within one carrier segment reduces segment count,
@@ -1148,7 +1219,7 @@ carrier path.
 
 ## Frame protocol
 
-WireHop defines a small binary framing protocol inside each carrier lane.
+WireHop uses version 1 of its binary framing protocol inside each carrier lane.
 
 The carrier provides a byte stream or WebSocket message stream. WireHop frames provide packet boundaries and control
 messages.
@@ -1421,10 +1492,10 @@ matching prefix of its sent FIFO. Packet and byte counters must identify the sam
 impossible active-generation report is a protocol violation. A wholly stale report from an older snapshot or generation
 is ignored.
 
-New packet IDs start at 1 and increase strictly within each session direction. The scheduler chooses the next ID before
-lane selection and commits it only after at least one copy enters a lane transmission store. Every proactive duplicate
-or migrated copy preserves that ID. Exhausting the 64-bit identifier space requires session replacement rather than
-zero-value reuse.
+New packet IDs start at 1 and increase strictly within each session direction. The scheduler chooses the next ID after
+selecting eligible lanes and commits it only after at least one copy enters a lane transmission store. Every proactive
+duplicate or migrated copy preserves that ID. Exhausting the 64-bit identifier space requires session replacement rather
+than zero-value reuse.
 
 ### Carrier mapping
 
@@ -1439,13 +1510,15 @@ server tracks that authenticated session independently from the lifetime of any 
 
 | State | Meaning |
 | --- | --- |
-| `attached` | At least one admitted lane is connected or an accepted lane reservation is completing |
+| `unconfirmed` | A candidate has prepared its target but no lane has supplied a valid first clock-sync frame |
+| `attached` | A confirmed session has a connected lane or an accepted lane reservation is completing |
 | `detached` | No lane is connected or completing an accepted reservation, but reconnect grace has not expired |
 | `closed` | Session state, credentials, queues, resolver state, and target sockets have been released |
 
-An unexpected loss of the final lane moves the session to `detached` unless an authenticated join has reserved lane
-capacity and is still completing. The server starts a bounded reconnect grace timer only after both active lanes and
-accepted reservations reach zero. During that grace period it retains:
+An unconfirmed creator's disconnection or clock-sync timeout releases its session without reconnect grace. Once
+confirmed, an unexpected loss of the final lane moves the session to `detached` unless an authenticated join has
+reserved lane capacity and is still completing. The server starts a bounded reconnect grace timer only after both active
+lanes and accepted reservations reach zero. During that grace period it retains:
 
 - Session identifier and ephemeral session secret
 - Logical target, last successful DNS candidates, WireGuard index affinity, and per-family UDP sockets
@@ -1462,17 +1535,16 @@ authenticated join with its next generation. A successful join returns the serve
 replacing the target endpoint or resetting direction-local packet ID state.
 
 Every reconnecting lane attempts an authenticated join independently. The first successful join preserves the old
-session and activates through the clock-sync gate. A lone `session_gone` response is isolated while another lane can
-still preserve the session. If all remaining supervisors report that the session is gone, the client erases the old
-secret and creates one replacement session through the normal single-flight bootstrap. The replacement reuses the
-configured stable lane and path group identifiers, but resets the connection generation, packet ID, deduplication, and
-clock-mapping namespaces.
+session and activates through the clock-sync gate. A `session_gone` response on a previously admitted lane invalidates
+that shared session, so the client erases the old secret and creates one replacement session through the normal
+candidate-selection bootstrap. A configured lane that has never joined cannot invalidate a session still preserved by an
+admitted lane. The replacement reuses the configured stable lane and path group identifiers, but resets the connection
+generation, packet ID, deduplication, and clock-mapping namespaces.
 
 A session-scoped retryable error or local exhaustion of a nonwrapping relay counter enters the same replacement path
-after bounded backoff. Before the first successful session, one overall startup deadline bounds all creation rounds.
-After a session has existed, each replacement round retains bounded connection and handshake deadlines, but retryable
-replacement rounds continue indefinitely. A permanent credential, certificate, protocol, or policy rejection still
-terminates the affected lane or complete client according to its authenticated scope.
+after bounded backoff. Initial and replacement creation use independent candidate retries with bounded connection and
+handshake deadlines. A permanent credential, certificate, protocol, or policy rejection still terminates the affected
+lane or complete client according to its authenticated scope.
 
 The scheduler returns any currently held control packet and preempted transport packet to the bounded ingress queue only
 while each packet remains fresh and queue capacity is still available. Packets already admitted to an old lane
@@ -1519,10 +1591,14 @@ Every configured listener must have a distinct canonical bind address. Different
 declare the same local address as separate listeners.
 
 The server validates all options, loads the TLS key pair when required, and binds every configured listener before
-serving any of them. A listener preparation failure prevents partial startup. A terminal listener failure stops the
-remaining listeners and the server process. One configured TLS key pair serves all `tls://` and `wss://` listeners.
-Listener URLs may omit the host to bind a wildcard address, but they still require an effective nonzero port. Shutdown
-cancels and waits for active raw-stream and hijacked WebSocket handlers before the command returns.
+serving any of them. All listeners share one startup deadline. Listener hostname lookup failures, including missing
+records, use the bounded initial DNS retry policy. Each lookup is also limited by the remaining shared budget. Local
+bind failures such as an occupied port, insufficient permissions, or an unavailable local address fail immediately.
+Failure or cancellation during preparation closes all sockets already prepared. Once serving, a terminal listener
+failure stops the remaining listeners and the server process. One configured TLS key pair serves all `tls://` and
+`wss://` listeners. Listener URLs may omit the host to bind a wildcard address, but they still require an effective
+nonzero port. Shutdown cancels and waits for active raw-stream and hijacked WebSocket handlers before the command
+returns.
 
 Forward flags:
 
@@ -1561,9 +1637,8 @@ carrier listeners. Every `--lane` occurrence creates an independent lane and TCP
 preserves identical declarations. Identical canonical URLs with the same resolution belong to one path group, while
 different fixed resolutions belong to different groups.
 
-The forwarder binds its local listener and then performs initial target resolution and opens UDP sockets for the usable
-target address families before it begins forwarding. Any startup failure closes the local listener. A fixed-port startup
-is silent. With port `0`, the selected address is printed only after the target endpoint is ready.
+The forwarder binds its local listener before resolving its target and opening upstream UDP sockets. A fixed-port
+startup is silent. With port `0`, the selected address is printed only after target preparation succeeds.
 
 ## IPv4 and IPv6 policy
 
@@ -1610,20 +1685,27 @@ target preparation.
 
 The client writes one timestamped structured warning when a permanently failed lane is disabled while another supervisor
 keeps the client running. The warning identifies the lane occurrence, canonical URL, optional fixed resolution, and
-either the local error or stable remote code, class, and scope. Retryable lane failures are silent.
+either the local error or stable remote code, class, and scope. Retryable failures of individual lane supervisors are
+silent.
+
+Client session creation and forward target preparation remain quiet for their first 30 seconds. Failed attempts after
+that window emit at most one warning per minute. Recovery produces one informational message only if that preparation
+loop previously warned. Client warnings use configured lane context and stable remote codes instead of untrusted peer
+diagnostics. Ordinary short retries do not generate warning or recovery messages.
 
 The server writes timestamped structured text records to standard error for actionable failures that do not terminate
 the process. These include post-admission protocol violations, local target-session failures, relay worker failures, and
 recovered HTTP server failures. Authentication failures, malformed unauthenticated requests, capacity rejections,
 routine TLS scans, connection loss, ping timeout, retryable lane failure, peer shutdown, and process cancellation are
-silent. Successful clock-skew correction and runtime session replacement are also silent. Terminal listener or process
-failures are returned to the command layer and printed once instead of also being logged as warnings. Peer error frames
-received after admission are logged by stable code, class, and scope without their peer-controlled diagnostic text.
-Client and server logs never include peer-controlled diagnostics, tokens, session secrets, or packet payloads.
+silent. Successful clock-skew correction and session replacement without prolonged preparation are also silent. Terminal
+listener or process failures are returned to the command layer and printed once instead of also being logged as
+warnings. Peer error frames received after admission are logged by stable code, class, and scope without their
+peer-controlled diagnostic text. Client and server logs never include peer-controlled diagnostics, tokens, session
+secrets, or packet payloads.
 
-The direct forwarder emits no warning log. A terminal endpoint failure is returned to the command layer and printed
-once. Structurally invalid packets, reserved mismatches, unavailable local peers, and per-datagram network errors that
-leave the UDP socket reusable are silent drops.
+A terminal forwarder endpoint failure is returned to the command layer and printed once. Structurally invalid packets,
+reserved mismatches, unavailable local peers, and per-datagram network errors that leave the UDP socket reusable are
+silent drops.
 
 WireHop exposes no network metrics endpoint or stable telemetry schema. Any telemetry interface must exclude tokens,
 session secrets, packet payloads, and identifying target metadata by default.
@@ -1692,7 +1774,11 @@ below.
 - An unreachable first lane does not block a later creator
 - One fast lane becomes usable while other lanes remain slow or unreachable
 - The sole accepted lane forwards without waiting for a probe interval
-- Prepared lanes join concurrently after the session is created
+- A stalled admission does not block a healthy candidate on any carrier scheme
+- A recoverable candidate failure retries without waiting for another candidate's stalled preparation or admission
+- Unselected candidates release their admissions, sessions, and target sockets without reconnect grace
+- Remaining lanes join the selected session concurrently over fresh connections
+- An abandoned raw or WebSocket creation cancels target resolution promptly
 - Concurrent background controls remain within per-lane and global startup bounds
 - Fresh and expired packets coexist in the startup ingress queue
 - One lane is rejected while another lane becomes active
@@ -1704,7 +1790,8 @@ below.
 - Client authentication time is hours behind or ahead of the server during startup on each carrier scheme
 - Client wall time jumps after a WebSocket session is active, then the retained session reconnects over `ws` and `wss`
 - Signed time correction is modified, signed with the wrong key, or bound to another request nonce
-- Replacement creation remains unavailable longer than the initial startup deadline
+- Initial and replacement creation remain unavailable across multiple bounded attempts and recover without process exit
+- A blackholed primary DNS server does not prevent fallback for listeners, carrier addresses, and target endpoints
 - Many clients reconnect after a shared outage
 
 ### Measurements

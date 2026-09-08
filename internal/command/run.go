@@ -24,6 +24,7 @@ import (
 	"github.com/aofei/wirehop/internal/forward"
 	"github.com/aofei/wirehop/internal/lanespec"
 	"github.com/aofei/wirehop/internal/laneurl"
+	"github.com/aofei/wirehop/internal/netsetup"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/policy"
 	"github.com/aofei/wirehop/internal/relay"
@@ -45,6 +46,8 @@ var (
 const (
 	// defaultHandshakeTimeout bounds carrier admission operations.
 	defaultHandshakeTimeout = 5 * time.Second
+	// listenerStartupTimeout bounds preparation of all required local listeners.
+	listenerStartupTimeout = 30 * time.Second
 	// defaultAuthenticationSkew bounds authenticated wall-clock timestamps.
 	defaultAuthenticationSkew = 2 * time.Minute
 	// defaultReconnectGrace retains detached server sessions.
@@ -259,7 +262,7 @@ func Run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	case "server":
 		return runServer(ctx, args[1:], getenv, stdout, stderr)
 	case "forward":
-		return runForward(ctx, args[1:], stdout)
+		return runForward(ctx, args[1:], stdout, stderr)
 	case "version":
 		return runVersion(args[1:], stdout)
 	default:
@@ -595,7 +598,7 @@ func runServer(ctx context.Context, args []string, getenv func(string) string, s
 }
 
 // runForward parses and runs one direct WireGuard UDP forwarding path.
-func runForward(ctx context.Context, args []string, stdout io.Writer) error {
+func runForward(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("wirehop forward", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.Usage = func() {}
@@ -662,7 +665,7 @@ func runForward(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	instance, err := forward.Start(ctx, forward.Config{
 		Listen: listen, Target: remoteTarget, Reserved: reserved, Resolver: dialer.Resolver,
-		TargetListenConfig: *listenConfig,
+		TargetListenConfig: *listenConfig, Logger: slog.New(slog.NewTextHandler(stderr, nil)),
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -678,6 +681,12 @@ func runForward(ctx context.Context, args []string, stdout io.Writer) error {
 		return nil
 	}
 	if listen.Port() == 0 {
+		if err := instance.WaitReady(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
 		if _, err := fmt.Fprintln(stdout, instance.LocalAddr()); err != nil {
 			return fmt.Errorf("write forward listen address: %w", err)
 		}
@@ -814,12 +823,9 @@ func serveListeners(ctx context.Context, instance *server.Server, urls []laneurl
 	defer cancel()
 	prepared := make([]runtimeListener, 0, len(urls))
 	listenConfig := net.ListenConfig{}
+	deadline := time.Now().Add(listenerStartupTimeout)
 	for _, url := range urls {
-		if ctx.Err() != nil {
-			closeRuntimeListeners(prepared)
-			return nil
-		}
-		listener, err := listenConfig.Listen(ctx, "tcp", url.Address())
+		listener, err := listenWithRetry(ctx, url.Address(), deadline, listenConfig.Listen)
 		if err != nil {
 			cancel()
 			closeRuntimeListeners(prepared)
@@ -895,6 +901,20 @@ func serveListeners(ctx context.Context, instance *server.Server, urls []laneurl
 		return nil
 	}
 	return result
+}
+
+// listenWithRetry retries listener DNS failures within the shared preparation deadline, not local bind failures.
+func listenWithRetry(parent context.Context, address string, deadline time.Time,
+	listen func(context.Context, string, string) (net.Listener, error)) (net.Listener, error) {
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	defer cancel()
+	var listener net.Listener
+	err := netsetup.RetryDNS(ctx, nil, func() error {
+		var err error
+		listener, err = listen(ctx, "tcp", address)
+		return err
+	})
+	return listener, err
 }
 
 // closeRuntimeListeners closes every prepared socket and HTTP server.

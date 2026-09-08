@@ -311,37 +311,48 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 	ticker := time.NewTicker(abandonmentCheckInterval)
 	defer ticker.Stop()
 	var preferred protocol.LaneID
-	var pending *packetqueue.Item[Packet]
-	var preempted *packetqueue.Item[Packet]
+	var pending packetqueue.Item[Packet]
+	var preempted packetqueue.Item[Packet]
+	var controlCandidate packetqueue.Item[Packet]
+	hasPending := false
+	hasPreempted := false
 	defer func() {
-		for _, item := range []*packetqueue.Item[Packet]{preempted, pending} {
-			if item == nil {
+		for _, state := range []struct {
+			item *packetqueue.Item[Packet]
+			has  bool
+		}{
+			{item: &preempted, has: hasPreempted},
+			{item: &pending, has: hasPending},
+		} {
+			if !state.has {
 				continue
 			}
-			err := s.ingress.Push(*item)
+			err := s.ingress.Push(*state.item)
 			switch {
 			case err == nil:
 			case errors.Is(err, packetqueue.ErrFull), errors.Is(err, packetqueue.ErrExpired),
 				errors.Is(err, packetqueue.ErrClosed):
-				item.ReleaseRetention()
+				state.item.Release()
 			default:
-				item.ReleaseRetention()
+				state.item.Release()
 				result = errors.Join(result, err)
 			}
 		}
 	}()
 	for {
 		progressed := false
-		if pending == nil {
-			if preempted != nil {
+		if !hasPending {
+			if hasPreempted {
 				pending = preempted
-				preempted = nil
+				preempted = packetqueue.Item[Packet]{}
+				hasPending = true
+				hasPreempted = false
 				progressed = true
 			} else if len(lanes) > 0 {
-				item, err := s.ingress.TryPop()
+				err := s.ingress.TryPop(&pending)
 				switch {
 				case err == nil:
-					pending = &item
+					hasPending = true
 					progressed = true
 				case errors.Is(err, packetqueue.ErrEmpty):
 				case errors.Is(err, packetqueue.ErrClosed):
@@ -351,12 +362,14 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 				}
 			}
 		}
-		if pending != nil && pending.Priority == packetqueue.PriorityNormal {
-			item, err := s.ingress.TryPopPriority(packetqueue.PriorityControl)
+		if hasPending && pending.Priority == packetqueue.PriorityNormal {
+			err := s.ingress.TryPopPriority(packetqueue.PriorityControl, &controlCandidate)
 			switch {
 			case err == nil:
 				preempted = pending
-				pending = &item
+				hasPreempted = true
+				pending = controlCandidate
+				controlCandidate = packetqueue.Item[Packet]{}
 				progressed = true
 			case errors.Is(err, packetqueue.ErrEmpty):
 			case errors.Is(err, packetqueue.ErrClosed):
@@ -365,23 +378,25 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 				return err
 			}
 		}
-		if pending != nil {
-			if !time.Now().Before(pending.Deadline) {
-				pending.ReleaseRetention()
-				pending = nil
-				progressed = true
-			} else if len(lanes) > 0 {
-				scheduled, err := s.schedule(lanes, &preferred, pending)
+		if hasPending {
+			if len(lanes) > 0 {
+				scheduled, err := s.schedule(lanes, &preferred, &pending)
 				if err != nil {
 					return err
 				}
 				if scheduled {
-					pending = nil
+					pending = packetqueue.Item[Packet]{}
+					hasPending = false
 					progressed = true
 				}
+			} else if !time.Now().Before(pending.Deadline) {
+				pending.Release()
+				pending = packetqueue.Item[Packet]{}
+				hasPending = false
+				progressed = true
 			}
 		}
-		if progressed && pending == nil {
+		if progressed && !hasPending {
 			select {
 			case event := <-s.events:
 				s.applyEvent(lanes, &preferred, event, time.Now())
@@ -521,12 +536,13 @@ func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane
 func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred *protocol.LaneID,
 	item *packetqueue.Item[Packet]) (bool, error) {
 	if err := item.Value.Validate(); err != nil {
-		item.ReleaseRetention()
+		item.Release()
 		return true, nil
 	}
-	remaining := time.Until(item.Deadline)
+	now := time.Now()
+	remaining := item.Deadline.Sub(now)
 	if remaining <= 0 {
-		item.ReleaseRetention()
+		item.Release()
 		return true, nil
 	}
 	deadlineMicros := uint64(remaining / time.Microsecond)
@@ -534,7 +550,7 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 	candidates := selectCandidates(lanes, *preferred, item.Value.Kind.Control(), frameBytes, deadlineMicros)
 	if candidates.count == 0 {
 		if candidates.available {
-			item.ReleaseRetention()
+			item.Release()
 		}
 		return candidates.available, nil
 	}
@@ -544,17 +560,19 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 	}
 	scheduled := false
 	for _, lane := range candidates.lanes[:candidates.count] {
-		if lane.enqueue(item, packetID) {
+		if lane.enqueue(item, packetID, now) {
 			scheduled = true
 			if !item.Value.Kind.Control() {
 				s.packetID = packetID
 				*preferred = lane.registration.LaneID
+				item.Release()
 				return true, nil
 			}
 		}
 	}
 	if scheduled {
 		s.packetID = packetID
+		item.Release()
 	}
 	return scheduled, nil
 }
@@ -705,26 +723,30 @@ func (l *scheduledLane) backlogDelay(bytes uint64) uint64 {
 }
 
 // enqueue retains one newly identified packet after successful store admission.
-func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64) bool {
+func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64, now time.Time) bool {
+	packet := item.Value.Retain()
 	data := protocol.Data{
-		PacketID: packetID, DeadlineMicros: item.Value.DeadlineMicros, Payload: item.Value.Payload,
+		PacketID: packetID, DeadlineMicros: packet.DeadlineMicros, Payload: packet.Payload,
 	}
 	size, err := protocol.DataFrameSize(data)
 	if err != nil {
+		packet.Release()
 		return false
 	}
 	budget, ok := item.TakeRetention(size)
 	if !ok {
+		packet.Release()
 		return false
 	}
 	transmission := retainedTransmission{
 		data: data, kind: item.Value.Kind, priority: item.Priority, deadline: item.Deadline,
-		budget: budget,
+		budget: budget, packet: packet,
 	}
-	if l.enqueueTransmission(transmission) {
+	if l.registration.Store.pushAt(transmission, now) == nil {
 		return true
 	}
 	item.RestoreRetention(budget, size)
+	transmission.releasePacket()
 	return false
 }
 
@@ -962,6 +984,7 @@ func (s *Scheduler) migrateTransmissions(lanes map[protocol.LaneID]*scheduledLan
 		for _, candidate := range candidates.lanes[:candidates.count] {
 			if candidate.enqueueTransmission(*transmission) {
 				transmission.budget = nil
+				transmission.packet = Packet{}
 				break
 			}
 		}

@@ -14,6 +14,14 @@ jobs:
           go-version: 1.26.x
       - name: Check Go formatting
         run: test -z "$(gofmt -l .)"
+      - name: Test DNS fallback
+        run: |
+          go mod download
+          docker run --rm --network none \
+            --dns 127.0.0.2 --dns 127.0.0.3 --dns-option timeout:5 --dns-option attempts:1 \
+            -v "$PWD:/src:ro" -v "$(go env GOMODCACHE):/go/pkg/mod:ro" \
+            -e GOPROXY=off -e GOSUMDB=off -e WIREHOP_TEST_DNS_FALLBACK=1 -w /src \
+            golang:1.26-bookworm go test -race -v ./internal/command -run '^TestDNSFallback$' -count=1 -timeout=3m
       - name: Fuzz input boundaries
         run: |
           go test ./internal/laneurl -run '^$' -fuzz '^FuzzParseDial$' -fuzztime 1000000x
@@ -50,7 +58,7 @@ jobs:
       - name: Test Go code
         run: go test -v -race -covermode atomic -coverprofile coverage.out ./...
       - name: Upload code coverage
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{secrets.CODECOV_TOKEN}}
           disable_search: true

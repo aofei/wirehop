@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -40,6 +41,8 @@ type Receiver struct {
 	mu              sync.Mutex
 	mapping         clockmap.Mapping
 	deduplication   *dedup.Window
+	payloads        [datagram.MaximumBatchSize][]byte
+	packetIDs       [datagram.MaximumBatchSize]uint64
 }
 
 // NewReceiver validates config and returns session-shared inbound state.
@@ -79,6 +82,19 @@ func (r *Receiver) ValidateDeadline(deadlineMicros uint64) error {
 	return err
 }
 
+// ValidateDeadlines verifies one sender deadline vector against a shared receiver clock sample.
+func (r *Receiver) ValidateDeadlines(deadlines []uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	nowMicros := r.clock.NowMicros()
+	for _, deadlineMicros := range deadlines {
+		if _, err := deadlineStatus(r.mapping, nowMicros, deadlineMicros); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Deliver deduplicates, deadline-checks, and writes one validated packet to UDP.
 func (r *Receiver) Deliver(ctx context.Context, data protocol.Data) error {
 	if err := r.ValidateDeadline(data.DeadlineMicros); err != nil {
@@ -89,15 +105,28 @@ func (r *Receiver) Deliver(ctx context.Context, data protocol.Data) error {
 
 // deliver deduplicates and writes data whose deadline was already validated before parse acknowledgement.
 func (r *Receiver) deliver(ctx context.Context, data protocol.Data) error {
-	err := r.write(ctx, data)
+	var batch [1]protocol.Data
+	batch[0] = data
+	return r.deliverBatch(ctx, batch[:])
+}
+
+// deliverBatch deduplicates and writes data whose deadlines were validated before parse acknowledgement.
+func (r *Receiver) deliverBatch(ctx context.Context, data []protocol.Data) error {
+	err := r.writeBatch(ctx, data)
 	if errors.Is(err, datagram.ErrNoLocalPeer) || errors.Is(err, datagram.ErrDatagramDropped) {
 		return nil
 	}
 	return err
 }
 
-// write serializes UDP delivery so one operation cannot overwrite another operation's socket deadline.
-func (r *Receiver) write(ctx context.Context, data protocol.Data) error {
+// writeBatch serializes and opportunistically batches one lane's UDP delivery vector.
+func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if len(data) > datagram.MaximumBatchSize {
+		return ErrInvalidReceiver
+	}
 	select {
 	case r.writeSlot <- struct{}{}:
 	case <-ctx.Done():
@@ -105,28 +134,78 @@ func (r *Receiver) write(ctx context.Context, data protocol.Data) error {
 	}
 	defer func() { <-r.writeSlot }()
 	r.mu.Lock()
-	duplicate := r.deduplication.Classify(data.PacketID) != dedup.New
-	expired, err := deadlineStatus(r.mapping, r.clock.NowMicros(), data.DeadlineMicros)
+	mapping := r.mapping
+	nowMicros := r.clock.NowMicros()
 	r.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if duplicate || expired {
-		return nil
-	}
 	writeDeadline := time.Now().Add(r.udpWriteTimeout)
 	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(writeDeadline) {
 		writeDeadline = parentDeadline
 	}
-	if err := r.endpoint.Write(ctx, data.Payload, writeDeadline); err != nil {
-		if errors.Is(err, datagram.ErrDatagramDropped) {
+	for dataOffset := 0; dataOffset < len(data); {
+		accepted := 0
+		r.mu.Lock()
+		for dataOffset < len(data) {
+			packet := data[dataOffset]
+			expired, err := deadlineStatus(mapping, nowMicros, packet.DeadlineMicros)
+			if err != nil {
+				r.mu.Unlock()
+				return err
+			}
+			if r.deduplication.Classify(packet.PacketID) != dedup.New || expired {
+				dataOffset++
+				continue
+			}
+			if accepted > 0 && packet.PacketID <= r.packetIDs[accepted-1] {
+				break
+			}
+			r.payloads[accepted] = packet.Payload
+			r.packetIDs[accepted] = packet.PacketID
+			accepted++
+			dataOffset++
+		}
+		r.mu.Unlock()
+		if accepted == 0 {
+			continue
+		}
+		err := r.writeAcceptedBatch(ctx, r.payloads[:accepted], r.packetIDs[:accepted], writeDeadline)
+		clear(r.payloads[:accepted])
+		clear(r.packetIDs[:accepted])
+		if err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// writeAcceptedBatch writes one increasing PacketID run and records only its successful packets.
+func (r *Receiver) writeAcceptedBatch(ctx context.Context, payloads [][]byte, packetIDs []uint64,
+	writeDeadline time.Time) error {
+	offset := 0
+	for offset < len(payloads) {
+		written, err := datagram.WriteBatch(ctx, r.endpoint, payloads[offset:], writeDeadline)
+		if written > 0 {
+			r.mu.Lock()
+			for _, packetID := range packetIDs[offset : offset+written] {
+				r.deduplication.Observe(packetID)
+			}
+			r.mu.Unlock()
+			offset += written
+		}
+		if err == nil {
+			if written == 0 {
+				return fmt.Errorf("%w: %w", ErrEndpointFailure, io.ErrNoProgress)
+			}
+			continue
+		}
+		if errors.Is(err, datagram.ErrNoLocalPeer) {
+			return err
+		}
+		if errors.Is(err, datagram.ErrDatagramDropped) {
+			offset++
+			continue
 		}
 		return fmt.Errorf("%w: %w", ErrEndpointFailure, err)
 	}
-	r.mu.Lock()
-	r.deduplication.Observe(data.PacketID)
-	r.mu.Unlock()
 	return nil
 }
 

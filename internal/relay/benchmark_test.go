@@ -80,6 +80,7 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 	}
 	transmission := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))
 	var batch [1]protocol.Data
+	var ownership [1]Packet
 	var packets uint64
 	var bytes uint64
 	b.ReportAllocs()
@@ -90,9 +91,11 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 		if err := store.push(transmission); err != nil {
 			b.Fatal(err)
 		}
-		if count, err := store.takeBatch(batch[:], transmission.size); err != nil || count != 1 {
+		count, err := store.takeBatch(batch[:], ownership[:], transmission.size)
+		if err != nil || count != 1 {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}
+		releaseBatchOwnership(ownership[:count])
 		bytes += uint64(transmission.size)
 		if _, _, err := store.acknowledge(packets, bytes); err != nil {
 			b.Fatal(err)
@@ -119,15 +122,17 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 		}
 	}
 	var batch [maximumDataBatchFrames]protocol.Data
+	var ownership [maximumDataBatchFrames]Packet
 	var sentPackets uint64
 	var sentBytes uint64
 	b.ReportAllocs()
 	b.SetBytes(int64(len(transmission.data.Payload) * len(batch)))
 	for b.Loop() {
-		count, err := store.takeBatch(batch[:], targetDataBatchBytes)
+		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes)
 		if err != nil || count != len(batch) {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}
+		releaseBatchOwnership(ownership[:count])
 		sentPackets += uint64(count)
 		sentBytes += uint64(count * transmission.size)
 		if _, _, err := store.acknowledge(sentPackets, sentBytes); err != nil {

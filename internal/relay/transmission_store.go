@@ -35,6 +35,7 @@ type retainedTransmission struct {
 	migrated bool
 	size     int
 	budget   *retention.Budget
+	packet   Packet
 }
 
 // deadlineAssessment summarizes retained deadline state in carrier order.
@@ -45,13 +46,19 @@ type deadlineAssessment struct {
 	atRisk     bool
 }
 
-// release returns a drained transmission's aggregate retention reservation.
+// release returns a drained transmission's packet and aggregate retention ownership.
 func (t *retainedTransmission) release() {
-	if t.budget == nil {
-		return
+	t.releasePacket()
+	if t.budget != nil {
+		t.budget.Release(1, t.size)
+		t.budget = nil
 	}
-	t.budget.Release(1, t.size)
-	t.budget = nil
+}
+
+// releasePacket relinquishes a transmission's retained packet ownership.
+func (t *retainedTransmission) releasePacket() {
+	t.packet.Release()
+	t.data.Payload = nil
 }
 
 // transmissionDeque is a compacting first-in, first-out transmission sequence.
@@ -144,6 +151,7 @@ func (d *transmissionDeque) removeExpired(now time.Time) (int, int) {
 		if !now.Before(transmission.deadline) {
 			removedPackets++
 			removedBytes += transmission.size
+			transmission.releasePacket()
 			continue
 		}
 		d.items[write] = transmission
@@ -248,6 +256,11 @@ func newTransmissionStoreWithBudget(limits packetqueue.Limits, now func() time.T
 
 // push retains one transmission when all limits and invariants permit it.
 func (s *TransmissionStore) push(transmission retainedTransmission) error {
+	return s.pushAt(transmission, s.now())
+}
+
+// pushAt retains one transmission when all limits and invariants permit it at now.
+func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.Time) error {
 	size, err := protocol.DataFrameSize(transmission.data)
 	if err != nil || !transmission.kind.Accepted() ||
 		wgpacket.Classify(transmission.data.Payload) != transmission.kind ||
@@ -266,7 +279,6 @@ func (s *TransmissionStore) push(transmission retainedTransmission) error {
 	if s.closed {
 		return packetqueue.ErrClosed
 	}
-	now := s.now()
 	if !now.Before(transmission.deadline) {
 		return packetqueue.ErrExpired
 	}
@@ -299,9 +311,9 @@ func (s *TransmissionStore) push(transmission retainedTransmission) error {
 	return nil
 }
 
-// takeBatch moves an available write-order batch into the sent prefix before exposing its bytes.
-func (s *TransmissionStore) takeBatch(destination []protocol.Data, targetBytes int) (int, error) {
-	if len(destination) == 0 || targetBytes <= 0 {
+// takeBatch moves an available write-order batch into the sent prefix and retains its packet buffers for the caller.
+func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []Packet, targetBytes int) (int, error) {
+	if len(destination) == 0 || len(ownership) < len(destination) || targetBytes <= 0 {
 		return 0, ErrInvalidTransmissionStore
 	}
 	s.mu.Lock()
@@ -328,6 +340,7 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, targetBytes i
 		s.sentPackets++
 		s.sentBytes += uint64(transmission.size)
 		destination[count] = transmission.data
+		ownership[count] = transmission.packet.Retain()
 		count++
 		bytes += transmission.size
 	}
@@ -356,6 +369,7 @@ func (s *TransmissionStore) nextQueuedLocked(now time.Time) (*transmissionDeque,
 			return source, transmission, true
 		}
 		transmission = source.pop()
+		transmission.releasePacket()
 		s.releaseBacklogLocked(1, transmission.size)
 	}
 }
@@ -390,7 +404,8 @@ func (s *TransmissionStore) acknowledge(packets, bytes uint64) (uint64, bool, er
 	}
 	releasedPackets := int(deltaPackets)
 	for range releasedPackets {
-		s.sent.pop()
+		transmission := s.sent.pop()
+		transmission.releasePacket()
 	}
 	s.reportedPackets = packets
 	s.reportedBytes = bytes

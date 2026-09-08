@@ -159,19 +159,40 @@ func TestLaneReconnectSessionRecreationAndGracefulClose(t *testing.T) {
 }
 
 func TestCreateSessionResolvesDomainTarget(t *testing.T) {
-	addressTarget, stopTarget := startSessionEchoTarget(t)
-	defer stopTarget()
-	domainTarget := targetpkg.MustParse(fmt.Sprintf("wg.example.com:%d", addressTarget.Port()))
-	instance := newSessionTestServer(t, []byte("test-token"), domainTarget, time.Second)
-	resolver := &serverTestResolver{addresses: []netip.Addr{addressTarget.Address()}}
-	instance.config.Resolver = resolver
-	session, err := instance.createSession(context.Background(), domainTarget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.close()
-	if resolver.host != "wg.example.com." {
-		t.Fatalf("resolver host = %q", resolver.host)
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "Resolved"},
+		{name: "TemporaryFailure", err: &net.DNSError{Err: "temporary", IsTemporary: true}},
+		{name: "MissingRecords", err: &net.DNSError{Err: "no such host", IsNotFound: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			addressTarget, stopTarget := startSessionEchoTarget(t)
+			defer stopTarget()
+			domainTarget := targetpkg.MustParse(fmt.Sprintf("wg.example.com:%d", addressTarget.Port()))
+			instance := newSessionTestServer(t, []byte("test-token"), domainTarget, time.Second)
+			resolver := &serverTestResolver{addresses: []netip.Addr{addressTarget.Address()}, err: test.err}
+			instance.config.Resolver = resolver
+			if test.err != nil {
+				session, err := instance.createSession(context.Background(), context.Background(), domainTarget)
+				if session != nil || !errors.Is(err, relay.ErrEndpointFailure) || !errors.Is(err, test.err) {
+					t.Fatalf("createSession() = %v, %v, want endpoint and DNS failures", session, err)
+				}
+				if snapshot := instance.Snapshot(); snapshot.Sessions != 0 || instance.creating != 0 {
+					t.Fatalf("failed DNS lookup retained session capacity: %+v, creating=%d", snapshot, instance.creating)
+				}
+				resolver.err = nil
+			}
+			session, err := instance.createSession(context.Background(), context.Background(), domainTarget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.close()
+			if resolver.host != "wg.example.com." {
+				t.Fatalf("resolver host = %q", resolver.host)
+			}
+		})
 	}
 }
 
@@ -179,7 +200,7 @@ func TestSessionLaneCancellationClosesNormally(t *testing.T) {
 	target, stopTarget := startSessionEchoTarget(t)
 	defer stopTarget()
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
-	session, err := instance.createSession(context.Background(), target)
+	session, err := instance.createSession(context.Background(), context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +235,7 @@ func TestSessionCloseRacesLaneAttachment(t *testing.T) {
 	defer stopTarget()
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
 	for index := range 200 {
-		session, err := instance.createSession(context.Background(), target)
+		session, err := instance.createSession(context.Background(), context.Background(), target)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +265,7 @@ func TestLaneReservationDefersDetachedExpiry(t *testing.T) {
 	defer stopTarget()
 	grace := 10 * time.Millisecond
 	instance := newSessionTestServer(t, []byte("test-token"), target, grace)
-	session, err := instance.createSession(context.Background(), target)
+	session, err := instance.createSession(context.Background(), context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +294,7 @@ func TestStaleDetachedExpiryCannotCloseReservedSession(t *testing.T) {
 	target, stopTarget := startSessionEchoTarget(t)
 	defer stopTarget()
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Hour)
-	session, err := instance.createSession(context.Background(), target)
+	session, err := instance.createSession(context.Background(), context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +352,7 @@ func TestCanceledSessionCreationDoesNotLeak(t *testing.T) {
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := instance.createSession(ctx, target); !errors.Is(err, context.Canceled) {
+	if _, err := instance.createSession(ctx, ctx, target); !errors.Is(err, context.Canceled) {
 		t.Fatalf("createSession() error = %v, want %v", err, context.Canceled)
 	}
 	waitSessionCondition(t, func() bool {
@@ -344,7 +365,7 @@ func TestSessionCloseReleasesRetainedCapacity(t *testing.T) {
 	target, stopTarget := startSessionEchoTarget(t)
 	defer stopTarget()
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
-	session, err := instance.createSession(context.Background(), target)
+	session, err := instance.createSession(context.Background(), context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +391,7 @@ func TestCreationCredentials(t *testing.T) {
 	target, stopTarget := startSessionEchoTarget(t)
 	defer stopTarget()
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
-	session, err := instance.createSession(context.Background(), target)
+	session, err := instance.createSession(context.Background(), context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +580,7 @@ func TestWebSocketLaneLimitIsTerminal(t *testing.T) {
 	defer stopTarget()
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
 	instance.config.MaxLanesPerSession = 1
-	session, err := instance.createSession(context.Background(), target)
+	session, err := instance.createSession(context.Background(), context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -872,7 +893,7 @@ func TestLanePathGroupIsStable(t *testing.T) {
 	target, stopTarget := startSessionEchoTarget(t)
 	defer stopTarget()
 	instance := newSessionTestServer(t, []byte("test-token"), target, time.Second)
-	session, err := instance.createSession(context.Background(), target)
+	session, err := instance.createSession(context.Background(), context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1216,9 +1237,10 @@ func startSessionEchoTarget(t *testing.T) (targetpkg.Endpoint, func()) {
 type serverTestResolver struct {
 	addresses []netip.Addr
 	host      string
+	err       error
 }
 
 func (r *serverTestResolver) LookupNetIP(_ context.Context, _ string, host string) ([]netip.Addr, error) {
 	r.host = host
-	return append([]netip.Addr(nil), r.addresses...), nil
+	return append([]netip.Addr(nil), r.addresses...), r.err
 }

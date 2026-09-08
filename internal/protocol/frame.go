@@ -2,6 +2,7 @@
 package protocol
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -139,6 +140,26 @@ func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
 	return Frame{Type: typeID, Payload: r.content}, nil
 }
 
+// ReadBuffered reads one complete frame only when it is already buffered.
+func (r *FrameReader) ReadBuffered(reader *bufio.Reader) (Frame, bool, error) {
+	if reader.Buffered() < frameHeaderSize {
+		return Frame{}, false, nil
+	}
+	header, err := reader.Peek(frameHeaderSize)
+	if err != nil {
+		return Frame{}, false, err
+	}
+	encodedLength, err := frameLength(header)
+	if err != nil {
+		return Frame{}, false, err
+	}
+	if reader.Buffered() < encodedLength {
+		return Frame{}, false, nil
+	}
+	frame, err := r.Read(reader)
+	return frame, true, err
+}
+
 // ParseFrameSequence validates one complete frame sequence and returns an allocation-free iterator whose frame payloads
 // alias message.
 func ParseFrameSequence(message []byte) (FrameSequence, error) {
@@ -188,6 +209,18 @@ func AppendFrames(destination []Frame, message []byte) ([]Frame, error) {
 
 // encodedFrameLength validates the first encoded frame in message and returns its complete byte length.
 func encodedFrameLength(message []byte) (int, error) {
+	encodedLength, err := frameLength(message)
+	if err != nil {
+		return 0, err
+	}
+	if encodedLength > len(message) {
+		return 0, ErrTrailingFrameData
+	}
+	return encodedLength, nil
+}
+
+// frameLength validates one frame header and returns its declared encoded length.
+func frameLength(message []byte) (int, error) {
 	if len(message) < frameHeaderSize {
 		return 0, ErrTrailingFrameData
 	}
@@ -198,9 +231,5 @@ func encodedFrameLength(message []byte) (int, error) {
 	if contentLength > MaxFrameContentSize {
 		return 0, ErrFrameTooLarge
 	}
-	encodedLength := frameHeaderSize + int(contentLength)
-	if encodedLength > len(message) {
-		return 0, ErrTrailingFrameData
-	}
-	return encodedLength, nil
+	return frameHeaderSize + int(contentLength), nil
 }

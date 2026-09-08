@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -159,7 +160,7 @@ func TestAuthenticationFailureRemainsTerminal(t *testing.T) {
 			config := clientConfig(
 				t, laneURL, target, []byte("a-sufficiently-long-client-authentication-token"), nil,
 			)
-			config.StartupTimeout = 2 * time.Second
+			config.SessionAttemptTimeout = 2 * time.Second
 			started := time.Now()
 			instance, err := client.Start(context.Background(), config)
 			if err != nil {
@@ -167,11 +168,11 @@ func TestAuthenticationFailureRemainsTerminal(t *testing.T) {
 			}
 			defer instance.Close()
 			err = instance.Wait()
-			if err == nil || errors.Is(err, client.ErrStartupTimeout) {
+			if err == nil || errors.Is(err, client.ErrSessionAttemptTimeout) {
 				t.Fatalf("Wait() error = %v, want terminal authentication rejection", err)
 			}
-			if elapsed := time.Since(started); elapsed >= config.StartupTimeout {
-				t.Fatalf("authentication rejection took %v, startup timeout %v", elapsed, config.StartupTimeout)
+			if elapsed := time.Since(started); elapsed >= config.SessionAttemptTimeout {
+				t.Fatalf("authentication rejection took %v, attempt timeout %v", elapsed, config.SessionAttemptTimeout)
 			}
 		})
 	}
@@ -228,6 +229,14 @@ func TestWebSocketRuntimeClockSkewRecovery(t *testing.T) {
 			}, serverInstance)
 			sessionID := waitForClientSession(t, instance)
 			initialConnection := receiveAcceptedConnection(t, listener.accepted)
+			peer, err := net.ListenUDP(
+				"udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			assertRelayExchange(t, peer, instance.LocalAddr())
 
 			wallClockOffset.Store(int64(-8 * time.Hour))
 			if err := initialConnection.Close(); err != nil {
@@ -242,13 +251,6 @@ func TestWebSocketRuntimeClockSkewRecovery(t *testing.T) {
 				t.Fatalf("SessionID() = %v after clock-skew recovery, want retained %v", got, sessionID)
 			}
 
-			peer, err := net.ListenUDP(
-				"udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")),
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer peer.Close()
 			assertRelayExchange(t, peer, instance.LocalAddr())
 		})
 	}
@@ -277,7 +279,7 @@ func TestMixedCarrierLanes(t *testing.T) {
 	testMultipathRelay(t, instance, []string{"tcp://" + serverAddress, webSocketURL}, target, token)
 }
 
-func TestPreparedLanesJoinConcurrently(t *testing.T) {
+func TestCandidateLanesJoinConcurrently(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -291,7 +293,7 @@ func TestPreparedLanesJoinConcurrently(t *testing.T) {
 			hello      protocol.ClientHello
 			err        error
 		}
-		connections := make([]net.Conn, 0, 3)
+		connections := make([]net.Conn, 0, 5)
 		defer func() {
 			for _, connection := range connections {
 				connection.Close()
@@ -335,9 +337,34 @@ func TestPreparedLanesJoinConcurrently(t *testing.T) {
 			result <- err
 			return
 		}
+		for range 2 {
+			candidate := <-hellos
+			if candidate.err != nil {
+				result <- candidate.err
+				return
+			}
+			if candidate.hello.Mode != protocol.HelloCreate {
+				result <- fmt.Errorf("candidate mode = %d, want create", candidate.hello.Mode)
+				return
+			}
+			candidate.connection.Close()
+		}
 		if err := protocol.WriteServerHello(creator.connection, response); err != nil {
 			result <- err
 			return
+		}
+		for range 2 {
+			connection, err := listener.Accept()
+			if err != nil {
+				result <- err
+				return
+			}
+			connections = append(connections, connection)
+			go func() {
+				connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+				hello, err := protocol.ReadClientHello(connection)
+				hellos <- helloResult{connection: connection, hello: hello, err: err}
+			}()
 		}
 		seen := map[protocol.LaneID]struct{}{creator.hello.LaneID: {}}
 		for range 2 {
@@ -379,11 +406,14 @@ func TestPreparedLanesJoinConcurrently(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("prepared lane joins did not start concurrently")
+		t.Fatal("candidate lane joins did not start concurrently")
 	}
 	cancel()
 	if err := instance.Wait(); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Wait() error = %v, want %v", err, context.Canceled)
+	}
+	if got := instance.SessionID(); !got.IsZero() {
+		t.Fatalf("SessionID() = %v after shutdown, want zero", got)
 	}
 }
 
@@ -548,8 +578,7 @@ func TestRawTCPRelayBindsBeforeDial(t *testing.T) {
 	config := clientConfig(
 		t, "tcp://"+address, netip.MustParseAddrPort("127.0.0.1:51820"), []byte("test-token"), nil,
 	)
-	config.StartupTimeout = 100 * time.Millisecond
-	started := time.Now()
+	config.SessionAttemptTimeout = 100 * time.Millisecond
 	instance, err := client.Start(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
@@ -558,15 +587,60 @@ func TestRawTCPRelayBindsBeforeDial(t *testing.T) {
 	if !instance.LocalAddr().IsValid() || instance.LocalAddr().Port() == 0 {
 		t.Fatalf("LocalAddr() = %v, want an allocated UDP port", instance.LocalAddr())
 	}
-	waitErr := instance.Wait()
-	if waitErr == nil {
-		t.Fatal("Wait() succeeded for an unavailable server")
+	assertClientKeepsRetrying(t, instance, 5*config.SessionAttemptTimeout)
+}
+
+func TestInitialSessionRecoversAcrossAttempts(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(waitErr.Error(), "lane 1 (tcp://"+address+")") {
-		t.Fatalf("Wait() error = %v, want configured lane context", waitErr)
+	address := listener.Addr().String()
+	listener.Close()
+	endpoint, stopTarget := startEchoTarget(t)
+	defer stopTarget()
+	token := []byte("test-token")
+	config := clientConfig(t, "tcp://"+address, endpoint, token, nil)
+	config.SessionAttemptTimeout = 100 * time.Millisecond
+	instance, err := client.Start(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed < 50*time.Millisecond {
-		t.Fatalf("unavailable server ended after %v without using the startup retry budget", elapsed)
+	defer instance.Close()
+	result := make(chan error, 1)
+	go func() { result <- instance.Wait() }()
+	select {
+	case err := <-result:
+		t.Fatalf("client stopped during initial outage: %v", err)
+	case <-time.After(5 * config.SessionAttemptTimeout):
+	}
+	listener, err = net.Listen("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverInstance := newServer(t, token, []netip.AddrPort{endpoint})
+	ctx, cancel := context.WithCancel(context.Background())
+	serverResult := make(chan error, 1)
+	go func() { serverResult <- serverInstance.Serve(ctx, listener) }()
+	defer func() {
+		cancel()
+		listener.Close()
+		<-serverResult
+	}()
+	deadline := time.Now().Add(7 * time.Second)
+	for instance.SessionID().IsZero() {
+		select {
+		case err := <-result:
+			t.Fatalf("client stopped before recovery: %v", err)
+		case <-time.After(time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("client did not establish a session after the server became available")
+		}
+	}
+	instance.Close()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() after recovery and cancellation = %v", err)
 	}
 }
 
@@ -579,7 +653,7 @@ func (w clientChannelWriter) Write(value []byte) (int, error) {
 	return len(value), nil
 }
 
-func TestSessionStartupTimeout(t *testing.T) {
+func TestSessionAttemptTimeoutClosesStalledCarrier(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -596,7 +670,7 @@ func TestSessionStartupTimeout(t *testing.T) {
 		t, "tcp://"+listener.Addr().String(), netip.MustParseAddrPort("127.0.0.1:51820"),
 		[]byte("test-token"), nil,
 	)
-	config.StartupTimeout = 50 * time.Millisecond
+	config.SessionAttemptTimeout = 50 * time.Millisecond
 	instance, err := client.Start(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
@@ -605,20 +679,26 @@ func TestSessionStartupTimeout(t *testing.T) {
 	select {
 	case connection := <-accepted:
 		defer connection.Close()
+		connection.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := protocol.ReadClientHello(connection); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := connection.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("stalled carrier read = %v, want EOF after the attempt deadline", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("client did not establish the stalled carrier")
 	}
-	if err := instance.Wait(); !errors.Is(err, client.ErrStartupTimeout) {
-		t.Fatalf("Wait() error = %v, want %v", err, client.ErrStartupTimeout)
-	}
+	assertClientKeepsRetrying(t, instance, 5*config.SessionAttemptTimeout)
 }
 
-func TestRetryableCreationRejectionHonorsStartupTimeout(t *testing.T) {
+func TestRetryableCreationRejectionOutlivesSessionAttemptTimeout(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	token := []byte("test-token")
+	var attempts atomic.Int32
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
@@ -629,6 +709,7 @@ func TestRetryableCreationRejectionHonorsStartupTimeout(t *testing.T) {
 			}
 			hello, readErr := protocol.ReadClientHello(connection)
 			if readErr == nil {
+				attempts.Add(1)
 				response := protocol.ServerHello{
 					Result: protocol.ServerRejected, RequestNonce: hello.Nonce,
 					ServerUnixSeconds: time.Now().Unix(), ReceiveMicros: hello.MonotonicMicros,
@@ -646,13 +727,14 @@ func TestRetryableCreationRejectionHonorsStartupTimeout(t *testing.T) {
 	config := clientConfig(
 		t, "tcp://"+listener.Addr().String(), netip.MustParseAddrPort("127.0.0.1:51820"), token, nil,
 	)
-	config.StartupTimeout = 100 * time.Millisecond
+	config.SessionAttemptTimeout = 100 * time.Millisecond
 	instance, err := client.Start(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := instance.Wait(); !errors.Is(err, client.ErrStartupTimeout) {
-		t.Fatalf("Wait() error = %v, want %v", err, client.ErrStartupTimeout)
+	assertClientKeepsRetrying(t, instance, time.Second)
+	if attempts.Load() < 2 {
+		t.Fatalf("creation attempts = %d, want repeated admission", attempts.Load())
 	}
 	instance.Close()
 	listener.Close()
@@ -663,7 +745,22 @@ func TestRetryableCreationRejectionHonorsStartupTimeout(t *testing.T) {
 	}
 }
 
-func TestRuntimeSessionReplacementOutlivesStartupTimeout(t *testing.T) {
+func assertClientKeepsRetrying(t *testing.T, instance *client.Client, duration time.Duration) {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- instance.Wait() }()
+	select {
+	case err := <-result:
+		t.Fatalf("client stopped during recoverable failure: %v", err)
+	case <-time.After(duration):
+	}
+	instance.Close()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() after Close() = %v, want cancellation", err)
+	}
+}
+
+func TestRuntimeSessionReplacementOutlivesSessionAttemptTimeout(t *testing.T) {
 	target, stopTarget := startEchoTarget(t)
 	defer stopTarget()
 	token := []byte("a-sufficiently-long-test-authentication-token")
@@ -678,7 +775,7 @@ func TestRuntimeSessionReplacementOutlivesStartupTimeout(t *testing.T) {
 	go func() { firstDone <- firstServer.Serve(firstContext, firstListener) }()
 
 	config := clientConfig(t, "tcp://"+address, target, token, nil)
-	config.StartupTimeout = 100 * time.Millisecond
+	config.SessionAttemptTimeout = 100 * time.Millisecond
 	instance, err := client.Start(context.Background(), config)
 	if err != nil {
 		stopFirst()
@@ -740,7 +837,7 @@ func TestRuntimeSessionReplacementOutlivesStartupTimeout(t *testing.T) {
 	if err := goneListener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(5 * config.StartupTimeout)
+	time.Sleep(5 * config.SessionAttemptTimeout)
 	select {
 	case err := <-waitResult:
 		t.Fatalf("client exited during runtime recovery: %v", err)
@@ -848,7 +945,7 @@ func testMultipathRelay(t *testing.T, serverInstance *server.Server, laneURLs []
 	}
 }
 
-func clientConfig(t *testing.T, laneURL string, target netip.AddrPort, token []byte,
+func clientConfig(t testing.TB, laneURL string, target netip.AddrPort, token []byte,
 	tlsConfig *tls.Config) client.Config {
 	t.Helper()
 	endpoint, err := targetpkg.FromAddrPort(target)
@@ -866,7 +963,7 @@ func clientConfig(t *testing.T, laneURL string, target netip.AddrPort, token []b
 	}
 }
 
-func parseLaneSpecs(t *testing.T, values ...string) []lanespec.Spec {
+func parseLaneSpecs(t testing.TB, values ...string) []lanespec.Spec {
 	t.Helper()
 	specs := make([]lanespec.Spec, 0, len(values))
 	for _, value := range values {
@@ -879,7 +976,16 @@ func parseLaneSpecs(t *testing.T, values ...string) []lanespec.Spec {
 	return specs
 }
 
-func newServer(t *testing.T, token []byte, targets []netip.AddrPort) *server.Server {
+func newServer(t testing.TB, token []byte, targets []netip.AddrPort) *server.Server {
+	t.Helper()
+	instance, err := server.New(serverConfig(t, token, targets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return instance
+}
+
+func serverConfig(t testing.TB, token []byte, targets []netip.AddrPort) server.Config {
 	t.Helper()
 	endpoints := make([]targetpkg.Endpoint, len(targets))
 	for index, address := range targets {
@@ -893,7 +999,7 @@ func newServer(t *testing.T, token []byte, targets []netip.AddrPort) *server.Ser
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := server.New(server.Config{
+	return server.Config{
 		Token: token, Targets: allowlist, AuthenticationSkew: time.Minute, HandshakeTimeout: time.Second,
 		ReplayEntries: 1024, JoinNonceEntries: 1024, MaxSessions: 64, MaxLanesPerSession: 8, MaxPendingAdmissions: 1,
 		ReconnectGrace: time.Second, IngressLimits: packetqueue.Limits{Packets: 64, Bytes: 256 * 1024},
@@ -901,21 +1007,17 @@ func newServer(t *testing.T, token []byte, targets []netip.AddrPort) *server.Ser
 		RetentionLimits:     retention.Limits{Packets: 1024, Bytes: 4 * 1024 * 1024},
 		Deadlines:           relay.DeadlinePolicy{Control: time.Second, Transport: time.Second},
 		DeduplicationWindow: 1024,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	return instance
 }
 
-func startRawServer(t *testing.T, token []byte, targets []netip.AddrPort,
+func startRawServer(t testing.TB, token []byte, targets []netip.AddrPort,
 	tlsConfig *tls.Config) (string, func()) {
 	t.Helper()
 	instance := newServer(t, token, targets)
 	return startRawServerInstance(t, instance, tlsConfig)
 }
 
-func startRawServerInstance(t *testing.T, instance *server.Server, tlsConfig *tls.Config) (string, func()) {
+func startRawServerInstance(t testing.TB, instance *server.Server, tlsConfig *tls.Config) (string, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1038,7 +1140,7 @@ func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
 	return &tls.Config{Certificates: []tls.Certificate{certificate}}, &tls.Config{RootCAs: roots}
 }
 
-func startEchoTarget(t *testing.T) (netip.AddrPort, func()) {
+func startEchoTarget(t testing.TB) (netip.AddrPort, func()) {
 	t.Helper()
 	connection, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
 	if err != nil {
