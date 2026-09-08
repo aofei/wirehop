@@ -233,8 +233,8 @@ func serveTestDNS(t *testing.T, address string, respond bool, queries *atomic.In
 				return
 			}
 			response := dnsmessage.Message{
-				Header: dnsmessage.Header{ID: request.ID, Response: true, Authoritative: true,
-					RecursionDesired: request.RecursionDesired, RecursionAvailable: true},
+				ID: request.ID, Response: true, Authoritative: true,
+				RecursionDesired: request.RecursionDesired, RecursionAvailable: true,
 				Questions: request.Questions,
 			}
 			for _, question := range request.Questions {

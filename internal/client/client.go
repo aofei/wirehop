@@ -1290,8 +1290,6 @@ func webSocketProxyAddress(proxy *neturl.URL) (string, error) {
 // proxy selects one WebSocket forward proxy from explicit client policy or the process environment.
 func (c *Client) proxy(request *http.Request) (*neturl.URL, error) {
 	requestCopy := request.Clone(request.Context())
-	urlCopy := *request.URL
-	requestCopy.URL = &urlCopy
 	switch requestCopy.URL.Scheme {
 	case "ws":
 		requestCopy.URL.Scheme = "http"
@@ -1308,12 +1306,12 @@ func (c *Client) proxy(request *http.Request) (*neturl.URL, error) {
 	if err != nil || proxyURL == nil {
 		return proxyURL, err
 	}
-	proxyCopy := *proxyURL
+	proxyCopy := proxyURL.Clone()
 	proxyCopy.Scheme = strings.ToLower(proxyCopy.Scheme)
 	if proxyCopy.Scheme == "" {
 		proxyCopy.Scheme = "http"
 	}
-	return &proxyCopy, nil
+	return proxyCopy, nil
 }
 
 // permanentHTTPRejection reports client-side HTTP status classes that retrying cannot repair.

@@ -48,7 +48,6 @@ func BenchmarkLocalRead(b *testing.B) {
 	b.Cleanup(cancel)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
-	b.ResetTimer()
 	for b.Loop() {
 		if _, err := peer.WriteToUDPAddrPort(payload, target); err != nil {
 			b.Fatal(err)
@@ -84,7 +83,6 @@ func BenchmarkLocalReadBatch(b *testing.B) {
 	b.Cleanup(cancel)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload) * len(packets)))
-	b.ResetTimer()
 	for b.Loop() {
 		for range packets {
 			if _, err := peer.WriteToUDPAddrPort(payload, target); err != nil {
@@ -159,7 +157,6 @@ func BenchmarkLocalWriteBatch(b *testing.B) {
 			})
 			b.ReportAllocs()
 			b.SetBytes(int64(len(payload) * len(payloads)))
-			b.ResetTimer()
 			for b.Loop() {
 				written, err := local.WriteBatch(context.Background(), payloads, time.Time{})
 				if err != nil {

@@ -50,7 +50,7 @@ configuration and requires a matching `NO_PROXY` entry.
 
 ## Build and test
 
-WireHop requires Go 1.26 or later.
+WireHop requires Go 1.27 or later.
 
 ```sh
 go build ./cmd/wirehop

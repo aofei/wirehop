@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aofei/wirehop/internal/packetqueue"
@@ -354,140 +355,142 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 }
 
 func TestSchedulerPreemptsHeldTransport(t *testing.T) {
-	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 4, Bytes: 8192})
-	if err != nil {
-		t.Fatal(err)
-	}
-	scheduler, err := NewScheduler(ingress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- scheduler.Run(ctx) }()
-
-	store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
-	existing := schedulerTransmission(99, wgpacket.TransportData, time.Now().Add(time.Second))
-	if err := store.push(existing); err != nil {
-		t.Fatal(err)
-	}
-	takeOneTransmission(t, store)
-	registration := schedulerRegistration(1, 1, store)
-	if err := scheduler.Register(ctx, registration); err != nil {
-		t.Fatal(err)
-	}
-
-	deadline := time.Now().Add(time.Second)
-	transportPayload := relayWireGuardPacket(wgpacket.TransportData)
-	transportPayload[4] = 1
-	if err := ingress.Push(packetqueue.Item[Packet]{
-		Value: Packet{
-			Kind: wgpacket.TransportData, Payload: transportPayload, DeadlineMicros: 10_000,
-		},
-		Size: len(transportPayload), Priority: packetqueue.PriorityNormal, Deadline: deadline,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for waitDeadline := time.Now().Add(time.Second); ingress.Len() != 0; {
-		if time.Now().After(waitDeadline) {
-			t.Fatal("scheduler did not hold the blocked transport packet")
+	synctest.Test(t, func(t *testing.T) {
+		ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 4, Bytes: 8192})
+		if err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(time.Millisecond)
-	}
-	controlPayload := relayWireGuardPacket(wgpacket.HandshakeInitiation)
-	if err := ingress.Push(packetqueue.Item[Packet]{
-		Value: Packet{
-			Kind: wgpacket.HandshakeInitiation, Payload: controlPayload, DeadlineMicros: 10_000,
-		},
-		Size: len(controlPayload), Priority: packetqueue.PriorityControl, Deadline: deadline,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := scheduler.ObserveDeliveryReport(ctx, protocol.DeliveryReport{
-		LaneID: registration.LaneID, Generation: registration.Generation,
-		DataPackets: 1, DataBytes: uint64(existing.size),
-	}, 1000); err != nil {
-		t.Fatal(err)
-	}
+		scheduler, err := NewScheduler(ingress)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- scheduler.Run(ctx) }()
 
-	control := awaitOneTransmission(t, store)
-	if control.PacketID != 1 || wgpacket.Classify(control.Payload) != wgpacket.HandshakeInitiation {
-		t.Fatalf("first scheduled packet = %+v, want control PacketID 1", control)
-	}
-	if err := scheduler.ObserveDeliveryReport(ctx, protocol.DeliveryReport{
-		LaneID: registration.LaneID, Generation: registration.Generation,
-		DataPackets: 2, DataBytes: uint64(existing.size + protocol.DataFrameOverhead + len(controlPayload)),
-	}, 2000); err != nil {
-		t.Fatal(err)
-	}
+		store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
+		existing := schedulerTransmission(99, wgpacket.TransportData, time.Now().Add(time.Second))
+		if err := store.push(existing); err != nil {
+			t.Fatal(err)
+		}
+		takeOneTransmission(t, store)
+		registration := schedulerRegistration(1, 1, store)
+		if err := scheduler.Register(ctx, registration); err != nil {
+			t.Fatal(err)
+		}
 
-	transport := awaitOneTransmission(t, store)
-	if transport.PacketID != 2 || transport.Payload[4] != 1 {
-		t.Fatalf("second scheduled packet = %+v, want held transport PacketID 2", transport)
-	}
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
-	}
-}
-
-func TestSchedulerRestoresHeldPackets(t *testing.T) {
-	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 4, Bytes: 8192})
-	if err != nil {
-		t.Fatal(err)
-	}
-	scheduler, err := NewScheduler(ingress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- scheduler.Run(ctx) }()
-
-	store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
-	if err := store.push(schedulerTransmission(99, wgpacket.TransportData, time.Now().Add(time.Second))); err != nil {
-		t.Fatal(err)
-	}
-	if err := scheduler.Register(ctx, schedulerRegistration(1, 1, store)); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for _, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation} {
-		payload := relayWireGuardPacket(kind)
+		deadline := time.Now().Add(time.Second)
+		transportPayload := relayWireGuardPacket(wgpacket.TransportData)
+		transportPayload[4] = 1
 		if err := ingress.Push(packetqueue.Item[Packet]{
-			Value: Packet{Kind: kind, Payload: payload, DeadlineMicros: 10_000},
-			Size:  len(payload), Priority: packetPriority(kind.Control()), Deadline: deadline,
+			Value: Packet{
+				Kind: wgpacket.TransportData, Payload: transportPayload, DeadlineMicros: 10_000,
+			},
+			Size: len(transportPayload), Priority: packetqueue.PriorityNormal, Deadline: deadline,
 		}); err != nil {
 			t.Fatal(err)
 		}
-		for waitDeadline := time.Now().Add(time.Second); ingress.Len() != 0; {
-			if time.Now().After(waitDeadline) {
+		synctest.Wait()
+		if ingress.Len() != 0 {
+			t.Fatal("scheduler did not hold the blocked transport packet")
+		}
+		controlPayload := relayWireGuardPacket(wgpacket.HandshakeInitiation)
+		if err := ingress.Push(packetqueue.Item[Packet]{
+			Value: Packet{
+				Kind: wgpacket.HandshakeInitiation, Payload: controlPayload, DeadlineMicros: 10_000,
+			},
+			Size: len(controlPayload), Priority: packetqueue.PriorityControl, Deadline: deadline,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := scheduler.ObserveDeliveryReport(ctx, protocol.DeliveryReport{
+			LaneID: registration.LaneID, Generation: registration.Generation,
+			DataPackets: 1, DataBytes: uint64(existing.size),
+		}, 1000); err != nil {
+			t.Fatal(err)
+		}
+
+		control := awaitOneTransmission(t, store)
+		if control.PacketID != 1 || wgpacket.Classify(control.Payload) != wgpacket.HandshakeInitiation {
+			t.Fatalf("first scheduled packet = %+v, want control PacketID 1", control)
+		}
+		if err := scheduler.ObserveDeliveryReport(ctx, protocol.DeliveryReport{
+			LaneID: registration.LaneID, Generation: registration.Generation,
+			DataPackets: 2, DataBytes: uint64(existing.size + protocol.DataFrameOverhead + len(controlPayload)),
+		}, 2000); err != nil {
+			t.Fatal(err)
+		}
+
+		transport := awaitOneTransmission(t, store)
+		if transport.PacketID != 2 || transport.Payload[4] != 1 {
+			t.Fatalf("second scheduled packet = %+v, want held transport PacketID 2", transport)
+		}
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+		}
+	})
+}
+
+func TestSchedulerRestoresHeldPackets(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 4, Bytes: 8192})
+		if err != nil {
+			t.Fatal(err)
+		}
+		scheduler, err := NewScheduler(ingress)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- scheduler.Run(ctx) }()
+
+		store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
+		if err := store.push(schedulerTransmission(99, wgpacket.TransportData, time.Now().Add(time.Second))); err != nil {
+			t.Fatal(err)
+		}
+		if err := scheduler.Register(ctx, schedulerRegistration(1, 1, store)); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(time.Second)
+		for _, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation} {
+			payload := relayWireGuardPacket(kind)
+			if err := ingress.Push(packetqueue.Item[Packet]{
+				Value: Packet{Kind: kind, Payload: payload, DeadlineMicros: 10_000},
+				Size:  len(payload), Priority: packetPriority(kind.Control()), Deadline: deadline,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait()
+			if ingress.Len() != 0 {
 				t.Fatal("scheduler did not take the held packet")
 			}
-			time.Sleep(time.Millisecond)
 		}
-	}
 
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
-	}
-	if ingress.Len() != 2 {
-		t.Fatalf("restored ingress length = %d, want 2", ingress.Len())
-	}
-	var first packetqueue.Item[Packet]
-	err = ingress.TryPop(&first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var second packetqueue.Item[Packet]
-	err = ingress.TryPop(&second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Value.Kind != wgpacket.HandshakeInitiation || second.Value.Kind != wgpacket.TransportData {
-		t.Fatalf("restored order = %s then %s", first.Value.Kind, second.Value.Kind)
-	}
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+		}
+		if ingress.Len() != 2 {
+			t.Fatalf("restored ingress length = %d, want 2", ingress.Len())
+		}
+		var first packetqueue.Item[Packet]
+		err = ingress.TryPop(&first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var second packetqueue.Item[Packet]
+		err = ingress.TryPop(&second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.Value.Kind != wgpacket.HandshakeInitiation || second.Value.Kind != wgpacket.TransportData {
+			t.Fatalf("restored order = %s then %s", first.Value.Kind, second.Value.Kind)
+		}
+	})
 }
 
 func TestSchedulerCommitsPacketIDAfterAdmission(t *testing.T) {
@@ -745,59 +748,59 @@ func TestSchedulerPacketIDExhaustion(t *testing.T) {
 }
 
 func TestSchedulerPendingPacketRetainsAggregateCapacity(t *testing.T) {
-	budget, err := retention.NewBudget(retention.Limits{Packets: 2, Bytes: 1024})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ingress, err := packetqueue.NewWithBudget[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024}, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 1, Bytes: 1024}, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.push(schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))); err != nil {
-		t.Fatal(err)
-	}
-	payload := relayWireGuardPacket(wgpacket.TransportData)
-	if err := ingress.Push(packetqueue.Item[Packet]{
-		Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 10_000},
-		Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	scheduler, err := NewScheduler(ingress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- scheduler.Run(ctx) }()
-	if err := scheduler.Register(ctx, schedulerRegistration(1, 1, store)); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for ingress.Len() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if ingress.Len() != 0 {
-		t.Fatal("scheduler did not retain the blocked packet")
-	}
-	if got := budget.Usage(); got.Packets != 2 {
-		t.Fatalf("budget usage with pending packet = %+v, want 2 packets", got)
-	}
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
-	}
-	if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: len(payload)}) {
-		t.Fatalf("budget usage after scheduler exit = %+v", got)
-	}
-	ingress.Close()
-	if got := budget.Usage(); got != (retention.Usage{}) {
-		t.Fatalf("budget usage after queue close = %+v", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		budget, err := retention.NewBudget(retention.Limits{Packets: 2, Bytes: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ingress, err := packetqueue.NewWithBudget[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024}, budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 1, Bytes: 1024}, budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.push(schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))); err != nil {
+			t.Fatal(err)
+		}
+		payload := relayWireGuardPacket(wgpacket.TransportData)
+		if err := ingress.Push(packetqueue.Item[Packet]{
+			Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 10_000},
+			Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		scheduler, err := NewScheduler(ingress)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- scheduler.Run(ctx) }()
+		if err := scheduler.Register(ctx, schedulerRegistration(1, 1, store)); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if ingress.Len() != 0 {
+			t.Fatal("scheduler did not retain the blocked packet")
+		}
+		if got := budget.Usage(); got.Packets != 2 {
+			t.Fatalf("budget usage with pending packet = %+v, want 2 packets", got)
+		}
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+		}
+		if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: len(payload)}) {
+			t.Fatalf("budget usage after scheduler exit = %+v", got)
+		}
+		ingress.Close()
+		if got := budget.Usage(); got != (retention.Usage{}) {
+			t.Fatalf("budget usage after queue close = %+v", got)
+		}
+	})
 }
 
 func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {

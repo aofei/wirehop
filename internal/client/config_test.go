@@ -842,6 +842,50 @@ func readSOCKS5Host(reader io.Reader, addressType byte) (string, error) {
 	return net.IP(address).String(), nil
 }
 
+func TestClientProxy(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		scheme string
+		want   string
+	}{
+		{name: "WS", scheme: "ws", want: "http"},
+		{name: "WSS", scheme: "wss", want: "https"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodGet, test.scheme+"://relay.example/_wirehop", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("X-Test", "original")
+			proxyURL := &neturl.URL{
+				Scheme: "HTTPS", Host: "proxy.example:8443", User: neturl.UserPassword("user", "test-password"),
+			}
+			instance := &Client{config: Config{Proxy: func(selected *http.Request) (*neturl.URL, error) {
+				if selected.URL.Scheme != test.want {
+					t.Fatalf("proxy request scheme = %q, want %q", selected.URL.Scheme, test.want)
+				}
+				selected.URL.Host = "changed.example"
+				selected.Header.Set("X-Test", "changed")
+				return proxyURL, nil
+			}}}
+			got, err := instance.proxy(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == proxyURL || got.String() != "https://user:test-password@proxy.example:8443" {
+				t.Fatalf("proxy() = %v, want an independent normalized URL", got)
+			}
+			got.Host = "changed.example:8443"
+			if proxyURL.Scheme != "HTTPS" || proxyURL.Host != "proxy.example:8443" {
+				t.Fatalf("original proxy URL changed: %v", proxyURL)
+			}
+			if request.URL.Scheme != test.scheme || request.URL.Host != "relay.example" || request.Header.Get("X-Test") != "original" {
+				t.Fatalf("original proxy request changed: URL=%v, Header=%v", request.URL, request.Header)
+			}
+		})
+	}
+}
+
 func TestWebSocketFirstHopNormalizesProxyScheme(t *testing.T) {
 	spec := testLaneSpec(t, "wss://relay.example:443/_wirehop")
 	for _, test := range []struct {

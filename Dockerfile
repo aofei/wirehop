@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine3.24 AS build
+FROM golang:1.27-alpine3.24 AS build
 
 ARG TARGETPLATFORM
 ARG USE_GORELEASER_ARTIFACTS=0

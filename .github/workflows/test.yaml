@@ -11,7 +11,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: 1.26.x
+          go-version: 1.27.x
       - name: Check Go formatting
         run: test -z "$(gofmt -l .)"
       - name: Test DNS fallback
@@ -21,7 +21,7 @@ jobs:
             --dns 127.0.0.2 --dns 127.0.0.3 --dns-option timeout:5 --dns-option attempts:1 \
             -v "$PWD:/src:ro" -v "$(go env GOMODCACHE):/go/pkg/mod:ro" \
             -e GOPROXY=off -e GOSUMDB=off -e WIREHOP_TEST_DNS_FALLBACK=1 -w /src \
-            golang:1.26-bookworm go test -race -v ./internal/command -run '^TestDNSFallback$' -count=1 -timeout=3m
+            golang:1.27-bookworm go test -race -v ./internal/command -run '^TestDNSFallback$' -count=1 -timeout=3m
       - name: Fuzz input boundaries
         run: |
           go test ./internal/laneurl -run '^$' -fuzz '^FuzzParseDial$' -fuzztime 1000000x
@@ -50,7 +50,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: 1.26.x
+          go-version: 1.27.x
       - name: Download Go modules
         run: go mod download
       - name: Vet Go code
@@ -76,7 +76,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: 1.26.x
+          go-version: 1.27.x
       - name: Build Go binary
         env:
           CGO_ENABLED: 0
@@ -114,7 +114,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: 1.26.x
+          go-version: 1.27.x
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
       - name: Set up Docker Buildx

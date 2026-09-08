@@ -330,8 +330,7 @@ func TestForwarderRetriesUntilCanceled(t *testing.T) {
 					cancel: cancel, ready: make(chan struct{}), done: make(chan struct{}),
 				}
 				go instance.run(ctx, Config{Target: target.MustParse("wg.example.com:51820"), Resolver: resolver})
-				time.Sleep(2 * time.Minute)
-				synctest.Wait()
+				synctest.Sleep(2 * time.Minute)
 				select {
 				case <-instance.done:
 					t.Fatalf("forwarder stopped during recoverable failure: %v", instance.err)

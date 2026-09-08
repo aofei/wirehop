@@ -89,7 +89,6 @@ func BenchmarkRelayPipeline(b *testing.B) {
 				b.Fatal(err)
 			}
 			b.SetBytes(int64(len(payload)))
-			b.ResetTimer()
 			for b.Loop() {
 				length, _, err := peer.ReadFromUDPAddrPort(buffer)
 				if err != nil {
