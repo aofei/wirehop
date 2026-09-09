@@ -531,6 +531,64 @@ func TestCopyPackets(t *testing.T) {
 	})
 }
 
+func TestWritePackets(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		writeErr   error
+		cancel     bool
+		wantErr    error
+		wantWrites int
+	}{
+		{name: "Success", wantWrites: 3},
+		{name: "NoLocalPeer", writeErr: datagram.ErrNoLocalPeer, wantWrites: 3},
+		{name: "DatagramDropped", writeErr: datagram.ErrDatagramDropped, wantWrites: 3},
+		{name: "TerminalError", writeErr: errTestEndpoint, wantErr: errTestEndpoint, wantWrites: 2},
+		{name: "Canceled", writeErr: errTestEndpoint, cancel: true, wantErr: context.Canceled, wantWrites: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			packets := make([]datagram.Packet, 3)
+			for index := range packets {
+				packets[index] = datagram.Packet{
+					Kind:    wgpacket.TransportData,
+					Payload: wireGuardPacket(4, 32, 0, uint32(index+1), wgpacket.Reserved{}),
+				}
+			}
+			payloads := make([][]byte, len(packets))
+			writes := 0
+			var firstDeadline time.Time
+			destination := stubEndpoint{write: func(_ context.Context, payload []byte, deadline time.Time) error {
+				writes++
+				if index := binary.LittleEndian.Uint32(payload[4:8]); index != uint32(writes) {
+					t.Fatalf("packet index = %d at write %d", index, writes)
+				}
+				if firstDeadline.IsZero() {
+					firstDeadline = deadline
+				} else if !deadline.Equal(firstDeadline) {
+					t.Fatalf("batch deadline changed from %v to %v", firstDeadline, deadline)
+				}
+				if writes == 2 {
+					if tt.cancel {
+						cancel()
+					}
+					return tt.writeErr
+				}
+				return nil
+			}}
+			err := writePackets(ctx, "local", destination, packets, payloads)
+			if !errors.Is(err, tt.wantErr) || writes != tt.wantWrites {
+				t.Fatalf("writePackets() = %v after %d writes, want %v after %d", err, writes, tt.wantErr, tt.wantWrites)
+			}
+			for index, packet := range packets {
+				if packet.Kind != wgpacket.NonWireGuard || packet.Payload != nil || payloads[index] != nil {
+					t.Fatalf("packet %d retained state after writePackets()", index)
+				}
+			}
+		})
+	}
+}
+
 func listenUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 	connection, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))

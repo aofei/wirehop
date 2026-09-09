@@ -395,38 +395,60 @@ func TestRemoteInitiationTriggersRefresh(t *testing.T) {
 	}
 }
 
-func TestRemoteSoftBatchDrainErrorTriggersRefresh(t *testing.T) {
-	peer := listenUDP(t)
-	peerAddress := peer.LocalAddr().(*net.UDPAddr).AddrPort()
-	connection := listenUDP(t)
-	resolver := &mutableResolver{addresses: []netip.Addr{peerAddress.Addr()}}
-	ctx, cancel := context.WithCancel(context.Background())
-	remote := &Remote{
-		target:   targetpkg.MustParse("wg.example.com:" + strconv.Itoa(int(peerAddress.Port()))),
-		resolver: resolver, resolveTimeout: time.Second, refreshInterval: time.Nanosecond,
-		ctx: ctx, cancel: cancel, reads: make(chan remoteRead, 1),
-		recent: make(map[netip.AddrPort]time.Time), retained: make(map[netip.AddrPort]int),
-		handshakeRoutes: make(map[uint32]targetRoute), transportRoutes: make(map[uint32]targetRoute),
-		candidates: []netip.AddrPort{peerAddress},
-	}
-	remote.sockets[0] = connection
-	remote.workers.Add(1)
-	go remote.readSocket(connection, stubUDPBatchConn{readErr: syscall.ENOBUFS})
-	t.Cleanup(func() { remote.Close() })
+func TestRemoteBatchDrainErrorTriggersRefresh(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "SoftError", err: syscall.ENOBUFS},
+		{name: "HardError", err: syscall.EBADF},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			peer := listenUDP(t)
+			peerAddress := peer.LocalAddr().(*net.UDPAddr).AddrPort()
+			connection, fallback := listenCandidatePair(t)
+			resolver := &mutableResolver{addresses: []netip.Addr{peerAddress.Addr()}}
+			ctx, cancel := context.WithCancel(context.Background())
+			remote := &Remote{
+				target:   targetpkg.MustParse("wg.example.com:" + strconv.Itoa(int(peerAddress.Port()))),
+				resolver: resolver, resolveTimeout: time.Second, refreshInterval: time.Nanosecond,
+				ctx: ctx, cancel: cancel, reads: make(chan remoteRead, 1),
+				recent: make(map[netip.AddrPort]time.Time), retained: make(map[netip.AddrPort]int),
+				handshakeRoutes: make(map[uint32]targetRoute), transportRoutes: make(map[uint32]targetRoute),
+				candidates: []netip.AddrPort{peerAddress},
+			}
+			remote.sockets[0] = connection
+			remote.sockets[1] = fallback
+			remote.workers.Add(1)
+			go remote.readSocket(connection, stubUDPBatchConn{readErr: tt.err})
+			t.Cleanup(func() { remote.Close() })
 
-	writeUDP(t, peer, connection.LocalAddr().(*net.UDPAddr).AddrPort(), indexedWireGuardPacket(1, 148, 11, 0))
-	select {
-	case result := <-remote.reads:
-		result.release()
-	case <-time.After(time.Second):
-		t.Fatal("target packet was not delivered")
-	}
-	deadline := time.Now().Add(time.Second)
-	for resolver.callCount() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("soft batch drain error did not trigger target refresh")
-		}
-		time.Sleep(time.Millisecond)
+			writeUDP(t, peer, connection.LocalAddr().(*net.UDPAddr).AddrPort(), indexedWireGuardPacket(1, 148, 11, 0))
+			select {
+			case result := <-remote.reads:
+				result.release()
+			case <-time.After(time.Second):
+				t.Fatal("target packet was not delivered")
+			}
+			deadline := time.Now().Add(time.Second)
+			for resolver.callCount() == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("batch drain error did not trigger target refresh")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			waitRemoteRefresh(t, remote)
+			current := remote.socket(peerAddress.Addr())
+			if current == nil {
+				t.Fatal("target refresh left the failed socket family unavailable")
+			}
+			if replaced := current != connection; replaced != (tt.err == syscall.EBADF) {
+				t.Fatalf("target socket replaced = %v after %v", replaced, tt.err)
+			}
+			if remote.socket(netip.IPv6Loopback()) != fallback {
+				t.Fatal("target refresh replaced the healthy fallback socket")
+			}
+		})
 	}
 }
 

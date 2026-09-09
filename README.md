@@ -31,7 +31,8 @@ WebSocket lanes use HTTPS proxy selection and a CONNECT tunnel through HTTP or H
 `socks5h` proxy URLs use native SOCKS tunneling.
 
 A reverse proxy must preserve the exact path, admission request headers, WebSocket Upgrade, selected subprotocol, and
-`WireHop-Rejection` response header. It must not cache or intercept WireHop admission responses.
+`WireHop-Rejection` response header. It must not cache or intercept WireHop admission responses. For nginx, use
+`proxy_intercept_errors off` in the WireHop location.
 
 WebSocket URLs use port `80` for `ws://` and port `443` for `wss://` when the port is omitted. Raw `tcp://` and `tls://`
 URLs require an explicit port.

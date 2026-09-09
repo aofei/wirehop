@@ -83,14 +83,19 @@ func (d *transmissionDeque) push(transmission retainedTransmission) {
 // pop removes and returns the oldest transmission from the nonempty deque.
 func (d *transmissionDeque) pop() retainedTransmission {
 	transmission := d.items[d.head]
-	d.items[d.head] = retainedTransmission{}
-	d.head++
+	d.discardPrefix(1)
+	return transmission
+}
+
+// discardPrefix clears consumed entries and compacts the remaining deque once.
+func (d *transmissionDeque) discardPrefix(count int) {
+	clear(d.items[d.head : d.head+count])
+	d.head += count
 	if d.head == len(d.items) {
 		d.resetEmpty()
-		return transmission
+		return
 	}
 	d.compact()
-	return transmission
 }
 
 // resetEmpty preserves ordinary reusable capacity while releasing an exceptional historical peak.
@@ -403,10 +408,10 @@ func (s *TransmissionStore) acknowledge(packets, bytes uint64) (uint64, bool, er
 		return 0, false, ErrInvalidDeliveryReport
 	}
 	releasedPackets := int(deltaPackets)
-	for range releasedPackets {
-		transmission := s.sent.pop()
-		transmission.releasePacket()
+	for index := s.sent.head; index < s.sent.head+releasedPackets; index++ {
+		s.sent.items[index].releasePacket()
 	}
+	s.sent.discardPrefix(releasedPackets)
 	s.reportedPackets = packets
 	s.reportedBytes = bytes
 	s.releaseBacklogLocked(releasedPackets, int(releasedBytes))

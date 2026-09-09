@@ -648,6 +648,21 @@ func TestSubcommandHelp(t *testing.T) {
 			if code != 0 || stdout.String() != test.want || stderr.Len() != 0 {
 				t.Fatalf("Execute() = %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
 			}
+			descriptionColumn := -1
+			for line := range strings.SplitSeq(stdout.String(), "\n") {
+				if !strings.HasPrefix(line, "  --") && !strings.HasPrefix(line, "  -h,") {
+					continue
+				}
+				_, description, ok := strings.Cut(line[2:], "  ")
+				if !ok {
+					t.Fatalf("help option has no description separator: %q", line)
+				}
+				column := len(line) - len(strings.TrimLeft(description, " "))
+				if descriptionColumn >= 0 && column != descriptionColumn {
+					t.Fatalf("help description starts at column %d, want %d: %q", column, descriptionColumn, line)
+				}
+				descriptionColumn = column
+			}
 		})
 	}
 }

@@ -453,6 +453,10 @@ while unsent work exists or at least half of the lane's packet or byte retention
 before that report releases acknowledged data. A lower application-limited offered rate therefore cannot be mistaken for
 a reduction in path capacity, while sustained sender pressure can still detect a real capacity drop.
 
+The half-RTT term approximates one-way delay, and application-limited traffic can preserve an outdated capacity estimate
+after a path slows. Directional asymmetry and stale estimates can therefore cause suboptimal packet placement even while
+all lanes remain healthy.
+
 Each lane sends its first timing request within a stable phase spread over the first quarter of the active ping
 interval. Timing requests back off exponentially while no real data is written and return to the active interval when
 traffic resumes. The first valid RTT sample replaces the conservative startup estimate directly. Later RTT samples and

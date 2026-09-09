@@ -59,7 +59,17 @@ func TestTransmissionStoreValidation(t *testing.T) {
 	}
 }
 
-func TestTransmissionStorePreservesWriteViewThroughDrain(t *testing.T) {
+func TestTransmissionStorePreservesWriteView(t *testing.T) {
+	t.Run("Drain", func(t *testing.T) {
+		testTransmissionStorePreservesWriteView(t, false)
+	})
+	t.Run("Acknowledgment", func(t *testing.T) {
+		testTransmissionStorePreservesWriteView(t, true)
+	})
+}
+
+func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
+	t.Helper()
 	store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
 	transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
 	local, err := datagram.ListenLocal(netip.MustParseAddrPort("127.0.0.1:0"))
@@ -94,12 +104,18 @@ func TestTransmissionStorePreservesWriteViewThroughDrain(t *testing.T) {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
 	defer ownership[0].Release()
-	releaseTransmissions(store.drain())
+	if acknowledge {
+		if _, _, err := store.acknowledge(store.sentPackets, store.sentBytes); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		releaseTransmissions(store.drain())
+	}
 	if err := ownership[0].Validate(); err != nil {
-		t.Fatalf("write ownership after drain is invalid: %v", err)
+		t.Fatalf("write ownership after release is invalid: %v", err)
 	}
 	if got := string(batch[0].Payload); got != wantPayload {
-		t.Fatalf("payload after drain = %q, want %q", got, wantPayload)
+		t.Fatalf("payload after release = %q, want %q", got, wantPayload)
 	}
 	retained := ownership[0].Retain()
 	retained.Release()
@@ -440,6 +456,43 @@ func TestTransmissionStoreDeliveryConstrained(t *testing.T) {
 	}
 }
 
+func TestTransmissionDequeDiscardPrefix(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		total    int
+		count    int
+		wantHead int
+	}{
+		{name: "Uncompacted", total: 100, count: 20, wantHead: 20},
+		{name: "Compacted", total: 128, count: 64},
+		{name: "Emptied", total: 128, count: 128},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backing := make([]retainedTransmission, tt.total)
+			for index := range backing {
+				backing[index] = retainedTransmission{
+					size: index + 1, data: protocol.Data{Payload: []byte{byte(index)}},
+				}
+			}
+			deque := transmissionDeque{items: backing}
+			deque.discardPrefix(tt.count)
+			if deque.len() != tt.total-tt.count || deque.head != tt.wantHead {
+				t.Fatalf("deque length = %d, head = %d, want %d and %d", deque.len(), deque.head, tt.total-tt.count, tt.wantHead)
+			}
+			for index, transmission := range backing {
+				if index >= deque.head && index < len(deque.items) {
+					original := tt.count + index - deque.head
+					if transmission.size != original+1 || len(transmission.data.Payload) != 1 || transmission.data.Payload[0] != byte(original) {
+						t.Fatalf("retained entry %d does not match original entry %d", index, original)
+					}
+				} else if transmission.size != 0 || transmission.data.Payload != nil {
+					t.Fatalf("consumed entry %d retained state", index)
+				}
+			}
+		})
+	}
+}
+
 func TestTransmissionDequeCapacityRetention(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -457,6 +510,15 @@ func TestTransmissionDequeCapacityRetention(t *testing.T) {
 				for deque.len() > count {
 					deque.pop()
 				}
+			},
+		},
+		{
+			name: "DiscardPrefix",
+			empty: func(_ *testing.T, deque *transmissionDeque) {
+				deque.discardPrefix(deque.len())
+			},
+			retain: func(_ *testing.T, deque *transmissionDeque, count int) {
+				deque.discardPrefix(deque.len() - count)
 			},
 		},
 		{

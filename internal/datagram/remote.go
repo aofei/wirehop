@@ -484,12 +484,13 @@ func (e *Remote) readSocket(connection *net.UDPConn, batchConnection udpBatchCon
 		if drainErr == nil {
 			continue
 		}
-		e.triggerRefresh()
 		if isSoftNetworkError(drainErr) {
+			e.triggerRefresh()
 			continue
 		}
 		available := e.retireSocket(connection)
 		connection.Close()
+		e.triggerRefresh()
 		if !available {
 			e.offerRead(remoteRead{err: fmt.Errorf("read target UDP datagram batch: %w", drainErr)})
 		}
