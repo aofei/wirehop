@@ -896,6 +896,11 @@ material. Multiple candidates may answer one initiation, but the first candidate
 gains transport affinity. An address that remains in DNS but stops responding is bypassed by the next successful
 handshake with another candidate.
 
+Successful UDP writes do not prove target reachability. A silent failure can leave transport traffic on the previous
+candidate until the local WireGuard implementation initiates another handshake. Recovery therefore depends on WireGuard
+handshake timers and candidate reachability, not only on DNS refresh timing. Sharing a WireGuard identity across
+backends does not replicate their NAT or application connection state.
+
 ```mermaid
 sequenceDiagram
   participant L as Local WireGuard
@@ -1127,10 +1132,10 @@ A GSO size rejection retries only the unsent datagrams without segmentation, pre
 behavior. It does not disable GSO for later batches. An offload capability failure disables GSO on that socket and
 retries its unsent datagrams with `sendmmsg`. Per-datagram failures after fallback follow the normal UDP error policy.
 
-Linux 7.0 and Linux 7.1 release candidates before rc5 receive an equal-tail GSO workaround. Batches smaller than eight
-datagrams use `sendmmsg` without GSO. Larger batches append a one-byte invalid WireGuard datagram to an otherwise
-equal-sized GSO run, avoiding the kernel's final-segment length defect. This extra datagram is not relay data and does
-not enter WireHop packet or delivery counters.
+Linux 7.0 before 7.0.11 and Linux 7.1 release candidates before rc5 receive an equal-tail GSO workaround. Batches
+smaller than eight datagrams use `sendmmsg` without GSO. Larger batches append a one-byte invalid WireGuard datagram to
+an otherwise equal-sized GSO run, avoiding the kernel's final-segment length defect. This extra datagram is not relay
+data and does not enter WireHop packet or delivery counters.
 
 Accepted UDP payloads are copied into reference-counted buffers. Queue admission, control duplication, carrier writes,
 and migration transfer or retain explicit ownership. A buffer returns to its pool only after the final owner releases
@@ -1657,6 +1662,9 @@ address selection apply, and the lane still creates only one connection.
 
 The scheduler does not infer physical independence from carrier scheme, server address, or IP family. Operators should
 add lanes only when reachability, failure isolation, or measured capacity justifies their connection and queue cost.
+
+Paths with different RTTs or loss patterns can increase packet reordering and lower inner TCP goodput compared with a
+single path. Evaluate sustained goodput and tail latency in both directions before retaining an additional lane.
 
 Mobile carriers may make WSS or TLS more reachable than UDP, but IPv4 and IPv6 commonly share one radio bottleneck.
 Additional lanes can increase radio wakeups, battery use, bufferbloat, and synchronized disruption during mobility.

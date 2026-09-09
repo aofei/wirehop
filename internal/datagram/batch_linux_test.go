@@ -330,8 +330,12 @@ func TestLinuxKernelHasEqualGSOTailBug(t *testing.T) {
 		want    bool
 	}{
 		{name: "BeforeRegression", release: "6.18.7"},
+		{name: "ShortAffectedSeries", release: "7.0", want: true},
 		{name: "FirstAffectedSeries", release: "7.0.0", want: true},
-		{name: "AffectedStablePatch", release: "7.0.12-1-pve", want: true},
+		{name: "AffectedSeriesReleaseCandidate", release: "7.0-rc4", want: true},
+		{name: "LastAffectedStablePatch", release: "7.0.10-1-pve", want: true},
+		{name: "FirstFixedStablePatch", release: "7.0.11"},
+		{name: "LaterFixedStablePatch", release: "7.0.12-1-pve"},
 		{name: "AffectedReleaseCandidate", release: "7.1.0-rc4-generic", want: true},
 		{name: "AffectedShortReleaseCandidate", release: "7.1-rc4", want: true},
 		{name: "FirstFixedReleaseCandidate", release: "7.1.0-rc5"},

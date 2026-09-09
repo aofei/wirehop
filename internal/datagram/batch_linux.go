@@ -118,8 +118,8 @@ func currentKernelHasEqualGSOTailBug() bool {
 	return unix.Uname(&name) == nil && linuxKernelHasEqualGSOTailBug(unix.ByteSliceToString(name.Release[:]))
 }
 
-// linuxKernelHasEqualGSOTailBug reports whether release identifies Linux 7.0 or a Linux 7.1 release candidate before
-// rc5.
+// linuxKernelHasEqualGSOTailBug reports whether release identifies Linux 7.0 before 7.0.11 or a Linux 7.1 release
+// candidate before rc5.
 func linuxKernelHasEqualGSOTailBug(release string) bool {
 	majorText, remainder, ok := strings.Cut(release, ".")
 	if !ok {
@@ -132,7 +132,11 @@ func linuxKernelHasEqualGSOTailBug(release string) bool {
 		return false
 	}
 	if minor == 0 {
-		return true
+		if !strings.HasPrefix(suffix, ".") {
+			return true
+		}
+		patch, ok := leadingDecimal(suffix[1:])
+		return !ok || patch < 11
 	}
 	if minor != 1 {
 		return false
