@@ -1054,8 +1054,8 @@ func TestLaneAbandonUsesAbortiveClose(t *testing.T) {
 			result := make(chan error, 1)
 			go func() { result <- lane.Run(ctx) }()
 			cancel(test.cause)
-			if err := <-result; !errors.Is(err, context.Canceled) {
-				t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+			if err := <-result; !errors.Is(err, test.cause) {
+				t.Fatalf("Run() error = %v, want %v", err, test.cause)
 			}
 			select {
 			case <-carrier.aborts:

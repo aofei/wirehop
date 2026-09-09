@@ -242,7 +242,7 @@ func (l *Lane) Run(ctx context.Context) error {
 	}
 	workers.Wait()
 	if parent.Err() != nil {
-		return parent.Err()
+		return context.Cause(parent)
 	}
 	return err
 }

@@ -58,7 +58,8 @@ go build ./cmd/wirehop
 go test -race ./...
 ```
 
-Tests require neither a kernel WireGuard interface nor administrator privileges.
+Go tests require neither a kernel WireGuard interface nor administrator privileges. The optional [kernel TCP integration
+tests](test/integration/README.md) use isolated Docker containers with kernel WireGuard.
 
 ## Basic usage
 
@@ -102,9 +103,10 @@ shutdown is also silent.
 The client independently retries recoverable connection and session-creation failures on each lane, including DNS
 failures, without an overall startup deadline. The direct forwarder likewise keeps retrying target DNS failures. Each
 attempt is bounded and retries use jittered backoff. Prolonged preparation failures produce rate-limited warnings, with
-one recovery message if a warning was emitted. Invalid options, local bind failures, and terminal rejections are not
-treated as transient DNS failures. Server listeners must all be prepared within a shared 30-second budget before any
-begin serving.
+one recovery message if a warning was emitted. Repeated short-lived lane connections follow the same warning policy, and
+recovery requires 30 seconds of sustained service. UDP socket errors also produce rate-limited diagnostics. Invalid
+options, local bind failures, and terminal rejections are not treated as transient DNS failures. Server listeners must
+all be prepared within a shared 30-second budget before any begin serving.
 
 Help is written to standard output. Diagnostics and warning logs are written to standard error. Command-line and
 environment validation errors exit with status `2`, runtime failures exit with status `1`, and help or signal-driven
@@ -117,20 +119,49 @@ client session, the server authorizes the canonical logical target before resolv
 and network view. The `forward` command resolves its target locally and has no target allowlist.
 
 A DNS target may return multiple IPv4 and IPv6 addresses. All records must represent the same logical WireGuard peer,
-whether they reach one dual-stack server or multiple servers configured with the same WireGuard identity. WireHop sends
-handshake initiations to the bounded candidate set and uses WireGuard's public sender and receiver indexes to route
-responses and subsequent transport data to the candidate selected by the local WireGuard implementation. Transport data
-is never sprayed across candidates.
+whether they reach one dual-stack server or multiple servers configured with the same WireGuard identity. WireHop
+initially sends handshake initiations to the bounded candidate set and uses WireGuard's public sender and receiver
+indexes to route responses and subsequent transport data to the candidate selected by the local WireGuard
+implementation. Transport data is never sprayed across candidates.
 
 Handshake Initiation packets and target-side UDP errors request rate-limited DNS refreshes without delaying the current
 packet. A successful refresh replaces the handshake fan-out set, while a lookup failure retains the last successful
 result. Established transport traffic keeps its selected candidate across answer reordering and rotating subsets. A
-later successful WireGuard handshake may select another candidate.
+routine rekey first uses that confirmed candidate. Only an unanswered handshake retry after five seconds discovers
+alternatives. Delayed old-key traffic cannot move the confirmed selection back to an earlier backend. Backends sharing a
+WireGuard identity still have independent NAT and TCP connection state, so failover cannot preserve that state.
 
 The direct forwarder binds its local listener immediately and discards packets while waiting for initial target
 resolution. Missing records and answers containing no usable target addresses remain retryable. Target socket
 preparation errors are fatal. Target address changes do not replace a WireHop session, reconnect carrier lanes, or
 restart a direct forwarder.
+
+## WireGuard MTU and UDP receive capacity
+
+Set an explicit MTU on the WireGuard interface whose endpoint points at WireHop. With `wg-quick`, automatic MTU
+detection can follow the route to `127.0.0.1` or `::1` and derive an oversized MTU from loopback. The actual UDP leg
+between WireHop and the remote WireGuard peer can have a much smaller path MTU.
+
+For example, when every external UDP leg has a path MTU of at least 1500 bytes, use:
+
+```ini
+[Interface]
+MTU = 1420
+```
+
+Choose a smaller value when the actual UDP path requires it. Check the active interface with `ip link show wg0` and its
+endpoint with `wg show wg0 endpoints`. WireHop preserves complete encrypted datagrams and cannot change the inner
+WireGuard interface MTU or clamp encrypted TCP MSS. TCP carrier frames can span TCP segments, so the outer TCP MSS alone
+does not determine the WireGuard MTU.
+
+WireHop requests a 4 MiB receive buffer for each local and target UDP socket. This absorbs bursts while retaining system
+socket limits. Linux may silently cap the request at `net.core.rmem_max`, and a rejected request retains the OS default
+with a warning. Check `sysctl net.core.rmem_max`, `ss -u -a -m`, and `nstat -az UdpRcvbufErrors UdpSndbufErrors` on the
+machine or network namespace running WireHop when evaluating sustained throughput. A rising `UdpRcvbufErrors` counter
+indicates kernel receive drops even if no UDP operation returned an error. WireHop does not modify system-wide limits.
+
+On servers, account for up to two target UDP sockets per session when adjusting system receive limits. Kernel socket
+memory is separate from WireHop's aggregate packet retention budget.
 
 ## Multipath lanes
 

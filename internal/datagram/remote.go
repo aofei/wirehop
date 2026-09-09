@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
@@ -24,14 +25,18 @@ const (
 	targetCandidateGrace = 15 * time.Second
 	// targetRouteLifetime retains public WireGuard index affinity for one key lifetime.
 	targetRouteLifetime = 3 * time.Minute
+	// targetHandshakeRetryInterval gives an established target one WireGuard handshake attempt before failover.
+	targetHandshakeRetryInterval = 5 * time.Second
 	// maximumTargetRoutes bounds unauthenticated public index state for one target endpoint.
 	maximumTargetRoutes = 1024
 )
 
 // targetRoute binds one public WireGuard index to the DNS candidate that emitted it.
 type targetRoute struct {
-	address netip.AddrPort
-	expires time.Time
+	address   netip.AddrPort
+	created   time.Time
+	expires   time.Time
+	confirmed bool
 }
 
 // remoteRead is one accepted target packet vector or terminal socket read failure.
@@ -53,37 +58,41 @@ func (r *remoteRead) release() {
 type RemoteConfig struct {
 	Resolver     target.Resolver
 	ListenConfig net.ListenConfig
+	Logger       *slog.Logger
 }
 
 // Remote is an upstream logical target with DNS candidates and WireGuard index affinity.
 type Remote struct {
-	target          target.Endpoint
-	resolver        target.Resolver
-	listenConfig    net.ListenConfig
-	resolveTimeout  time.Duration
-	refreshInterval time.Duration
-	ctx             context.Context
-	cancel          context.CancelFunc
-	reads           chan remoteRead
-	readMu          sync.Mutex
-	pending         remoteRead
-	pendingOffset   int
-	writeMu         sync.Mutex
-	writeMessages   [MaximumBatchSize]udpMessage
-	mu              sync.Mutex
-	sockets         [2]*net.UDPConn
-	batchSockets    [2]udpBatchConn
-	candidates      []netip.AddrPort
-	recent          map[netip.AddrPort]time.Time
-	retained        map[netip.AddrPort]int
-	current         netip.AddrPort
-	handshakeRoutes map[uint32]targetRoute
-	transportRoutes map[uint32]targetRoute
-	nextRoutePrune  time.Time
-	lastRefresh     time.Time
-	refreshing      bool
-	closed          bool
-	workers         sync.WaitGroup
+	target           target.Endpoint
+	resolver         target.Resolver
+	listenConfig     net.ListenConfig
+	resolveTimeout   time.Duration
+	refreshInterval  time.Duration
+	ctx              context.Context
+	cancel           context.CancelFunc
+	reads            chan remoteRead
+	readMu           sync.Mutex
+	pending          remoteRead
+	pendingOffset    int
+	writeMu          sync.Mutex
+	writeMessages    [MaximumBatchSize]udpMessage
+	mu               sync.Mutex
+	sockets          [2]*net.UDPConn
+	batchSockets     [2]udpBatchConn
+	candidates       []netip.AddrPort
+	recent           map[netip.AddrPort]time.Time
+	retained         map[netip.AddrPort]int
+	current          netip.AddrPort
+	currentRouteAt   time.Time
+	handshakeStarted time.Time
+	handshakeRoutes  map[uint32]targetRoute
+	transportRoutes  map[uint32]targetRoute
+	nextRoutePrune   time.Time
+	lastRefresh      time.Time
+	refreshing       bool
+	closed           bool
+	workers          sync.WaitGroup
+	notice           udpNotice
 }
 
 // OpenRemote resolves target and opens its per-family UDP sockets. The context bounds preparation only. The caller
@@ -122,6 +131,7 @@ func openRemote(parent context.Context, endpoint target.Endpoint, config RemoteC
 		retained:        make(map[netip.AddrPort]int),
 		handshakeRoutes: make(map[uint32]targetRoute), transportRoutes: make(map[uint32]targetRoute),
 		lastRefresh: time.Now(),
+		notice:      udpNotice{logger: config.Logger},
 	}
 	if err := remote.ensureSockets(parent, addresses); err != nil {
 		remote.Close()
@@ -253,6 +263,7 @@ func (e *Remote) WriteBatch(ctx context.Context, payloads [][]byte, deadline tim
 		if err != nil {
 			e.triggerRefresh()
 			if isSoftNetworkError(err) {
+				e.notice.report("write target", err)
 				return written, fmt.Errorf("%w: write target UDP datagram batch: %w", ErrDatagramDropped, err)
 			}
 			return written, fmt.Errorf("write target UDP datagram batch: %w", err)
@@ -299,6 +310,7 @@ func (e *Remote) writeDestinationsLocked(ctx context.Context, payload []byte, de
 		written, err := connection.WriteToUDPAddrPort(payload, destination)
 		if err != nil {
 			lastErr = err
+			e.notice.report("write target", err)
 			e.triggerRefresh()
 			if !isSoftNetworkError(err) {
 				terminalErr = err
@@ -400,6 +412,7 @@ func (e *Remote) ensureSockets(ctx context.Context, addresses []netip.AddrPort) 
 			continue
 		}
 		connection := packetConnection.(*net.UDPConn)
+		configureReceiveBuffer(connection, &e.notice)
 		e.mu.Lock()
 		if e.closed {
 			e.mu.Unlock()
@@ -443,6 +456,7 @@ func (e *Remote) readSocket(connection *net.UDPConn, batchConnection udpBatchCon
 				return
 			}
 			if isSoftNetworkError(err) {
+				e.notice.report("read target", err)
 				e.triggerRefresh()
 				continue
 			}
@@ -485,6 +499,7 @@ func (e *Remote) readSocket(connection *net.UDPConn, batchConnection udpBatchCon
 			continue
 		}
 		if isSoftNetworkError(drainErr) {
+			e.notice.report("read target", drainErr)
 			e.triggerRefresh()
 			continue
 		}
@@ -531,6 +546,11 @@ func (e *Remote) observeSource(peer netip.AddrPort, header wgpacket.Header, now 
 	}
 	switch header.Kind {
 	case wgpacket.HandshakeInitiation:
+		// An alternate backend can still remember a previous handshake. Do not let its unsolicited rekey move
+		// healthy inner connections away from the target selected by the local WireGuard implementation.
+		if peer != e.current && !e.currentRouteAt.IsZero() && !e.handshakeFailoverLocked(now) {
+			return false
+		}
 		e.rememberRouteLocked(e.handshakeRoutes, header.SenderIndex, peer, now)
 	case wgpacket.HandshakeResponse:
 		e.rememberRouteLocked(e.transportRoutes, header.SenderIndex, peer, now)
@@ -538,7 +558,7 @@ func (e *Remote) observeSource(peer netip.AddrPort, header wgpacket.Header, now 
 	return true
 }
 
-// destinations appends handshake fan-out or one public-index-affine target candidate to buffer.
+// destinations appends an established target, handshake discovery candidates, or one index-affine target to buffer.
 func (e *Remote) destinations(header wgpacket.Header, buffer []netip.AddrPort, now time.Time) []netip.AddrPort {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -547,17 +567,40 @@ func (e *Remote) destinations(header wgpacket.Header, buffer []netip.AddrPort, n
 	var found bool
 	switch header.Kind {
 	case wgpacket.HandshakeInitiation:
+		if !e.currentRouteAt.IsZero() {
+			if e.handshakeStarted.IsZero() {
+				e.handshakeStarted = now
+			}
+			if !e.handshakeFailoverLocked(now) {
+				return append(buffer, e.current)
+			}
+		}
 		return append(buffer, e.candidates...)
-	case wgpacket.HandshakeResponse, wgpacket.CookieReply:
+	case wgpacket.HandshakeResponse:
 		route, found = e.handshakeRoutes[header.ReceiverIndex]
-	case wgpacket.TransportData:
-		route, found = e.transportRoutes[header.ReceiverIndex]
+	case wgpacket.CookieReply:
+		route, found = e.handshakeRoutes[header.ReceiverIndex]
 		if !found {
-			route, found = e.handshakeRoutes[header.ReceiverIndex]
+			route, found = e.transportRoutes[header.ReceiverIndex]
+		}
+	case wgpacket.TransportData:
+		routes := e.transportRoutes
+		route, found = routes[header.ReceiverIndex]
+		if !found {
+			routes = e.handshakeRoutes
+			route, found = routes[header.ReceiverIndex]
+		}
+		if found && !route.confirmed {
+			route.confirmed = true
+			routes[header.ReceiverIndex] = route
+			if !route.created.Before(e.currentRouteAt) {
+				e.current = route.address
+				e.currentRouteAt = route.created
+				e.handshakeStarted = time.Time{}
+			}
 		}
 	}
 	if found {
-		e.current = route.address
 		return append(buffer, route.address)
 	}
 	if header.Kind == wgpacket.HandshakeResponse || header.Kind == wgpacket.CookieReply {
@@ -567,6 +610,11 @@ func (e *Remote) destinations(header wgpacket.Header, buffer []netip.AddrPort, n
 		return append(buffer, e.current)
 	}
 	return nil
+}
+
+// handshakeFailoverLocked reports whether an established target has had a complete unanswered handshake attempt.
+func (e *Remote) handshakeFailoverLocked(now time.Time) bool {
+	return !e.handshakeStarted.IsZero() && now.Sub(e.handshakeStarted) >= targetHandshakeRetryInterval
 }
 
 // triggerRefresh starts one rate-limited DNS refresh without delaying the current packet.
@@ -621,6 +669,8 @@ func (e *Remote) replaceCandidates(addresses []netip.AddrPort) {
 	e.candidates = append(e.candidates[:0], addresses...)
 	if !e.current.IsValid() || e.socketLocked(e.current.Addr()) == nil {
 		e.current = netip.AddrPort{}
+		e.currentRouteAt = time.Time{}
+		e.handshakeStarted = time.Time{}
 		for _, address := range addresses {
 			if e.socketLocked(address.Addr()) != nil {
 				e.current = address
@@ -652,7 +702,12 @@ func (e *Remote) rememberRouteLocked(routes map[uint32]targetRoute, index uint32
 		e.retained[address]++
 	}
 	expires := now.Add(targetRouteLifetime)
-	routes[index] = targetRoute{address: address, expires: expires}
+	route := targetRoute{address: address, created: now, expires: expires}
+	if exists && previous.address == address {
+		route.created = previous.created
+		route.confirmed = previous.confirmed
+	}
+	routes[index] = route
 	if e.nextRoutePrune.IsZero() || expires.Before(e.nextRoutePrune) {
 		e.nextRoutePrune = expires
 	}

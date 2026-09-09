@@ -148,6 +148,61 @@ func TestLogDisabledLaneRedactsRemoteDiagnostic(t *testing.T) {
 	}
 }
 
+type retryLogWriter chan string
+
+func (w retryLogWriter) Write(data []byte) (int, error) {
+	w <- string(data)
+	return len(data), nil
+}
+
+func TestClientSuperviseLaneReportsProlongedRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		spec, err := lanespec.Parse("tcp://127.0.0.1:9")
+		if err != nil {
+			t.Fatal(err)
+		}
+		output := make(retryLogWriter, 8)
+		instance := &Client{config: Config{
+			Logger: slog.New(slog.NewTextHandler(output, nil)),
+			Dialer: &net.Dialer{Control: func(string, string, syscall.RawConn) error {
+				return errors.New("simulated unavailable carrier")
+			}},
+		}}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() {
+			result <- instance.superviseLane(ctx, clientLane{spec: spec, laneID: protocol.LaneID{1}},
+				creationResult{}, nil, nil, nil)
+		}()
+		time.Sleep(29 * time.Second)
+		synctest.Wait()
+		if len(output) != 0 {
+			t.Fatal("ordinary retries logged before the quiet window")
+		}
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		if len(output) != 1 {
+			t.Fatalf("prolonged lane retry messages = %d, want 1", len(output))
+		}
+		time.Sleep(60 * time.Second)
+		synctest.Wait()
+		if len(output) != 2 {
+			t.Fatalf("rate-limited lane retry messages = %d, want 2", len(output))
+		}
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("superviseLane() error = %v, want cancellation", err)
+		}
+		for range 2 {
+			if logged := <-output; !strings.Contains(logged, "level=WARN") ||
+				!strings.Contains(logged, "relay lane unavailable, retrying") {
+				t.Fatalf("unexpected retry diagnostic: %s", logged)
+			}
+		}
+	})
+}
+
 func TestTLSConfigEnforcesMinimumVersion(t *testing.T) {
 	configured := &tls.Config{MinVersion: tls.VersionTLS10, NextProtos: []string{"custom"}}
 	instance := &Client{config: Config{TLSConfig: configured}}

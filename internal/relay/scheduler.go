@@ -78,7 +78,7 @@ const (
 	schedulerReport
 	// schedulerTiming applies one RTT sample.
 	schedulerTiming
-	// schedulerRouteReport routes cumulative feedback over a healthy outbound lane.
+	// schedulerRouteReport routes cumulative feedback over a connected outbound lane.
 	schedulerRouteReport
 	// schedulerPeerAbandon closes the exact generation abandoned by the peer.
 	schedulerPeerAbandon
@@ -478,7 +478,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 	}
 }
 
-// routeReport duplicates feedback over its own healthy lane and one best alternate lane.
+// routeReport duplicates feedback over its own connected lane and one best alternate lane.
 func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report protocol.DeliveryReport,
 	complete func(bool)) {
 	frame, err := protocol.MarshalDeliveryReport(report)
@@ -509,13 +509,13 @@ func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report
 	}
 }
 
-// orderedControlLanes returns every healthy lane in deterministic predicted-delivery order.
+// orderedControlLanes returns every non-abandoning lane in deterministic predicted-delivery order.
 // The result remains valid until this method is called again.
 func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane) []*scheduledLane {
 	clear(s.controlOrder)
 	ordered := s.controlOrder[:0]
 	for _, lane := range lanes {
-		if !lane.degraded && !lane.abandoning {
+		if !lane.abandoning {
 			ordered = append(ordered, lane)
 		}
 	}
@@ -802,7 +802,7 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	l.lastProbeBytes = report.ProbeBytes
 	l.lastProbePackets = report.ProbePackets
 	l.lastProgressAt = receiveTime
-	l.degraded = laneDeadlineAtRisk(l, receiveTime)
+	l.degraded = false
 	return nil
 }
 
@@ -869,7 +869,7 @@ func weightedAverage7(previous, sample uint64) uint64 {
 	return previous/8*7 + sample/8 + (previous%8*7+sample%8)/8
 }
 
-// checkAbandonment degrades deadline-risk lanes and cancels expired generations.
+// checkAbandonment diverts deadline-risk work and migrates stalled generations while packets remain useful.
 func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, now time.Time) {
 	for _, lane := range lanes {
 		if lane.abandoning {
@@ -881,15 +881,12 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 			continue
 		}
 		remaining := assessment.deadline.Sub(now)
-		if remaining <= 0 {
-			lane.degraded = true
-			lane.abandoning = true
-			s.announceAbandonment(lanes, lane)
-			lane.registration.Abandon()
-			continue
-		}
-		lane.degraded = assessment.atRisk
-		if lane.degraded && laneProgressStalled(lane, now) &&
+		// Retained sent bytes include packets already delivered while their parsing report is in flight. Their
+		// age alone cannot justify withholding fresh packets with later deadlines from a progressing connection.
+		lane.degraded = assessment.atRisk && laneProgressStalled(lane, now, assessment.unreportedSince)
+		// Packet expiry does not imply carrier failure. A parsing report can still be returning after successful
+		// delivery. Keep that connection available for feedback and let its ping and write budgets detect failure.
+		if remaining > 0 && lane.degraded &&
 			hasTimelyAlternative(lanes, lane, assessment.frameBytes, remaining) {
 			lane.abandoning = true
 			s.announceAbandonment(lanes, lane)
@@ -898,10 +895,14 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 	}
 }
 
-// laneProgressStalled reports whether cumulative peer parsing progress has stopped beyond a path-aware guard.
-func laneProgressStalled(lane *scheduledLane, now time.Time) bool {
-	if lane.lastProgressAt.IsZero() || now.Before(lane.lastProgressAt) {
+// laneProgressStalled reports whether outstanding work has waited beyond a path-aware progress guard.
+func laneProgressStalled(lane *scheduledLane, now, unreportedSince time.Time) bool {
+	if lane.lastProgressAt.IsZero() || unreportedSince.IsZero() {
 		return false
+	}
+	progressSince := lane.lastProgressAt
+	if unreportedSince.After(progressSince) {
+		progressSince = unreportedSince
 	}
 	marginMicros := uint64(progressStallReportMargin / time.Microsecond)
 	if lane.rttMicros > (math.MaxUint64-marginMicros)/2 {
@@ -916,12 +917,7 @@ func laneProgressStalled(lane *scheduledLane, now time.Time) bool {
 		return false
 	}
 	threshold := time.Duration(thresholdMicros) * time.Microsecond
-	return now.Sub(lane.lastProgressAt) >= threshold
-}
-
-// laneDeadlineAtRisk reports whether retained work is no longer predicted to meet its earliest deadline.
-func laneDeadlineAtRisk(lane *scheduledLane, now time.Time) bool {
-	return lane.registration.Store.atRisk(now, lane.backlogDelay)
+	return now.Sub(progressSince) >= threshold
 }
 
 // hasTimelyAlternative reports whether another eligible generation can carry equivalent work before the first deadline.
@@ -937,7 +933,7 @@ func hasTimelyAlternative(lanes map[protocol.LaneID]*scheduledLane, current *sch
 	return false
 }
 
-// announceAbandonment asks the peer to close the same generation over another healthy lane.
+// announceAbandonment asks the peer to close the same generation over another connected lane.
 func (s *Scheduler) announceAbandonment(lanes map[protocol.LaneID]*scheduledLane, abandoned *scheduledLane) {
 	frame, err := protocol.MarshalLaneAbandon(protocol.LaneGeneration{
 		LaneID: abandoned.registration.LaneID, Generation: abandoned.registration.Generation,
@@ -948,7 +944,7 @@ func (s *Scheduler) announceAbandonment(lanes map[protocol.LaneID]*scheduledLane
 	s.routeControl(lanes, frame, abandoned.registration.LaneID, nil)
 }
 
-// routeControl queues one fixed control frame on the best healthy lane outside exclude.
+// routeControl queues one fixed control frame on the best connected lane outside exclude.
 func (s *Scheduler) routeControl(lanes map[protocol.LaneID]*scheduledLane, frame protocol.Frame,
 	exclude protocol.LaneID, onSent func()) bool {
 	for _, candidate := range s.orderedControlLanes(lanes) {

@@ -40,10 +40,11 @@ type retainedTransmission struct {
 
 // deadlineAssessment summarizes retained deadline state in carrier order.
 type deadlineAssessment struct {
-	deadline   time.Time
-	frameBytes uint64
-	retained   bool
-	atRisk     bool
+	deadline        time.Time
+	unreportedSince time.Time
+	frameBytes      uint64
+	retained        bool
+	atRisk          bool
 }
 
 // release returns a drained transmission's packet and aggregate retention ownership.
@@ -211,6 +212,7 @@ type TransmissionStore struct {
 	control         transmissionDeque
 	normal          transmissionDeque
 	sent            transmissionDeque
+	unreportedSince time.Time
 	packets         int
 	bytes           int
 	budget          *retention.Budget
@@ -341,6 +343,9 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 			break
 		}
 		transmission = source.pop()
+		if s.sent.len() == 0 {
+			s.unreportedSince = now
+		}
 		s.sent.push(transmission)
 		s.sentPackets++
 		s.sentBytes += uint64(transmission.size)
@@ -412,6 +417,9 @@ func (s *TransmissionStore) acknowledge(packets, bytes uint64) (uint64, bool, er
 		s.sent.items[index].releasePacket()
 	}
 	s.sent.discardPrefix(releasedPackets)
+	if s.sent.len() == 0 {
+		s.unreportedSince = time.Time{}
+	}
 	s.reportedPackets = packets
 	s.reportedBytes = bytes
 	s.releaseBacklogLocked(releasedPackets, int(releasedBytes))
@@ -470,7 +478,7 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 		return deadlineAssessment{}
 	}
 	s.removeExpiredQueuedLocked(now)
-	assessment := deadlineAssessment{}
+	assessment := deadlineAssessment{unreportedSince: s.unreportedSince}
 	prefixBytes := uint64(0)
 	visit := func(transmission retainedTransmission) bool {
 		if !assessment.retained || transmission.deadline.Before(assessment.deadline) {
@@ -512,6 +520,7 @@ func (s *TransmissionStore) drain() []retainedTransmission {
 	retained = s.control.appendTo(retained)
 	retained = s.normal.appendTo(retained)
 	s.sent.clear()
+	s.unreportedSince = time.Time{}
 	s.control.clear()
 	s.normal.clear()
 	s.packets = 0

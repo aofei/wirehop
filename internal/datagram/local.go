@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -22,15 +23,19 @@ type Local struct {
 	writeMessages [MaximumBatchSize]udpMessage
 	mu            sync.RWMutex
 	peer          netip.AddrPort
+	notice        udpNotice
 }
 
 // ListenLocal binds a local WireGuard UDP listener.
-func ListenLocal(address netip.AddrPort) (*Local, error) {
+func ListenLocal(address netip.AddrPort, logger *slog.Logger) (*Local, error) {
 	conn, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(address))
 	if err != nil {
 		return nil, fmt.Errorf("bind local UDP listener: %w", err)
 	}
-	return NewLocal(conn), nil
+	local := NewLocal(conn)
+	local.notice.logger = logger
+	configureReceiveBuffer(conn, &local.notice)
+	return local, nil
 }
 
 // NewLocal wraps an already bound local WireGuard UDP listener.
@@ -77,6 +82,7 @@ func (e *Local) ReadBatch(ctx context.Context, packets []Packet) (int, error) {
 		}
 	}
 	if isSoftNetworkError(drainErr) {
+		e.notice.report("read local", drainErr)
 		drainErr = nil
 	}
 	e.rememberPeer(latestPeer)
@@ -98,6 +104,7 @@ func (e *Local) readOne(ctx context.Context) (Packet, netip.AddrPort, error) {
 				return Packet{}, netip.AddrPort{}, ctx.Err()
 			}
 			if isSoftNetworkError(err) {
+				e.notice.report("read local", err)
 				continue
 			}
 			return Packet{}, netip.AddrPort{}, fmt.Errorf("read local UDP datagram: %w", err)
@@ -156,6 +163,7 @@ func (e *Local) WriteBatch(ctx context.Context, payloads [][]byte, deadline time
 				length, err := e.conn.WriteToUDPAddrPort(payload, peer)
 				if err != nil {
 					if isSoftNetworkError(err) {
+						e.notice.report("write local", err)
 						return written + index, fmt.Errorf("%w: write local UDP datagram: %w", ErrDatagramDropped, err)
 					}
 					return written + index, fmt.Errorf("write local UDP datagram: %w", err)
@@ -176,6 +184,7 @@ func (e *Local) WriteBatch(ctx context.Context, payloads [][]byte, deadline time
 		written += countWritten
 		if err != nil {
 			if isSoftNetworkError(err) {
+				e.notice.report("write local", err)
 				return written, fmt.Errorf("%w: write local UDP datagram batch: %w", ErrDatagramDropped, err)
 			}
 			return written, fmt.Errorf("write local UDP datagram batch: %w", err)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/aofei/wirehop/internal/protocol"
 	targetpkg "github.com/aofei/wirehop/internal/target"
+	"github.com/aofei/wirehop/internal/wgpacket"
 )
 
 func TestLocal(t *testing.T) {
@@ -273,14 +274,14 @@ func TestRemoteRoutesWireGuardIndexesAcrossCandidates(t *testing.T) {
 	readUDP(t, second, len(transport))
 	assertNoUDP(t, first)
 
-	writeUDP(t, first, firstSource, indexedWireGuardPacket(1, 148, 31, 0))
+	writeUDP(t, second, secondSource, indexedWireGuardPacket(1, 148, 31, 0))
 	readAndRelease(t, remote)
 	response := indexedWireGuardPacket(2, 92, 41, 31)
 	if err := remote.Write(context.Background(), response, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	readUDP(t, first, len(response))
-	assertNoUDP(t, second)
+	readUDP(t, second, len(response))
+	assertNoUDP(t, first)
 }
 
 func TestRemoteRoutesResponderTransportAcrossCandidates(t *testing.T) {
@@ -490,9 +491,18 @@ func TestRemoteMovesTransportAfterCandidateFailover(t *testing.T) {
 	if err := remote.Write(context.Background(), secondInitiation, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
+	readUDP(t, first, len(secondInitiation))
+	assertNoUDP(t, second)
+	remote.mu.Lock()
+	remote.handshakeStarted = time.Now().Add(-targetHandshakeRetryInterval)
+	remote.mu.Unlock()
+	secondInitiation = indexedWireGuardPacket(1, 148, 13, 0)
+	if err := remote.Write(context.Background(), secondInitiation, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
 	secondSource := readUDPFrom(t, second, len(secondInitiation))
 	assertNoUDP(t, first)
-	writeUDP(t, second, secondSource, indexedWireGuardPacket(2, 92, 22, 12))
+	writeUDP(t, second, secondSource, indexedWireGuardPacket(2, 92, 22, 13))
 	readAndRelease(t, remote)
 	secondTransport := indexedWireGuardPacket(4, 32, 0, 22)
 	if err := remote.Write(context.Background(), secondTransport, time.Time{}); err != nil {
@@ -505,6 +515,11 @@ func TestRemoteMovesTransportAfterCandidateFailover(t *testing.T) {
 	}
 	readUDP(t, first, len(firstTransport))
 	assertNoUDP(t, second)
+	if err := remote.Write(context.Background(), indexedWireGuardPacket(1, 148, 14, 0), time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	readUDP(t, second, 148)
+	assertNoUDP(t, first)
 
 	writeUDP(t, first, firstSource, indexedWireGuardPacket(4, 32, 0, 31))
 	readAndRelease(t, remote)
@@ -543,6 +558,69 @@ func TestRemoteAcceptsResponseFromRecentlyReplacedCandidate(t *testing.T) {
 	}
 	readUDP(t, second, len(transport))
 	assertNoUDP(t, first)
+}
+
+func TestRemoteDestinationsPreservesConfirmedTarget(t *testing.T) {
+	first := netip.MustParseAddrPort("192.0.2.1:51820")
+	second := netip.MustParseAddrPort("192.0.2.2:51820")
+	remote := &Remote{
+		current: first, candidates: []netip.AddrPort{first, second}, retained: make(map[netip.AddrPort]int),
+		handshakeRoutes: make(map[uint32]targetRoute), transportRoutes: make(map[uint32]targetRoute),
+	}
+	now := time.Now()
+	remote.observeSource(first, wgpacket.Header{Kind: wgpacket.HandshakeResponse, SenderIndex: 11}, now)
+	remote.destinations(wgpacket.Header{Kind: wgpacket.TransportData, ReceiverIndex: 11}, nil, now)
+	initiation := wgpacket.Header{Kind: wgpacket.HandshakeInitiation, SenderIndex: 21}
+	for _, elapsed := range []time.Duration{time.Second, 2 * time.Second} {
+		got := remote.destinations(initiation, nil, now.Add(elapsed))
+		if len(got) != 1 || got[0] != first {
+			t.Fatalf("routine rekey destinations = %v, want only %s", got, first)
+		}
+	}
+	remote.destinations(wgpacket.Header{Kind: wgpacket.TransportData, ReceiverIndex: 11}, nil, now.Add(3*time.Second))
+	if got := remote.destinations(initiation, nil, now.Add(6*time.Second)); len(got) != 2 {
+		t.Fatalf("unanswered handshake retry destinations = %v, want both candidates", got)
+	}
+	remote.observeSource(second, wgpacket.Header{Kind: wgpacket.HandshakeResponse, SenderIndex: 12}, now.Add(7*time.Second))
+	remote.destinations(wgpacket.Header{Kind: wgpacket.TransportData, ReceiverIndex: 12}, nil, now.Add(7*time.Second))
+	remote.destinations(wgpacket.Header{Kind: wgpacket.TransportData, ReceiverIndex: 11}, nil, now.Add(8*time.Second))
+	remote.observeSource(first, wgpacket.Header{Kind: wgpacket.HandshakeResponse, SenderIndex: 11}, now.Add(9*time.Second))
+	remote.destinations(wgpacket.Header{Kind: wgpacket.TransportData, ReceiverIndex: 11}, nil, now.Add(9*time.Second))
+	if got := remote.destinations(initiation, nil, now.Add(10*time.Second)); len(got) != 1 || got[0] != second {
+		t.Fatalf("rekey after old-key traffic routes to %v, want selected target %s", got, second)
+	}
+	unsolicited := wgpacket.Header{Kind: wgpacket.HandshakeInitiation, SenderIndex: 31}
+	if remote.observeSource(first, unsolicited, now.Add(11*time.Second)) {
+		t.Fatal("an alternate backend's unsolicited rekey displaced a healthy selection")
+	}
+	if !remote.observeSource(first, unsolicited, now.Add(15*time.Second)) {
+		t.Fatal("handshake retry did not permit an alternate backend to recover the peer")
+	}
+}
+
+func TestRemoteDestinationsRoutesCookies(t *testing.T) {
+	for _, kind := range []wgpacket.Kind{wgpacket.HandshakeInitiation, wgpacket.HandshakeResponse} {
+		name := "Initiation"
+		if kind == wgpacket.HandshakeResponse {
+			name = "Response"
+		}
+		t.Run(name, func(t *testing.T) {
+			peer := netip.MustParseAddrPort("192.0.2.1:51820")
+			remote := &Remote{
+				candidates: []netip.AddrPort{peer}, retained: make(map[netip.AddrPort]int),
+				handshakeRoutes: make(map[uint32]targetRoute), transportRoutes: make(map[uint32]targetRoute),
+			}
+			now := time.Now()
+			remote.observeSource(peer, wgpacket.Header{Kind: kind, SenderIndex: 42}, now)
+			got := remote.destinations(wgpacket.Header{Kind: wgpacket.CookieReply, ReceiverIndex: 42}, nil, now)
+			if len(got) != 1 || got[0] != peer {
+				t.Fatalf("cookie reply destinations = %v, want %s", got, peer)
+			}
+			if !remote.currentRouteAt.IsZero() {
+				t.Fatal("an unauthenticated cookie challenge confirmed a target")
+			}
+		})
+	}
 }
 
 func TestRemoteRouteRetention(t *testing.T) {

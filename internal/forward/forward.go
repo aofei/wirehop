@@ -53,7 +53,7 @@ func Start(parent context.Context, config Config) (*Forwarder, error) {
 	if err := parent.Err(); err != nil {
 		return nil, err
 	}
-	local, err := datagram.ListenLocal(config.Listen)
+	local, err := datagram.ListenLocal(config.Listen, config.Logger)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +112,7 @@ func (f *Forwarder) run(parent context.Context, config Config) {
 	err := netsetup.RetryDNS(ctx, config.Logger, func() error {
 		var err error
 		remote, err = datagram.OpenRemote(ctx, config.Target, datagram.RemoteConfig{
-			Resolver: config.Resolver, ListenConfig: config.TargetListenConfig,
+			Resolver: config.Resolver, ListenConfig: config.TargetListenConfig, Logger: config.Logger,
 		})
 		return err
 	})

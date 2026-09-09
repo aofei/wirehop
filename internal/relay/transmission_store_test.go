@@ -72,7 +72,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 	t.Helper()
 	store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
 	transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
-	local, err := datagram.ListenLocal(netip.MustParseAddrPort("127.0.0.1:0"))
+	local, err := datagram.ListenLocal(netip.MustParseAddrPort("127.0.0.1:0"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

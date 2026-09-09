@@ -63,6 +63,28 @@ jobs:
           token: ${{secrets.CODECOV_TOKEN}}
           disable_search: true
           files: coverage.out
+  kernel-tcp:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+      - name: Build kernel test tools
+        run: docker build -t wirehop-integration test/integration
+      - name: Test kernel WireGuard TCP stability
+        run: |
+          go build -o "$RUNNER_TEMP/wirehop" ./cmd/wirehop
+          sh test/integration/run.sh "$RUNNER_TEMP/wirehop" "$RUNNER_TEMP/tcp-results" \
+            native forward tcp-latency tcp-stall wss
+      - name: Preserve kernel TCP results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-tcp-results
+          path: ${{ runner.temp }}/tcp-results
   test-go-build:
     needs:
       - quality

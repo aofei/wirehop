@@ -159,7 +159,7 @@ func Start(parent context.Context, config Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	local, err := datagram.ListenLocal(config.Listen)
+	local, err := datagram.ListenLocal(config.Listen, config.Logger)
 	if err != nil {
 		return nil, err
 	}
@@ -699,6 +699,17 @@ func (c *Client) superviseLane(ctx context.Context, configured clientLane, sessi
 	generation := uint64(1)
 	retryAttempt := 0
 	attached := initial != nil
+	logger := c.config.Logger
+	if logger != nil {
+		logger = logger.With("lane_id", configured.laneID, "url", configured.spec.URL())
+	}
+	notice := netsetup.NewRetryNotice(logger, "relay lane")
+	reportFailure := func(err error) {
+		if notice == nil {
+			notice = netsetup.NewRetryNotice(logger, "relay lane")
+		}
+		notice.Failed(laneFailureAttributes(err)...)
+	}
 	for {
 		accepted := initial
 		initial = nil
@@ -716,6 +727,7 @@ func (c *Client) superviseLane(ctx context.Context, configured clientLane, sessi
 				if classifyLaneFailure(err) != failureRetry {
 					return err
 				}
+				reportFailure(err)
 				if err := advanceGeneration(&generation); err != nil {
 					return err
 				}
@@ -730,13 +742,27 @@ func (c *Client) superviseLane(ctx context.Context, configured clientLane, sessi
 		}
 		receiver.UpdateClock(accepted.mapping.Inverse())
 		started := time.Now()
-		err := c.runLaneGeneration(ctx, configured, generation, *accepted, receiver, scheduler)
+		result := make(chan error, 1)
+		go func() { result <- c.runLaneGeneration(ctx, configured, generation, *accepted, receiver, scheduler) }()
+		stable := time.NewTimer(reconnectStabilityInterval)
+		var err error
+		select {
+		case err = <-result:
+		case <-stable.C:
+			if notice != nil {
+				notice.Recovered()
+				notice = nil
+			}
+			err = <-result
+		}
+		stable.Stop()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if classifyLaneFailure(err) != failureRetry {
 			return err
 		}
+		reportFailure(err)
 		retryAttempt = reconnectAttemptAfterUptime(retryAttempt, time.Since(started))
 		if err := advanceGeneration(&generation); err != nil {
 			return err

@@ -188,7 +188,7 @@ func TestStart(t *testing.T) {
 		}
 		defer instance.Close()
 		<-started
-		duplicate, err := datagram.ListenLocal(instance.LocalAddr())
+		duplicate, err := datagram.ListenLocal(instance.LocalAddr(), nil)
 		if err == nil {
 			duplicate.Close()
 			t.Fatal("local port was not reserved during target preparation")

@@ -53,9 +53,9 @@ const (
 	// defaultReconnectGrace retains detached server sessions.
 	defaultReconnectGrace = 30 * time.Second
 	// defaultControlDeadline bounds WireGuard handshake and cookie packets.
-	defaultControlDeadline = 2 * time.Second
-	// defaultTransportDeadline bounds WireGuard transport packets.
-	defaultTransportDeadline = time.Second
+	defaultControlDeadline = 5 * time.Second
+	// defaultTransportDeadline permits ordinary TCP loss recovery while bounding retained WireGuard transport packets.
+	defaultTransportDeadline = 5 * time.Second
 	// defaultDeduplicationWindow bounds received packet sequence retention.
 	defaultDeduplicationWindow = 1_048_576
 	// defaultIngressPackets bounds one session ingress queue by packet count.

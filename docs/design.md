@@ -146,8 +146,8 @@ stateDiagram-v2
   Connecting --> Active: generation admitted
   Connecting --> Reconnecting: retryable setup failure
   Reconnecting --> Active: generation admitted
-  Active --> Degraded: deadline risk
-  Degraded --> Active: risk clears
+  Active --> Degraded: deadline risk and progress stall
+  Degraded --> Active: progress resumes or risk clears
   Active --> Abandoning
   Degraded --> Abandoning
   Active --> Reconnecting: retryable generation failure
@@ -641,8 +641,9 @@ parsed carrier progress.
 Each lane direction has one bounded transmission store for queued and sent-but-unreported data. Retention preserves the
 packet metadata and payload needed for possible migration. A queued entry that expires before entering carrier order is
 reclaimed when it reaches the write-order head, under capacity pressure, or by the periodic deadline-risk scan. A sent
-entry cannot be removed from the middle of an ordered TCP stream. Its expiry instead causes generation abandonment,
-after which the complete retained state is drained.
+entry cannot be removed from the middle of an ordered TCP stream. Its deadline does not prove that the carrier has
+failed: the peer may already have delivered it while a parsing report is returning. It remains bounded by the store's
+packet and byte limits until parsing is reported or the generation closes.
 
 Before exposing any bytes to a potentially partial carrier write, the writer moves the complete batch into the sent
 prefix. The active write holds an independent packet-buffer reference until encoding and carrier I/O finish, so draining
@@ -700,8 +701,8 @@ The command uses these time and traffic limits:
 | Initial DNS backoff for server listeners and forward targets | 1 s initial ceiling, 5 s maximum ceiling, full jitter |
 | Preparation failure reporting | 30-second quiet window, then at most one warning per minute on failed attempts |
 | Detached-session reconnect grace | 30 seconds |
-| WireGuard handshake and cookie packet lifetime | 2 seconds |
-| WireGuard transport packet lifetime | 1 second |
+| WireGuard handshake and cookie packet lifetime | 5 seconds |
+| WireGuard transport packet lifetime | 5 seconds |
 | UDP delivery operation | 1 second |
 | Delivery-report trigger | 256 data packets, 256 KiB, or 25 milliseconds |
 | Deadline-risk abandonment check | 25 milliseconds |
@@ -731,11 +732,16 @@ successful connection, listener, or retained target endpoint.
 TCP cannot remove one stale application frame after its bytes have entered the stream. When a lost TCP segment blocks
 the stream, the only way to discard all bytes trapped behind that loss is to close the carrier connection.
 
-WireHop marks a lane `degraded` and stops assigning new packets when any retained frame is predicted to complete at or
-after its own deadline. It recomputes that risk after cumulative delivery progress or queued expiry changes retained
-backlog. The lane resumes scheduling whenever no remaining work is at risk. Risk prediction follows the sent FIFO,
-queued WireGuard control packets, and queued WireGuard transport packets in transmission-store order. It counts only
-bytes at or before each retained frame. Bytes ordered after a frame cannot make that earlier frame appear late.
+WireHop marks a lane `degraded` and stops assigning new packets only when retained work is at deadline risk and
+cumulative parsing progress has stalled for at least the greater of 250 milliseconds or two estimated round trips plus
+two delivery report intervals. Sent-but-unreported packets may already be at their destination, so their age alone must
+not suppress fresh traffic with later deadlines. A valid advancing report immediately restores scheduling. Risk is
+recomputed during periodic scans and queued expiry. Prediction follows the sent FIFO, queued WireGuard control packets,
+and queued WireGuard transport packets in transmission-store order. Bytes ordered after a frame cannot make that earlier
+frame appear late.
+
+The progress guard starts no earlier than the first outstanding carrier write. Fully reporting that sent prefix resets
+the outstanding interval. Time spent idle or holding only queued work cannot make the next fresh burst appear stalled.
 
 WireHop abandons the connection when waiting for recovery is no longer predicted to deliver its earliest-deadline
 unconfirmed work usefully. An eligible alternative lane permits earlier abandonment only after cumulative delivery
@@ -744,13 +750,14 @@ report intervals. Requiring both deadline risk and a progress stall prevents ord
 healthy carrier generations. The alternative must still be predicted to carry a frame of the same encoded size as the
 earliest-deadline retained frame before that deadline. This permits future traffic and eligible migrations to continue
 immediately, but does not make an otherwise unduplicated control frame migratable. Without such an alternative or
-confirmed progress stall, WireHop keeps the generation until a sent-but-unreported frame reaches its hard deadline.
-Queued frames expire in place and do not by themselves force generation abandonment.
+confirmed progress stall, WireHop keeps the generation subject to its independent ping and carrier write budgets.
+Neither queued expiry nor sent-but-unreported expiry alone forces generation abandonment. Packet lifetimes allow
+ordinary TCP retransmission and remain independent of carrier failure detection.
 
 The abandonment sequence is:
 
 1. Stop assigning new packets to the affected lane generation
-2. Attempt to queue a lane-abandon control frame on another healthy lane, preferring the earliest predicted delivery
+2. Attempt to queue a lane-abandon control frame on another connected lane, preferring the earliest predicted delivery
 3. Close the affected carrier connection without waiting for its outstanding bytes to drain
 4. Drain queued and sent-but-unreported state from the abandoned generation
 5. Requeue retained transport packets only when they are unexpired, have not migrated before, and can still meet their
@@ -851,9 +858,9 @@ lookup or backoff, closes the local socket, and waits for forwarding workers to 
 Each target endpoint owns at most one unconnected IPv4 UDP socket and one unconnected IPv6 UDP socket. Candidates in the
 same family share the endpoint's source socket and port. Replies are accepted only from the current DNS candidates, the
 current transport candidate, candidates retained by unexpired WireGuard index affinity, or recently replaced candidates
-completing an in-flight handshake. A replaced candidate remains eligible to reply for 15 seconds but no longer receives
-new handshake fan-out. Multiple WireHop sessions and forwarder processes may use the same logical target without sharing
-target sockets or routing state.
+completing an in-flight handshake. The recent-candidate grace is 15 seconds. Removed addresses are excluded from
+discovery fan-out, while a confirmed target still receives pinned rekeys. Multiple WireHop sessions and forwarder
+processes may use the same logical target without sharing target sockets or routing state.
 
 The standard resolver does not expose DNS TTL values. WireHop therefore refreshes a DNS target when a WireGuard
 handshake initiation or a concrete UDP network error arrives, with at most one lookup every five seconds and one lookup
@@ -867,9 +874,10 @@ or deduplication state, reconnect carrier lanes, or restart a direct forwarder.
 Each successful DNS answer is authoritative for subsequent handshake fan-out. WireHop does not accumulate a union of
 rotating answers because doing so would retain addresses deliberately removed from DNS. Answer reordering or a changed
 subset does not move established transport traffic. Existing public-index affinity remains attached to its recorded
-source candidate, while a later WireGuard handshake may select any candidate in the latest answer. A direct forwarder
-uses one unconnected UDP socket per address family rather than one connection per candidate, so this selection does not
-incur an upstream connection teardown.
+source candidate. Routine rekeys first use the confirmed target, including when DNS has removed it. An unanswered
+handshake permits discovery from the latest answer on retry after five seconds. A direct forwarder uses one unconnected
+UDP socket per address family rather than one connection per candidate, so this selection does not incur an upstream
+connection teardown.
 
 ## WireGuard candidate affinity
 
@@ -880,9 +888,13 @@ minutes, matching WireGuard's maximum key lifetime, and each map retains at most
 
 Routing follows these rules:
 
-- A local Handshake Initiation is sent to every current DNS candidate
-- A remote Handshake Initiation records its sender index and source candidate
-- A local Handshake Response or Cookie Reply uses its receiver index to return to the recorded initiator candidate
+- Initial local Handshake Initiations discover the current DNS candidates until the local WireGuard peer confirms one
+- Subsequent local Handshake Initiations use the confirmed candidate first, including during routine rekeying
+- An unanswered handshake allows fan-out to the latest DNS candidates on a retry after five seconds
+- A remote Handshake Initiation records its sender index and source candidate, but an unsolicited initiation from an
+  alternate candidate is ignored while the confirmed target has not entered handshake failover
+- A local Handshake Response uses its receiver index to return to the recorded initiator candidate
+- A local Cookie Reply uses its receiver index to return to either the recorded initiator or responder candidate
 - A remote Handshake Response records its sender index and source candidate, and every candidate response is forwarded
   to the local WireGuard implementation
 - A local Transport Data packet uses its receiver index to select the candidate whose initiation or response established
@@ -893,8 +905,10 @@ The local WireGuard implementation emits Transport Data only after authenticatin
 When the client or forward UDP listener is restricted to that implementation or another trusted boundary, its receiver
 index provides WireHop with an indirect selection signal grounded in WireGuard authentication without exposing any key
 material. Multiple candidates may answer one initiation, but the first candidate whose response the local peer accepts
-gains transport affinity. An address that remains in DNS but stops responding is bypassed by the next successful
-handshake with another candidate.
+gains transport affinity. Each index can confirm a selection only once, and an older route cannot replace a newer
+confirmed selection. Old-key transport, delayed duplicate responses, and cookies do not move the preferred target or
+cancel a pending handshake retry. An unanswered handshake can still select a reachable alternative after the retry
+interval, whether or not the previous target remains in DNS.
 
 Successful UDP writes do not prove target reachability. A silent failure can leave transport traffic on the previous
 candidate until the local WireGuard implementation initiates another handshake. Recovery therefore depends on WireGuard
@@ -1486,9 +1500,10 @@ The counters describe the exact prefix parsed from that generation's ordered car
 exceed the number exposed to that generation's carrier writer, and their cumulative byte count must equal the packet
 count times that generation's fixed encoded Probe frame size.
 
-A report may travel over any healthy lane in the session. Its counters describe carrier parsing progress and do not
-promise that the WireGuard target accepted or authenticated the payload. Exhausting a cumulative counter ends the owning
-connection generation instead of reusing a lower value.
+A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
+risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Its counters
+describe carrier parsing progress and do not promise that the WireGuard target accepted or authenticated the payload.
+Exhausting a cumulative counter ends the owning connection generation instead of reusing a lower value.
 
 The single carrier writer gives internally generated control frames priority in bursts of at most eight writes. When
 WireGuard data is ready after such a burst, the writer sends one data batch before accepting another control burst. This
@@ -1697,8 +1712,10 @@ target preparation.
 
 The client writes one timestamped structured warning when a permanently failed lane is disabled while another supervisor
 keeps the client running. The warning identifies the lane occurrence, canonical URL, optional fixed resolution, and
-either the local error or stable remote code, class, and scope. Retryable failures of individual lane supervisors are
-silent.
+either the local error or stable remote code, class, and scope. Individual lane supervisors also report prolonged
+retryable instability, using a 30-second quiet window and at most one warning per minute. Briefly successful reconnects
+do not reset that window. Thirty seconds of sustained service produces one recovery message if a warning was emitted and
+resets the window for a subsequent outage. Local abandonment retains its specific error cause.
 
 Client session creation and forward target preparation remain quiet for their first 30 seconds. Failed attempts after
 that window emit at most one warning per minute. Recovery produces one informational message only if that preparation
@@ -1716,8 +1733,10 @@ peer-controlled diagnostic text. Client and server logs never include peer-contr
 secrets, or packet payloads.
 
 A terminal forwarder endpoint failure is returned to the command layer and printed once. Structurally invalid packets,
-reserved mismatches, unavailable local peers, and per-datagram network errors that leave the UDP socket reusable are
-silent drops.
+reserved mismatches, and unavailable local peers remain silent drops. Reusable UDP socket errors produce an immediate
+warning and at most one further warning per minute per endpoint, including a count of suppressed errors. Message-size
+errors suggest checking WireGuard and UDP path MTU. These warnings include the operation and a local socket error
+category, without packet contents, peer addresses, or wrapped diagnostic text.
 
 WireHop exposes no network metrics endpoint or stable telemetry schema. Any telemetry interface must exclude tokens,
 session secrets, packet payloads, and identifying target metadata by default.

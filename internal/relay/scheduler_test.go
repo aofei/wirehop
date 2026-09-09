@@ -994,56 +994,139 @@ func TestSchedulerRunReleasesAggregateBudget(t *testing.T) {
 	}
 }
 
-func TestSchedulerAbandonsExpiredSentPrefix(t *testing.T) {
-	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024})
-	if err != nil {
-		t.Fatal(err)
-	}
-	scheduler, err := NewScheduler(ingress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	abandoned := make(chan struct{}, 1)
-	announced := make(chan protocol.LaneGeneration, 1)
-	source := schedulerLane(t, 1, 1, 1, 1_000_000)
-	source.registration.Generation = 2
-	source.registration.Abandon = func() { abandoned <- struct{}{} }
-	alternate := schedulerLane(t, 2, 2, 1, 1_000_000)
-	alternate.registration.SendControl = func(frame protocol.Frame, sent func()) bool {
-		generation, err := protocol.ParseLaneAbandon(frame)
-		if err == nil {
-			announced <- generation
+func TestSchedulerRetainsExpiredSentPrefixUntilReport(t *testing.T) {
+	for _, alternate := range []bool{false, true} {
+		name := "SoleLane"
+		if alternate {
+			name = "WithAlternative"
 		}
-		if sent != nil {
-			sent()
-		}
-		return true
+		t.Run(name, func(t *testing.T) {
+			scheduler := new(Scheduler)
+			now := time.Now()
+			source := schedulerLane(t, 1, 1, 1_200_000, 1_000_000)
+			source.lastProgressAt = now
+			source.registration.Abandon = func() { t.Fatal("packet expiry abandoned a connected lane") }
+			store := source.registration.Store
+			t.Cleanup(func() { releaseTransmissions(store.drain()) })
+			if err := store.push(schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))); err != nil {
+				t.Fatal(err)
+			}
+			packet := takeOneTransmission(t, store)
+			lanes := map[protocol.LaneID]*scheduledLane{source.registration.LaneID: source}
+			if alternate {
+				other := schedulerLane(t, 2, 2, 1, 1_000_000)
+				lanes[other.registration.LaneID] = other
+			}
+			scheduler.checkAbandonment(lanes, now.Add(1100*time.Millisecond))
+			if source.abandoning || source.degraded {
+				t.Fatalf("expired lane: abandoning=%t degraded=%t", source.abandoning, source.degraded)
+			}
+			size, err := protocol.DataFrameSize(packet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := source.applyReport(protocol.DeliveryReport{
+				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1, DataBytes: uint64(size),
+			}, 1_200_000, now.Add(1200*time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			if source.degraded || source.abandoning {
+				t.Fatal("delayed parsing report did not restore the same lane")
+			}
+			if packets, bytes := store.backlog(); packets != 0 || bytes != 0 {
+				t.Fatalf("reported backlog = %d packets, %d bytes", packets, bytes)
+			}
+		})
 	}
-	deadline := time.Now().Add(10 * time.Millisecond)
-	if err := source.registration.Store.push(schedulerTransmission(
-		1, wgpacket.TransportData, deadline,
-	)); err != nil {
-		t.Fatal(err)
-	}
-	takeOneTransmission(t, source.registration.Store)
-	lanes := map[protocol.LaneID]*scheduledLane{
-		source.registration.LaneID:    source,
-		alternate.registration.LaneID: alternate,
-	}
-	scheduler.checkAbandonment(lanes, deadline.Add(time.Microsecond))
+}
 
-	select {
-	case <-abandoned:
-	default:
-		t.Fatal("expired sent prefix did not abandon its lane")
-	}
-	select {
-	case got := <-announced:
-		if got.LaneID != source.registration.LaneID || got.Generation != 2 {
-			t.Fatalf("announced generation = %+v", got)
+func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
+	for _, allDegraded := range []bool{false, true} {
+		name := "SoleDegradedLane"
+		if allDegraded {
+			name = "AllDegradedLanes"
 		}
-	default:
-		t.Fatal("abandonment was not announced over another lane")
+		t.Run(name, func(t *testing.T) {
+			scheduler := new(Scheduler)
+			source := schedulerLane(t, 1, 1, 100_000, 1_000_000)
+			now := time.Now()
+			source.lastProgressAt = now.Add(-3 * time.Second)
+			if err := source.registration.Store.push(schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))); err != nil {
+				t.Fatal(err)
+			}
+			takeOneTransmission(t, source.registration.Store)
+			t.Cleanup(func() { releaseTransmissions(source.registration.Store.drain()) })
+			lanes := map[protocol.LaneID]*scheduledLane{source.registration.LaneID: source}
+			scheduler.checkAbandonment(lanes, now.Add(960*time.Millisecond))
+			if !source.degraded || source.abandoning {
+				t.Fatal("expected an unexpired degraded lane")
+			}
+			sent := 0
+			write := func(_ protocol.Frame, done func()) bool {
+				sent++
+				if done != nil {
+					done()
+				}
+				return true
+			}
+			source.registration.SendControl = write
+			if allDegraded {
+				other := schedulerLane(t, 2, 2, 100_000, 1_000_000)
+				other.degraded = true
+				other.registration.SendControl = write
+				lanes[other.registration.LaneID] = other
+			}
+			completed := 0
+			scheduler.routeReport(lanes, protocol.DeliveryReport{
+				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1, DataBytes: 53,
+			}, func(ok bool) {
+				if ok {
+					completed++
+				}
+			})
+			if sent != len(lanes) || completed != 1 {
+				t.Fatalf("report writes=%d completions=%d, want %d and 1", sent, completed, len(lanes))
+			}
+		})
+	}
+}
+
+func TestSchedulerDoesNotCountIdleTimeAsProgressStall(t *testing.T) {
+	now := time.Now()
+	source := schedulerLane(t, 1, 1, 100_000, 112)
+	store := source.registration.Store
+	store.now = func() time.Time { return now }
+	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	source.lastProgressAt = now.Add(-time.Minute)
+	source.registration.Abandon = func() { t.Fatal("an idle interval caused a fresh burst to be abandoned") }
+	alternate := schedulerLane(t, 2, 2, 10_000, 1_000_000)
+	lanes := map[protocol.LaneID]*scheduledLane{
+		source.registration.LaneID: source, alternate.registration.LaneID: alternate,
+	}
+	var scheduler Scheduler
+	var bytes uint64
+	for burst := range 2 {
+		for index := range 2 {
+			transmission := schedulerTransmission(uint64(burst*2+index+1), wgpacket.TransportData, now.Add(time.Second))
+			if source.score(uint64(transmission.size)) >= 1_000_000 {
+				t.Fatal("test burst was not initially eligible for this lane")
+			}
+			if err := store.push(transmission); err != nil {
+				t.Fatal(err)
+			}
+			takeOneTransmission(t, store)
+			bytes += uint64(transmission.size)
+		}
+		scheduler.checkAbandonment(lanes, now.Add(25*time.Millisecond))
+		if source.degraded {
+			t.Fatal("fresh burst was degraded before one report could return")
+		}
+		if err := source.applyReport(protocol.DeliveryReport{
+			LaneID: source.registration.LaneID, Generation: 1, DataPackets: uint64((burst + 1) * 2), DataBytes: bytes,
+		}, uint64(burst+1)*1_000_000, now.Add(100*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
 	}
 }
 
@@ -1068,6 +1151,7 @@ func TestSchedulerRequiresProgressStallForEarlyAbandonment(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			abandonments := 0
 			source := schedulerLane(t, 1, 1, 80_000, 1)
+			source.registration.Store.now = func() time.Time { return now.Add(-minimumProgressStall) }
 			source.lastProgressAt = tt.lastProgressAt
 			source.registration.Abandon = func() { abandonments++ }
 			if err := source.registration.Store.push(schedulerTransmission(
@@ -1084,8 +1168,8 @@ func TestSchedulerRequiresProgressStallForEarlyAbandonment(t *testing.T) {
 			if abandonments != tt.wantAbandonments {
 				t.Fatalf("abandonments = %d, want %d", abandonments, tt.wantAbandonments)
 			}
-			if source.abandoning != (tt.wantAbandonments == 1) {
-				t.Fatalf("abandoning = %t", source.abandoning)
+			if source.abandoning != (tt.wantAbandonments == 1) || source.degraded != (tt.wantAbandonments == 1) {
+				t.Fatalf("abandoning = %t, degraded = %t", source.abandoning, source.degraded)
 			}
 		})
 	}
@@ -1110,7 +1194,7 @@ func TestLaneProgressStalled(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			lane := &scheduledLane{rttMicros: tt.rttMicros, lastProgressAt: tt.lastProgressAt}
-			if got := laneProgressStalled(lane, now); got != tt.want {
+			if got := laneProgressStalled(lane, now, now.Add(-time.Hour)); got != tt.want {
 				t.Fatalf("laneProgressStalled() = %t, want %t", got, tt.want)
 			}
 		})
