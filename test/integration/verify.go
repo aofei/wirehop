@@ -1,4 +1,4 @@
-// Command verify checks completed kernel TCP flows and prints their measured goodput and retransmissions.
+// Command verify checks completed kernel WireGuard flows and prints goodput, retransmissions, or UDP delivery.
 package main
 
 import (
@@ -12,13 +12,19 @@ import (
 
 // flowResult contains the iperf3 fields needed to distinguish completed transfers from nominal test completion.
 type flowResult struct {
-	Error string
-	End   struct {
+	Error     string
+	Intervals []struct {
+		Sum struct {
+			Bytes uint64
+		}
+	}
+	End struct {
 		Received struct {
 			Bytes         uint64
 			BitsPerSecond float64 `json:"bits_per_second"`
 		} `json:"sum_received"`
 		Sent struct {
+			Bytes       uint64
 			Retransmits uint64
 		} `json:"sum_sent"`
 		ReverseReceived struct {
@@ -50,6 +56,16 @@ func main() {
 		if err == nil && strings.HasSuffix(scenario, "-rekey") {
 			err = verifyRekey(directory)
 		}
+		udp := strings.HasSuffix(scenario, "-udp")
+		if err == nil && udp && (flow.End.Sent.Bytes == 0 || flow.End.Received.Bytes < flow.End.Sent.Bytes-flow.End.Sent.Bytes/20) {
+			err = fmt.Errorf("UDP delivery lost more than five percent of the controlled offered load")
+		}
+		if err == nil && (strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole")) {
+			_, err = os.Stat(filepath.Join(directory, "route-recovered.txt"))
+			if err == nil && (len(flow.Intervals) == 0 || flow.Intervals[len(flow.Intervals)-1].Sum.Bytes == 0) {
+				err = fmt.Errorf("TCP flow did not resume after route recovery")
+			}
+		}
 		if err == nil {
 			err = verifyCarrier(directory, scenario)
 		}
@@ -58,8 +74,13 @@ func main() {
 			failed = true
 			continue
 		}
-		fmt.Printf("%s: %.3f Mbit/s, %d TCP retransmissions\n",
-			scenario, flow.End.Received.BitsPerSecond/1e6, flow.End.Sent.Retransmits)
+		if udp {
+			fmt.Printf("%s: %.3f Mbit/s, %d of %d UDP bytes received\n",
+				scenario, flow.End.Received.BitsPerSecond/1e6, flow.End.Received.Bytes, flow.End.Sent.Bytes)
+		} else {
+			fmt.Printf("%s: %.3f Mbit/s, %d TCP retransmissions\n",
+				scenario, flow.End.Received.BitsPerSecond/1e6, flow.End.Sent.Retransmits)
+		}
 	}
 	if failed {
 		os.Exit(1)
@@ -72,31 +93,34 @@ func verifyCarrier(directory, scenario string) error {
 		return nil
 	}
 	expected := 3
-	if scenario == "native" || strings.HasPrefix(scenario, "forward") {
+	if strings.HasPrefix(scenario, "native") || strings.HasPrefix(scenario, "forward") {
 		expected = 2
 	} else if scenario == "tcp-bidir" {
 		expected = 4
 	} else if scenario == "tcp-idle" {
 		expected = 5
 	}
-	data, err := os.ReadFile(filepath.Join(directory, "server-nstat.txt"))
+	if strings.HasSuffix(scenario, "-udp") {
+		expected--
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "client-after.txt"))
 	if err != nil {
 		return err
 	}
 	for line := range strings.Lines(string(data)) {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "TcpPassiveOpens" {
+		if len(fields) >= 2 && fields[0] == "TcpActiveOpens" {
 			opened, err := strconv.Atoi(fields[1])
 			if err != nil {
 				return err
 			}
 			if opened != expected {
-				return fmt.Errorf("accepted %d TCP connections, expected %d including iperf3 control and data", opened, expected)
+				return fmt.Errorf("initiated %d TCP connections, expected %d including iperf3 control and data", opened, expected)
 			}
 			return nil
 		}
 	}
-	return fmt.Errorf("missing TCP passive-open counter")
+	return fmt.Errorf("missing TCP active-open counter")
 }
 
 // verifyRekey requires a fresh kernel handshake after the initial establishment of a long-lived flow.

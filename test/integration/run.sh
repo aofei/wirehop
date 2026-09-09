@@ -8,10 +8,12 @@ fi
 binary=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 mkdir -p "$2"
 results=$(cd "$2" && pwd)
-scripts=$(CDPATH= cd "$(dirname "$0")" && pwd)
+scripts=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 shift 2
 if [ "$#" -eq 0 ]; then
-  set -- native forward tcp tls ws wss tcp-multipath tcp-latency tcp-loss tcp-stall tcp-bidir tcp-idle tcp-rekey forward-rekey
+  set -- native forward tcp tls ws wss tcp-multipath tcp-latency tcp-loss tcp-stall tcp-bidir tcp-idle \
+    tcp-rekey forward-rekey forward-prohibit forward-blackhole tcp-prohibit tcp-blackhole \
+    native-udp forward-udp tcp-udp wss-udp
 fi
 image=${WIREHOP_TEST_IMAGE:-wirehop-integration}
 network=wirehop-tcp-$$
@@ -28,7 +30,8 @@ trap 'exit 143' TERM
 docker network create --internal "$network" > /dev/null
 for scenario in "$@"; do
   case "$scenario" in
-    native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey) ;;
+    native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
+    forward-prohibit|forward-blackhole|tcp-prohibit|tcp-blackhole|native-udp|forward-udp|tcp-udp|wss-udp) ;;
     *) echo "unknown case: $scenario" >&2; exit 2 ;;
   esac
   echo "$scenario"
@@ -37,7 +40,7 @@ for scenario in "$@"; do
     -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$results/$scenario:/results" \
     --entrypoint sh "$image" /test/node.sh server "$scenario" > /dev/null
   ready=false
-  for attempt in $(seq 1 30); do
+  for _attempt in $(seq 1 30); do
     if [ -f "$results/$scenario/ready" ]; then
       ready=true
       break

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/aofei/wirehop/internal/netsetup"
 )
 
 // udpReceiveBufferSize absorbs bounded receive bursts without changing system-wide socket limits.
@@ -33,12 +35,12 @@ func (n *udpNotice) report(operation string, err error) {
 		return
 	}
 	reason := "socket error"
-	var errno syscall.Errno
+	errno, socketError := netsetup.SocketErrno(err)
 	var networkError net.Error
 	switch {
-	case errors.Is(err, syscall.EMSGSIZE):
+	case socketError && errno == syscall.EMSGSIZE:
 		reason = "datagram too large, check WireGuard MTU and UDP path MTU"
-	case errors.As(err, &errno):
+	case socketError:
 		reason = errno.Error()
 	case errors.As(err, &networkError) && networkError.Timeout():
 		reason = "socket deadline exceeded"

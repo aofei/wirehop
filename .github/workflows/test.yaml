@@ -63,7 +63,7 @@ jobs:
           token: ${{secrets.CODECOV_TOKEN}}
           disable_search: true
           files: coverage.out
-  kernel-tcp:
+  kernel-wireguard:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
@@ -74,17 +74,24 @@ jobs:
           go-version: 1.27.x
       - name: Build kernel test tools
         run: docker build -t wirehop-integration test/integration
-      - name: Test kernel WireGuard TCP stability
+      - name: Test UDP socket recovery
         run: |
-          go build -o "$RUNNER_TEMP/wirehop" ./cmd/wirehop
-          sh test/integration/run.sh "$RUNNER_TEMP/wirehop" "$RUNNER_TEMP/tcp-results" \
-            native forward tcp-latency tcp-stall wss
-      - name: Preserve kernel TCP results
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/datagram.test" ./internal/datagram
+          docker run --rm --network none --read-only --cap-add NET_ADMIN \
+            -e WIREHOP_TEST_ROUTES=1 -v "$RUNNER_TEMP/datagram.test:/datagram.test:ro" \
+            wirehop-integration /datagram.test \
+            -test.run 'TestUDPRouteRecovery|TestLinuxUDPBatch.*Interrupted' -test.v
+      - name: Test kernel WireGuard stability
+        run: |
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/wirehop" ./cmd/wirehop
+          sh test/integration/run.sh "$RUNNER_TEMP/wirehop" "$RUNNER_TEMP/kernel-results" \
+            native forward tcp-latency tcp-loss tcp-stall wss forward-prohibit tcp-blackhole tcp-udp
+      - name: Preserve kernel WireGuard results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kernel-tcp-results
-          path: ${{ runner.temp }}/tcp-results
+          name: kernel-wireguard-results
+          path: ${{ runner.temp }}/kernel-results
   test-go-build:
     needs:
       - quality

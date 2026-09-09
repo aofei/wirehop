@@ -479,7 +479,8 @@ func TestDialWebSocketBoundsResponseHeaders(t *testing.T) {
 	}
 	connection, _, _, cancel, err := instance.dialWebSocket(context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout)
 	cancel()
-	if connection != nil || err == nil || !strings.Contains(err.Error(), "response headers exceeded") {
+	requestError, ok := errors.AsType[*neturl.Error](err)
+	if connection != nil || !ok || !strings.Contains(requestError.Err.Error(), "response headers exceeded") {
 		t.Fatalf("dialWebSocket() = %v, %v", connection, err)
 	}
 }

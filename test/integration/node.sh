@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
-umask 077
+# Result files must be readable by the host verifier and artifact uploader.
+umask 022
 
 role=$1
 scenario=$2
@@ -9,16 +10,36 @@ export WIREHOP_TOKEN=isolated-kernel-tcp-test-fixture
 export SSL_CERT_FILE=/results/ca.pem
 ip link add wgtest type wireguard
 if [ "$role" = server ]; then
-  printf '%s\n' 'AD7V1ztVgGww3j+Ke9qzivE1OSIFMwVeY1aQuLh61kE=' > /tmp/private.key
+  case "$scenario" in
+    tcp-prohibit|tcp-blackhole)
+      ip route add local 192.0.2.1/32 dev lo table 100
+      ip rule add pref 100 to 192.0.2.1/32 lookup 100
+      (
+        while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
+        sleep 5
+        ip route replace "${scenario#tcp-}" 192.0.2.1/32 table 100
+        sleep 1
+        ip route replace local 192.0.2.1/32 dev lo table 100
+        date +%s > /results/route-recovered.txt
+      ) &
+      target=192.0.2.1:51820
+      ;;
+    *) target=127.0.0.1:51820 ;;
+  esac
+  private_key='AD7V1ztVgGww3j+Ke9qzivE1OSIFMwVeY1aQuLh61kE='
   peer='+SjU9sG4bBLyViwQsHxVXFxX/QD1npDI2NiHZyccv3w='
   local_ip=10.253.91.2
   remote_ip=10.253.91.1
 else
-  printf '%s\n' 'CH7G4Uu+0hDnIVzcc0aN+iPwgKG/uGZbL9gJvZnSg3k=' > /tmp/private.key
+  private_key='CH7G4Uu+0hDnIVzcc0aN+iPwgKG/uGZbL9gJvZnSg3k='
   peer='xMjphMUyLIGExyJluSslD9tjaIcF9QS6ADyI8DOTzyg='
   local_ip=10.253.91.1
   remote_ip=10.253.91.2
 fi
+(
+  umask 077
+  printf '%s\n' "$private_key" > /tmp/private.key
+)
 wg set wgtest private-key /tmp/private.key listen-port 51820 peer "$peer" allowed-ips "$remote_ip/32"
 ip addr add "$local_ip/32" dev wgtest
 ip link set wgtest mtu 1420 up
@@ -47,7 +68,7 @@ if [ "$role" = server ]; then
     *) set -- --allow-insecure ;;
   esac
   touch /results/ready
-  exec /wirehop server --listen "$scheme://:51822" --allow-target 127.0.0.1:51820 "$@"
+  exec /wirehop server --listen "$scheme://:51822" --allow-target "$target" "$@"
 fi
 
 duration=20
@@ -63,6 +84,10 @@ case "$scheme" in
     wg set wgtest peer "$peer" endpoint 127.0.0.1:51821
     ;;
   *)
+    case "$scenario" in
+      tcp-prohibit|tcp-blackhole) target=192.0.2.1:51820 ;;
+      *) target=127.0.0.1:51820 ;;
+    esac
     case "$scheme" in
       tls|wss) set -- --tls-server-name wirehop.test ;;
       *) set -- --allow-insecure ;;
@@ -70,7 +95,7 @@ case "$scheme" in
     if [ "$scenario" = tcp-multipath ]; then
       set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51822"
     fi
-    /wirehop client --listen 127.0.0.1:51821 --target 127.0.0.1:51820 \
+    /wirehop client --listen 127.0.0.1:51821 --target "$target" \
       --lane "$scheme://$WIREHOP_TEST_SERVER:51822" "$@" > /results/client.log 2>&1 &
     wg set wgtest peer "$peer" endpoint 127.0.0.1:51821
     ;;
@@ -88,10 +113,26 @@ if [ "$scenario" = tcp-stall ]; then
     tc qdisc del dev eth0 root
   ) &
 fi
+case "$scenario" in
+  forward-prohibit|forward-blackhole)
+    (
+      sleep 5
+      ip route add "${scenario#forward-}" "$WIREHOP_TEST_SERVER/32" table 100
+      ip rule add pref 100 to "$WIREHOP_TEST_SERVER/32" lookup 100
+      sleep 1
+      ip rule del pref 100 to "$WIREHOP_TEST_SERVER/32" lookup 100
+      ip route flush table 100
+      date +%s > /results/route-recovered.txt
+    ) &
+    ;;
+esac
 set --
 if [ "$scenario" = tcp-bidir ]; then
   set -- --bidir
 fi
+case "$scenario" in
+  *-udp) set -- -u -b 20M -l 1200 ;;
+esac
 date +%s > /results/flow-start.txt
 nstat -az > /results/client-before.txt
 ss -u -a -m > /results/client-sockets.txt

@@ -6,11 +6,13 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/aofei/wirehop/internal/netsetup"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
@@ -220,10 +222,16 @@ func newPacketBufferPools() [pooledPacketClassCount]*sync.Pool {
 
 // isSoftNetworkError reports per-datagram failures that do not invalidate a reusable UDP socket.
 func isSoftNetworkError(err error) bool {
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
-		errors.Is(err, syscall.EMSGSIZE) || errors.Is(err, syscall.ENOBUFS) {
-		return true
+	if errno, ok := netsetup.SocketErrno(err); ok {
+		switch errno {
+		case syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+			syscall.EMSGSIZE, syscall.ENOBUFS, syscall.ENOMEM, syscall.EACCES, syscall.EPERM, syscall.ENETDOWN,
+			syscall.EHOSTDOWN, syscall.ETIMEDOUT:
+			return true
+		case syscall.EINVAL:
+			// Linux blackhole routes return EINVAL even for a valid datagram on a reusable socket.
+			return runtime.GOOS == "linux"
+		}
 	}
 	networkError, ok := errors.AsType[net.Error](err)
 	return ok && networkError.Timeout()

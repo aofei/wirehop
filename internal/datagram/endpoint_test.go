@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -870,14 +871,25 @@ func TestSoftNetworkError(t *testing.T) {
 		syscall.ENETUNREACH,
 		syscall.EMSGSIZE,
 		syscall.ENOBUFS,
+		syscall.ENOMEM,
+		syscall.EACCES,
+		syscall.EPERM,
+		syscall.ENETDOWN,
+		syscall.EHOSTDOWN,
+		syscall.ETIMEDOUT,
 		&net.DNSError{IsTimeout: true},
 	} {
 		if !isSoftNetworkError(err) {
 			t.Fatalf("isSoftNetworkError(%v) = false", err)
 		}
 	}
-	if isSoftNetworkError(syscall.EACCES) {
-		t.Fatal("isSoftNetworkError(EACCES) = true")
+	if isSoftNetworkError(syscall.EINVAL) != (runtime.GOOS == "linux") {
+		t.Fatal("isSoftNetworkError(EINVAL) did not account for Linux blackhole routes")
+	}
+	for _, err := range []error{net.ErrClosed, syscall.EBADF, syscall.ENOTSOCK} {
+		if isSoftNetworkError(err) {
+			t.Fatalf("isSoftNetworkError(%v) = true", err)
+		}
 	}
 }
 

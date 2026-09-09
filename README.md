@@ -58,8 +58,9 @@ go build ./cmd/wirehop
 go test -race ./...
 ```
 
-Go tests require neither a kernel WireGuard interface nor administrator privileges. The optional [kernel TCP integration
-tests](test/integration/README.md) use isolated Docker containers with kernel WireGuard.
+Ordinary Go tests require neither a kernel WireGuard interface nor administrator privileges. The optional
+[kernel WireGuard integration tests](test/integration/README.md) use isolated Docker containers to check TCP and UDP
+traffic, route failure recovery, and socket interruption handling.
 
 ## Basic usage
 
@@ -162,6 +163,11 @@ indicates kernel receive drops even if no UDP operation returned an error. WireH
 
 On servers, account for up to two target UDP sockets per session when adjusting system receive limits. Kernel socket
 memory is separate from WireHop's aggregate packet retention budget.
+
+Temporary UDP network failures drop affected datagrams while preserving the endpoint for later traffic. This includes
+ICMP errors, route rejection or blackholing, buffer pressure, and write deadlines. The same recovery policy applies to
+the client, server, and direct forwarder. It preserves the socket, but cannot prevent inner connections from timing out
+if the network remains unavailable long enough.
 
 ## Multipath lanes
 

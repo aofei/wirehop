@@ -706,12 +706,17 @@ The command uses these time and traffic limits:
 | UDP delivery operation | 1 second |
 | Delivery-report trigger | 256 data packets, 256 KiB, or 25 milliseconds |
 | Deadline-risk abandonment check | 25 milliseconds |
-| Ping interval and timeout | 1 second active, exponential idle backoff to 15 seconds, and 3-second response timeout |
+| Ping interval and timeout | 1 second active, idle backoff to 15 seconds, and 3-second receive inactivity timeout |
 | Carrier write operation | 3 seconds |
 | Probe interval and payload | Exponential idle backoff from 2 to 60 seconds and 1200 bytes |
 | Initial lane RTT and delivery rate | 100 milliseconds and 1,000,000 bytes per second |
 | Reconnect backoff and stability reset | 100 ms initial, 5 s maximum, reset after 30 s healthy |
 | Graceful client session-close attempt | 200 milliseconds |
+
+The ping timeout starts after the request is written. Valid data and control frames extend its receive inactivity
+budget while the matching Pong waits behind earlier TCP data or retransmissions. A delayed Pong still has to match the
+outstanding identifier and send timestamp before updating the clock mapping. Once receive progress stops, the pending
+ping expires within three seconds. A blocked carrier write retains its independent operation deadline.
 
 DNS and TCP dialing use the standard resolver and dialer, preserving configured nameserver fallback and dual-stack
 connection racing. Their budgets are independent of the short protocol-handshake limit. A five-second total lookup
@@ -948,9 +953,10 @@ write failure closes both endpoints, waits for both workers, and terminates the 
 
 While a session is detached, the server continues draining its target sockets so their kernel receive buffers cannot
 grow without bound. It drops replies that cannot meet a packet deadline because no lane is available. On either UDP
-side, per-datagram ICMP refusal, reset, route-unreachable, message-size, buffer-pressure, and deadline errors drop the
-affected datagram without destroying the reusable endpoint. A target-side network error also requests a rate-limited DNS
-refresh.
+side, per-datagram ICMP refusal, reset, route rejection, network unavailability, message-size, buffer-pressure, and
+deadline errors drop the affected datagram without destroying the reusable endpoint. Linux `prohibit` and `blackhole`
+routes return `EACCES` and `EINVAL`, respectively, even when the socket remains usable. Windows Winsock and completion
+errors are normalized before applying this policy. A target-side network error also requests a rate-limited DNS refresh.
 
 ## Authentication model
 
@@ -1145,6 +1151,9 @@ for a batch to fill.
 A GSO size rejection retries only the unsent datagrams without segmentation, preserving ordinary UDP fragmentation
 behavior. It does not disable GSO for later batches. An offload capability failure disables GSO on that socket and
 retries its unsent datagrams with `sendmmsg`. Per-datagram failures after fallback follow the normal UDP error policy.
+Interrupted batch syscalls retry only their unfinished operation. A successful prefix is preserved, so interruption
+neither closes the endpoint nor resends datagrams that were already accepted. Each retry re-enters the socket poller to
+retain deadline and close handling.
 
 Linux 7.0 before 7.0.11 and Linux 7.1 release candidates before rc5 receive an equal-tail GSO workaround. Batches
 smaller than eight datagrams use `sendmmsg` without GSO. Larger batches append a one-byte invalid WireGuard datagram to
@@ -1470,10 +1479,11 @@ the new generation. An additional lane updates the mapping without blocking traf
 never sends a clock-sync frame to the client. Later bidirectional clock updates use ping and pong. The receiver maps the
 sender's absolute deadline into its local protocol clock and drops an expired frame before writing its payload to UDP.
 
-Each lane permits one outstanding ping. A valid pong echoes both its ID and original send timestamp. The response
-timeout starts only after the complete ping frame is written to the carrier. The connection generation fails when no
-matching pong arrives within 3 seconds. Timing requests use a 1-second interval during real data transfer and
-exponential idle backoff capped at 15 seconds, which bounds idle traffic without delaying active-path measurements.
+Each lane permits one outstanding ping. A valid pong echoes both its ID and original send timestamp. The inactivity
+timeout starts only after the complete ping frame is written to the carrier. While the pong remains pending, valid
+received frames extend the budget. Three seconds without receive progress fails the generation. Timing requests use a
+1-second interval during real data transfer and exponential idle backoff capped at 15 seconds, which bounds idle traffic
+without delaying active-path measurements.
 
 Clock samples are measurements rather than authorization data. The estimator rejects reversed spans and values outside
 safe signed arithmetic. Deadline checks use the latest edge of the mapped uncertainty interval, so asymmetric delay does
@@ -1716,6 +1726,10 @@ either the local error or stable remote code, class, and scope. Individual lane 
 retryable instability, using a 30-second quiet window and at most one warning per minute. Briefly successful reconnects
 do not reset that window. Thirty seconds of sustained service produces one recovery message if a warning was emitted and
 resets the window for a subsequent outage. Local abandonment retains its specific error cause.
+WebSocket close failures retain the close status without the peer's reason text. Remote admission and relay errors
+retain code, class, and scope even when formatted as a terminal command error. Failed HTTP upgrades retain the status
+without echoing untrusted response headers. Malformed HTTP responses use local transport error categories, preserving
+the underlying error for retry and TLS failure classification without formatting the parser's raw response text.
 
 Client session creation and forward target preparation remain quiet for their first 30 seconds. Failed attempts after
 that window emit at most one warning per minute. Recovery produces one informational message only if that preparation
@@ -1731,6 +1745,12 @@ listener or process failures are returned to the command layer and printed once 
 warnings. Peer error frames received after admission are logged by stable code, class, and scope without their
 peer-controlled diagnostic text. Client and server logs never include peer-controlled diagnostics, tokens, session
 secrets, or packet payloads.
+
+Temporary listener failures caused by resource pressure or an incoming connection's network error do not stop the
+server. Raw stream listeners retry with a delay starting at five milliseconds and capped at one second. Cancellation
+interrupts this delay. Prolonged failures use the same 30-second quiet window and one-minute warning interval as other
+preparation loops. WebSocket listeners mark recoverable errors for the HTTP server's existing accept backoff. Closed or
+invalid listeners still terminate their serve loop.
 
 A terminal forwarder endpoint failure is returned to the command layer and printed once. Structurally invalid packets,
 reserved mismatches, and unavailable local peers remain silent drops. Reusable UDP socket errors produce an immediate

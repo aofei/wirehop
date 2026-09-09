@@ -57,9 +57,9 @@ type RejectionError struct {
 	Diagnostic string
 }
 
-// Error returns the stable rejection diagnostic.
+// Error returns stable rejection metadata without exposing the peer's diagnostic text.
 func (e *RejectionError) Error() string {
-	return fmt.Sprintf("server rejected admission with code %d: %s", e.Code, e.Diagnostic)
+	return fmt.Sprintf("server rejected admission with code %d (class=%d, scope=%d)", e.Code, e.Class, e.Scope)
 }
 
 // Config defines the carrier lanes and local WireGuard listener for one relay session.
@@ -637,6 +637,8 @@ func laneFailureAttributes(err error) []any {
 	} else if remote, ok := errors.AsType[*relay.RemoteError](err); ok {
 		attributes = append(attributes,
 			"code", remote.Value.Code, "class", remote.Value.Class, "scope", remote.Value.Scope)
+	} else if closeError, ok := errors.AsType[websocket.CloseError](err); ok {
+		attributes = append(attributes, "close_code", int(closeError.Code))
 	} else {
 		attributes = append(attributes, "error", err)
 	}
@@ -1061,8 +1063,7 @@ func (c *Client) createWebSocketSession(ctx context.Context,
 			}
 			if permanentHTTPRejection(response.StatusCode) {
 				return nil, creationResult{}, clockmap.Mapping{}, protocol.Frame{},
-					fmt.Errorf("%w: WebSocket admission returned HTTP %d: %v", ErrLaneRejected,
-						response.StatusCode, err)
+					fmt.Errorf("%w: WebSocket admission returned HTTP %d", ErrLaneRejected, response.StatusCode)
 			}
 			return nil, creationResult{}, clockmap.Mapping{}, protocol.Frame{},
 				fmt.Errorf("WebSocket admission returned HTTP %d: %w", response.StatusCode, err)
@@ -1117,8 +1118,7 @@ func (c *Client) joinWebSocketSession(ctx context.Context, url laneurl.URL, atte
 				return acceptedLane{}, rejection
 			}
 			if permanentHTTPRejection(response.StatusCode) {
-				return acceptedLane{}, fmt.Errorf("%w: WebSocket join returned HTTP %d: %v", ErrLaneRejected,
-					response.StatusCode, err)
+				return acceptedLane{}, fmt.Errorf("%w: WebSocket join returned HTTP %d", ErrLaneRejected, response.StatusCode)
 			}
 			return acceptedLane{}, fmt.Errorf("WebSocket join returned HTTP %d: %w", response.StatusCode, err)
 		}
@@ -1230,7 +1230,7 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 	})
 	httpTransport.CloseIdleConnections()
 	if err != nil {
-		return nil, response, handshakeContext, cancel, err
+		return nil, response, handshakeContext, cancel, &webSocketHandshakeError{cause: err}
 	}
 	if webSocket.Subprotocol() != wsheader.Subprotocol {
 		webSocket.CloseNow()

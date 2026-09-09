@@ -23,8 +23,8 @@ var (
 	ErrInvalidWireGuardPacket = errors.New("invalid WireGuard packet")
 	// ErrRemoteClosed indicates an intentional close received from the relay peer.
 	ErrRemoteClosed = errors.New("relay session closed by peer")
-	// ErrPingTimeout indicates that an admitted timing request received no response within its lane budget.
-	ErrPingTimeout = errors.New("lane ping timed out")
+	// ErrPingTimeout indicates that a written timing request remained pending while the lane stopped receiving frames.
+	ErrPingTimeout = errors.New("lane ping timed out without receive progress")
 	// ErrUnexpectedPong indicates a response that does not match the sole outstanding timing request.
 	ErrUnexpectedPong = errors.New("unexpected lane pong")
 	// ErrClockSyncRequired indicates data arrived before the generation's initial clock mapping.
@@ -45,9 +45,9 @@ type RemoteError struct {
 	Value protocol.ErrorFrame
 }
 
-// Error returns the stable remote diagnostic without discarding its class or scope.
+// Error returns stable remote metadata without exposing the peer's diagnostic text.
 func (e *RemoteError) Error() string {
-	return fmt.Sprintf("remote relay error %d: %s", e.Value.Code, e.Value.Diagnostic)
+	return fmt.Sprintf("remote relay error %d (class=%d, scope=%d)", e.Value.Code, e.Value.Class, e.Value.Scope)
 }
 
 const (
@@ -139,6 +139,7 @@ type Lane struct {
 	pendingPingID     uint64
 	pendingPingAt     time.Time
 	pendingPingMicros uint64
+	lastReceivedAt    time.Time
 	pingChanged       chan struct{}
 }
 
@@ -348,7 +349,7 @@ func (l *Lane) ping(ctx context.Context) error {
 	}
 }
 
-// pingState reports whether a request is pending and how long remains in its response budget.
+// pingState reports whether a request is pending and how long remains in its receive inactivity budget.
 func (l *Lane) pingState(now time.Time) (bool, time.Duration) {
 	l.pingMu.Lock()
 	defer l.pingMu.Unlock()
@@ -358,7 +359,18 @@ func (l *Lane) pingState(now time.Time) (bool, time.Duration) {
 	if l.pendingPingAt.IsZero() {
 		return true, l.pingInterval
 	}
-	return true, l.pingTimeout - now.Sub(l.pendingPingAt)
+	since := l.pendingPingAt
+	if l.lastReceivedAt.After(since) {
+		since = l.lastReceivedAt
+	}
+	return true, l.pingTimeout - now.Sub(since)
+}
+
+// recordReceive preserves a progressing stream while a timing response waits behind TCP data or retransmissions.
+func (l *Lane) recordReceive() {
+	l.pingMu.Lock()
+	l.lastReceivedAt = time.Now()
+	l.pingMu.Unlock()
 }
 
 // startPing records a timing request before exposing it to the carrier writer.
@@ -379,7 +391,7 @@ func (l *Lane) recordPingSend(identifier, sendMicros uint64) {
 	l.pingMu.Unlock()
 }
 
-// recordPingWritten starts the response timeout after the carrier accepts the complete request.
+// recordPingWritten starts the inactivity timeout after the carrier accepts the complete request.
 func (l *Lane) recordPingWritten(identifier uint64, now time.Time) {
 	l.pingMu.Lock()
 	written := l.pendingPingID == identifier
@@ -661,6 +673,7 @@ func (l *Lane) read(ctx context.Context) error {
 			if err := l.readControl(ctx, frame, &clockSyncPending); err != nil {
 				return err
 			}
+			l.recordReceive()
 			if readContext != carrierContext && !clockSyncPending {
 				cancelSync()
 				readContext = carrierContext
@@ -703,6 +716,7 @@ func (l *Lane) readDataBatch(ctx context.Context, frames []protocol.Frame) error
 			return err
 		}
 	}
+	l.recordReceive()
 	return l.receiver.deliverBatch(ctx, data[:len(frames)])
 }
 

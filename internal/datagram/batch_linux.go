@@ -45,7 +45,7 @@ var (
 	// linuxReadBatches bounds borrowed read vectors while retaining them for reuse.
 	linuxReadBatches = newLinuxReadBatchPool()
 	// linuxWriteBatches reuses sendmmsg metadata without retaining payloads.
-	linuxWriteBatches = sync.Pool{New: func() any { return newLinuxWriteBatch() }}
+	linuxWriteBatches = &sync.Pool{New: func() any { return newLinuxWriteBatch() }}
 )
 
 // linuxMMsgHdr matches Linux struct mmsghdr on every supported architecture.
@@ -261,9 +261,14 @@ func (c *linuxUDPBatchConn) readAvailable(limit int) (udpReadBatch, error) {
 		header.length = 0
 		batch.vectors[index].SetLen(len(batch.buffers[index]))
 	}
-	if err := c.raw.Read(batch.receive); err != nil {
-		batch.release()
-		return nil, err
+	for {
+		if err := c.raw.Read(batch.receive); err != nil {
+			batch.release()
+			return nil, err
+		}
+		if batch.err != syscall.EINTR {
+			break
+		}
 	}
 	runtime.KeepAlive(batch)
 	if errors.Is(batch.err, syscall.EAGAIN) || errors.Is(batch.err, syscall.EWOULDBLOCK) {
@@ -326,6 +331,9 @@ func (c *linuxUDPBatchConn) write(values []udpMessage) (int, error) {
 			return written, err
 		}
 		runtime.KeepAlive(values)
+		if batch.err == syscall.EINTR {
+			continue
+		}
 		if batch.err != 0 {
 			segmented := batch.headers[batch.offset].header.Control != nil
 			if segmented && (batch.err == syscall.EIO || batch.err == syscall.EMSGSIZE || batch.err == syscall.EINVAL) {

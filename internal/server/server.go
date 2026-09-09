@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aofei/wirehop/internal/auth"
@@ -76,6 +77,26 @@ type Server struct {
 type webSocketAdmissionListener struct {
 	net.Listener
 	owner *Server
+}
+
+// temporaryListenerError lets net/http retry socket failures that leave the listener usable.
+type temporaryListenerError struct {
+	cause error
+}
+
+// Error returns the original accept failure.
+func (e *temporaryListenerError) Error() string { return e.cause.Error() }
+
+// Unwrap preserves the native failure for diagnostics.
+func (e *temporaryListenerError) Unwrap() error { return e.cause }
+
+// Temporary reports that the existing listener can accept another connection.
+func (*temporaryListenerError) Temporary() bool { return true }
+
+// Timeout reports whether the underlying accept operation timed out.
+func (e *temporaryListenerError) Timeout() bool {
+	err, ok := errors.AsType[net.Error](e.cause)
+	return ok && err.Timeout()
 }
 
 // admissionConnection transfers one pre-header reservation into the HTTP request context.
@@ -217,6 +238,9 @@ func (l *webSocketAdmissionListener) Accept() (net.Conn, error) {
 	for {
 		connection, err := l.Listener.Accept()
 		if err != nil {
+			if temporaryAcceptError(err) {
+				return nil, &temporaryListenerError{cause: err}
+			}
 			return nil, err
 		}
 		if l.owner.beginAdmission() {
@@ -356,15 +380,39 @@ func (s *Server) Serve(parent context.Context, listener net.Listener) error {
 	defer stopClose()
 	var sessions sync.WaitGroup
 	defer sessions.Wait()
+	var retryDelay time.Duration
+	var notice *netsetup.RetryNotice
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
+			if temporaryAcceptError(err) {
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+					notice = netsetup.NewRetryNotice(s.config.Logger, "carrier listener")
+				} else {
+					retryDelay = min(2*retryDelay, time.Second)
+				}
+				notice.Failed("error", err)
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return nil
+				}
+				continue
+			}
 			cancel()
 			listener.Close()
 			return fmt.Errorf("accept stream lane: %w", err)
+		}
+		if notice != nil {
+			notice.Recovered()
+			notice = nil
+			retryDelay = 0
 		}
 		if !s.beginAdmission() {
 			connection.Close()
@@ -377,6 +425,25 @@ func (s *Server) Serve(parent context.Context, listener net.Listener) error {
 				s.logLaneError("stream lane ended", connection.RemoteAddr(), err)
 			}
 		})
+	}
+}
+
+// temporaryAcceptError identifies resource pressure and failed incoming connections on a reusable TCP listener.
+func temporaryAcceptError(err error) bool {
+	if temporary, ok := errors.AsType[net.Error](err); ok && temporary.Temporary() {
+		return true
+	}
+	errno, ok := netsetup.SocketErrno(err)
+	if !ok {
+		return false
+	}
+	switch errno {
+	case syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ENETDOWN,
+		syscall.ENETUNREACH, syscall.EHOSTDOWN, syscall.EHOSTUNREACH, syscall.EPROTO,
+		syscall.ENOPROTOOPT, syscall.EOPNOTSUPP:
+		return true
+	default:
+		return false
 	}
 }
 
