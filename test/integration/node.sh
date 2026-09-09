@@ -24,6 +24,7 @@ if [ "$role" = server ]; then
       ) &
       target=192.0.2.1:51820
       ;;
+    tcp-ipv6|wss-ipv6) target='[::1]:51820' ;;
     *) target=127.0.0.1:51820 ;;
   esac
   private_key='AD7V1ztVgGww3j+Ke9qzivE1OSIFMwVeY1aQuLh61kE='
@@ -36,14 +37,36 @@ else
   local_ip=10.253.91.1
   remote_ip=10.253.91.2
 fi
+prefix=32
+if [ "$scenario" = tcp-inner-ipv6 ]; then
+  prefix=128
+  if [ "$role" = server ]; then
+    local_ip=fd34:253:91::2
+    remote_ip=fd34:253:91::1
+  else
+    local_ip=fd34:253:91::1
+    remote_ip=fd34:253:91::2
+  fi
+fi
 (
   umask 077
   printf '%s\n' "$private_key" > /tmp/private.key
 )
-wg set wgtest private-key /tmp/private.key listen-port 51820 peer "$peer" allowed-ips "$remote_ip/32"
-ip addr add "$local_ip/32" dev wgtest
+wg set wgtest private-key /tmp/private.key listen-port 51820 peer "$peer" allowed-ips "$remote_ip/$prefix"
+ip addr add "$local_ip/$prefix" dev wgtest
 ip link set wgtest mtu 1420 up
-ip route add "$remote_ip/32" dev wgtest
+ip route add "$remote_ip/$prefix" dev wgtest
+if [ "$role" = client ]; then
+  case "$scenario" in
+    tcp-fwmark|forward-fwmark)
+      wg set wgtest peer "$peer" allowed-ips 0.0.0.0/0
+      ip route add default dev wgtest table 51820
+      ip rule add pref 100 not fwmark 51820 table 51820
+      ip route get "$WIREHOP_TEST_SERVER" > /results/unmarked-route.txt
+      ip route get "$WIREHOP_TEST_SERVER" mark 51820 > /results/marked-route.txt
+      ;;
+  esac
+fi
 case "$scenario" in
   tcp-latency) tc qdisc replace dev eth0 root netem delay 600ms ;;
   tcp-loss) tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 0.5% ;;
@@ -53,13 +76,13 @@ if [ "$role" = server ]; then
   iperf3 --version > /results/iperf-version.txt
   uname -a > /results/kernel.txt
   iperf3 -s > /results/iperf-server.log 2>&1 &
-  case "$scheme" in
-    native|forward)
+  case "$scheme:$scenario" in
+    native:*|forward:*)
       touch /results/ready
       wait
       exit
       ;;
-    tls|wss)
+    tls:*|wss:*|*:tcp-mixed)
       openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=wirehop.test \
         -addext subjectAltName=DNS:wirehop.test -keyout /tmp/tls.key -out /results/ca.pem \
         > /results/certificate.log 2>&1
@@ -67,6 +90,9 @@ if [ "$role" = server ]; then
       ;;
     *) set -- --allow-insecure ;;
   esac
+  if [ "$scenario" = tcp-mixed ]; then
+    set -- "$@" --allow-insecure --listen wss://:51823
+  fi
   touch /results/ready
   exec /wirehop server --listen "$scheme://:51822" --allow-target "$target" "$@"
 fi
@@ -75,17 +101,24 @@ duration=20
 case "$scenario" in
   *-rekey) duration=140 ;;
 esac
+local_endpoint=127.0.0.1:51821
+case "$scenario" in
+  tcp-ipv6|wss-ipv6|forward-ipv6) local_endpoint='[::1]:51821' ;;
+esac
 case "$scheme" in
   native)
     wg set wgtest peer "$peer" endpoint "$WIREHOP_TEST_SERVER:51820"
     ;;
   forward)
-    /wirehop forward --listen 127.0.0.1:51821 --target "$WIREHOP_TEST_SERVER:51820" > /results/client.log 2>&1 &
-    wg set wgtest peer "$peer" endpoint 127.0.0.1:51821
+    set --
+    if [ "$scenario" = forward-fwmark ]; then set -- --fwmark 51820; fi
+    /wirehop forward --listen "$local_endpoint" --target "$WIREHOP_TEST_SERVER:51820" "$@" > /results/client.log 2>&1 &
+    wg set wgtest peer "$peer" endpoint "$local_endpoint"
     ;;
   *)
     case "$scenario" in
       tcp-prohibit|tcp-blackhole) target=192.0.2.1:51820 ;;
+      tcp-ipv6|wss-ipv6) target='[::1]:51820' ;;
       *) target=127.0.0.1:51820 ;;
     esac
     case "$scheme" in
@@ -95,9 +128,13 @@ case "$scheme" in
     if [ "$scenario" = tcp-multipath ]; then
       set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51822"
     fi
-    /wirehop client --listen 127.0.0.1:51821 --target "$target" \
+    if [ "$scenario" = tcp-fwmark ]; then set -- "$@" --fwmark 51820; fi
+    if [ "$scenario" = tcp-mixed ]; then
+      set -- "$@" --tls-server-name wirehop.test --lane "wss://$WIREHOP_TEST_SERVER:51823"
+    fi
+    /wirehop client --listen "$local_endpoint" --target "$target" \
       --lane "$scheme://$WIREHOP_TEST_SERVER:51822" "$@" > /results/client.log 2>&1 &
-    wg set wgtest peer "$peer" endpoint 127.0.0.1:51821
+    wg set wgtest peer "$peer" endpoint "$local_endpoint"
     ;;
 esac
 sleep 2
@@ -136,9 +173,11 @@ esac
 date +%s > /results/flow-start.txt
 nstat -az > /results/client-before.txt
 ss -u -a -m > /results/client-sockets.txt
+ss -tnH state established > /results/client-tcp-sockets.txt
 cat /proc/sys/net/core/rmem_max > /results/receive-buffer-limit.txt
 status=0
 timeout "$((duration + 60))" iperf3 -c "$remote_ip" -t "$duration" -J "$@" > /results/flow.json || status=$?
 nstat -az > /results/client-after.txt
+ss -tnH state established > /results/client-tcp-sockets-after.txt
 wg show wgtest latest-handshakes > /results/client-handshake.txt
 exit "$status"

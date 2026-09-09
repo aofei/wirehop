@@ -128,7 +128,7 @@ func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 	}
 	ingress, err := packetqueue.NewWithBudget[Packet](packetqueue.Limits{
 		Packets: 1, Bytes: len(payload),
-	}, budget)
+	}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,13 +148,13 @@ func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 	}
 	firstStore, err := NewTransmissionStoreWithBudget(packetqueue.Limits{
 		Packets: 1, Bytes: encodedSize,
-	}, budget)
+	}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondStore, err := NewTransmissionStoreWithBudget(packetqueue.Limits{
 		Packets: 1, Bytes: encodedSize,
-	}, budget)
+	}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,11 +753,11 @@ func TestSchedulerPendingPacketRetainsAggregateCapacity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ingress, err := packetqueue.NewWithBudget[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024}, budget)
+		ingress, err := packetqueue.NewWithBudget[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024}, budget, time.Now)
 		if err != nil {
 			t.Fatal(err)
 		}
-		store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 1, Bytes: 1024}, budget)
+		store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 1, Bytes: 1024}, budget, time.Now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -822,14 +822,14 @@ func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {
 			ingress, err := packetqueue.NewWithBudget[Packet](packetqueue.Limits{
 				Packets: 1,
 				Bytes:   payloadSize,
-			}, budget)
+			}, budget, time.Now)
 			if err != nil {
 				t.Fatal(err)
 			}
 			store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{
 				Packets: 1,
 				Bytes:   encodedSize,
-			}, budget)
+			}, budget, time.Now)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -927,15 +927,24 @@ func TestSchedulerTransfersAggregateBudgetDuringMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	limits := packetqueue.Limits{Packets: 1, Bytes: 4096}
-	sourceStore, err := NewTransmissionStoreWithBudget(limits, budget)
+	now := func() time.Time { return time.Unix(123, 0) }
+	ingress, err := packetqueue.NewWithClock[Packet](limits, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	destinationStore, err := NewTransmissionStoreWithBudget(limits, budget)
+	scheduler, err := NewScheduler(ingress)
 	if err != nil {
 		t.Fatal(err)
 	}
-	transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
+	sourceStore, err := NewTransmissionStoreWithBudget(limits, budget, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationStore, err := NewTransmissionStoreWithBudget(limits, budget, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transmission := schedulerTransmission(1, wgpacket.TransportData, now().Add(time.Second))
 	if err := sourceStore.push(transmission); err != nil {
 		t.Fatal(err)
 	}
@@ -943,7 +952,7 @@ func TestSchedulerTransfersAggregateBudgetDuringMigration(t *testing.T) {
 	destination := &scheduledLane{
 		registration: schedulerRegistration(2, 2, destinationStore), rttMicros: 1000, deliveryRate: 1_000_000,
 	}
-	new(Scheduler).migrateTransmissions(map[protocol.LaneID]*scheduledLane{
+	scheduler.migrateTransmissions(map[protocol.LaneID]*scheduledLane{
 		destination.registration.LaneID: destination,
 	}, source)
 	if packets, _ := destinationStore.backlog(); packets != 1 {
@@ -971,7 +980,7 @@ func TestSchedulerRunReleasesAggregateBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 1, Bytes: 4096}, budget)
+	store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 1, Bytes: 4096}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}

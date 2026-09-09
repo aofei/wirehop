@@ -389,7 +389,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 					hasPending = false
 					progressed = true
 				}
-			} else if !time.Now().Before(pending.Deadline) {
+			} else if !s.ingress.Now().Before(pending.Deadline) {
 				pending.Release()
 				pending = packetqueue.Item[Packet]{}
 				hasPending = false
@@ -399,9 +399,9 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		if progressed && !hasPending {
 			select {
 			case event := <-s.events:
-				s.applyEvent(lanes, &preferred, event, time.Now())
-			case now := <-ticker.C:
-				s.checkAbandonment(lanes, now)
+				s.applyEvent(lanes, &preferred, event, s.ingress.Now())
+			case <-ticker.C:
+				s.checkAbandonment(lanes, s.ingress.Now())
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
@@ -410,10 +410,10 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		}
 		select {
 		case event := <-s.events:
-			s.applyEvent(lanes, &preferred, event, time.Now())
+			s.applyEvent(lanes, &preferred, event, s.ingress.Now())
 		case <-s.ingress.Ready():
-		case now := <-ticker.C:
-			s.checkAbandonment(lanes, now)
+		case <-ticker.C:
+			s.checkAbandonment(lanes, s.ingress.Now())
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -539,7 +539,7 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 		item.Release()
 		return true, nil
 	}
-	now := time.Now()
+	now := s.ingress.Now()
 	remaining := item.Deadline.Sub(now)
 	if remaining <= 0 {
 		item.Release()
@@ -960,7 +960,7 @@ func (s *Scheduler) routeControl(lanes map[protocol.LaneID]*scheduledLane, frame
 
 // migrateTransmissions moves each still-fresh transport packet at most once after generation removal.
 func (s *Scheduler) migrateTransmissions(lanes map[protocol.LaneID]*scheduledLane, removed *scheduledLane) {
-	now := time.Now()
+	now := s.ingress.Now()
 	retained := removed.registration.Store.drain()
 	sort.SliceStable(retained, func(left, right int) bool {
 		return retained[left].deadline.Before(retained[right].deadline)

@@ -126,11 +126,11 @@ func TestTransmissionStoreAggregateBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 2, Bytes: 4096}, budget)
+	first, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 2, Bytes: 4096}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 2, Bytes: 4096}, budget)
+	second, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: 2, Bytes: 4096}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,6 +582,22 @@ func TestTransmissionDequeCapacityRetention(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestTransmissionDequeFeedbackWindowReusesStorage(t *testing.T) {
+	var deque transmissionDeque
+	for range 128 {
+		deque.push(retainedTransmission{})
+	}
+	allocations := testing.AllocsPerRun(100, func() {
+		for range reportPacketThreshold {
+			deque.push(retainedTransmission{})
+		}
+		deque.discardPrefix(reportPacketThreshold)
+	})
+	if allocations != 0 {
+		t.Fatalf("steady feedback window allocated %.1f times per report", allocations)
 	}
 }
 

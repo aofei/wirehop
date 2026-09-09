@@ -628,8 +628,8 @@ charged at its payload size in ingress and at its complete encoded Data-frame si
 packet between those states transfers and resizes the same reservation without an unaccounted gap.
 
 Each packet carries an absolute deadline in the sender's protocol clock, expressed in process-relative monotonic
-microseconds. The sender computes it once at UDP ingress from the packet-class lifetime. It separately retains an
-equivalent local wall-time deadline, without Go's optional monotonic reading, for queueing and scheduling. The receiver
+microseconds. The sender computes it once at UDP ingress from the packet-class lifetime, rounded up to whole
+microseconds. Queueing and scheduling use the same deadline and clock through a local time representation. The receiver
 maps the protocol deadline into its own protocol clock and drops the packet only when the complete clock-uncertainty
 interval proves that the deadline has expired.
 
@@ -657,6 +657,10 @@ triggers a report after 256 data packets or 256 KiB, while the 25 ms interval bo
 The default 16,384-packet and 32 MiB lane limits leave headroom for common bandwidth-delay products, and the shared
 process budget keeps their aggregate memory cost bounded. Deployments should validate these defaults against the
 intended path bandwidth and delivery-report return time.
+
+An emptied transmission deque retains at most 512 metadata slots. This accommodates one 256-packet report batch plus
+in-flight progress without repeated allocation and copying under steady traffic. Larger historical capacities still
+shrink as occupancy falls. Retained metadata is separate from the charged packet payload and frame bytes.
 
 The scheduler also drops a packet before assignment when no eligible lane predicts delivery before its deadline. It does
 not enqueue work that is already expected to arrive stale.
@@ -713,8 +717,8 @@ The command uses these time and traffic limits:
 | Reconnect backoff and stability reset | 100 ms initial, 5 s maximum, reset after 30 s healthy |
 | Graceful client session-close attempt | 200 milliseconds |
 
-The ping timeout starts after the request is written. Valid data and control frames extend its receive inactivity
-budget while the matching Pong waits behind earlier TCP data or retransmissions. A delayed Pong still has to match the
+The ping timeout starts after the request is written. Valid data and control frames extend its receive inactivity budget
+while the matching Pong waits behind earlier TCP data or retransmissions. A delayed Pong still has to match the
 outstanding identifier and send timestamp before updating the clock mapping. Once receive progress stops, the pending
 ping expires within three seconds. A blocked carrier write retains its independent operation deadline.
 
@@ -945,9 +949,9 @@ back to that address. An unchanged WireGuard peer endpoint normally uses a stabl
 process tolerates a source address change after a local WireGuard restart. Because the latest structurally valid local
 packet selects that return address, binding the listener to loopback or another trusted local network boundary is an
 operational security requirement. A target reply received before any valid local packet establishes this return address
-is dropped. Each local listener therefore serves one active WireGuard UDP source at a time. Concurrent WireGuard
-devices require separate client or forward instances and listen addresses. The shared WireHop server can still serve
-their independent sessions.
+is dropped. Each local listener therefore serves one active WireGuard UDP source at a time. Concurrent WireGuard devices
+require separate client or forward instances and listen addresses. The shared WireHop server can still serve their
+independent sessions.
 
 The direct forwarder runs one synchronous worker in each UDP direction. It has no intermediate packet queue and bounds
 each UDP write to one second. A per-datagram drop does not stop forwarding. Cancellation or a terminal endpoint read or
@@ -1227,6 +1231,9 @@ sockets used by the Go resolver. Deployments on other platforms must provide ext
 and every actual first hop, including a selected forward proxy. Every lane and every replacement connection generation
 applies the same route-exclusion policy independently.
 
+Setting `SO_MARK` requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on Linux 5.17 and later. Non-root processes and containers
+need an explicitly granted capability. This option does not install policy-routing rules.
+
 ### Direct forwarding route exclusion
 
 A direct forwarder's upstream UDP traffic must also avoid the local WireGuard tunnel when that tunnel captures its
@@ -1496,9 +1503,10 @@ safe signed arithmetic. Deadline checks use the latest edge of the mapped uncert
 not make the receiver drop a packet earlier than the sample supports.
 
 Linux protocol clocks use `CLOCK_BOOTTIME`, and Darwin protocol clocks use `CLOCK_MONOTONIC_RAW`, so packet deadlines
-and clock samples advance across system suspend on both platforms. Local packet retention also uses wall-time deadlines
-without Go's optional monotonic reading. This ensures that sleep cannot preserve stale packets in ingress or lane queues
-on platforms whose ordinary monotonic clock pauses while suspended.
+and clock samples advance across system suspend on both platforms. Ingress, scheduling, migration, and lane retention
+use the same protocol clock for local deadlines. Wall-clock adjustments cannot extend packet retention or prematurely
+expire fresh packets. On other platforms, suspend behavior follows the platform clock used by Go. These local deadline
+values have an arbitrary epoch and are never compared with wall time or passed to socket deadline APIs.
 
 ### Delivery feedback and packet identity
 
@@ -1731,11 +1739,11 @@ keeps the client running. The warning identifies the lane occurrence, canonical 
 either the local error or stable remote code, class, and scope. Individual lane supervisors also report prolonged
 retryable instability, using a 30-second quiet window and at most one warning per minute. Briefly successful reconnects
 do not reset that window. Thirty seconds of sustained service produces one recovery message if a warning was emitted and
-resets the window for a subsequent outage. Local abandonment retains its specific error cause.
-WebSocket close failures retain the close status without the peer's reason text. Remote admission and relay errors
-retain code, class, and scope even when formatted as a terminal command error. Failed HTTP upgrades retain the status
-without echoing untrusted response headers. Malformed HTTP responses use local transport error categories, preserving
-the underlying error for retry and TLS failure classification without formatting the parser's raw response text.
+resets the window for a subsequent outage. Local abandonment retains its specific error cause. WebSocket close failures
+retain the close status without the peer's reason text. Remote admission and relay errors retain code, class, and scope
+even when formatted as a terminal command error. Failed HTTP upgrades retain the status without echoing untrusted
+response headers. Malformed HTTP responses use local transport error categories, preserving the underlying error for
+retry and TLS failure classification without formatting the parser's raw response text.
 
 Client session creation and forward target preparation remain quiet for their first 30 seconds. Failed attempts after
 that window emit at most one warning per minute. Recovery produces one informational message only if that preparation

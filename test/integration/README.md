@@ -19,7 +19,7 @@ sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-results
 Use `GOARCH=amd64` for an x86-64 engine. Each run requires a fresh results directory. To reuse an equivalent tool image,
 set `WIREHOP_TEST_IMAGE`. It must provide `sh`, `ip`, `wg`, `tc`, `nstat`, `iperf3`, `openssl`, and `timeout`.
 
-The default matrix contains 22 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
+The default matrix contains 29 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
 1.2-second RTT, 0.5% loss with delay and jitter, a four-second one-way outage, bidirectional TCP, an idle interval
 followed by a new burst, and 140-second TCP flows spanning an actual kernel WireGuard rekey. Each scenario uses fresh
 endpoints. The ordinary cases run for 20 seconds. Select a subset by passing case names:
@@ -27,6 +27,12 @@ endpoints. The ordinary cases run for 20 seconds. Select a subset by passing cas
 ```sh
 sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-smoke tcp-latency tcp-loss tcp-stall
 ```
+
+The `tcp-ipv6`, `wss-ipv6`, and `forward-ipv6` cases use IPv6 carrier or forwarding destinations and IPv6 local UDP
+listeners. Their Docker network enables IPv6 explicitly. `tcp-inner-ipv6` carries IPv6 TCP through WireGuard, while
+`tcp-mixed` keeps TCP and WSS lanes in one session. `tcp-fwmark` and `forward-fwmark` install a policy route that sends
+unmarked traffic into WireGuard. The marked relay traffic must bypass it and complete the transfer. Results retain both
+route lookups so a non-capturing route cannot accidentally make the exclusion test pass.
 
 The `forward-prohibit`, `forward-blackhole`, `tcp-prohibit`, and `tcp-blackhole` cases install a rejecting route for one
 second during an active TCP transfer. Forward cases change the forwarder's target route. TCP cases change the server's
@@ -37,9 +43,10 @@ WireGuard. At least 95% of the offered bytes must arrive. Iperf3 still uses one 
 The verifier rejects incomplete transfers and zero-byte results. Ordinary single-lane cases also check the client's TCP
 active-open count to detect unexpected reconnect attempts. Server passive-open counts can include discarded child
 sockets during concurrent handshake processing and are retained only as supporting evidence. The outage case permits
-reconnection, and the multipath case permits concurrent admission attempts. Rekey cases require a later kernel handshake
-while the same iperf3 TCP flow remains active. Results preserve iperf3 JSON, kernel counters, socket receive limits,
-handshake timestamps, software versions, and WireHop diagnostics. Compare goodput, retransmissions, and
+reconnection. The parallel-lane cases permit concurrent admission attempts but require both configured carriers before
+and after the flow, with no additional carrier connection attempts during the flow. Rekey cases require a later kernel
+handshake while the same iperf3 TCP flow remains active. Results preserve iperf3 JSON, kernel counters, socket receive
+limits, handshake timestamps, software versions, and WireHop diagnostics. Compare goodput, retransmissions, and
 `UdpRcvbufErrors` across repeated runs on the same engine. Kernel counters are namespace totals, so `TcpOutRsts` alone
 cannot identify an outer carrier reset. The tests use MTU 1420 and fixed public test keys exclusively inside the
 isolated network.
@@ -58,4 +65,5 @@ docker run --rm --network none --read-only --cap-add NET_ADMIN \
 ```
 
 The route test is skipped during ordinary `go test` runs. CI runs the socket recovery tests in isolation and selects
-nine representative kernel flow cases. The complete matrix remains available through `run.sh` without case arguments.
+thirteen representative kernel flow cases. The complete matrix remains available through `run.sh` without case
+arguments.

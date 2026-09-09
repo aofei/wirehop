@@ -232,12 +232,17 @@ func New[T any](limits Limits) (*Queue[T], error) {
 	return newQueue[T](limits, time.Now, nil)
 }
 
-// NewWithBudget returns an empty queue sharing an aggregate retention budget.
-func NewWithBudget[T any](limits Limits, budget *retention.Budget) (*Queue[T], error) {
+// NewWithBudget returns an empty queue sharing an aggregate retention budget and using now for deadline decisions.
+func NewWithBudget[T any](limits Limits, budget *retention.Budget, now func() time.Time) (*Queue[T], error) {
 	if budget == nil {
 		return nil, ErrInvalidLimits
 	}
-	return newQueue[T](limits, time.Now, budget)
+	return newQueue[T](limits, now, budget)
+}
+
+// Now samples the queue's deadline clock so scheduling and retention can use the same time domain.
+func (q *Queue[T]) Now() time.Time {
+	return q.now()
 }
 
 // NewWithClock returns an empty queue using now for deterministic deadline decisions.
@@ -426,16 +431,18 @@ func (q *Queue[T]) TryPop(destination *Item[T]) error {
 	if q.closed {
 		return ErrClosed
 	}
+	if !q.popLocked(destination) {
+		return ErrEmpty
+	}
 	now := q.now()
 	for {
-		ok := q.popLocked(destination)
-		if !ok {
-			return ErrEmpty
-		}
 		if now.Before(destination.Deadline) {
 			return nil
 		}
 		destination.Release()
+		if !q.popLocked(destination) {
+			return ErrEmpty
+		}
 	}
 }
 
@@ -451,16 +458,18 @@ func (q *Queue[T]) TryPopPriority(priority Priority, destination *Item[T]) error
 	if q.closed {
 		return ErrClosed
 	}
+	if !q.popPriorityLocked(priority, destination) {
+		return ErrEmpty
+	}
 	now := q.now()
 	for {
-		ok := q.popPriorityLocked(priority, destination)
-		if !ok {
-			return ErrEmpty
-		}
 		if now.Before(destination.Deadline) {
 			return nil
 		}
 		destination.Release()
+		if !q.popPriorityLocked(priority, destination) {
+			return ErrEmpty
+		}
 	}
 }
 

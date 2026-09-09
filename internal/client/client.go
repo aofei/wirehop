@@ -164,7 +164,9 @@ func Start(parent context.Context, config Config) (*Client, error) {
 		return nil, err
 	}
 	endpoint := datagram.WithReservedTranslation(local, config.Reserved)
-	queue, err := packetqueue.NewWithBudget[relay.Packet](config.IngressLimits, retentionBudget)
+	queue, err := packetqueue.NewWithBudget[relay.Packet](config.IngressLimits, retentionBudget, func() time.Time {
+		return monotime.Time(config.Clock.NowMicros())
+	})
 	if err != nil {
 		endpoint.Close()
 		return nil, err
@@ -789,7 +791,7 @@ func advanceGeneration(generation *uint64) error {
 func (c *Client) runLaneGeneration(ctx context.Context, configured clientLane, generation uint64,
 	accepted acceptedLane, receiver *relay.Receiver, scheduler *relay.Scheduler) error {
 	defer accepted.connection.Close()
-	store, err := relay.NewTransmissionStoreWithBudget(c.config.LaneLimits, c.retention)
+	store, err := relay.NewTransmissionStoreWithBudget(c.config.LaneLimits, c.retention, c.queue.Now)
 	if err != nil {
 		return err
 	}

@@ -4,6 +4,7 @@ package monotime
 
 import (
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -30,7 +31,9 @@ func (c *Clock) NowMicros() uint64 {
 // bootMicros returns Linux CLOCK_BOOTTIME rounded down to whole microseconds.
 func bootMicros() uint64 {
 	var value unix.Timespec
-	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &value); err != nil {
+	// CLOCK_BOOTTIME cannot block, so reading it does not require a goroutine scheduler transition.
+	_, _, err := unix.RawSyscall(unix.SYS_CLOCK_GETTIME, unix.CLOCK_BOOTTIME, uintptr(unsafe.Pointer(&value)), 0)
+	if err != 0 {
 		panic("read CLOCK_BOOTTIME: " + err.Error())
 	}
 	return uint64(value.Sec)*uint64(time.Second/time.Microsecond) +

@@ -69,6 +69,9 @@ func main() {
 		if err == nil {
 			err = verifyCarrier(directory, scenario)
 		}
+		if err == nil && strings.HasSuffix(scenario, "-fwmark") {
+			err = verifyRouteExclusion(directory)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", scenario, err)
 			failed = true
@@ -89,8 +92,11 @@ func main() {
 
 // verifyCarrier detects unexpected reconnects in scenarios that should retain one admitted carrier.
 func verifyCarrier(directory, scenario string) error {
-	if scenario == "tcp-stall" || scenario == "tcp-multipath" {
+	if scenario == "tcp-stall" {
 		return nil
+	}
+	if scenario == "tcp-multipath" || scenario == "tcp-mixed" {
+		return verifyParallelCarriers(directory, scenario)
 	}
 	expected := 3
 	if strings.HasPrefix(scenario, "native") || strings.HasPrefix(scenario, "forward") {
@@ -103,24 +109,91 @@ func verifyCarrier(directory, scenario string) error {
 	if strings.HasSuffix(scenario, "-udp") {
 		expected--
 	}
-	data, err := os.ReadFile(filepath.Join(directory, "client-after.txt"))
+	opened, err := tcpActiveOpens(filepath.Join(directory, "client-after.txt"))
 	if err != nil {
 		return err
+	}
+	if opened != expected {
+		return fmt.Errorf("initiated %d TCP connections, expected %d including iperf3 control and data", opened, expected)
+	}
+	return nil
+}
+
+// tcpActiveOpens reads the namespace counter for locally initiated TCP connections.
+func tcpActiveOpens(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
 	}
 	for line := range strings.Lines(string(data)) {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && fields[0] == "TcpActiveOpens" {
-			opened, err := strconv.Atoi(fields[1])
-			if err != nil {
-				return err
-			}
-			if opened != expected {
-				return fmt.Errorf("initiated %d TCP connections, expected %d including iperf3 control and data", opened, expected)
-			}
-			return nil
+			return strconv.Atoi(fields[1])
 		}
 	}
-	return fmt.Errorf("missing TCP active-open counter")
+	return 0, fmt.Errorf("missing TCP active-open counter")
+}
+
+// verifyParallelCarriers requires both configured lanes to remain available without reconnecting during the flow.
+func verifyParallelCarriers(directory, scenario string) error {
+	for _, name := range []string{"client-tcp-sockets.txt", "client-tcp-sockets-after.txt"} {
+		data, err := os.ReadFile(filepath.Join(directory, name))
+		if err != nil {
+			return err
+		}
+		tcp, wss := 0, 0
+		for line := range strings.Lines(string(data)) {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+			if strings.HasSuffix(fields[3], ":51822") {
+				tcp++
+			} else if strings.HasSuffix(fields[3], ":51823") {
+				wss++
+			}
+		}
+		if scenario == "tcp-mixed" && (tcp != 1 || wss != 1) || scenario == "tcp-multipath" && tcp != 2 {
+			return fmt.Errorf("%s has %d TCP and %d WSS carriers, expected two configured lanes", name, tcp, wss)
+		}
+	}
+	before, err := tcpActiveOpens(filepath.Join(directory, "client-before.txt"))
+	if err != nil {
+		return err
+	}
+	after, err := tcpActiveOpens(filepath.Join(directory, "client-after.txt"))
+	if err != nil {
+		return err
+	}
+	if after-before != 2 {
+		return fmt.Errorf("initiated %d TCP connections during the flow, expected only iperf3 control and data", after-before)
+	}
+	return nil
+}
+
+// verifyRouteExclusion confirms that the configured mark bypasses an otherwise capturing WireGuard route.
+func verifyRouteExclusion(directory string) error {
+	for _, route := range []struct{ name, device string }{
+		{name: "unmarked-route.txt", device: "wgtest"},
+		{name: "marked-route.txt", device: "eth0"},
+	} {
+		data, err := os.ReadFile(filepath.Join(directory, route.name))
+		if err != nil {
+			return err
+		}
+		fields := strings.Fields(string(data))
+		device := ""
+		for index := 0; index+1 < len(fields); index++ {
+			if fields[index] == "dev" {
+				device = fields[index+1]
+				break
+			}
+		}
+		if device != route.device {
+			return fmt.Errorf("%s uses device %q, expected %q", route.name, device, route.device)
+		}
+	}
+	return nil
 }
 
 // verifyRekey requires a fresh kernel handshake after the initial establishment of a long-lived flow.

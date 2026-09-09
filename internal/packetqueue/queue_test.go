@@ -63,11 +63,11 @@ func TestQueueAggregateBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := NewWithBudget[int](Limits{Packets: 2, Bytes: 10}, budget)
+	first, err := NewWithBudget[int](Limits{Packets: 2, Bytes: 10}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := NewWithBudget[int](Limits{Packets: 2, Bytes: 10}, budget)
+	second, err := NewWithBudget[int](Limits{Packets: 2, Bytes: 10}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,11 +138,11 @@ func TestQueueTransfersAggregateRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := NewWithBudget[int](Limits{Packets: 1, Bytes: 10}, budget)
+	first, err := NewWithBudget[int](Limits{Packets: 1, Bytes: 10}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := NewWithBudget[int](Limits{Packets: 1, Bytes: 10}, budget)
+	second, err := NewWithBudget[int](Limits{Packets: 1, Bytes: 10}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,11 +353,11 @@ func TestControlAdmissionEvictsNormalForAggregateCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	queue, err := NewWithBudget[string](Limits{Packets: 4, Bytes: 12, ControlPreemption: true}, budget)
+	queue, err := NewWithBudget[string](Limits{Packets: 4, Bytes: 12, ControlPreemption: true}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := NewWithBudget[string](Limits{Packets: 1, Bytes: 4}, budget)
+	other, err := NewWithBudget[string](Limits{Packets: 1, Bytes: 4}, budget, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}

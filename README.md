@@ -234,6 +234,9 @@ datagrams re-enter the listener and form a local UDP feedback loop.
 The corresponding policy-routing rule is deployment-specific. On other platforms, deployments require external routes
 that exclude carrier endpoints, direct forwarding targets, forward proxies, and the DNS paths used to resolve them.
 
+Setting `--fwmark` requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on Linux 5.17 and later. A non-root process or container
+must receive that capability explicitly. The option marks sockets but does not install policy-routing rules.
+
 ## Overhead and MTU
 
 Each WireGuard datagram receives a 16-byte WireHop data header, a one-byte frame type, and a four-byte content length.

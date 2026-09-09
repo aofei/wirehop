@@ -10,6 +10,7 @@ import (
 
 	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
@@ -595,14 +596,14 @@ func TestLanePingResumesActiveInterval(t *testing.T) {
 
 func TestIngress(t *testing.T) {
 	endpoint := newTestEndpoint()
-	queue, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 2, Bytes: 1024})
+	clock := &testClock{now: 1234}
+	queuedAt := monotime.Time(clock.now)
+	queue, err := packetqueue.NewWithClock[Packet](packetqueue.Limits{Packets: 2, Bytes: 1024}, func() time.Time { return queuedAt })
 	if err != nil {
 		t.Fatal(err)
 	}
-	clock := &testClock{now: 1234}
 	policy := DeadlinePolicy{Control: 1500 * time.Microsecond, Transport: 3 * time.Millisecond}
-	queuedAt := time.Now()
-	ingress, err := newIngress(endpoint, queue, clock, policy, func() time.Time { return queuedAt })
+	ingress, err := NewIngress(endpoint, queue, clock, policy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,8 +622,8 @@ func TestIngress(t *testing.T) {
 		item.Priority != packetqueue.PriorityControl {
 		t.Fatalf("ingress item = %+v", item)
 	}
-	if want := queuedAt.Add(policy.Control).Round(0); item.Deadline != want {
-		t.Fatalf("ingress deadline = %v, want suspend-aware wall deadline %v", item.Deadline, want)
+	if want := queuedAt.Add(policy.Control); item.Deadline != want {
+		t.Fatalf("ingress deadline = %v, want protocol deadline %v", item.Deadline, want)
 	}
 	if len(item.Value.Payload) == 0 || &item.Value.Payload[0] != &payload[0] {
 		t.Fatal("ingress did not transfer packet ownership")
@@ -630,6 +631,44 @@ func TestIngress(t *testing.T) {
 	cancel()
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestIngressDeadlineFollowsProtocolClock(t *testing.T) {
+	endpoint := newTestEndpoint()
+	clock := &testClock{now: 1000}
+	queue, err := packetqueue.NewWithClock[Packet](packetqueue.Limits{Packets: 2, Bytes: 1024}, func() time.Time {
+		return time.Unix(0, int64(clock.now)*int64(time.Microsecond))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	ingress, err := NewIngress(endpoint, queue, clock, DeadlinePolicy{Control: time.Second, Transport: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- ingress.Run(ctx) }()
+	endpoint.reads <- datagram.Packet{
+		Kind: wgpacket.TransportData, Payload: relayWireGuardPacket(wgpacket.TransportData),
+	}
+	select {
+	case <-queue.Ready():
+	case <-time.After(time.Second):
+		t.Fatal("ingress did not enqueue the packet")
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want cancellation", err)
+	}
+	clock.now += 2_000_000
+	var item packetqueue.Item[Packet]
+	if err := queue.TryPop(&item); !errors.Is(err, packetqueue.ErrEmpty) {
+		item.Release()
+		t.Fatalf("TryPop() = %v, want expiry after the protocol clock advances", err)
 	}
 }
 

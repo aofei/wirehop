@@ -10,6 +10,7 @@ import (
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/lifecycle"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/relay"
@@ -67,7 +68,9 @@ type serverSession struct {
 // newServerSession allocates one target-owning session.
 func newServerSession(parent context.Context, owner *Server, id protocol.SessionID, secret protocol.SessionSecret,
 	endpoint *datagram.Remote) (*serverSession, error) {
-	ingressQueue, err := packetqueue.NewWithBudget[relay.Packet](owner.config.IngressLimits, owner.retention)
+	ingressQueue, err := packetqueue.NewWithBudget[relay.Packet](owner.config.IngressLimits, owner.retention, func() time.Time {
+		return monotime.Time(owner.config.Clock.NowMicros())
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +185,7 @@ func (s *serverSession) creationCredentials() (protocol.SessionID, protocol.Sess
 func (s *serverSession) runLane(connection carrier.Conn, laneID protocol.LaneID, generation uint64,
 	pathGroupID protocol.PathGroupID) error {
 	defer s.rejectReservedLane()
-	store, err := relay.NewTransmissionStoreWithBudget(s.owner.config.LaneLimits, s.owner.retention)
+	store, err := relay.NewTransmissionStoreWithBudget(s.owner.config.LaneLimits, s.owner.retention, s.ingressQueue.Now)
 	if err != nil {
 		return reportLaneError(err)
 	}

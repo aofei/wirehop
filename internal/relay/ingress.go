@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 )
 
@@ -17,25 +18,19 @@ type Ingress struct {
 	queue     *packetqueue.Queue[Packet]
 	clock     Clock
 	deadlines DeadlinePolicy
-	now       func() time.Time
 }
 
-// NewIngress returns a UDP ingress using the process wall clock for local queue deadlines.
+// NewIngress returns a UDP ingress using clock for both local and wire deadlines. The queue must use the same clock
+// through [monotime.Time].
 func NewIngress(endpoint datagram.Endpoint, queue *packetqueue.Queue[Packet], clock Clock,
 	deadlines DeadlinePolicy) (*Ingress, error) {
-	return newIngress(endpoint, queue, clock, deadlines, time.Now)
-}
-
-// newIngress returns a UDP ingress with an injectable local deadline clock.
-func newIngress(endpoint datagram.Endpoint, queue *packetqueue.Queue[Packet], clock Clock,
-	deadlines DeadlinePolicy, now func() time.Time) (*Ingress, error) {
-	if endpoint == nil || queue == nil || clock == nil || now == nil {
+	if endpoint == nil || queue == nil || clock == nil {
 		return nil, ErrInvalidPacket
 	}
 	if err := deadlines.Validate(); err != nil {
 		return nil, err
 	}
-	return &Ingress{endpoint: endpoint, queue: queue, clock: clock, deadlines: deadlines, now: now}, nil
+	return &Ingress{endpoint: endpoint, queue: queue, clock: clock, deadlines: deadlines}, nil
 }
 
 // Run reads UDP packets until the context, endpoint, or queue is closed.
@@ -51,7 +46,6 @@ func (i *Ingress) Run(ctx context.Context) error {
 			return fmt.Errorf("%w: read relay ingress: %w", ErrEndpointFailure, readErr)
 		}
 		nowMicros := i.clock.NowMicros()
-		now := i.now()
 		for index := range count {
 			packet := packets[index]
 			packets[index] = datagram.Packet{}
@@ -67,8 +61,7 @@ func (i *Ingress) Run(ctx context.Context) error {
 				Value:    newPacket(packet, nowMicros+lifetimeMicros),
 				Size:     len(packet.Payload),
 				Priority: packetPriority(packet.Kind.Control()),
-				// Strip the monotonic reading so local expiry includes time spent suspended.
-				Deadline: now.Add(lifetime).Round(0),
+				Deadline: monotime.Time(nowMicros + lifetimeMicros),
 			}
 		}
 		for offset := 0; offset < count; {

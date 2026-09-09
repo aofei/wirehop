@@ -148,6 +148,20 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 	}
 }
 
+func BenchmarkTransmissionDequeFeedbackWindow(b *testing.B) {
+	var deque transmissionDeque
+	for range 128 {
+		deque.push(retainedTransmission{})
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		for range reportPacketThreshold {
+			deque.push(retainedTransmission{})
+		}
+		deque.discardPrefix(reportPacketThreshold)
+	}
+}
+
 func BenchmarkReceiverDeliver(b *testing.B) {
 	receiver, err := NewReceiver(ReceiverConfig{
 		Endpoint: benchmarkEndpoint{}, Clock: &testClock{now: 1}, DeduplicationSize: 1_048_576,

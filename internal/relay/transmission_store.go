@@ -23,8 +23,9 @@ var (
 	ErrInvalidDeliveryReport = errors.New("invalid delivery report")
 )
 
-// maximumRetainedDequeCapacity preserves ordinary report batches without retaining exceptional lane high-water marks.
-const maximumRetainedDequeCapacity = 256
+// maximumRetainedDequeCapacity preserves a report batch plus in-flight progress without repeatedly growing and shrinking
+// steady feedback windows. Larger lane high-water marks still shrink when occupancy falls.
+const maximumRetainedDequeCapacity = 2 * reportPacketThreshold
 
 // retainedTransmission is one assigned packet retained until parsing is reported or its generation is drained.
 type retainedTransmission struct {
@@ -232,13 +233,13 @@ func NewTransmissionStore(limits packetqueue.Limits) (*TransmissionStore, error)
 	return newTransmissionStoreWithBudget(limits, time.Now, nil)
 }
 
-// NewTransmissionStoreWithBudget returns an empty store sharing an aggregate retention budget.
+// NewTransmissionStoreWithBudget returns an empty store sharing an aggregate retention budget and deadline clock.
 func NewTransmissionStoreWithBudget(limits packetqueue.Limits,
-	budget *retention.Budget) (*TransmissionStore, error) {
+	budget *retention.Budget, now func() time.Time) (*TransmissionStore, error) {
 	if budget == nil {
 		return nil, ErrInvalidTransmissionStore
 	}
-	return newTransmissionStoreWithBudget(limits, time.Now, budget)
+	return newTransmissionStoreWithBudget(limits, now, budget)
 }
 
 // newTransmissionStore returns an empty bounded store with an injectable deadline clock.
@@ -327,6 +328,9 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 	defer s.mu.Unlock()
 	if s.closed {
 		return 0, packetqueue.ErrClosed
+	}
+	if s.control.len()+s.normal.len() == 0 {
+		return 0, packetqueue.ErrEmpty
 	}
 	now := s.now()
 	count := 0

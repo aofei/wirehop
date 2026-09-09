@@ -13,7 +13,7 @@ shift 2
 if [ "$#" -eq 0 ]; then
   set -- native forward tcp tls ws wss tcp-multipath tcp-latency tcp-loss tcp-stall tcp-bidir tcp-idle \
     tcp-rekey forward-rekey forward-prohibit forward-blackhole tcp-prohibit tcp-blackhole \
-    native-udp forward-udp tcp-udp wss-udp
+    native-udp forward-udp tcp-udp wss-udp tcp-ipv6 wss-ipv6 forward-ipv6 tcp-inner-ipv6 tcp-fwmark forward-fwmark tcp-mixed
 fi
 image=${WIREHOP_TEST_IMAGE:-wirehop-integration}
 network=wirehop-tcp-$$
@@ -27,11 +27,22 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-docker network create --internal "$network" > /dev/null
+ipv6=false
+for scenario in "$@"; do
+  case "$scenario" in
+    tcp-ipv6|wss-ipv6|forward-ipv6) ipv6=true ;;
+  esac
+done
+if [ "$ipv6" = true ]; then
+  docker network create --internal --ipv6 "$network" > /dev/null
+else
+  docker network create --internal "$network" > /dev/null
+fi
 for scenario in "$@"; do
   case "$scenario" in
     native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
-    forward-prohibit|forward-blackhole|tcp-prohibit|tcp-blackhole|native-udp|forward-udp|tcp-udp|wss-udp) ;;
+    forward-prohibit|forward-blackhole|tcp-prohibit|tcp-blackhole|native-udp|forward-udp|tcp-udp|wss-udp|\
+    tcp-ipv6|wss-ipv6|forward-ipv6|tcp-inner-ipv6|tcp-fwmark|forward-fwmark|tcp-mixed) ;;
     *) echo "unknown case: $scenario" >&2; exit 2 ;;
   esac
   echo "$scenario"
@@ -55,6 +66,16 @@ for scenario in "$@"; do
     exit 1
   fi
   server_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$server")
+  case "$scenario" in
+    tcp-ipv6|wss-ipv6|forward-ipv6)
+      server_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' "$server")
+      if [ -z "$server_ip" ]; then
+        echo "case requires an IPv6 container address: $scenario" >&2
+        exit 1
+      fi
+      server_ip="[$server_ip]"
+      ;;
+  esac
   docker run -d --name "$client" --network "$network" --read-only --cap-add NET_ADMIN --tmpfs /tmp \
     -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$results/$scenario:/results" \
     -e "WIREHOP_TEST_SERVER=$server_ip" --entrypoint sh "$image" /test/node.sh client "$scenario" > /dev/null
