@@ -945,7 +945,9 @@ back to that address. An unchanged WireGuard peer endpoint normally uses a stabl
 process tolerates a source address change after a local WireGuard restart. Because the latest structurally valid local
 packet selects that return address, binding the listener to loopback or another trusted local network boundary is an
 operational security requirement. A target reply received before any valid local packet establishes this return address
-is dropped.
+is dropped. Each local listener therefore serves one active WireGuard UDP source at a time. Concurrent WireGuard
+devices require separate client or forward instances and listen addresses. The shared WireHop server can still serve
+their independent sessions.
 
 The direct forwarder runs one synchronous worker in each UDP direction. It has no intermediate packet queue and bounds
 each UDP write to one second. A per-datagram drop does not stop forwarding. Cancellation or a terminal endpoint read or
@@ -1196,6 +1198,10 @@ an idle lane can still answer WebSocket Ping frames.
 WebSocket lanes honor `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`. Proxy selection maps `ws://` to HTTP policy and
 `wss://` to HTTPS policy. Secure WebSocket lanes use CONNECT through selected HTTP or HTTPS proxies. Selected `socks5`
 and `socks5h` proxies use their native TCP tunneling behavior.
+
+Rejected HTTP proxy tunnels preserve their numeric CONNECT status. Authentication or policy rejection, including HTTP
+407 and 403, disables that lane. HTTP 408, 429, and 5xx remain retryable. These decisions use the same status policy as
+WebSocket upgrade failures and never depend on a proxy's reason phrase, response headers, or body.
 
 Raw `tcp://` and `tls://` lanes dial their declared or fixed-resolution destinations directly and do not consult these
 proxy variables.

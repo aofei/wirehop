@@ -95,6 +95,10 @@ wirehop client \
 Configure the local WireGuard peer endpoint as `127.0.0.1:51821`. The client authenticates the logical target to the
 server, and the server resolves and reaches it from the server network.
 
+Each client or forward listener serves one local WireGuard UDP source at a time. Replies go to the address and port of
+the latest structurally valid local packet, allowing source changes after a restart. Give concurrent local WireGuard
+devices separate listeners and instances, since sharing one listener can send replies to the wrong device.
+
 When the requested `--listen` port is `0`, the client prints the selected UDP address to standard output as soon as the
 socket is ready. Carrier establishment continues asynchronously, and fresh WireGuard packets remain in a bounded
 priority queue while the first lane is starting. The `forward` command prints a dynamic address only after its target is
@@ -118,6 +122,10 @@ graceful shutdown exits with status `0`.
 `--target` and `--allow-target` accept an IP literal or ASCII DNS hostname with an explicit, nonzero UDP port. For a
 client session, the server authorizes the canonical logical target before resolving it through the server's name service
 and network view. The `forward` command resolves its target locally and has no target allowlist.
+
+DNS target names are resolved as absolute names, without appending resolver search suffixes. Use the complete DNS name
+when the deployment normally relies on a search domain, such as a Kubernetes service's full cluster DNS name. Carrier
+hostnames use the dialer's normal resolver behavior.
 
 A DNS target may return multiple IPv4 and IPv6 addresses. All records must represent the same logical WireGuard peer,
 whether they reach one dual-stack server or multiple servers configured with the same WireGuard identity. WireHop

@@ -4,10 +4,26 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 
 	"github.com/aofei/wirehop/internal/netsetup"
 )
+
+// proxyConnectError preserves a rejected tunnel's status without trusting the proxy's response text.
+type proxyConnectError struct {
+	statusCode int
+}
+
+// Error describes the proxy rejection using its numeric HTTP status.
+func (e *proxyConnectError) Error() string {
+	return fmt.Sprintf("WebSocket proxy CONNECT returned HTTP %d", e.statusCode)
+}
+
+// Is classifies permanent proxy rejections with the same policy as WebSocket upgrade failures.
+func (e *proxyConnectError) Is(target error) bool {
+	return target == ErrLaneRejected && permanentHTTPRejection(e.statusCode)
+}
 
 // webSocketHandshakeError preserves failure classification without formatting untrusted HTTP parser diagnostics.
 type webSocketHandshakeError struct {
@@ -16,6 +32,9 @@ type webSocketHandshakeError struct {
 
 // Error describes the failure using local transport categories instead of response text.
 func (e *webSocketHandshakeError) Error() string {
+	if proxyError, ok := errors.AsType[*proxyConnectError](e.cause); ok {
+		return proxyError.Error()
+	}
 	reason := "transport or HTTP response error"
 	if errors.Is(e.cause, context.Canceled) {
 		reason = "operation canceled"

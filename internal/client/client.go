@@ -1187,6 +1187,12 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 		Proxy: http.ProxyURL(proxyURL), ForceAttemptHTTP2: false,
 		TLSHandshakeTimeout:    c.config.HandshakeTimeout,
 		MaxResponseHeaderBytes: maximumWebSocketResponseHeaderBytes,
+		OnProxyConnectResponse: func(_ context.Context, _ *neturl.URL, _ *http.Request, response *http.Response) error {
+			if response.StatusCode != http.StatusOK {
+				return &proxyConnectError{statusCode: response.StatusCode}
+			}
+			return nil
+		},
 	}
 	availableConnection := net.Conn(preparedWebSocket)
 	var takeMutex sync.Mutex

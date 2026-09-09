@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	neturl "net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -176,6 +177,39 @@ func TestAuthenticationFailureRemainsTerminal(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProxyAuthenticationFailureRemainsTerminal(t *testing.T) {
+	var attempts atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts.Add(1)
+		writer.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	defer proxy.Close()
+	proxyURL, err := neturl.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := clientConfig(t, "wss://relay.example/_wirehop", netip.MustParseAddrPort("127.0.0.1:51820"), []byte("test-token"), nil)
+	config.Proxy = http.ProxyURL(proxyURL)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	instance, err := client.Start(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Close()
+	if err := instance.Wait(); !errors.Is(err, client.ErrLaneRejected) || !strings.Contains(err.Error(), "HTTP 407") {
+		t.Fatalf("Wait() = %v, want terminal proxy authentication rejection", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("proxy authentication attempted %d times, want one terminal attempt", got)
+	}
+	listener, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(instance.LocalAddr()))
+	if err != nil {
+		t.Fatalf("terminal proxy rejection retained the local UDP listener: %v", err)
+	}
+	listener.Close()
 }
 
 func TestWebSocketRuntimeClockSkewRecovery(t *testing.T) {
