@@ -917,11 +917,11 @@ sequenceDiagram
 ```
 
 The client and direct forwarder track the local UDP source address that sent packets to their listener and write replies
-back to that address. In the normal case this is stable because one WireGuard interface uses one local UDP socket, but
-the process tolerates a source address change after a local WireGuard restart. Because the latest structurally valid
-local packet selects that return address, binding the listener to loopback or another trusted local network boundary is
-an operational security requirement. A target reply received before any valid local packet establishes this return
-address is dropped.
+back to that address. An unchanged WireGuard peer endpoint normally uses a stable source address and port, but the
+process tolerates a source address change after a local WireGuard restart. Because the latest structurally valid local
+packet selects that return address, binding the listener to loopback or another trusted local network boundary is an
+operational security requirement. A target reply received before any valid local packet establishes this return address
+is dropped.
 
 The direct forwarder runs one synchronous worker in each UDP direction. It has no intermediate packet queue and bounds
 each UDP write to one second. A per-datagram drop does not stop forwarding. Cancellation or a terminal endpoint read or
@@ -1571,8 +1571,8 @@ WireHop receives runtime configuration from command-line flags. The client and s
 the `WIREHOP_TOKEN` environment variable so that they do not need to appear in process arguments. Direct forwarding does
 not use the WireHop admission protocol and therefore does not read a token.
 
-`wirehop version` and `wirehop --version` write the Go toolchain-embedded module version, or `devel` for an unversioned
-local build, to standard output and exit with status `0`.
+`wirehop version` and `wirehop --version` write the binary's version, or `devel` for an unversioned local build, to
+standard output and exit with status `0`.
 
 Client flags:
 

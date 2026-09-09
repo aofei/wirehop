@@ -119,11 +119,26 @@ func TestLaneReconnectSessionRecreationAndGracefulClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientInstance.Close()
-	waitSessionCondition(t, func() bool { return instance.Snapshot().AttachedLanes == 2 })
-	session, laneID, generation := firstSessionLane(t, instance)
-	session.mu.Lock()
-	laneCancel := session.lanes[laneID].cancel
-	session.mu.Unlock()
+	var session *serverSession
+	var laneID protocol.LaneID
+	var generation uint64
+	var laneCancel context.CancelFunc
+	waitSessionCondition(t, func() bool {
+		session = instance.findSession(clientInstance.SessionID())
+		if session == nil {
+			return false
+		}
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		if !session.confirmed || len(session.lanes) != 2 {
+			return false
+		}
+		for id, lane := range session.lanes {
+			laneID, generation, laneCancel = id, lane.generation, lane.cancel
+			break
+		}
+		return true
+	})
 	laneCancel()
 	reconnectDeadline := time.Now().Add(3 * time.Second)
 	for {
@@ -1174,23 +1189,6 @@ func newSessionTestServer(t *testing.T, token []byte, target targetpkg.Endpoint,
 		t.Fatal(err)
 	}
 	return instance
-}
-
-func firstSessionLane(t *testing.T, instance *Server) (*serverSession, protocol.LaneID, uint64) {
-	t.Helper()
-	instance.mu.Lock()
-	defer instance.mu.Unlock()
-	for _, session := range instance.sessions {
-		session.mu.Lock()
-		for laneID, lane := range session.lanes {
-			generation := lane.generation
-			session.mu.Unlock()
-			return session, laneID, generation
-		}
-		session.mu.Unlock()
-	}
-	t.Fatal("no active session lane")
-	return nil, protocol.LaneID{}, 0
 }
 
 func waitSessionCondition(t *testing.T, condition func() bool) {
