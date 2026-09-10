@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/aofei/wirehop/compare/v0.2.0...v0.2.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* correct multipath scheduling estimates and Linux clock reads ([7ab2779](https://github.com/aofei/wirehop/commit/7ab2779e5cf3eb74cf2b516f3998070b007e1ffa))
+* keep packet retention on the protocol clock ([d7af038](https://github.com/aofei/wirehop/commit/d7af038e9812aebd76eaf786b276d6a6167f16d7))
+* preserve forwarding stability through delays and rekeys ([2872013](https://github.com/aofei/wirehop/commit/28720137561842b25dd4bb1bb11c1ceccee9a2d7))
+* preserve proxy CONNECT rejection classification ([9f9cbac](https://github.com/aofei/wirehop/commit/9f9cbacfdcbc7c5a9b1176562084b3f00f502112))
+* preserve sessions through transient network failures ([3635021](https://github.com/aofei/wirehop/commit/36350214f8792ce898540a935a661637f47c7de6))
+* reject empty lane URL fragments and clarify relay behavior ([f55d1c1](https://github.com/aofei/wirehop/commit/f55d1c10858c1b89dea62d702b9197bcb1e5fd90))
+
 ## [0.2.0](https://github.com/aofei/wirehop/compare/v0.1.0...v0.2.0) (2026-09-09)
 
 
