@@ -116,7 +116,7 @@ func parse(value string, listen bool) (URL, error) {
 	if parsed.ForceQuery || parsed.RawQuery != "" {
 		return URL{}, newInvalidError("query parameters are not allowed", nil)
 	}
-	if parsed.Fragment != "" {
+	if strings.Contains(value, "#") {
 		return URL{}, newInvalidError("fragments are not allowed", nil)
 	}
 	host, port, err := splitAuthority(parsed.Host, scheme)

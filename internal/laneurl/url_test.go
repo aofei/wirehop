@@ -31,6 +31,8 @@ func TestParseDial(t *testing.T) {
 			result: "wss://example.com:443/%7Ewirehop"},
 		{value: "WSS://EXAMPLE.COM/_wirehop", scheme: WSS, address: "example.com:443",
 			result: "wss://example.com:443/_wirehop"},
+		{value: "wss://example.com/path%23suffix", scheme: WSS, address: "example.com:443",
+			result: "wss://example.com:443/path%23suffix"},
 		{value: "tls://[::ffff:192.0.2.1]:443", scheme: TLS, address: "192.0.2.1:443",
 			result: "tls://192.0.2.1:443"},
 	} {
@@ -69,6 +71,8 @@ func TestParseDialErrors(t *testing.T) {
 		{value: "tcp://example.com:80?", reason: "query parameters are not allowed"},
 		{value: "ws://example.com:80/path?", reason: "query parameters are not allowed"},
 		{value: "ws://example.com:80/path#fragment", reason: "fragments are not allowed"},
+		{value: "ws://example.com:80/path#", reason: "fragments are not allowed"},
+		{value: "tcp://example.com:80#", reason: "fragments are not allowed"},
 		{
 			value:  "wss://example.com:443/" + strings.Repeat("a", wsheader.MaxPathSize),
 			reason: fmt.Sprintf("WebSocket path exceeds %d bytes", wsheader.MaxPathSize),
@@ -146,6 +150,8 @@ func TestParseListen(t *testing.T) {
 		{value: "tls://localhost", reason: "tls URLs require an explicit port"},
 		{value: "tcp://:80/path", reason: "tcp URLs cannot contain a path"},
 		{value: "ws://", reason: "server listener URL requires a host or port"},
+		{value: "wss://:443/path#", reason: "fragments are not allowed"},
+		{value: "tls://:443#", reason: "fragments are not allowed"},
 	} {
 		_, err := ParseListen(test.value)
 		if !errors.Is(err, ErrInvalid) || err.Error() != test.reason {

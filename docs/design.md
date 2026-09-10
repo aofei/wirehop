@@ -686,7 +686,7 @@ Packet duplication policy:
 - Duplicate handshake response on up to two deadline-eligible lanes
 - Duplicate cookie reply on up to two deadline-eligible lanes
 - Do not proactively duplicate transport data during normal scheduling
-- Permit one migration attempt for an unexpired transport packet only when its original connection is abandoned
+- Permit one migration attempt for an unexpired transport packet when its original connection generation ends
 
 The first control-packet copy uses the eligible lane with the earliest predicted arrival. The second copy prefers an
 eligible lane in another path group. When none is available, it uses the next eligible independent lane in the same
@@ -842,16 +842,15 @@ frame appear late.
 The progress guard starts no earlier than the first outstanding carrier write. Fully reporting that sent prefix resets
 the outstanding interval. Time spent idle or holding only queued work cannot make the next fresh burst appear stalled.
 
-WireHop abandons the connection when waiting for recovery is no longer predicted to deliver its earliest-deadline
-unconfirmed work usefully. An eligible alternative lane permits earlier abandonment only after cumulative delivery
-progress has also stopped for at least the greater of 250 milliseconds or two estimated round trips plus two delivery
-report intervals. Requiring both deadline risk and a progress stall prevents ordinary sustained congestion from churning
-healthy carrier generations. The alternative must still be predicted to carry a frame of the same encoded size as the
-earliest-deadline retained frame before that deadline. This permits future traffic and eligible migrations to continue
-immediately, but does not make an otherwise unduplicated control frame migratable. Without such an alternative or
-confirmed progress stall, WireHop keeps the generation subject to its independent ping and carrier write budgets.
-Neither queued expiry nor sent-but-unreported expiry alone forces generation abandonment. Packet lifetimes allow
-ordinary TCP retransmission and remain independent of carrier failure detection.
+WireHop abandons a generation only when retained work is at deadline risk, parsing progress has stalled according to the
+guard above, and an eligible alternative can still carry equivalent work before the earliest retained deadline. That
+deadline must remain in the future. The alternative's prediction uses a frame of the same encoded size as the
+earliest-deadline retained frame. These conditions prevent ordinary sustained congestion from churning healthy carrier
+generations. Abandonment permits future traffic and eligible migrations to continue immediately, but does not make an
+otherwise unduplicated control frame migratable. Without all three conditions, WireHop keeps the generation subject to
+its independent ping and carrier write budgets. Neither queued expiry nor sent-but-unreported expiry alone forces
+generation abandonment. Packet lifetimes allow ordinary TCP retransmission and remain independent of carrier failure
+detection.
 
 The abandonment sequence is:
 
@@ -946,8 +945,9 @@ policy below.
 The direct forwarder binds its local UDP listener before resolving the target. Initial lookup failures, including
 timeouts, missing records, and answers without usable addresses, retry until cancellation. Negative answers can change
 and are not permanent configuration errors. Retries use full-jitter exponential backoff with the limits in the timing
-table and honor system resolver caching. Invalid options and local bind failures are immediately fatal. Non-DNS target
-socket preparation failures terminate the forwarder and release the local port.
+table and honor system resolver caching. Invalid options and local bind failures are immediately fatal. If no required
+address family can open a target UDP socket, the forwarder terminates and releases the local port. A usable family
+permits forwarding even when another family cannot open its socket.
 
 While target preparation is pending, the forwarder drains and discards local packets instead of accumulating a startup
 queue. Once the target is prepared, it switches to direct bidirectional batch forwarding without readiness checks in the
@@ -1245,6 +1245,7 @@ WireGuard protects its payload, not the WireHop control plane or exposed relay r
 The WireGuard reserved field is public header metadata. Its value is neither a secret nor an authentication mechanism.
 Reserved translation does not replace WireGuard peer authentication or, when a carrier relay is used, the WireHop
 admission token.
+
 ## Data-path I/O
 
 ### Carrier writes
@@ -1604,12 +1605,12 @@ The single carrier writer gives internally generated control frames priority in 
 WireGuard data is ready after such a burst, the writer sends one data batch before accepting another control burst. This
 keeps timing, feedback, and lifecycle controls prompt without allowing sustained control traffic to starve relay data.
 
-A changed report snapshot is offered to its target lane when healthy and to the best healthy alternate lane when
-available. The first completed carrier write marks the snapshot reported, and duplicate callbacks are coalesced. If no
-copy completes, the cumulative snapshot becomes eligible again after four report intervals. The sender releases only the
-matching prefix of its sent FIFO. Packet and byte counters must identify the same prefix. A mixed, partially changed, or
-impossible active-generation report is a protocol violation. A wholly stale report from an older snapshot or generation
-is ignored.
+A changed report snapshot is offered to its target lane and the best alternate lane when they are connected and not
+abandoning, including when either lane is degraded. The first completed carrier write marks the snapshot reported, and
+duplicate callbacks are coalesced. If no copy completes, the cumulative snapshot becomes eligible again after four
+report intervals. The sender releases only the matching prefix of its sent FIFO. Packet and byte counters must identify
+the same prefix. A mixed, partially changed, or impossible active-generation report is a protocol violation. A wholly
+stale report from an older snapshot or generation is ignored.
 
 New packet IDs start at 1 and increase strictly within each session direction. The scheduler chooses the next ID after
 selecting eligible lanes and commits it only after at least one copy enters a lane transmission store. Every proactive

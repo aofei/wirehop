@@ -278,8 +278,8 @@ alternatives. Delayed old-key traffic cannot move the confirmed selection back t
 WireGuard identity still have independent NAT and TCP connection state, so failover cannot preserve that state.
 
 The direct forwarder binds its local listener immediately and discards packets while waiting for initial target
-resolution. Missing records and answers containing no usable target addresses remain retryable. Target socket
-preparation errors are fatal. Target address changes do not replace a WireHop session, reconnect carrier lanes, or
+resolution. Missing records and answers containing no usable target addresses remain retryable. Failure to prepare any
+usable target UDP socket is fatal. Target address changes do not replace a WireHop session, reconnect carrier lanes, or
 restart a direct forwarder.
 
 ## Reserved field translation
