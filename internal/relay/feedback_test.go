@@ -143,14 +143,14 @@ func TestLaneDeliveryThresholdReleasesHighBandwidthWindow(t *testing.T) {
 			t.Fatal("timed out waiting for relayed packets")
 		}
 	}
-	for firstStore.backlogByteCount() != 0 {
+	for firstStore.backlogBytes.Load() != 0 {
 		select {
 		case err := <-results:
 			t.Fatalf("relay worker ended before feedback drained the store: %v", err)
 		case <-time.After(10 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("transmission backlog = %d bytes after all packets arrived", firstStore.backlogByteCount())
+			t.Fatalf("transmission backlog = %d bytes after all packets arrived", firstStore.backlogBytes.Load())
 		}
 	}
 

@@ -37,6 +37,21 @@ type retainedTransmission struct {
 	size     int
 	budget   *retention.Budget
 	packet   Packet
+	delivery deliverySnapshot
+}
+
+// deliverySnapshot anchors one transmission to the preceding delivery curve and send interval.
+type deliverySnapshot struct {
+	sentMicros      uint64
+	firstSentMicros uint64
+	deliveredMicros uint64
+	deliveredBytes  uint64
+}
+
+// deliverySample measures bytes delivered over the longer corresponding send or acknowledgement interval.
+type deliverySample struct {
+	bytes          uint64
+	intervalMicros uint64
 }
 
 // deadlineAssessment summarizes retained deadline state in carrier order.
@@ -221,6 +236,8 @@ type TransmissionStore struct {
 	sentBytes       uint64
 	reportedPackets uint64
 	reportedBytes   uint64
+	firstSentMicros uint64
+	deliveredMicros uint64
 	backlogPackets  atomic.Int64
 	backlogBytes    atomic.Uint64
 	notify          chan struct{}
@@ -333,6 +350,7 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 		return 0, packetqueue.ErrEmpty
 	}
 	now := s.now()
+	sentMicros := uint64(now.UnixMicro())
 	count := 0
 	bytes := 0
 	for count < len(destination) && bytes < targetBytes {
@@ -349,6 +367,12 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 		transmission = source.pop()
 		if s.sent.len() == 0 {
 			s.unreportedSince = now
+			s.firstSentMicros = sentMicros
+			s.deliveredMicros = sentMicros
+		}
+		transmission.delivery = deliverySnapshot{
+			sentMicros: sentMicros, firstSentMicros: s.firstSentMicros,
+			deliveredMicros: s.deliveredMicros, deliveredBytes: s.reportedBytes,
 		}
 		s.sent.push(transmission)
 		s.sentPackets++
@@ -388,46 +412,52 @@ func (s *TransmissionStore) nextQueuedLocked(now time.Time) (*transmissionDeque,
 	}
 }
 
-// acknowledge releases the exact sent prefix represented by cumulative packet and byte counters.
-func (s *TransmissionStore) acknowledge(packets, bytes uint64) (uint64, bool, error) {
+// acknowledge releases the exact cumulative sent prefix and samples its delivery in the store's deadline clock.
+func (s *TransmissionStore) acknowledge(packets, bytes, receiveMicros uint64) (deliverySample, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return 0, true, nil
+		return deliverySample{}, true, nil
 	}
 	direction, err := cumulativeDirection(packets, bytes, s.reportedPackets, s.reportedBytes)
 	if err != nil {
-		return 0, false, err
+		return deliverySample{}, false, err
 	}
-	if direction < 0 {
-		return 0, true, nil
-	}
-	if direction == 0 {
-		return 0, false, nil
+	if direction <= 0 {
+		return deliverySample{}, direction < 0, nil
 	}
 	deltaPackets := packets - s.reportedPackets
 	if deltaPackets > uint64(s.sent.len()) || packets > s.sentPackets || bytes > s.sentBytes {
-		return 0, false, ErrInvalidDeliveryReport
+		return deliverySample{}, false, ErrInvalidDeliveryReport
 	}
 	releasedBytes, ok := s.sent.prefixSize(deltaPackets)
-	if !ok {
-		return 0, false, ErrInvalidDeliveryReport
+	if !ok || releasedBytes != bytes-s.reportedBytes {
+		return deliverySample{}, false, ErrInvalidDeliveryReport
 	}
-	if releasedBytes != bytes-s.reportedBytes {
-		return 0, false, ErrInvalidDeliveryReport
+	acknowledged := s.sent.items[s.sent.head : s.sent.head+int(deltaPackets)]
+	delivery := acknowledged[len(acknowledged)-1].delivery
+	var sample deliverySample
+	if receiveMicros > s.deliveredMicros && receiveMicros >= delivery.sentMicros &&
+		delivery.sentMicros >= delivery.firstSentMicros {
+		sample = deliverySample{
+			bytes: bytes - delivery.deliveredBytes,
+			intervalMicros: max(receiveMicros-delivery.deliveredMicros,
+				delivery.sentMicros-delivery.firstSentMicros),
+		}
 	}
-	releasedPackets := int(deltaPackets)
-	for index := s.sent.head; index < s.sent.head+releasedPackets; index++ {
-		s.sent.items[index].releasePacket()
+	for index := range acknowledged {
+		acknowledged[index].releasePacket()
 	}
-	s.sent.discardPrefix(releasedPackets)
+	s.sent.discardPrefix(len(acknowledged))
 	if s.sent.len() == 0 {
 		s.unreportedSince = time.Time{}
 	}
 	s.reportedPackets = packets
 	s.reportedBytes = bytes
-	s.releaseBacklogLocked(releasedPackets, int(releasedBytes))
-	return releasedBytes, false, nil
+	s.firstSentMicros = delivery.sentMicros
+	s.deliveredMicros = max(s.deliveredMicros, receiveMicros)
+	s.releaseBacklogLocked(len(acknowledged), int(releasedBytes))
+	return sample, false, nil
 }
 
 // cumulativeDirection compares paired packet and byte counters while rejecting an impossible partial change.
@@ -445,9 +475,12 @@ func (s *TransmissionStore) backlog() (int, uint64) {
 	return int(s.backlogPackets.Load()), s.backlogBytes.Load()
 }
 
-// backlogByteCount returns the retained encoded byte count used by scheduler scoring.
-func (s *TransmissionStore) backlogByteCount() uint64 {
-	return s.backlogBytes.Load()
+// deliveryBacklog returns unsent and total retained encoded bytes from one consistent snapshot.
+func (s *TransmissionStore) deliveryBacklog() (uint64, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	retained := uint64(s.bytes)
+	return retained - (s.sentBytes - s.reportedBytes), retained
 }
 
 // deliveryConstrained reports whether queued work or retained occupancy makes a lower rate sample meaningful.

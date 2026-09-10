@@ -25,11 +25,40 @@ func (c *testClock) NowMicros() uint64 {
 }
 
 type testLaneObserver struct {
-	lane *Lane
+	lane          *Lane
+	source        protocol.LaneGeneration
+	report        protocol.DeliveryReport
+	receiveMicros uint64
 }
 
-func (*testLaneObserver) ObserveDeliveryReport(context.Context, protocol.DeliveryReport, uint64) error {
+func (o *testLaneObserver) ObserveDeliveryReport(_ context.Context, source protocol.LaneGeneration,
+	report protocol.DeliveryReport, receiveMicros uint64) error {
+	o.source = source
+	o.report = report
+	o.receiveMicros = receiveMicros
 	return nil
+}
+
+func TestLaneReadControlDeliveryReportSource(t *testing.T) {
+	observer := &testLaneObserver{}
+	lane := &Lane{
+		laneID: protocol.LaneID{2}, generation: 7, clock: &testClock{now: 12345}, observer: observer,
+	}
+	report := protocol.DeliveryReport{
+		LaneID: protocol.LaneID{3}, Generation: 9, DataPackets: 1, DataBytes: 64,
+	}
+	frame, err := protocol.MarshalDeliveryReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clockSyncPending := false
+	if err := lane.readControl(context.Background(), frame, &clockSyncPending); err != nil {
+		t.Fatal(err)
+	}
+	wantSource := protocol.LaneGeneration{LaneID: lane.laneID, Generation: lane.generation}
+	if observer.source != wantSource || observer.report != report || observer.receiveMicros != 12345 {
+		t.Fatalf("observed report = %+v, want source %+v, report %+v, time 12345", observer, wantSource, report)
+	}
 }
 
 func (*testLaneObserver) ObserveTiming(protocol.LaneID, uint64, protocol.TimingPong, uint64) {}

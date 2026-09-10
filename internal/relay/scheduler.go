@@ -37,8 +37,6 @@ const (
 	abandonmentCheckInterval = 25 * time.Millisecond
 	// minimumRateSampleBytes avoids treating isolated packets as path-capacity measurements.
 	minimumRateSampleBytes = 4 * 1024
-	// maximumRateSampleIntervalMicros discards sparse offered traffic from delivery-rate estimation.
-	maximumRateSampleIntervalMicros = uint64((250 * time.Millisecond) / time.Microsecond)
 	// minimumProgressStall prevents ordinary report cadence and congestion from looking like a carrier black hole.
 	minimumProgressStall = 250 * time.Millisecond
 	// progressStallReportMargin allows two report intervals beyond the measured round trips.
@@ -60,7 +58,7 @@ type LaneRegistration struct {
 
 // LaneObserver receives cumulative lane feedback parsed by any carrier reader.
 type LaneObserver interface {
-	ObserveDeliveryReport(context.Context, protocol.DeliveryReport, uint64) error
+	ObserveDeliveryReport(context.Context, protocol.LaneGeneration, protocol.DeliveryReport, uint64) error
 	ObserveTiming(protocol.LaneID, uint64, protocol.TimingPong, uint64)
 	ObserveLaneAbandon(context.Context, protocol.LaneGeneration) error
 	RouteDeliveryReport(protocol.DeliveryReport, func(bool)) bool
@@ -102,20 +100,19 @@ type schedulerEvent struct {
 
 // scheduledLane contains direction-local predictive state for one generation.
 type scheduledLane struct {
-	registration          LaneRegistration
-	rttMicros             uint64
-	deliveryRate          uint64
-	lastReportMicros      uint64
-	lastDataBytes         uint64
-	lastDataPackets       uint64
-	lastProbeBytes        uint64
-	lastProbePackets      uint64
-	rateSampleBytes       uint64
-	rateSampleStartMicros uint64
-	lastProgressAt        time.Time
-	rttObserved           bool
-	degraded              bool
-	abandoning            bool
+	registration        LaneRegistration
+	rttMicros           uint64
+	minimumRTTMicros    uint64
+	feedbackDelayMicros uint64
+	deliveryRate        uint64
+	lastDataBytes       uint64
+	lastDataPackets     uint64
+	lastProbeBytes      uint64
+	lastProbePackets    uint64
+	lastProgressAt      time.Time
+	rttObserved         bool
+	degraded            bool
+	abandoning          bool
 }
 
 // laneCandidates is a fixed-capacity ordered scheduler result.
@@ -218,13 +215,14 @@ func (s *Scheduler) Remove(ctx context.Context, laneID protocol.LaneID, generati
 	}
 }
 
-// ObserveDeliveryReport synchronously validates and applies cumulative parsing feedback.
-func (s *Scheduler) ObserveDeliveryReport(ctx context.Context, report protocol.DeliveryReport,
+// ObserveDeliveryReport validates cumulative parsing feedback received over one exact carrier generation.
+func (s *Scheduler) ObserveDeliveryReport(ctx context.Context, source protocol.LaneGeneration, report protocol.DeliveryReport,
 	receiveMicros uint64) error {
 	result := make(chan error, 1)
 	select {
 	case s.events <- schedulerEvent{
 		kind: schedulerReport, report: report, receiveMicros: receiveMicros, result: result,
+		laneID: source.LaneID, generation: source.Generation,
 	}:
 	case <-ctx.Done():
 		return ctx.Err()
@@ -452,11 +450,19 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		event.result <- nil
 	case schedulerReport:
 		lane := lanes[event.report.LaneID]
-		if lane != nil && lane.registration.Generation == event.report.Generation {
-			event.result <- lane.applyReport(event.report, event.receiveMicros, now)
-		} else {
+		if lane == nil || lane.registration.Generation != event.report.Generation {
 			event.result <- nil
+			return
 		}
+		if err := lane.applyReport(event.report, event.receiveMicros, now); err != nil {
+			event.result <- err
+			return
+		}
+		lane.feedbackDelayMicros = 0
+		if source := lanes[event.laneID]; source != nil && source.registration.Generation == event.generation {
+			lane.feedbackDelayMicros = source.minimumRTTMicros / 2
+		}
+		event.result <- nil
 	case schedulerTiming:
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation {
@@ -702,15 +708,27 @@ func laneBetterForFrame(left, right *scheduledLane, frameBytes uint64) bool {
 
 // score returns predicted delivery delay in microseconds.
 func (l *scheduledLane) score(frameBytes uint64) uint64 {
-	backlogBytes := l.registration.Store.backlogByteCount()
-	if backlogBytes > math.MaxUint64-frameBytes {
+	queuedBytes, backlogBytes := l.registration.Store.deliveryBacklog()
+	if l.deliveryRate == 0 || backlogBytes > math.MaxUint64-frameBytes ||
+		backlogBytes+frameBytes > math.MaxUint64/1_000_000 {
 		return math.MaxUint64
 	}
-	return l.backlogDelay(backlogBytes + frameBytes)
+	queuedMicros := (queuedBytes + frameBytes) * 1_000_000 / l.deliveryRate
+	retainedMicros := (backlogBytes + frameBytes) * 1_000_000 / l.deliveryRate
+	base := l.rttMicros / 2
+	if queuedMicros > math.MaxUint64-base {
+		return math.MaxUint64
+	}
+	// Unsent data still needs serialization and propagation. Already committed data can have reached the peer
+	// while its report returns over another lane. Discount only that carrier's minimum observed return delay.
+	if retainedMicros <= l.feedbackDelayMicros {
+		return base + queuedMicros
+	}
+	return max(base+queuedMicros, retainedMicros-l.feedbackDelayMicros)
 }
 
-// backlogDelay returns the predicted completion delay for an already ordered byte prefix.
-func (l *scheduledLane) backlogDelay(bytes uint64) uint64 {
+// retentionDelay conservatively estimates deadline risk without discounting unreported work.
+func (l *scheduledLane) retentionDelay(bytes uint64) uint64 {
 	if l.deliveryRate == 0 || bytes > math.MaxUint64/1_000_000 {
 		return math.MaxUint64
 	}
@@ -781,22 +799,15 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	if dataDirection == 0 && probeDirection == 0 {
 		return nil
 	}
-	deltaDataBytes := report.DataBytes - l.lastDataBytes
 	deliveryConstrained := l.registration.Store.deliveryConstrained()
-	_, stale, err := l.registration.Store.acknowledge(report.DataPackets, report.DataBytes)
+	sample, stale, err := l.registration.Store.acknowledge(report.DataPackets, report.DataBytes, receiveMicros)
 	if err != nil {
 		return err
 	}
 	if stale {
 		return nil
 	}
-	if receiveMicros > l.lastReportMicros {
-		l.updateDeliveryRate(deltaDataBytes, receiveMicros, deliveryConstrained)
-		l.lastReportMicros = receiveMicros
-	} else if deltaDataBytes > 0 {
-		l.rateSampleStartMicros = l.lastReportMicros
-		l.rateSampleBytes = 0
-	}
+	l.updateDeliveryRate(sample, deliveryConstrained)
 	l.lastDataBytes = report.DataBytes
 	l.lastDataPackets = report.DataPackets
 	l.lastProbeBytes = report.ProbeBytes
@@ -806,39 +817,15 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	return nil
 }
 
-// updateDeliveryRate measures dense real data without reducing capacity from an application-limited sample.
-func (l *scheduledLane) updateDeliveryRate(dataBytes, receiveMicros uint64, deliveryConstrained bool) {
-	if dataBytes == 0 {
+// updateDeliveryRate uses a send-bounded sample without reducing capacity from an application-limited sample.
+func (l *scheduledLane) updateDeliveryRate(sample deliverySample, deliveryConstrained bool) {
+	if sample.bytes < minimumRateSampleBytes || sample.intervalMicros == 0 || sample.bytes > math.MaxUint64/1_000_000 {
 		return
 	}
-	if l.lastReportMicros == 0 || receiveMicros <= l.lastReportMicros ||
-		receiveMicros-l.lastReportMicros > maximumRateSampleIntervalMicros ||
-		l.rateSampleStartMicros == 0 || receiveMicros-l.rateSampleStartMicros > maximumRateSampleIntervalMicros {
-		l.rateSampleStartMicros = receiveMicros
-		l.rateSampleBytes = 0
-		return
+	rate := sample.bytes * 1_000_000 / sample.intervalMicros
+	if rate > l.deliveryRate || rate > 0 && deliveryConstrained {
+		l.deliveryRate = weightedAverage7(l.deliveryRate, rate)
 	}
-	if l.rateSampleBytes > math.MaxUint64-dataBytes {
-		l.rateSampleStartMicros = receiveMicros
-		l.rateSampleBytes = 0
-		return
-	}
-	l.rateSampleBytes += dataBytes
-	if l.rateSampleBytes < minimumRateSampleBytes || receiveMicros <= l.rateSampleStartMicros {
-		return
-	}
-	deltaMicros := receiveMicros - l.rateSampleStartMicros
-	var sample uint64
-	if l.rateSampleBytes > math.MaxUint64/1_000_000 {
-		sample = math.MaxUint64
-	} else {
-		sample = l.rateSampleBytes * 1_000_000 / deltaMicros
-	}
-	if sample > l.deliveryRate || sample > 0 && deliveryConstrained {
-		l.deliveryRate = weightedAverage7(l.deliveryRate, sample)
-	}
-	l.rateSampleBytes = 0
-	l.rateSampleStartMicros = receiveMicros
 }
 
 // applyTiming updates a bounded RTT exponential moving average.
@@ -853,8 +840,8 @@ func (l *scheduledLane) applyTiming(pong protocol.TimingPong, receiveMicros uint
 	} else {
 		roundTrip = 1
 	}
-	if roundTrip == 0 {
-		roundTrip = 1
+	if l.minimumRTTMicros == 0 || roundTrip < l.minimumRTTMicros {
+		l.minimumRTTMicros = roundTrip
 	}
 	if !l.rttObserved {
 		l.rttMicros = roundTrip
@@ -875,7 +862,7 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 		if lane.abandoning {
 			continue
 		}
-		assessment := lane.registration.Store.assessDeadlines(now, lane.backlogDelay)
+		assessment := lane.registration.Store.assessDeadlines(now, lane.retentionDelay)
 		if !assessment.retained {
 			lane.degraded = false
 			continue

@@ -3,6 +3,7 @@
 package monotime
 
 import (
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -31,8 +32,8 @@ func (c *Clock) NowMicros() uint64 {
 // bootMicros returns Linux CLOCK_BOOTTIME rounded down to whole microseconds.
 func bootMicros() uint64 {
 	var value unix.Timespec
-	// CLOCK_BOOTTIME cannot block, so reading it does not require a goroutine scheduler transition.
-	_, _, err := unix.RawSyscall(unix.SYS_CLOCK_GETTIME, unix.CLOCK_BOOTTIME, uintptr(unsafe.Pointer(&value)), 0)
+	// CLOCK_BOOTTIME cannot block. The standard syscall entry point keeps value live without allowing a stack split.
+	_, _, err := syscall.RawSyscall(unix.SYS_CLOCK_GETTIME, unix.CLOCK_BOOTTIME, uintptr(unsafe.Pointer(&value)), 0)
 	if err != 0 {
 		panic("read CLOCK_BOOTTIME: " + err.Error())
 	}

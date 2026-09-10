@@ -406,125 +406,63 @@ If all lanes fail at runtime but at least one failure remains retryable, the cli
 exiting. The first accepted reconnect refreshes the session clock mapping and passes through the normal data-plane gate.
 Later lanes register independently.
 
-## Multipath scheduling
+## Session lifecycle and recovery
 
-The scheduler chooses a lane for each WireGuard packet. Lane activation is path-group aware, while packet placement uses
-per-lane delivery predictions.
+A session binds one local UDP listener and one remote WireGuard target through one or more path groups and lanes. The
+server tracks that authenticated session independently from the lifetime of any one lane:
 
-The scheduling goal is to maximize useful goodput within packet deadlines while minimizing delivery time and unnecessary
-reordering. Maximum raw carrier throughput is not a reason to stripe packets when one lane can deliver them earlier.
+| State | Meaning |
+| --- | --- |
+| `unconfirmed` | A candidate has prepared its target but no lane has supplied a valid first clock-sync frame |
+| `attached` | A confirmed session has a connected lane or an accepted lane reservation is completing |
+| `detached` | No lane is connected or completing an accepted reservation, but reconnect grace has not expired |
+| `closed` | Session state, credentials, queues, resolver state, and target sockets have been released |
 
-Each usable lane direction maintains these scheduling estimates:
+An unconfirmed creator's disconnection or clock-sync timeout releases its session without reconnect grace. Once
+confirmed, an unexpected loss of the final lane moves the session to `detached` unless an authenticated join has
+reserved lane capacity and is still completing. The server starts a bounded reconnect grace timer only after both active
+lanes and accepted reservations reach zero. During that grace period it retains:
 
-- Smoothed round trip time
-- Estimated delivery rate
-- Retained encoded bytes, including queued and sent-but-unreported data
+- Session identifier and ephemeral session secret
+- Logical target, last successful DNS candidates, WireGuard index affinity, and per-family UDP sockets
+- Path groups, stable lane identifiers, and highest accepted connection generations
+- Direction-local packet ID, deduplication, and clock-mapping state
+- Bounded session ingress queued from the target UDP sockets
 
-The session clock mapping is shared by all lanes in that session. RTT, delivery rate, and retained backlog remain
-lane-local and direction-local. Preferred-lane state is also direction-local, so observations in one direction do not
-stand in for capacity in the reverse direction. A new lane refines path timing without creating a separate clock domain.
+Detached state does not suspend packet deadlines or queue limits. Retained packets and target replies continue to expire
+and are dropped when they cannot be delivered usefully.
 
-The scheduler does not use unconditional round robin because that can create excessive reordering and continue sending
-packets into stalled lanes.
+The client retains the session identifier, secret, path groups, lane generations, and direction-local packet ID,
+deduplication, and clock-mapping state while it is `disconnected`. A reconnecting lane first attempts a normal
+authenticated join with its next generation. A successful join returns the server session to `attached` without
+replacing the target endpoint or resetting direction-local packet ID state.
 
-For packet `p` and candidate lane `i`, the baseline prediction is:
+Every reconnecting lane attempts an authenticated join independently. The first successful join preserves the old
+session and activates through the clock-sync gate. A `session_gone` response on a previously admitted lane invalidates
+that shared session, so the client erases the old secret and creates one replacement session through the normal
+candidate-selection bootstrap. A configured lane that has never joined cannot invalidate a session still preserved by an
+admitted lane. The replacement reuses the configured stable lane and path group identifiers, but resets the connection
+generation, packet ID, deduplication, and clock-mapping namespaces.
 
-```text
-queue_delay_i = retained_bytes_i / estimated_delivery_rate_i
-serialization_delay_i = frame_size(p) / estimated_delivery_rate_i
+A session-scoped retryable error or local exhaustion of a nonwrapping relay counter enters the same replacement path
+after bounded backoff. Initial and replacement creation use independent candidate retries with bounded connection and
+handshake deadlines. A permanent credential, certificate, protocol, or policy rejection still terminates the affected
+lane or complete client according to its authenticated scope.
 
-predicted_arrival_i =
-  now
-  + queue_delay_i
-  + serialization_delay_i
-  + smoothed_rtt_i / 2
-```
+The scheduler returns any currently held control packet and preempted transport packet to the bounded ingress queue only
+while each packet remains fresh and queue capacity is still available. Packets already admitted to an old lane
+transmission store are not carried into the replacement session. Removing an old generation may apply its normal
+one-time migration to another lane in the old session, but the replacement session never retransmits that packet.
 
-The scheduler assigns the packet to the eligible lane with the earliest predicted arrival that can meet the packet
-deadline. Successful admission transfers the complete frame into that generation's bounded transmission store. Retained
-bytes remain part of later predictions until delivery feedback releases them.
+An explicit session-close control received on an admitted lane, an unrecoverable session worker error, or reconnect
+grace expiry moves the session to `closed`. Explicit client shutdown gives the close control up to 200 milliseconds to
+complete a carrier write before closing its lanes. Connection loss alone is never interpreted as an explicit close.
 
-Sparse probes validate an idle carrier and its cross-lane delivery-report path. Their interval backs off exponentially
-while the lane remains idle, and any completed real data write restores the initial interval. Probes do not update the
-capacity estimate. Delivery rate changes only after at least 4 KiB of dense real data arrives within a 250 ms sampling
-window. This avoids treating probe cadence or isolated packets as available path capacity. A sample above the current
-estimate can increase it immediately. A lower sample decreases the estimate only when its completing report arrives
-while unsent work exists or at least half of the lane's packet or byte retention window is occupied. Pressure is sampled
-before that report releases acknowledged data. A lower application-limited offered rate therefore cannot be mistaken for
-a reduction in path capacity, while sustained sender pressure can still detect a real capacity drop.
+Closing a session closes every remaining member lane, invalidates and erases its ephemeral secret, and releases its
+target resolver state, UDP sockets, and retained packet state.
 
-The half-RTT term approximates one-way delay, and application-limited traffic can preserve an outdated capacity estimate
-after a path slows. Directional asymmetry and stale estimates can therefore cause suboptimal packet placement even while
-all lanes remain healthy.
-
-Each lane sends its first timing request within a stable phase spread over the first quarter of the active ping
-interval. Timing requests back off exponentially while no real data is written and return to the active interval when
-traffic resumes. The first valid RTT sample replaces the conservative startup estimate directly. Later RTT samples and
-accepted delivery-rate samples use a seven-to-one previous-to-new weighted average.
-
-Each session direction maintains one preferred lane for sparse traffic. The scheduler keeps that lane when it is
-healthy, can meet the current packet's deadline, and another lane's predicted advantage is no larger than the fixed 2 ms
-switching margin:
-
-```text
-switch_gain = preferred_predicted_arrival - best_predicted_arrival
-
-switch only when switch_gain > 2 ms
-```
-
-Equal predictions use a stable lane identifier as the tie-break. They never use randomness. This stickiness prevents
-measurement noise from causing repeated lane changes.
-
-Under sparse transport-data traffic, the preferred lane may carry every packet because its retained backlog remains
-empty. This is expected and avoids needless reordering. Under sustained load, assigning packets to the preferred lane
-increases its retained backlog until another eligible lane predicts an earlier arrival beyond the switching margin.
-Traffic then spills across lanes according to their observed RTT, real-data delivery rate, and outstanding work.
-
-WireHop cannot determine whether encrypted transport data contains bulk, interactive, or control traffic. Scheduling
-therefore uses observable packet timing, size, deadlines, and lane behavior rather than inferred inner payload
-semantics.
-
-Handshake and cookie packets use the duplication policy below. Transport data is not proactively duplicated during
-normal operation.
-
-## Lane count policy
-
-More lanes are not always better.
-
-Benefits of more lanes:
-
-- Avoid single stream head-of-line blocking
-- Avoid single connection rate limits
-- Use multiple carrier paths
-- Use IPv4 and IPv6 when they behave differently
-- Improve failover speed
-
-Costs of more lanes:
-
-- More TLS and WebSocket state
-- More CPU and memory use
-- More packet reordering
-- More contention on the same bottleneck
-- More bufferbloat risk
-- More proxy and NAT state
-
-For each packet, at most the two best healthy lanes with enough transmission-store capacity in one path group are
-eligible for WireGuard packet scheduling. The eligible pair can change as predictions, retained capacity, and health
-change. Other connected lanes remain liveness-monitored and may carry session control or delivery feedback. Lanes from
-different path groups compete using the same per-lane predictions.
-
-Two active lanes in one path group isolate TCP sequence spaces and permit progress around one stalled stream. They do
-not prove that the underlying path has additional bandwidth. Large numbers of parallel TCP connections are not a
-supported strategy for taking an unfair share of a shared bottleneck.
-
-WireHop cannot portably couple congestion windows managed by independent kernel TCP implementations. It therefore caps
-same-group WireGuard packet scheduling eligibility at two lanes and does not claim the bottleneck fairness guarantees of
-a transport with native coupled congestion control. Ping, probe, session-lifecycle control, and delivery-feedback paths
-may still use other connected lanes in the same group.
-
-One lane is the default when reachability and capacity are sufficient. Two repeated declarations in one path group are
-recommended when isolating a single TCP stream stall matters. Additional path groups are useful only when measurements
-or independent failure domains justify their resource cost.
+The default reconnect grace is 30 seconds. Attached and detached sessions share the same global session limit, so a
+detached session cannot escape the server resource bound.
 
 ## WireGuard packet awareness
 
@@ -584,6 +522,158 @@ length. In a relay session it also does not change WireHop framing overhead, pac
 The CLI rejects an explicitly configured all-zero value because it would have no effect. The fixed-value adapter
 intentionally does not model per-peer, per-direction, negotiated, or rotating reserved schemes. Local peers that need
 different fixed values require separate client sessions or direct forwarder processes.
+
+## Multipath scheduling
+
+The scheduler chooses a lane for each WireGuard packet. Path groups organize the candidates for each scheduling
+decision, while packet placement uses per-lane delivery predictions.
+
+The scheduling goal is to maximize useful goodput within packet deadlines while minimizing delivery time and unnecessary
+reordering. Maximum raw carrier throughput is not a reason to stripe packets when one lane can deliver them earlier.
+
+Each usable lane direction maintains these scheduling estimates:
+
+- Smoothed round trip time and the generation's minimum observed round trip time
+- Estimated delivery rate
+- Unsent and total retained encoded bytes
+- Return-delay estimate from the carrier that most recently supplied valid delivery feedback
+
+The session clock mapping is shared by all lanes in that session. RTT, delivery rate, and retained backlog remain
+lane-local and direction-local. Preferred-lane state is also direction-local, so observations in one direction do not
+stand in for capacity in the reverse direction. A new lane refines path timing without creating a separate clock domain.
+
+The scheduler does not use unconditional round robin because that can create excessive reordering and continue sending
+packets into stalled lanes.
+
+For packet `p` and candidate lane `i`, the baseline prediction is:
+
+```text
+queued_time_i = (unsent_bytes_i + frame_size(p)) / estimated_delivery_rate_i
+retained_time_i = (retained_bytes_i + frame_size(p)) / estimated_delivery_rate_i
+feedback_delay_i = feedback_carrier_minimum_rtt / 2
+
+predicted_arrival_i =
+  now + max(
+    smoothed_rtt_i / 2 + queued_time_i,
+    max(0, retained_time_i - feedback_delay_i)
+  )
+```
+
+The scheduler assigns the packet to the eligible lane with the earliest predicted arrival that can meet the packet
+deadline. Successful admission transfers the complete frame into that generation's bounded transmission store. Retained
+bytes remain budgeted until validated delivery feedback releases them. Unsent bytes require both serialization and
+propagation. Sent-but-unreported bytes can include packets already parsed while their reports return, so treating every
+retained byte as additional unsent work can overstate delay and cause unnecessary lane changes.
+
+The feedback event records its incoming carrier identity and generation separately from the data generation named in the
+report. The return-delay correction uses that carrier's minimum observed RTT, keeping transient congestion out of the
+deducted propagation estimate. If the incoming generation is no longer registered or has no RTT observation, the
+correction is zero. Valid cumulative progress still releases its reported data in either case. New generations start
+with no minimum RTT or feedback-delay history.
+
+Deadline-risk assessment uses the complete retained prefix without deducting feedback delay. Packet expiry, cumulative
+report validation, aggregate retention accounting, and generation abandonment continue to govern retained ownership.
+
+Sparse probes validate an idle carrier and its cross-lane delivery-report path. Their interval backs off exponentially
+while the lane remains idle, and any completed real data write restores the initial interval. Probes do not update the
+capacity estimate. Each committed data transmission records its send time, send-interval anchor, and preceding
+cumulative delivery count and time. Valid feedback samples the bytes delivered since the last acknowledged
+transmission's recorded delivery count. The sampling interval is the longer of the corresponding send and feedback
+intervals. Feedback arriving in a burst therefore cannot inflate capacity merely by shortening the interval between
+reports. Starting a new flight with no unreported data resets both time anchors, excluding idle time. Migrated packets
+receive fresh sampling metadata when committed to their new generation.
+
+Delivery rate changes only for samples covering at least 4 KiB of real data over a positive interval. Duplicate, stale,
+and invalid reports do not change the sampling anchors. Valid cumulative progress with an earlier receive timestamp
+still releases its exact retained prefix, without producing a rate sample or moving the delivery-time anchor backwards.
+A sample above the current estimate can increase it immediately. A lower sample decreases the estimate only when its
+completing report arrives while unsent work exists or at least half of the lane's packet or byte retention window is
+occupied. Pressure is sampled before that report releases acknowledged data. A lower application-limited offered rate
+therefore cannot be mistaken for a reduction in path capacity, while sustained sender pressure can still detect a real
+capacity drop.
+
+The half-RTT term approximates one-way delay, and application-limited traffic can preserve an outdated capacity estimate
+after a path slows. Directional asymmetry and stale estimates can therefore cause suboptimal packet placement even while
+all lanes remain healthy.
+
+Each lane sends its first timing request within a stable phase spread over the first quarter of the active ping
+interval. Timing requests back off exponentially while no real data is written and return to the active interval when
+traffic resumes. The first valid RTT sample replaces the conservative startup estimate directly. Later RTT samples and
+accepted delivery-rate samples use a seven-to-one previous-to-new weighted average.
+
+Each session direction maintains one preferred lane for sparse traffic. The scheduler keeps that lane when it is
+healthy, can meet the current packet's deadline, and another lane's predicted advantage is no larger than the fixed 2 ms
+switching margin:
+
+```text
+switch_gain = preferred_predicted_arrival - best_predicted_arrival
+
+switch only when switch_gain > 2 ms
+```
+
+Equal predictions use a stable lane identifier as the tie-break. They never use randomness. This stickiness prevents
+measurement noise from causing repeated lane changes.
+
+Under sparse transport-data traffic, the preferred lane may carry every packet because its retained backlog remains
+empty. This is expected and avoids needless reordering. Under sustained load, assigning packets to the preferred lane
+increases its retained backlog until another eligible lane predicts an earlier arrival beyond the switching margin.
+Traffic then spills across lanes according to their observed RTT, real-data delivery rate, and outstanding work.
+
+This spillover does not guarantee capacity aggregation. Inner TCP congestion control can keep offered traffic below the
+level that would consistently favor a higher-delay lane, even when that lane has substantially more available bandwidth.
+Occasional lane changes can still introduce reordering and reduce inner TCP goodput. Since idle probes do not measure
+capacity, an underused lane may also retain its conservative startup delivery-rate estimate. Evaluate each lane alone as
+well as the combined configuration with the actual workload.
+
+WireHop cannot determine whether encrypted transport data contains bulk, interactive, or control traffic. Scheduling
+therefore uses observable packet timing, size, deadlines, and lane behavior rather than inferred inner payload
+semantics.
+
+Handshake and cookie packets use the duplication policy below. Transport data is not proactively duplicated during
+normal operation.
+
+## Lane count policy
+
+More lanes are not always better.
+
+Benefits of more lanes:
+
+- Avoid single stream head-of-line blocking
+- Avoid single connection rate limits
+- Use multiple carrier paths
+- Use IPv4 and IPv6 when they behave differently
+- Improve failover speed
+
+Costs of more lanes:
+
+- More TLS and WebSocket state
+- More CPU and memory use
+- More packet reordering
+- More contention on the same bottleneck
+- More bufferbloat risk
+- More proxy and NAT state
+
+For each packet, at most the two best healthy lanes with enough transmission-store capacity in one path group are
+eligible for WireGuard packet scheduling. The eligible pair can change as predictions, retained capacity, and health
+change. Other connected lanes remain liveness-monitored and may carry session control or delivery feedback. Lanes from
+different path groups compete using the same per-lane predictions.
+
+The pair is selected independently for each packet. Across successive decisions, more than two members can receive
+transport data and retain unreported work at the same time. The candidate limit does not cap a group's active TCP
+congestion windows or aggregate in-flight data at two connections.
+
+Two configured lanes in one path group isolate TCP sequence spaces and permit progress around one stalled stream. They
+do not prove that the underlying path has additional bandwidth. Large numbers of parallel TCP connections are not a
+supported strategy for taking an unfair share of a shared bottleneck.
+
+WireHop cannot portably couple congestion windows managed by independent kernel TCP implementations and does not claim
+the bottleneck fairness guarantees of a transport with native coupled congestion control. Every configured connection
+also retains its own ping, probe, session-lifecycle control, and delivery-feedback activity. Operators must account for
+all configured lanes when evaluating shared-bottleneck contention and resource cost.
+
+One lane is the default when reachability and capacity are sufficient. Two repeated declarations in one path group are
+recommended when isolating a single TCP stream stall matters. Additional path groups are useful only when measurements
+or independent failure domains justify their resource cost.
 
 ## Packet duplication policy
 
@@ -944,6 +1034,8 @@ sequenceDiagram
   W->>B: Route transport to selected candidate
 ```
 
+## UDP endpoint behavior
+
 The client and direct forwarder track the local UDP source address that sent packets to their listener and write replies
 back to that address. An unchanged WireGuard peer endpoint normally uses a stable source address and port, but the
 process tolerates a source address change after a local WireGuard restart. Because the latest structurally valid local
@@ -985,7 +1077,53 @@ rather than moving it backward. A later authenticated response replaces the samp
 can be corrected without widening the acceptance window. This estimate never changes the operating-system clock and is
 not used for TLS certificate validation, packet deadlines, RTT, logging, or the session clock mapping.
 
-## Authentication for WebSocket lanes
+### Authentication for TCP and TLS lanes
+
+For `tcp://` and `tls://`, WireHop needs its own binary client hello.
+
+The client hello contains:
+
+- Magic value
+- Protocol version
+- Mode: create session or join session
+- 96-bit random client nonce
+- Unix timestamp in seconds
+- Client monotonic send timestamp
+- Lane identifier
+- Connection generation
+- Proposed path group identifier
+- Session identifier when joining
+- Target when creating
+- Authentication tag
+
+For session creation:
+
+```text
+auth_tag = HMAC_SHA256(token, canonical_client_hello_without_auth_tag)
+```
+
+For lane join:
+
+```text
+auth_tag = HMAC_SHA256(session_secret, canonical_lane_join_without_auth_tag)
+```
+
+The server authenticates creation responses and pre-session rejections with the long-term token. Once a join resolves an
+existing session, its acceptance or rejection uses that session's secret. An unknown-session `session_gone` rejection
+uses the long-term token because the server has no retained session secret. The client accepts that fallback only for a
+`session_not_found` code with session-gone class and session scope. Every response echoes the request nonce and supplies
+the server Unix time under the same HMAC.
+
+This avoids sending the long-term token directly over insecure raw TCP. It does not provide the same protection as TLS,
+but it is better than a plaintext token. The returned session secret and all later control frames remain visible and
+modifiable on `tcp://`, so raw HMAC admission does not turn the carrier into a secure channel.
+
+The server accepts timestamps only within a bounded clock-skew window and keeps the nonce in a replay cache for that
+window. A timestamp outside the window returns a retryable `clock_skew` response before the nonce enters the cache. A
+repeated nonce that already entered the cache returns terminal `replay`. Clock correction never weakens replay
+protection.
+
+### Authentication for WebSocket lanes
 
 For `ws://` and `wss://`, authentication occurs in HTTP headers during the WebSocket handshake.
 
@@ -1060,52 +1198,6 @@ HTTP 408, 429, and 5xx are retryable. Every other unsigned non-upgrade HTTP resp
 candidate. In particular, HTTP 410 triggers session replacement only when its rejection metadata authenticates a
 `session_gone` result.
 
-## Authentication for TCP and TLS lanes
-
-For `tcp://` and `tls://`, WireHop needs its own binary client hello.
-
-The client hello contains:
-
-- Magic value
-- Protocol version
-- Mode: create session or join session
-- 96-bit random client nonce
-- Unix timestamp in seconds
-- Client monotonic send timestamp
-- Lane identifier
-- Connection generation
-- Proposed path group identifier
-- Session identifier when joining
-- Target when creating
-- Authentication tag
-
-For session creation:
-
-```text
-auth_tag = HMAC_SHA256(token, canonical_client_hello_without_auth_tag)
-```
-
-For lane join:
-
-```text
-auth_tag = HMAC_SHA256(session_secret, canonical_lane_join_without_auth_tag)
-```
-
-The server authenticates creation responses and pre-session rejections with the long-term token. Once a join resolves an
-existing session, its acceptance or rejection uses that session's secret. An unknown-session `session_gone` rejection
-uses the long-term token because the server has no retained session secret. The client accepts that fallback only for a
-`session_not_found` code with session-gone class and session scope. Every response echoes the request nonce and supplies
-the server Unix time under the same HMAC.
-
-This avoids sending the long-term token directly over insecure raw TCP. It does not provide the same protection as TLS,
-but it is better than a plaintext token. The returned session secret and all later control frames remain visible and
-modifiable on `tcp://`, so raw HMAC admission does not turn the carrier into a secure channel.
-
-The server accepts timestamps only within a bounded clock-skew window and keeps the nonce in a replay cache for that
-window. A timestamp outside the window returns a retryable `clock_skew` response before the nonce enters the cache. A
-repeated nonce that already entered the cache returns terminal `replay`. Clock correction never weakens replay
-protection.
-
 ## TLS policy
 
 WireGuard payload encryption does not protect WireHop authorization material, target metadata, lane joins, session
@@ -1128,7 +1220,34 @@ lanes and HTTPS proxy first hops therefore retain independent tickets for differ
 tunneled WSS target uses its logical address because the proxy does not expose the upstream socket. HTTPS proxy TLS and
 WSS use only HTTP/1.1 ALPN. Raw TLS does not claim an HTTP application protocol.
 
-## Carrier data-path policy
+## Security considerations
+
+WireGuard protects its payload, not the WireHop control plane or exposed relay resources. The security boundary is:
+
+| Threat | Mitigation |
+| --- | --- |
+| Unauthorized relay or lane access | Long-term token, per-lane authentication, and session-bound join HMAC |
+| Replay of admission requests | Random nonces, bounded timestamp skew, and replay caches |
+| Forged authentication time correction | HMAC-authenticated server time bound to the exact request nonce |
+| Stale or forged lifecycle feedback | Admission-bound controls, TLS in production, and identity and generation checks |
+| Unauthorized target selection | Canonical logical target allowlist checked before server-side resolution |
+| DNS target rebinding or compromise | Explicit operator trust in the allowed hostname and WireGuard authentication at every candidate |
+| Flooding an allowed target | Authentication, bounded ingress, and deployment-level rate limits when required |
+| Injection through a client or forward UDP listener | Bind to loopback or another trusted local interface |
+| Direct target traffic entering its local WireGuard tunnel | Forward socket mark or explicit target and DNS routes |
+| Direct target overlapping its local listener | Keep every target candidate outside the listener's bound address and port |
+| Token, metadata, or control exposure | TLS in production and explicit opt-in for plaintext carriers |
+| Connection and admission exhaustion | Global bounds plus deployment admission rate limits when required |
+| Packet-retention exhaustion | Per-queue limits, shared process budgets, deadlines, and one migration per packet |
+| Detached-session exhaustion | Reconnect grace and detached sessions counted in the global session limit |
+| Reconnect storms | Capped exponential backoff with full jitter |
+
+The WireGuard reserved field is public header metadata. Its value is neither a secret nor an authentication mechanism.
+Reserved translation does not replace WireGuard peer authentication or, when a carrier relay is used, the WireHop
+admission token.
+## Data-path I/O
+
+### Carrier writes
 
 All carrier implementations prioritize bounded latency over maximizing bytes accepted by local socket buffers.
 
@@ -1214,54 +1333,6 @@ A fixed-resolution WebSocket lane requires direct access because a forward proxy
 independently. If proxy selection returns an HTTP, HTTPS, SOCKS5, or SOCKS5H proxy for such a lane, client validation
 fails before binding the local UDP socket. Operators use `NO_PROXY` to select direct access.
 
-### Carrier route exclusion
-
-Carrier route exclusion is a deployment invariant. A client carrier connection and any DNS lookup needed to establish it
-cannot depend on the WireGuard tunnel that it carries. Every carrier dial follows this order:
-
-1. Resolve the first-hop hostname through a route-excluded resolver socket when resolution is required
-2. Create the TCP socket
-3. Apply route-exclusion and interface policy
-4. Connect the socket
-5. Apply connected-socket TCP options
-6. Perform TLS or WebSocket handshakes
-
-On Linux, an optional `--fwmark` value applies `SO_MARK` to carrier TCP sockets before `connect` and to local DNS
-sockets used by the Go resolver. Deployments on other platforms must provide external routes that exclude the DNS path
-and every actual first hop, including a selected forward proxy. Every lane and every replacement connection generation
-applies the same route-exclusion policy independently.
-
-Setting `SO_MARK` requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on Linux 5.17 and later. Non-root processes and containers
-need an explicitly granted capability. This option does not install policy-routing rules.
-
-### Direct forwarding route exclusion
-
-A direct forwarder's upstream UDP traffic must also avoid the local WireGuard tunnel when that tunnel captures its
-target route. The kernel WireGuard peer knows only the forwarder's local listen address and cannot automatically exclude
-the real target. On Linux, forward `--fwmark` applies `SO_MARK` before binding every upstream IPv4 and IPv6 UDP socket
-and to DNS sockets used to resolve a target hostname. The local WireGuard-facing listener remains unmarked.
-
-The mark does not create a policy-routing rule. Deployments must provide the corresponding rule, or equivalent explicit
-target and DNS routes on platforms without `SO_MARK`. Every target socket opened after a DNS refresh receives the same
-socket policy.
-
-The logical target must not resolve to an address and port covered by the forwarder's local listener. Otherwise,
-outbound datagrams re-enter local ingress and form a UDP feedback loop.
-
-### Carrier overhead and MTU
-
-Each datagram adds exactly 21 bytes of WireHop framing. TCP/IP, TLS, and WebSocket overhead depends on IP family, TCP
-options, record boundaries, and write coalescing. WireHop does not modify the WireGuard interface MTU.
-
-The forwarding protocol remains correct when one WireHop frame spans several TCP segments. A conservative WireGuard MTU
-is still desirable because fitting a normal WireGuard transport packet within one carrier segment reduces segment count,
-loss amplification, and head-of-line delay. Mixed-lane deployments should use the most restrictive active carrier path
-when choosing an MTU.
-
-Direct forwarding adds no WireHop framing and does not change the WireGuard datagram length. It still crosses a
-userspace UDP boundary, but its MTU requirement is the native IP and UDP path to the target rather than a TCP-based
-carrier path.
-
 ## Frame protocol
 
 WireHop uses version 1 of its binary framing protocol inside each carrier lane.
@@ -1284,9 +1355,9 @@ identifies the session or lane generation when applicable. The error class disti
 `session_gone`, and `session_rejected` outcomes. Free-form diagnostics never determine retry or exit behavior.
 Successful admission responses carry no diagnostic.
 
-When a lane detects deterministic in-session protocol input, it attempts to queue a lane-scoped protocol-violation error
-through the normal single writer. If the bounded control queue accepts it, the lane waits at most 200 milliseconds for
-the write-completion callback before closing. Transport failures and local UDP failures close through their own
+When a lane detects a protocol violation in an in-session frame, it attempts to queue a lane-scoped protocol-violation
+error through the normal single writer. If the bounded control queue accepts it, the lane waits at most 200 milliseconds
+for the write-completion callback before closing. Transport failures and local UDP failures close through their own
 lifecycle paths and are not mislabeled as peer violations.
 
 Raw-stream admission responses use exact protocol codes and classes. WebSocket admission carries the same signed
@@ -1551,64 +1622,6 @@ For WebSocket lanes, one nonempty binary message carries one or more complete Wi
 span WebSocket messages. Text messages, empty messages, incomplete frames, and trailing partial frame bytes are protocol
 violations. For TCP and TLS lanes, length-prefixed frames are read directly from the ordered byte stream.
 
-## Session lifecycle and recovery
-
-A session binds one local UDP listener and one remote WireGuard target through one or more path groups and lanes. The
-server tracks that authenticated session independently from the lifetime of any one lane:
-
-| State | Meaning |
-| --- | --- |
-| `unconfirmed` | A candidate has prepared its target but no lane has supplied a valid first clock-sync frame |
-| `attached` | A confirmed session has a connected lane or an accepted lane reservation is completing |
-| `detached` | No lane is connected or completing an accepted reservation, but reconnect grace has not expired |
-| `closed` | Session state, credentials, queues, resolver state, and target sockets have been released |
-
-An unconfirmed creator's disconnection or clock-sync timeout releases its session without reconnect grace. Once
-confirmed, an unexpected loss of the final lane moves the session to `detached` unless an authenticated join has
-reserved lane capacity and is still completing. The server starts a bounded reconnect grace timer only after both active
-lanes and accepted reservations reach zero. During that grace period it retains:
-
-- Session identifier and ephemeral session secret
-- Logical target, last successful DNS candidates, WireGuard index affinity, and per-family UDP sockets
-- Path groups, stable lane identifiers, and highest accepted connection generations
-- Direction-local packet ID, deduplication, and clock-mapping state
-- Bounded session ingress queued from the target UDP sockets
-
-Detached state does not suspend packet deadlines or queue limits. Retained packets and target replies continue to expire
-and are dropped when they cannot be delivered usefully.
-
-The client retains the session identifier, secret, path groups, lane generations, and direction-local packet ID,
-deduplication, and clock-mapping state while it is `disconnected`. A reconnecting lane first attempts a normal
-authenticated join with its next generation. A successful join returns the server session to `attached` without
-replacing the target endpoint or resetting direction-local packet ID state.
-
-Every reconnecting lane attempts an authenticated join independently. The first successful join preserves the old
-session and activates through the clock-sync gate. A `session_gone` response on a previously admitted lane invalidates
-that shared session, so the client erases the old secret and creates one replacement session through the normal
-candidate-selection bootstrap. A configured lane that has never joined cannot invalidate a session still preserved by an
-admitted lane. The replacement reuses the configured stable lane and path group identifiers, but resets the connection
-generation, packet ID, deduplication, and clock-mapping namespaces.
-
-A session-scoped retryable error or local exhaustion of a nonwrapping relay counter enters the same replacement path
-after bounded backoff. Initial and replacement creation use independent candidate retries with bounded connection and
-handshake deadlines. A permanent credential, certificate, protocol, or policy rejection still terminates the affected
-lane or complete client according to its authenticated scope.
-
-The scheduler returns any currently held control packet and preempted transport packet to the bounded ingress queue only
-while each packet remains fresh and queue capacity is still available. Packets already admitted to an old lane
-transmission store are not carried into the replacement session. Removing an old generation may apply its normal
-one-time migration to another lane in the old session, but the replacement session never retransmits that packet.
-
-An explicit session-close control received on an admitted lane, an unrecoverable session worker error, or reconnect
-grace expiry moves the session to `closed`. Explicit client shutdown gives the close control up to 200 milliseconds to
-complete a carrier write before closing its lanes. Connection loss alone is never interpreted as an explicit close.
-
-Closing a session closes every remaining member lane, invalidates and erases its ephemeral secret, and releases its
-target resolver state, UDP sockets, and retained packet state.
-
-The default reconnect grace is 30 seconds. Attached and detached sessions share the same global session limit, so a
-detached session cannot escape the server resource bound.
-
 ## CLI model
 
 WireHop receives runtime configuration from command-line flags. The client and server read authentication tokens from
@@ -1688,16 +1701,9 @@ different fixed resolutions belong to different groups.
 The forwarder binds its local listener before resolving its target and opening upstream UDP sockets. A fixed-port
 startup is silent. With port `0`, the selected address is printed only after target preparation succeeds.
 
-## IPv4 and IPv6 policy
-
-IPv4 and IPv6 are lane properties rather than separate operating modes. A session can use lanes across different
-addresses, IP families, and carrier schemes.
-
-Scheduling uses observed lane behavior and has no fixed preference for either IP family. A fixed resolution provides
-deterministic address-family and server-address selection for one lane. Without one, the system resolver and connection
-address selection apply, and the lane still creates only one connection.
-
 ## Deployment guidance
+
+### Lane selection
 
 The scheduler does not infer physical independence from carrier scheme, server address, or IP family. Operators should
 add lanes only when reachability, failure isolation, or measured capacity justifies their connection and queue cost.
@@ -1714,6 +1720,69 @@ Wi-Fi lanes commonly share one wireless medium and can similarly increase latenc
 are more likely to benefit when one TCP stream cannot fill the path, a per-connection limit exists, or lanes use
 independently provisioned paths. Two lanes in one path group are appropriate when single-stream stall isolation alone is
 the goal.
+
+### IPv4 and IPv6 policy
+
+IPv4 and IPv6 are lane properties rather than separate operating modes. A session can use lanes across different
+addresses, IP families, and carrier schemes.
+
+Scheduling uses observed lane behavior and has no fixed preference for either IP family. A fixed resolution provides
+deterministic address-family and server-address selection for one lane. Without one, the system resolver and connection
+address selection apply, and the lane still creates only one connection.
+
+### Carrier route exclusion
+
+Carrier route exclusion is a deployment invariant. A client carrier connection and any DNS lookup needed to establish it
+cannot depend on the WireGuard tunnel that it carries. Every carrier dial follows this order:
+
+1. Resolve the first-hop hostname through a route-excluded resolver socket when resolution is required
+2. Create the TCP socket
+3. Apply route-exclusion and interface policy
+4. Connect the socket
+5. Apply connected-socket TCP options
+6. Perform TLS or WebSocket handshakes
+
+On Linux, an optional `--fwmark` value applies `SO_MARK` to carrier TCP sockets before `connect` and to local DNS
+sockets used by the Go resolver. Deployments on other platforms must provide external routes that exclude the DNS path
+and every actual first hop, including a selected forward proxy. Every lane and every replacement connection generation
+applies the same route-exclusion policy independently.
+
+Setting `SO_MARK` requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on Linux 5.17 and later. Non-root processes and containers
+need an explicitly granted capability. This option does not install policy-routing rules.
+
+### Direct forwarding route exclusion
+
+A direct forwarder's upstream UDP traffic must also avoid the local WireGuard tunnel when that tunnel captures its
+target route. The kernel WireGuard peer knows only the forwarder's local listen address and cannot automatically exclude
+the real target. On Linux, forward `--fwmark` applies `SO_MARK` before binding every upstream IPv4 and IPv6 UDP socket
+and to DNS sockets used to resolve a target hostname. The local WireGuard-facing listener remains unmarked.
+
+The mark does not create a policy-routing rule. Deployments must provide the corresponding rule, or equivalent explicit
+target and DNS routes on platforms without `SO_MARK`. Every target socket opened after a DNS refresh receives the same
+socket policy.
+
+The logical target must not resolve to an address and port covered by the forwarder's local listener. Otherwise,
+outbound datagrams re-enter local ingress and form a UDP feedback loop.
+
+### Carrier overhead and MTU
+
+Each datagram adds exactly 21 bytes of WireHop framing. TCP/IP, TLS, and WebSocket overhead depends on IP family, TCP
+options, record boundaries, and write coalescing. WireHop does not modify the WireGuard interface MTU.
+
+The WireGuard interface MTU must account for WireGuard, IP, and UDP overhead on every actual UDP leg, including the
+server-to-target path. Carrier framing is removed before UDP delivery and does not reduce that UDP path's payload
+budget. A loopback WireGuard endpoint can hide this external constraint from automatic MTU selection, so deployments
+must set an explicit interface MTU appropriate for their UDP paths.
+
+TCP carries a byte stream and does not preserve application-write boundaries as segment boundaries, as specified in
+[RFC 9293, section 3.7](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7). One WireHop frame can span several TCP
+segments even when its size is below the carrier MSS. Carrier overhead affects bandwidth use and buffering, while
+smaller inner packets can change loss recovery and latency. These performance effects require workload measurements and
+do not establish a requirement to fit each frame into one TCP segment.
+
+Direct forwarding adds no WireHop framing and does not change the WireGuard datagram length. It still crosses a
+userspace UDP boundary, but its MTU requirement is the native IP and UDP path to the target rather than a TCP-based
+carrier path.
 
 ## Observability
 
@@ -1896,29 +1965,3 @@ below.
 - Carrier bytes per WireGuard payload byte
 - Probe traffic overhead
 - Effective goodput after framing, WebSocket, and TLS overhead
-
-## Security considerations
-
-WireGuard protects its payload, not the WireHop control plane or exposed relay resources. The security boundary is:
-
-| Threat | Mitigation |
-| --- | --- |
-| Unauthorized relay or lane access | Long-term token, per-lane authentication, and session-bound join HMAC |
-| Replay of admission requests | Random nonces, bounded timestamp skew, and replay caches |
-| Forged authentication time correction | HMAC-authenticated server time bound to the exact request nonce |
-| Stale or forged lifecycle feedback | Admission-bound controls, TLS in production, and identity and generation checks |
-| Unauthorized target selection | Canonical logical target allowlist checked before server-side resolution |
-| DNS target rebinding or compromise | Explicit operator trust in the allowed hostname and WireGuard authentication at every candidate |
-| Flooding an allowed target | Authentication, bounded ingress, and deployment-level rate limits when required |
-| Injection through a client or forward UDP listener | Bind to loopback or another trusted local interface |
-| Direct target traffic entering its local WireGuard tunnel | Forward socket mark or explicit target and DNS routes |
-| Direct target overlapping its local listener | Keep every target candidate outside the listener's bound address and port |
-| Token, metadata, or control exposure | TLS in production and explicit opt-in for plaintext carriers |
-| Connection and admission exhaustion | Global bounds plus deployment admission rate limits when required |
-| Packet-retention exhaustion | Per-queue limits, shared process budgets, deadlines, and one migration per packet |
-| Detached-session exhaustion | Reconnect grace and detached sessions counted in the global session limit |
-| Reconnect storms | Capped exponential backoff with full jitter |
-
-The WireGuard reserved field is public header metadata. Its value is neither a secret nor an authentication mechanism.
-Reserved translation does not replace WireGuard peer authentication or, when a carrier relay is used, the WireHop
-admission token.

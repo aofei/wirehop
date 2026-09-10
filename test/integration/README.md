@@ -51,6 +51,14 @@ limits, handshake timestamps, software versions, and WireHop diagnostics. Compar
 cannot identify an outer carrier reset. The tests use MTU 1420 and fixed public test keys exclusively inside the
 isolated network.
 
+These cases establish connectivity and recovery under the specified faults. Their endpoint-egress netem settings and
+short flows do not establish comparative WAN throughput or multipath capacity aggregation. For performance comparisons,
+apply impairments on an intermediate router or receiver ingress, verify that traffic traverses the configured queues,
+and run each candidate separately before testing the combined lanes. Keep workloads sequential on the same engine and
+record per-path traffic, retransmissions, and latency along with goodput. See the
+[netem limitations](https://man7.org/linux/man-pages/man8/tc-netem.8.html#LIMITATIONS) for the effect of TCP Small
+Queues on sender-side emulation.
+
 An additional opt-in Go test exercises actual Linux `prohibit`, `blackhole`, and `unreachable` routes against both UDP
 endpoint implementations. It verifies delivery through the same endpoint before and after every fault. Batch tests
 inject `EINTR` around actual UDP syscalls, including interruption after a partial write, and check for lost or

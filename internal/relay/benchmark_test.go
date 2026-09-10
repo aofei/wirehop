@@ -31,13 +31,32 @@ func (benchmarkEndpoint) Close() error {
 
 func BenchmarkSelectCandidates(b *testing.B) {
 	lanes := make(map[protocol.LaneID]*scheduledLane, 16)
+	deadline := time.Now().Add(time.Hour)
 	for index := range 16 {
 		laneID := protocol.LaneID{byte(index + 1)}
 		store, err := NewTransmissionStore(packetqueue.Limits{Packets: 1024, Bytes: 16 * 1024 * 1024})
 		if err != nil {
 			b.Fatal(err)
 		}
-		store.backlogBytes.Store(uint64(index * 1500))
+		b.Cleanup(func() { releaseTransmissions(store.drain()) })
+		for packetIndex := range index {
+			transmission := schedulerTransmission(uint64(packetIndex+1), wgpacket.TransportData, deadline)
+			payload := make([]byte, 1500-protocol.DataFrameOverhead)
+			copy(payload, transmission.data.Payload)
+			transmission.data.Payload = payload
+			if err := store.push(transmission); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if committed := index / 2; committed > 0 {
+			var batch [16]protocol.Data
+			var ownership [16]Packet
+			count, err := store.takeBatch(batch[:committed], ownership[:], committed*1500)
+			releaseBatchOwnership(ownership[:count])
+			if err != nil || count != committed {
+				b.Fatalf("takeBatch() = %d, %v, want %d committed packets", count, err, committed)
+			}
+		}
 		lanes[laneID] = &scheduledLane{
 			registration: LaneRegistration{
 				LaneID: laneID, PathGroupID: protocol.PathGroupID{byte(index/2 + 1)}, Store: store,
@@ -97,7 +116,7 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 		}
 		releaseBatchOwnership(ownership[:count])
 		bytes += uint64(transmission.size)
-		if _, _, err := store.acknowledge(packets, bytes); err != nil {
+		if _, _, err := store.acknowledge(packets, bytes, uint64(store.now().UnixMicro())); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -135,7 +154,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 		releaseBatchOwnership(ownership[:count])
 		sentPackets += uint64(count)
 		sentBytes += uint64(count * transmission.size)
-		if _, _, err := store.acknowledge(sentPackets, sentBytes); err != nil {
+		if _, _, err := store.acknowledge(sentPackets, sentBytes, uint64(store.now().UnixMicro())); err != nil {
 			b.Fatal(err)
 		}
 		for range count {

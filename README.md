@@ -14,6 +14,8 @@ WireHop is WireGuard-aware but is not a WireGuard peer. It classifies public Wir
 prioritize handshake traffic, duplicate control packets, enforce short packet deadlines, and schedule transport data. It
 never decrypts or authenticates WireGuard cryptographic content and preserves complete datagrams by default.
 
+See the [design document](docs/design.md) for the scheduling model, wire protocol, and recovery rules.
+
 ## Carrier schemes
 
 | Scheme | Carrier | Intended use |
@@ -64,6 +66,8 @@ traffic, route failure recovery, and socket interruption handling.
 
 ## Basic usage
 
+### Client and server
+
 Set the same high-entropy token on the client and server:
 
 ```sh
@@ -95,6 +99,21 @@ wirehop client \
 Configure the local WireGuard peer endpoint as `127.0.0.1:51821`. The client authenticates the logical target to the
 server, and the server resolves and reaches it from the server network.
 
+### Direct UDP forwarding
+
+When no TCP-based carrier is needed, forward directly to the remote WireGuard UDP endpoint:
+
+```sh
+wirehop forward \
+  --listen 127.0.0.1:51821 \
+  --target wg.example.com:51820
+```
+
+Configure the local WireGuard peer endpoint as `127.0.0.1:51821`. The forwarder resolves the target locally and needs no
+WireHop server or `WIREHOP_TOKEN`.
+
+### Startup and diagnostics
+
 Each client or forward listener serves one local WireGuard UDP source at a time. Replies go to the address and port of
 the latest structurally valid local packet, allowing source changes after a restart. Give concurrent local WireGuard
 devices separate listeners and instances, since sharing one listener can send replies to the wrong device.
@@ -117,35 +136,9 @@ Help is written to standard output. Diagnostics and warning logs are written to 
 environment validation errors exit with status `2`, runtime failures exit with status `1`, and help or signal-driven
 graceful shutdown exits with status `0`.
 
-## Target resolution and failover
-
-`--target` and `--allow-target` accept an IP literal or ASCII DNS hostname with an explicit, nonzero UDP port. For a
-client session, the server authorizes the canonical logical target before resolving it through the server's name service
-and network view. The `forward` command resolves its target locally and has no target allowlist.
-
-DNS target names are resolved as absolute names, without appending resolver search suffixes. Use the complete DNS name
-when the deployment normally relies on a search domain, such as a Kubernetes service's full cluster DNS name. Carrier
-hostnames use the dialer's normal resolver behavior.
-
-A DNS target may return multiple IPv4 and IPv6 addresses. All records must represent the same logical WireGuard peer,
-whether they reach one dual-stack server or multiple servers configured with the same WireGuard identity. WireHop
-initially sends handshake initiations to the bounded candidate set and uses WireGuard's public sender and receiver
-indexes to route responses and subsequent transport data to the candidate selected by the local WireGuard
-implementation. Transport data is never sprayed across candidates.
-
-Handshake Initiation packets and target-side UDP errors request rate-limited DNS refreshes without delaying the current
-packet. A successful refresh replaces the handshake fan-out set, while a lookup failure retains the last successful
-result. Established transport traffic keeps its selected candidate across answer reordering and rotating subsets. A
-routine rekey first uses that confirmed candidate. Only an unanswered handshake retry after five seconds discovers
-alternatives. Delayed old-key traffic cannot move the confirmed selection back to an earlier backend. Backends sharing a
-WireGuard identity still have independent NAT and TCP connection state, so failover cannot preserve that state.
-
-The direct forwarder binds its local listener immediately and discards packets while waiting for initial target
-resolution. Missing records and answers containing no usable target addresses remain retryable. Target socket
-preparation errors are fatal. Target address changes do not replace a WireHop session, reconnect carrier lanes, or
-restart a direct forwarder.
-
 ## WireGuard MTU and UDP receive capacity
+
+### WireGuard interface MTU
 
 Set an explicit MTU on the WireGuard interface whose endpoint points at WireHop. With `wg-quick`, automatic MTU
 detection can follow the route to `127.0.0.1` or `::1` and derive an oversized MTU from loopback. The actual UDP leg
@@ -163,6 +156,23 @@ endpoint with `wg show wg0 endpoints`. WireHop preserves complete encrypted data
 WireGuard interface MTU or clamp encrypted TCP MSS. TCP carrier frames can span TCP segments, so the outer TCP MSS alone
 does not determine the WireGuard MTU.
 
+### Carrier overhead
+
+Each WireGuard datagram receives a 16-byte WireHop data header, a one-byte frame type, and a four-byte content length.
+The exact WireHop framing overhead is therefore 21 bytes per datagram. TCP/IP, TLS records, and WebSocket frames add
+carrier overhead. Coalescing can amortize TLS and WebSocket overhead across several already-ready WireHop frames without
+waiting for more traffic.
+
+WireHop framing and TCP, TLS, or WebSocket headers are absent from the datagram delivered to WireGuard, so do not
+subtract them again from that UDP path's MTU. TCP segmentation and write coalescing do not preserve WireHop frame
+boundaries. Smaller packets can change loss recovery and latency, but tuning requires workload measurements rather than
+assuming one frame per TCP segment.
+
+The `forward` command uses direct UDP and adds no WireHop framing or packet-length overhead. Reserved translation does
+not change the WireGuard datagram length.
+
+### UDP receive capacity and errors
+
 WireHop requests a 4 MiB receive buffer for each local and target UDP socket. This absorbs bursts while retaining system
 socket limits. Linux may silently cap the request at `net.core.rmem_max`, and a rejected request retains the OS default
 with a warning. Check `sysctl net.core.rmem_max`, `ss -u -a -m`, and `nstat -az UdpRcvbufErrors UdpSndbufErrors` on the
@@ -176,33 +186,6 @@ Temporary UDP network failures drop affected datagrams while preserving the endp
 ICMP errors, route rejection or blackholing, buffer pressure, and write deadlines. The same recovery policy applies to
 the client, server, and direct forwarder. It preserves the socket, but cannot prevent inner connections from timing out
 if the network remains unavailable long enough.
-
-## Multipath lanes
-
-Repeat `--lane` to create independent full-duplex carrier connections in one session:
-
-```sh
-wirehop client \
-  --listen 127.0.0.1:51821 \
-  --target 203.0.113.10:51820 \
-  --lane 'url=wss://relay.example.com/_wirehop,resolve=203.0.113.10' \
-  --lane 'url=wss://relay.example.com/_wirehop,resolve=203.0.113.11' \
-  --lane 'url=wss://relay.example.com/_wirehop,resolve=2001:db8::10'
-```
-
-Each flag occurrence is one stable lane identity and one TCP connection. Repeating the same canonical URL and `resolve`
-value creates multiple connections in the same path group. A different URL or fixed resolution creates a different path
-group. WireHop prefers a stable low-delay lane for sparse transport traffic, spills load when predicted queueing makes
-another lane faster, and sends at most two copies of a WireGuard control packet. The second copy prefers another path
-group.
-
-The client races carrier preparation and session admission across configured lanes, selects the first successful
-candidate, and cancels the others. Only the selected session carries WireGuard packets. The remaining lanes reconnect
-and join that session concurrently. Lane-scoped rejections close only the affected lane while healthy lanes continue.
-Session-scoped failures coordinate complete session replacement or termination. Retryable lane failures reconnect
-independently with increasing generations and full-jitter backoff. After the first session succeeds, retryable session
-replacement continues without an overall recovery deadline. A permanent lane failure writes one warning when another
-lane supervisor keeps the client running. Individual lane reconnects remain silent.
 
 ## Route exclusion
 
@@ -237,20 +220,67 @@ that exclude carrier endpoints, direct forwarding targets, forward proxies, and 
 Setting `--fwmark` requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on Linux 5.17 and later. A non-root process or container
 must receive that capability explicitly. The option marks sockets but does not install policy-routing rules.
 
-## Overhead and MTU
+## Multipath lanes
 
-Each WireGuard datagram receives a 16-byte WireHop data header, a one-byte frame type, and a four-byte content length.
-The exact WireHop framing overhead is therefore 21 bytes per datagram. TCP/IP, TLS records, and WebSocket frames add
-carrier overhead. Coalescing can amortize TLS and WebSocket overhead across several already-ready WireHop frames without
-waiting for more traffic.
+Repeat `--lane` to create independent full-duplex carrier connections in one session:
 
-WireHop does not change the WireGuard interface MTU. A deployment should account for the most restrictive active path,
-IP family, TCP options, the 21-byte WireHop frame overhead, WireGuard's own transport overhead, and any TLS or WebSocket
-framing. Correctness does not depend on one frame fitting one TCP segment, but a conservative MTU reduces TCP segment
-loss amplification and head-of-line delay.
+```sh
+wirehop client \
+  --listen 127.0.0.1:51821 \
+  --target 203.0.113.10:51820 \
+  --lane 'url=wss://relay.example.com/_wirehop,resolve=203.0.113.10' \
+  --lane 'url=wss://relay.example.com/_wirehop,resolve=203.0.113.11' \
+  --lane 'url=wss://relay.example.com/_wirehop,resolve=2001:db8::10'
+```
 
-The `forward` command uses direct UDP and adds no WireHop framing or packet-length overhead. Reserved translation does
-not change the WireGuard datagram length.
+Each flag occurrence is one stable lane identity and one TCP connection. Repeating the same canonical URL and `resolve`
+value creates multiple connections in the same path group. A different URL or fixed resolution creates a different path
+group. WireHop prefers a stable low-delay lane for sparse transport traffic, spills load when predicted queueing makes
+another lane faster, and sends at most two copies of a WireGuard control packet. The second copy prefers another path
+group.
+
+Start with one lane and measure each candidate separately. Two repeated declarations can isolate a single carrier stream
+stall, but additional connections do not establish additional physical bandwidth. Paths with different delays can
+reorder packets and reduce inner TCP goodput below the best single-lane result. WireHop forwards received datagrams
+without waiting for packet ID order, and a higher-capacity lane can remain underused when the offered traffic keeps the
+preferred lane's queue short. Compare sustained goodput and latency in both directions, with both single and concurrent
+inner flows, before retaining extra lanes.
+
+The client races carrier preparation and session admission across configured lanes, selects the first successful
+candidate, and cancels the others. Only the selected session carries WireGuard packets. The remaining lanes reconnect
+and join that session concurrently. Lane-scoped rejections close only the affected lane while healthy lanes continue.
+Session-scoped failures coordinate complete session replacement or termination. Retryable lane failures reconnect
+independently with increasing generations and full-jitter backoff. After the first session succeeds, retryable session
+replacement continues without an overall recovery deadline. A permanent lane failure writes one warning when another
+lane supervisor keeps the client running. Individual lane reconnects remain silent.
+
+## Target resolution and failover
+
+`--target` and `--allow-target` accept an IP literal or ASCII DNS hostname with an explicit, nonzero UDP port. For a
+client session, the server authorizes the canonical logical target before resolving it through the server's name service
+and network view. The `forward` command resolves its target locally and has no target allowlist.
+
+DNS target names are resolved as absolute names, without appending resolver search suffixes. Use the complete DNS name
+when the deployment normally relies on a search domain, such as a Kubernetes service's full cluster DNS name. Carrier
+hostnames use the dialer's normal resolver behavior.
+
+A DNS target may return multiple IPv4 and IPv6 addresses. All records must represent the same logical WireGuard peer,
+whether they reach one dual-stack server or multiple servers configured with the same WireGuard identity. WireHop
+initially sends handshake initiations to the bounded candidate set and uses WireGuard's public sender and receiver
+indexes to route responses and subsequent transport data to the candidate selected by the local WireGuard
+implementation. Transport data is never sprayed across candidates.
+
+Handshake Initiation packets and target-side UDP errors request rate-limited DNS refreshes without delaying the current
+packet. A successful refresh replaces the handshake fan-out set, while a lookup failure retains the last successful
+result. Established transport traffic keeps its selected candidate across answer reordering and rotating subsets. A
+routine rekey first uses that confirmed candidate. Only an unanswered handshake retry after five seconds discovers
+alternatives. Delayed old-key traffic cannot move the confirmed selection back to an earlier backend. Backends sharing a
+WireGuard identity still have independent NAT and TCP connection state, so failover cannot preserve that state.
+
+The direct forwarder binds its local listener immediately and discards packets while waiting for initial target
+resolution. Missing records and answers containing no usable target addresses remain retryable. Target socket
+preparation errors are fatal. Target address changes do not replace a WireHop session, reconnect carrier lanes, or
+restart a direct forwarder.
 
 ## Reserved field translation
 
@@ -271,7 +301,7 @@ wirehop client \
   --reserved AQID
 ```
 
-When no WireHop carrier is needed, the same translation can run as a direct WireGuard UDP forwarding path:
+The same option enables translation on the [direct UDP forwarding](#direct-udp-forwarding) path:
 
 ```sh
 wirehop forward \
@@ -279,9 +309,6 @@ wirehop forward \
   --target wg.example.com:51820 \
   --reserved AQID
 ```
-
-This command does not use lanes, WireHop framing, or `WIREHOP_TOKEN`. It resolves and reaches the target from the local
-network. Without `--reserved`, it remains a transparent WireGuard-aware UDP forwarder.
 
 With `--reserved`, the local WireGuard implementation must use the standard zero reserved field. The client or forwarder
 overwrites that field on packets read from the local endpoint. On packets returning from the target, it requires the

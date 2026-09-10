@@ -764,7 +764,9 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 		if err != nil {
 			return err
 		}
-		return l.observer.ObserveDeliveryReport(ctx, report, l.clock.NowMicros())
+		return l.observer.ObserveDeliveryReport(ctx, protocol.LaneGeneration{
+			LaneID: l.laneID, Generation: l.generation,
+		}, report, l.clock.NowMicros())
 	case protocol.FrameSessionClose:
 		reason, err := protocol.ParseSessionClose(frame)
 		if err != nil {
