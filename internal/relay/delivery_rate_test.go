@@ -139,7 +139,13 @@ func newDeliverySampleStore(t *testing.T, now *time.Time) *TransmissionStore {
 func sendDeliverySamplePacket(t *testing.T, store *TransmissionStore, packetID uint64) {
 	t.Helper()
 	transmission := schedulerTransmission(packetID, wgpacket.TransportData, store.now().Add(time.Second))
-	payload := make([]byte, 4096-protocol.DataFrameOverhead)
+	metadata := transmission.data
+	metadata.Payload = nil
+	frame, err := protocol.MarshalData(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 4096-3-len(frame.Payload))
 	copy(payload, transmission.data.Payload)
 	transmission.data.Payload = payload
 	if err := store.push(transmission); err != nil {

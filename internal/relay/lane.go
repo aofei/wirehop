@@ -73,14 +73,14 @@ const (
 	defaultProbeInterval = 2 * time.Second
 	// maximumIdleProbeInterval bounds representative probe backoff without real data writes.
 	maximumIdleProbeInterval = time.Minute
-	// defaultProbeSize fits one representative packet below common carrier MTUs.
+	// defaultProbeSize provides representative bounded idle carrier traffic.
 	defaultProbeSize = 1200
 	// maximumDataBatchFrames bounds nonblocking carrier write coalescing.
 	maximumDataBatchFrames = 16
 	// targetDataBatchBytes stops nonblocking coalescing after a compact write budget.
 	targetDataBatchBytes = 64 * 1024
-	// maximumConsecutiveControlWrites bounds internal-control priority while data is ready.
-	maximumConsecutiveControlWrites = 8
+	// maximumConsecutiveControlFrames bounds internal-control priority by frame count while data is ready.
+	maximumConsecutiveControlFrames = 8
 	// protocolErrorWriteTimeout bounds best-effort rejection before a violating lane closes.
 	protocolErrorWriteTimeout = 200 * time.Millisecond
 )
@@ -132,6 +132,7 @@ type Lane struct {
 	probeSize         int
 	dataWrites        atomic.Uint64
 	probeWrites       atomic.Uint64
+	controlBatch      [maximumConsecutiveControlFrames]protocol.Frame
 	dataBatch         [maximumDataBatchFrames]protocol.Data
 	dataOwnership     [maximumDataBatchFrames]Packet
 	progress          deliveryProgress
@@ -139,6 +140,7 @@ type Lane struct {
 	pendingPingID     uint64
 	pendingPingAt     time.Time
 	pendingPingMicros uint64
+	pendingPingBuilt  bool
 	lastReceivedAt    time.Time
 	pingChanged       chan struct{}
 }
@@ -379,14 +381,16 @@ func (l *Lane) startPing(identifier uint64) {
 	l.pendingPingID = identifier
 	l.pendingPingAt = time.Time{}
 	l.pendingPingMicros = 0
+	l.pendingPingBuilt = false
 	l.pingMu.Unlock()
 }
 
-// recordPingSend binds the request identifier to the monotonic timestamp exposed to the peer.
+// recordPingSend binds the request to its writer-sampled timestamp before carrier exposure.
 func (l *Lane) recordPingSend(identifier, sendMicros uint64) {
 	l.pingMu.Lock()
 	if l.pendingPingID == identifier {
 		l.pendingPingMicros = sendMicros
+		l.pendingPingBuilt = true
 	}
 	l.pingMu.Unlock()
 }
@@ -411,20 +415,22 @@ func (l *Lane) cancelPing(identifier uint64) {
 		l.pendingPingID = 0
 		l.pendingPingAt = time.Time{}
 		l.pendingPingMicros = 0
+		l.pendingPingBuilt = false
 	}
 	l.pingMu.Unlock()
 }
 
-// completePing accepts only the response for the sole outstanding request.
+// completePing accepts only a matching response for a request built by the carrier writer.
 func (l *Lane) completePing(identifier, sendMicros uint64) bool {
 	l.pingMu.Lock()
-	if l.pendingPingID != identifier || l.pendingPingMicros != sendMicros {
+	if !l.pendingPingBuilt || l.pendingPingID != identifier || l.pendingPingMicros != sendMicros {
 		l.pingMu.Unlock()
 		return false
 	}
 	l.pendingPingID = 0
 	l.pendingPingAt = time.Time{}
 	l.pendingPingMicros = 0
+	l.pendingPingBuilt = false
 	l.pingMu.Unlock()
 	l.signalPingChanged()
 	return true
@@ -442,11 +448,10 @@ func (l *Lane) signalPingChanged() {
 func (l *Lane) probe(ctx context.Context) error {
 	timer := time.NewTimer(l.probeInterval + lanePhase(l.laneID, l.generation, l.probeInterval/4))
 	defer timer.Stop()
-	identifier := uint64(0)
 	interval := l.probeInterval
 	maximumInterval := max(l.probeInterval, maximumIdleProbeInterval)
 	observedDataWrites := l.dataWrites.Load()
-	payload := make([]byte, l.probeSize)
+	frame := protocol.Frame{Type: protocol.FrameProbe, Payload: make([]byte, l.probeSize)}
 	for {
 		select {
 		case <-timer.C:
@@ -454,14 +459,6 @@ func (l *Lane) probe(ctx context.Context) error {
 				interval = l.probeInterval
 				timer.Reset(l.probeInterval)
 				continue
-			}
-			identifier++
-			if identifier == 0 {
-				return ErrCounterExhausted
-			}
-			frame, err := protocol.MarshalProbe(protocol.Probe{ID: identifier, Payload: payload})
-			if err != nil {
-				return err
 			}
 			request := controlWrite{build: func(uint64) (protocol.Frame, error) { return frame, nil }}
 			select {
@@ -515,38 +512,40 @@ func (l *Lane) write(ctx context.Context) error {
 			return err
 		}
 	}
-	controlWrites := 0
+	controlFrames := 0
 	for {
-		if controlWrites == maximumConsecutiveControlWrites {
+		if controlFrames == maximumConsecutiveControlFrames {
 			select {
 			case <-l.store.Ready():
 				if err := l.writeReadyData(carrierContext); err != nil {
 					return err
 				}
-				controlWrites = 0
+				controlFrames = 0
 				continue
 			default:
-				controlWrites = 0
+				controlFrames = 0
 			}
 		}
 		select {
 		case request := <-l.control:
-			if err := l.writeControl(carrierContext, request); err != nil {
+			count, err := l.writeControlBatch(carrierContext, request, maximumConsecutiveControlFrames-controlFrames)
+			if err != nil {
 				return err
 			}
-			controlWrites++
+			controlFrames += count
 		default:
 			select {
 			case request := <-l.control:
-				if err := l.writeControl(carrierContext, request); err != nil {
+				count, err := l.writeControlBatch(carrierContext, request, maximumConsecutiveControlFrames-controlFrames)
+				if err != nil {
 					return err
 				}
-				controlWrites++
+				controlFrames += count
 			case <-l.store.Ready():
 				if err := l.writeReadyData(carrierContext); err != nil {
 					return err
 				}
-				controlWrites = 0
+				controlFrames = 0
 			case <-l.store.Done():
 				return ErrLaneAbandoned
 			case <-ctx.Done():
@@ -582,28 +581,62 @@ func (l *Lane) writeDataBatch(ctx context.Context) error {
 	return err
 }
 
-// writeControl builds and writes one control frame.
-func (l *Lane) writeControl(ctx context.Context, request controlWrite) error {
-	frame, err := request.build(l.clock.NowMicros())
-	if err != nil {
-		return err
+// writeControlBatch drains ready controls within the remaining fairness budget. Timing and lifecycle frames end
+// the batch. Success callbacks run in queue order after the complete carrier write succeeds.
+func (l *Lane) writeControlBatch(ctx context.Context, first controlWrite, limit int) (int, error) {
+	frames := l.controlBatch[:]
+	defer clear(frames)
+	var callbacks [maximumConsecutiveControlFrames]func()
+	count := 0
+	request := first
+collect:
+	for {
+		frame, err := request.build(l.clock.NowMicros())
+		if err != nil {
+			return count, err
+		}
+		frames[count] = frame
+		callbacks[count] = request.sent
+		count++
+		switch frame.Type {
+		case protocol.FramePing, protocol.FramePong, protocol.FrameClockSync,
+			protocol.FrameSessionClose, protocol.FrameLaneAbandon, protocol.FrameError:
+			break collect
+		}
+		if count == limit {
+			break
+		}
+		select {
+		case request = <-l.control:
+		default:
+			break collect
+		}
 	}
-	if err := l.writeFrames(ctx, []protocol.Frame{frame}); err != nil {
-		return err
+	if err := l.writeFrames(ctx, frames[:count]); err != nil {
+		return count, err
 	}
-	if request.sent != nil {
-		request.sent()
+	for _, callback := range callbacks[:count] {
+		if callback != nil {
+			callback()
+		}
 	}
-	return nil
+	return count, nil
 }
 
 // writeFrames writes one control batch within the carrier stall budget.
 func (l *Lane) writeFrames(ctx context.Context, frames []protocol.Frame) error {
+	var probes uint64
 	for _, frame := range frames {
 		if frame.Type == protocol.FrameProbe {
-			// Publish before writing because peer feedback can return on another lane before this call completes.
-			l.probeWrites.Add(1)
+			probes++
 		}
+	}
+	if probes != 0 {
+		if probes > ^uint64(0)-l.probeWrites.Load() {
+			return ErrCounterExhausted
+		}
+		// Publish before writing because peer feedback can return on another lane before this call completes.
+		l.probeWrites.Add(probes)
 	}
 	return carrier.WriteFramesWithin(ctx, l.carrier, frames, l.writeTimeout)
 }
@@ -634,7 +667,7 @@ func (l *Lane) SendControl(frame protocol.Frame, onSent func()) bool {
 
 // ValidateProbeProgress reports whether cumulative feedback matches probes exposed to this generation's carrier writer.
 func (l *Lane) ValidateProbeProgress(packets, bytes uint64) bool {
-	frameBytes := uint64(protocol.ProbeFrameOverhead + l.probeSize)
+	frameBytes := uint64(protocol.FrameSize(l.probeSize))
 	return packets <= l.probeWrites.Load() && packets <= ^uint64(0)/frameBytes && bytes == packets*frameBytes
 }
 
@@ -758,7 +791,7 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 		if err != nil {
 			return err
 		}
-		return l.progress.addProbe(len(probe.Payload) + protocol.ProbeFrameOverhead)
+		return l.progress.addProbe(protocol.FrameSize(len(probe.Payload)))
 	case protocol.FrameDeliveryReport:
 		report, err := protocol.ParseDeliveryReport(frame)
 		if err != nil {

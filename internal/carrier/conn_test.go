@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -322,6 +323,57 @@ func TestWebSocketConnBoundedWritesPreserveControlFrames(t *testing.T) {
 }
 
 func TestWebSocketConnReadLimit(t *testing.T) {
+	t.Run("MaximumMessage", func(t *testing.T) {
+		result := make(chan error, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			connection, err := websocket.Accept(writer, request, nil)
+			if err != nil {
+				result <- err
+				return
+			}
+			defer connection.CloseNow()
+			var frames [2]protocol.Frame
+			count, err := NewWebSocketConn(connection).ReadFrames(request.Context(), frames[:])
+			if err == nil && count != len(frames) {
+				err = errors.New("maximum message lost a frame")
+			}
+			if err == nil {
+				for index, frame := range frames {
+					data, parseErr := protocol.ParseData(frame)
+					if parseErr != nil || data.PacketID != math.MaxUint64-uint64(index) ||
+						data.DeadlineMicros != math.MaxUint64 || len(data.Payload) != protocol.MaxPacketSize ||
+						bytes.Count(data.Payload, []byte{byte(index + 1)}) != protocol.MaxPacketSize {
+						err = errors.New("maximum message changed data fields")
+						break
+					}
+				}
+			}
+			result <- err
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stream := NewWebSocketConn(connection)
+		defer stream.Close()
+		var data [2]protocol.Data
+		for index := range data {
+			data[index] = protocol.Data{PacketID: math.MaxUint64 - uint64(index), DeadlineMicros: math.MaxUint64,
+				Payload: bytes.Repeat([]byte{byte(index + 1)}, protocol.MaxPacketSize)}
+		}
+		if WebSocketReadLimit != 131_118 {
+			t.Fatalf("message limit = %d, want 131118", WebSocketReadLimit)
+		}
+		if err := stream.WriteDataBatch(ctx, data[:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+	})
 	t.Run("LargeFrame", func(t *testing.T) {
 		result := make(chan error, 1)
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -535,6 +587,9 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 		if _, err := stream.ReadFrame(canceled); !errors.Is(err, context.Canceled) {
 			t.Fatalf("ReadFrame() error = %v, want %v", err, context.Canceled)
 		}
+		if frame, err := stream.ReadFrame(ctx); err != nil || !reflect.DeepEqual(frame, frames[1]) {
+			t.Fatalf("ReadFrame() after cancellation = %#v, %v, want %#v", frame, err, frames[1])
+		}
 	})
 
 	for _, tt := range []struct {
@@ -552,6 +607,11 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 		{name: "TrailingPartialFrame", messageType: websocket.MessageBinary,
 			messages: [][]byte{append(append([]byte(nil), encoded...), byte(protocol.FramePing))},
 			want:     protocol.ErrTrailingFrameData},
+		{name: "NonminimalLength", messageType: websocket.MessageBinary,
+			messages: [][]byte{{byte(protocol.FrameProbe), 0x80, 0}}, want: protocol.ErrInvalidInteger},
+		{name: "ValidPrefixBeforeNonminimalLength", messageType: websocket.MessageBinary,
+			messages: [][]byte{append(append([]byte(nil), encoded...), byte(protocol.FrameProbe), 0x80, 0)},
+			want:     protocol.ErrInvalidInteger},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			result := make(chan error, 1)

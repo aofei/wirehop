@@ -3,13 +3,12 @@ package protocol
 import (
 	"encoding/binary"
 	"errors"
+	"slices"
 )
 
 const (
-	// dataHeaderSize is the encoded data-frame header size.
-	dataHeaderSize = 16
-	// DataFrameOverhead is the complete per-datagram frame overhead excluding the WireGuard payload.
-	DataFrameOverhead = frameHeaderSize + dataHeaderSize
+	// maximumDataHeaderSize bounds the two unsigned 64-bit metadata fields.
+	maximumDataHeaderSize = 2 * binary.MaxVarintLen64
 	// MaxPacketSize is the largest UDP datagram carried by WireHop.
 	MaxPacketSize = 65_535
 	// MaxPacketLifetimeMicros is the absolute wire-protocol packet lifetime limit.
@@ -34,7 +33,7 @@ func MarshalData(data Data) (Frame, error) {
 		return Frame{}, err
 	}
 
-	payload := make([]byte, dataHeaderSize+len(data.Payload))
+	payload := make([]byte, dataPayloadSize(data))
 	encodeDataPayload(payload, data)
 	return Frame{Type: FrameData, Payload: payload}, nil
 }
@@ -44,7 +43,7 @@ func DataFrameSize(data Data) (int, error) {
 	if err := validateData(data); err != nil {
 		return 0, err
 	}
-	return DataFrameOverhead + len(data.Payload), nil
+	return FrameSize(dataPayloadSize(data)), nil
 }
 
 // MarshalDataFrame returns one complete data-frame encoding without an intermediate payload copy.
@@ -54,16 +53,19 @@ func MarshalDataFrame(data Data) ([]byte, error) {
 
 // AppendDataFrame appends one complete data frame to destination.
 func AppendDataFrame(destination []byte, data Data) ([]byte, error) {
-	size, err := DataFrameSize(data)
-	if err != nil {
+	if err := validateData(data); err != nil {
 		return destination, err
 	}
+	contentSize := dataPayloadSize(data)
+	size := FrameSize(contentSize)
 	start := len(destination)
-	destination = append(destination, make([]byte, size)...)
+	destination = slices.Grow(destination, size)
+	destination = destination[:start+size]
 	encoded := destination[start:]
+	headerSize := size - contentSize
+	encodeDataPayload(encoded[headerSize:], data)
 	encoded[0] = byte(FrameData)
-	binary.BigEndian.PutUint32(encoded[1:frameHeaderSize], uint32(size-frameHeaderSize))
-	encodeDataPayload(encoded[frameHeaderSize:], data)
+	binary.PutUvarint(encoded[1:], uint64(contentSize))
 	return destination, nil
 }
 
@@ -77,22 +79,28 @@ func validateData(data Data) error {
 
 // encodeDataPayload writes data into a validated payload-sized destination.
 func encodeDataPayload(payload []byte, data Data) {
-	binary.BigEndian.PutUint64(payload[0:8], data.PacketID)
-	binary.BigEndian.PutUint64(payload[8:16], data.DeadlineMicros)
-	copy(payload[dataHeaderSize:], data.Payload)
+	metadataSize := uvarintSize(data.PacketID) + uvarintSize(data.DeadlineMicros)
+	copy(payload[metadataSize:], data.Payload)
+	offset := binary.PutUvarint(payload, data.PacketID)
+	binary.PutUvarint(payload[offset:], data.DeadlineMicros)
+}
+
+// dataPayloadSize returns the exact content length of validated data.
+func dataPayloadSize(data Data) int {
+	return uvarintSize(data.PacketID) + uvarintSize(data.DeadlineMicros) + len(data.Payload)
 }
 
 // ParseData parses and validates one generic data frame.
 func ParseData(frame Frame) (Data, error) {
-	if frame.Type != FrameData || len(frame.Payload) < dataHeaderSize {
+	if frame.Type != FrameData {
 		return Data{}, ErrInvalidDataFrame
 	}
-
-	data := Data{
-		PacketID:       binary.BigEndian.Uint64(frame.Payload[0:8]),
-		DeadlineMicros: binary.BigEndian.Uint64(frame.Payload[8:16]),
-		Payload:        frame.Payload[dataHeaderSize:],
+	var data Data
+	payload, err := parseIntegers(frame.Payload, &data.PacketID, &data.DeadlineMicros)
+	if err != nil {
+		return Data{}, ErrInvalidDataFrame
 	}
+	data.Payload = payload
 	if err := validateData(data); err != nil {
 		return Data{}, err
 	}

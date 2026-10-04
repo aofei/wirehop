@@ -47,7 +47,7 @@ func TestLaneDelayedPongWithReceiveProgress(t *testing.T) {
 							Payload: relayWireGuardPacket(wgpacket.TransportData),
 						})
 					} else {
-						frame, err = protocol.MarshalProbe(protocol.Probe{ID: uint64(index + 1)})
+						frame, err = protocol.MarshalProbe(protocol.Probe{})
 					}
 					if err != nil {
 						t.Fatal(err)

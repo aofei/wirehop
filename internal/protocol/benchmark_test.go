@@ -77,12 +77,15 @@ func BenchmarkAppendFrames(b *testing.B) {
 }
 
 func BenchmarkFrameSequence(b *testing.B) {
-	encoded := make([]byte, 0, 16*1441)
-	for range 16 {
-		var err error
-		encoded, err = AppendDataFrame(encoded, Data{
-			PacketID: 1, DeadlineMicros: 1, Payload: make([]byte, 1420),
-		})
+	data := Data{PacketID: 1, DeadlineMicros: 1, Payload: make([]byte, 1420)}
+	size, err := DataFrameSize(data)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encoded := make([]byte, 0, 16*size)
+	for index := range 16 {
+		data.PacketID = uint64(index + 1)
+		encoded, err = AppendDataFrame(encoded, data)
 		if err != nil {
 			b.Fatal(err)
 		}

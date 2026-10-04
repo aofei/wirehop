@@ -144,7 +144,7 @@ Set an explicit MTU on the WireGuard interface whose endpoint points at WireHop.
 detection can follow the route to `127.0.0.1` or `::1` and derive an oversized MTU from loopback. The actual UDP leg
 between WireHop and the remote WireGuard peer can have a much smaller path MTU.
 
-For example, when every external UDP leg has a path MTU of at least 1500 bytes, use:
+For example, when every actual UDP leg has a path MTU of at least 1500 bytes, use:
 
 ```ini
 [Interface]
@@ -158,15 +158,20 @@ does not determine the WireGuard MTU.
 
 ### Carrier overhead
 
-Each WireGuard datagram receives a 16-byte WireHop data header, a one-byte frame type, and a four-byte content length.
-The exact WireHop framing overhead is therefore 21 bytes per datagram. TCP/IP, TLS records, and WebSocket frames add
-carrier overhead. Coalescing can amortize TLS and WebSocket overhead across several already-ready WireHop frames without
-waiting for more traffic.
+Each WireGuard datagram receives a one-byte frame type and shortest-form unsigned LEB128 integers for its content
+length, packet ID, and absolute deadline. WireHop framing overhead varies from 4 to 24 bytes. For example, a 1452-byte
+WireGuard datagram with a five-byte packet ID and six-byte deadline adds 14 bytes. TCP/IP, TLS records, and WebSocket
+frames add carrier overhead. Coalescing amortizes TLS and WebSocket overhead across already-ready frames without waiting
+for more traffic. Control coalescing is bounded by frame count and ends at timing and lifecycle frames.
 
 WireHop framing and TCP, TLS, or WebSocket headers are absent from the datagram delivered to WireGuard, so do not
-subtract them again from that UDP path's MTU. TCP segmentation and write coalescing do not preserve WireHop frame
-boundaries. Smaller packets can change loss recovery and latency, but tuning requires workload measurements rather than
-assuming one frame per TCP segment.
+subtract them again from that UDP path's MTU. The outer TCP path still obeys its own PMTU and MSS constraints through
+segmentation and reassembly. Broken TCP PMTU discovery can stall the carrier and requires diagnosis of that path.
+Application writes and TCP segmentation do not preserve WireHop frame boundaries. Smaller packets can change loss
+recovery and latency, but tuning requires workload measurements rather than assuming one frame per TCP segment.
+
+WireHop probes validate the carrier and feedback path. They terminate at WireHop and cannot establish the server-to-peer
+UDP path MTU. Reverse-proxy message limits and idle timeouts must also suit the carrier.
 
 The `forward` command uses direct UDP and adds no WireHop framing or packet-length overhead. Reserved translation does
 not change the WireGuard datagram length.

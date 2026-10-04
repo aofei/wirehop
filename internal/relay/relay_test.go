@@ -489,11 +489,11 @@ func TestLaneProbeProgressValidation(t *testing.T) {
 	lane := &Lane{
 		carrier: carrier, clock: &testClock{now: 1}, writeTimeout: time.Second, probeSize: probeSize,
 	}
-	frame, err := protocol.MarshalProbe(protocol.Probe{ID: 1, Payload: make([]byte, probeSize)})
+	frame, err := protocol.MarshalProbe(protocol.Probe{Payload: make([]byte, probeSize)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	frameBytes := uint64(protocol.ProbeFrameOverhead + probeSize)
+	frameBytes := uint64(protocol.FrameSize(probeSize))
 	if lane.ValidateProbeProgress(1, frameBytes) {
 		t.Fatal("probe progress was accepted before the probe reached the carrier writer")
 	}
@@ -501,9 +501,10 @@ func TestLaneProbeProgressValidation(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		result <- lane.writeControl(ctx, controlWrite{
+		_, err := lane.writeControlBatch(ctx, controlWrite{
 			build: func(uint64) (protocol.Frame, error) { return frame, nil },
-		})
+		}, maximumConsecutiveControlFrames)
+		result <- err
 	}()
 	select {
 	case <-carrier.writeEntered:
@@ -550,9 +551,13 @@ func TestLanePingState(t *testing.T) {
 		t.Fatalf("empty ping state = %t, %v", pending, remaining)
 	}
 	lane.startPing(1)
+	if lane.completePing(1, 0) {
+		t.Fatal("queued ping accepted a response before the writer generated its timestamp")
+	}
 	if pending, remaining := lane.pingState(now); !pending || remaining != time.Second {
 		t.Fatalf("queued ping state = %t, %v", pending, remaining)
 	}
+	lane.recordPingSend(1, 0)
 	lane.recordPingWritten(1, now)
 	if pending, remaining := lane.pingState(now.Add(2 * time.Second)); !pending || remaining != time.Second {
 		t.Fatalf("written ping state = %t, %v", pending, remaining)
@@ -579,6 +584,65 @@ func TestLanePingState(t *testing.T) {
 	if lane.completePing(2, 42) {
 		t.Fatal("canceled ping accepted a later response")
 	}
+	t.Run("PongValidation", func(t *testing.T) {
+		for _, tt := range []struct {
+			name  string
+			built bool
+		}{
+			{name: "Queued"},
+			{name: "Built", built: true},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
+				lane.startPing(1)
+				want := ErrUnexpectedPong
+				if tt.built {
+					lane.recordPingSend(1, 0)
+					want = nil
+				}
+				frame, err := protocol.MarshalTimingPong(protocol.TimingPong{
+					ID: 1, PingSendMicros: 0, ReceiveMicros: 1000, SendMicros: 1000,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pending := false
+				if err := lane.readControl(context.Background(), frame, &pending); !errors.Is(err, want) {
+					t.Fatalf("readControl() error = %v, want %v", err, want)
+				}
+				if !tt.built && (lane.pendingPingID != 1 || lane.receiver.mapping != (clockmap.Mapping{})) {
+					t.Fatal("rejected pong changed the pending request or session clock mapping")
+				}
+				if tt.built && lane.pendingPingID != 0 {
+					t.Fatal("matching pong did not complete the writer-built request")
+				}
+			})
+		}
+	})
+	t.Run("ReplyBeforeWriteCompletion", func(t *testing.T) {
+		for _, sendMicros := range []uint64{0, 128} {
+			lane := &Lane{pingInterval: time.Second, pingTimeout: 3 * time.Second,
+				pingChanged: make(chan struct{}, 1)}
+			lane.startPing(1)
+			lane.recordPingSend(1, sendMicros)
+			if !lane.completePing(1, sendMicros) {
+				t.Fatal("writer-built ping rejected a response before write completion")
+			}
+			lane.startPing(2)
+			lane.recordPingWritten(1, now)
+			if lane.pendingPingID != 2 || !lane.pendingPingAt.IsZero() || lane.pendingPingBuilt {
+				t.Fatal("late write completion changed the newer queued request")
+			}
+			if lane.completePing(2, 0) {
+				t.Fatal("new queued request inherited the previous request's exposure")
+			}
+			lane.cancelPing(2)
+			lane.recordPingSend(2, sendMicros)
+			if lane.pendingPingBuilt || lane.completePing(2, sendMicros) {
+				t.Fatal("canceled request was restored by a late builder")
+			}
+		}
+	})
 }
 
 func TestLanePingResumesActiveInterval(t *testing.T) {
@@ -1448,13 +1512,13 @@ func TestLanePingTimeoutStartsAfterCarrierWrite(t *testing.T) {
 
 func TestLaneWriterBoundsInternalControlBurst(t *testing.T) {
 	carrier := newTestCarrier()
-	carrier.writes = make(chan []protocol.Frame, 2*maximumConsecutiveControlWrites)
+	carrier.writes = make(chan []protocol.Frame, 2*maximumConsecutiveControlFrames)
 	lane := newTestLane(t, carrier, newTestEndpoint())
 	control, err := protocol.MarshalTimingPong(protocol.TimingPong{ID: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range maximumConsecutiveControlWrites + 1 {
+	for range maximumConsecutiveControlFrames + 1 {
 		if !lane.SendControl(control, nil) {
 			t.Fatal("SendControl() rejected a bounded test write")
 		}
@@ -1482,9 +1546,9 @@ func TestLaneWriterBoundsInternalControlBurst(t *testing.T) {
 				t.Fatalf("carrier batch has %d frames, want 1", len(batch))
 			}
 			if batch[0].Type == protocol.FrameData {
-				if controlWrites != maximumConsecutiveControlWrites {
+				if controlWrites != maximumConsecutiveControlFrames {
 					t.Fatalf("control writes before data = %d, want %d", controlWrites,
-						maximumConsecutiveControlWrites)
+						maximumConsecutiveControlFrames)
 				}
 				cancel()
 				if err := <-result; !errors.Is(err, context.Canceled) {

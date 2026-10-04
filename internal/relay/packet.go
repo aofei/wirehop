@@ -13,7 +13,7 @@ import (
 var (
 	// ErrInvalidDeadlinePolicy indicates a zero or protocol-invalid packet lifetime.
 	ErrInvalidDeadlinePolicy = errors.New("invalid packet deadline policy")
-	// ErrCounterExhausted indicates that a direction-local identifier space is exhausted.
+	// ErrCounterExhausted indicates that a nonwrapping relay counter cannot advance.
 	ErrCounterExhausted = errors.New("relay counter exhausted")
 	// ErrInvalidPacket indicates inconsistent relay packet metadata.
 	ErrInvalidPacket = errors.New("invalid relay packet")

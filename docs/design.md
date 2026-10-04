@@ -1262,7 +1262,7 @@ Fast-path behavior:
 - Bound one data batch to 16 frames and a target of 64 KiB before the final admitted frame
 - Keep application queues and unconfirmed retention bounded independently from kernel socket buffers
 - Use an abortive TCP close for an abandoned generation so unacknowledged stale bytes are discarded
-- Bound each WebSocket binary message to two maximum encoded frames, or 131,112 bytes, on receipt
+- Bound each WebSocket binary message to two maximum encoded frames, or 131,118 bytes, on receipt
 
 Socket write success only means that the local kernel or TLS stack accepted bytes. It never counts as peer delivery or
 as permission to release retained backlog and packet state.
@@ -1293,9 +1293,10 @@ it. Size classes retain buffers up to 32 KiB, and larger payload allocations are
 Linux receive staging uses a process-wide pool of 15-datagram vectors. Its capacity is chosen from `GOMAXPROCS` at
 initialization, with a minimum of two vectors and a maximum of 16. At the maximum, payload storage occupies 15 MiB plus
 vector metadata. A reader that cannot borrow a vector continues with scalar reads. Carrier frame and encoding buffers
-reuse capacities up to 32 KiB. Larger encoding buffers are discarded after writing, and larger read buffers are
-discarded before reading the next frame or message. These scratch buffers, size-class overhead, and kernel socket
-buffers are separate from the retained relay-work budget.
+reuse capacities up to 32 KiB. Larger encoding buffers are discarded after writing. Frame readers discard oversized
+content buffers before reading another validated body, and WebSocket readers discard oversized message buffers before
+starting another message. These scratch buffers, size-class overhead, and kernel socket buffers are separate from the
+retained relay-work budget.
 
 ### WebSocket transport
 
@@ -1366,7 +1367,7 @@ rejection as an unpadded base64url `WireHop-Rejection` response header because r
 HTTP status remains a conventional summary for intermediaries. In-session error frames carry the full code, class,
 scope, optional lane generation, and bounded diagnostic.
 
-All WireHop integers use network byte order. The raw client hello is 126 plus `N` bytes, where `N` is the canonical
+Admission hello integers use network byte order. The raw client hello is 126 plus `N` bytes, where `N` is the canonical
 target length and is zero for a join:
 
 | Offset | Size | Field |
@@ -1426,26 +1427,38 @@ layout. Diagnostics are optional printable ASCII and are limited to 512 bytes.
 Every WireHop frame, including successful WebSocket admission responses and all post-admission traffic, uses this
 envelope:
 
-| Offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 1 | Frame type |
-| 1 | 4 | Type-specific content length |
-| 5 | N | Type-specific payload |
+| Order | Encoding | Field |
+| ---: | --- | --- |
+| 1 | `u8` | Frame type |
+| 2 | `uvarint` | Type-specific content length |
+| 3 | N bytes | Type-specific payload |
 
-The content length excludes the five-byte common header. The maximum content length is 65,551 bytes, and the maximum
-encoded frame is 65,556 bytes. Data content has 16 bytes of metadata followed by one WireGuard datagram:
+In framed messages, `uvarint` is shortest-form unsigned LEB128. Each byte contributes seven value bits,
+least-significant group first, and its high bit indicates another byte. Zero occupies one byte. A `uint64` occupies at
+most ten bytes, and the tenth byte can contain only bit 0. Nonminimal encodings, overflow, and values outside a field's
+semantic bounds are protocol violations. Integers must be complete within their containing frame or WebSocket message. A
+stream that ends partway through a header or payload fails with unexpected EOF. These rules apply to every `uvarint`
+field, including content lengths. The authenticated admission hellos use the fixed-width big-endian layouts above.
 
-| Payload offset | Size | Field |
-| ---: | ---: | --- |
-| 0 | 8 | Direction-local packet ID |
-| 8 | 8 | Absolute deadline in sender monotonic microseconds |
-| 16 | N | WireGuard packet bytes |
+The content length excludes the common header. It occupies one to three bytes and cannot exceed 65,555 bytes. The common
+header therefore occupies two to four bytes, and the maximum encoded frame is 65,559 bytes. A reader validates the
+bounded header before allocating content storage. Data content contains:
 
-The complete per-datagram overhead is therefore 1 byte of type, 4 bytes of content length, and 16 bytes of metadata. The
-total is 21 bytes. The content length covers the packet ID, deadline, and WireGuard packet, so a generic frame parser
-can skip or reject a complete frame without interpreting Data fields. A separate WireGuard packet length is unnecessary
-because it is the Data content length minus 16. The lane handshake binds every frame to a session, so data frames do not
-repeat the session identifier.
+| Order | Encoding | Field |
+| ---: | --- | --- |
+| 1 | `uvarint` | Direction-local packet ID |
+| 2 | `uvarint` | Absolute deadline in sender monotonic microseconds |
+| 3 | Remaining bytes | WireGuard packet |
+
+Let `U(x)` be the shortest unsigned LEB128 length of `x`, and let `P` be the WireGuard datagram length. Data content
+length is `L = U(packet_id) + U(deadline_micros) + P`. Its complete encoded length is `1 + U(L) + L`, and its
+per-datagram overhead is `1 + U(L) + U(packet_id) + U(deadline_micros)`. The overhead ranges from 4 to 24 bytes. For
+example, a 1452-byte datagram with a five-byte packet ID and six-byte deadline has 14 bytes of overhead. The maximum
+occurs with two ten-byte metadata fields and a three-byte content length.
+
+A generic frame parser can skip or reject a complete frame without interpreting Data fields. A separate WireGuard packet
+length is unnecessary because the packet occupies the rest of the Data content after the two integers. The lane
+handshake binds every frame to a session, so data frames do not repeat the session identifier.
 
 WireGuard class and duplicate or migration state are not transmitted. Both peers derive the class from the public
 WireGuard packet structure. The sender keeps migration state locally, while copies share the same packet ID.
@@ -1454,17 +1467,17 @@ Protocol version 1 frame types and phase constraints are:
 
 | ID | Frame | Payload size | Allowed use |
 | ---: | --- | ---: | --- |
-| 1 | Data | 48 to 65,551 bytes | Both directions after admission |
-| 2 | Ping | 16 bytes | Both directions after admission |
-| 3 | Pong | 32 bytes | Both directions after admission |
-| 4 | Clock sync | 32 bytes | Client to server, first post-admission frame |
-| 5 | Probe | 8 to 1,208 bytes | Both directions after admission |
-| 6 | Delivery report | 56 bytes | Both directions after admission |
-| 7 | Session created | 80 bytes | Server to client, first WebSocket create response |
-| 8 | Lane accepted | 48 bytes | Server to client, first WebSocket join response |
+| 1 | Data | 34 to 65,555 bytes | Both directions after admission |
+| 2 | Ping | 2 to 20 bytes | Both directions after admission |
+| 3 | Pong | 4 to 40 bytes | Both directions after admission |
+| 4 | Clock sync | 4 to 40 bytes | Client to server, first post-admission frame |
+| 5 | Probe | 0 to 1200 bytes | Both directions after admission |
+| 6 | Delivery report | 21 to 66 bytes | Both directions after admission |
+| 7 | Session created | 66 to 84 bytes | Server to client, first WebSocket create response |
+| 8 | Lane accepted | 34 to 52 bytes | Server to client, first WebSocket join response |
 | 9 | Session close | 1 byte | Client to server after admission |
-| 10 | Lane abandon | 24 bytes | Both directions after admission |
-| 11 | Error | 30 to 542 bytes | Both directions after admission |
+| 10 | Lane abandon | 17 to 26 bytes | Both directions after admission |
+| 11 | Error | 20 to 541 bytes | Both directions after admission |
 
 In the client-to-server direction, no other in-session frame may precede the generation's clock-sync frame. The
 server-to-client direction may carry in-session frames immediately after admission.
@@ -1475,25 +1488,29 @@ used outside its allowed phase or direction is a protocol violation.
 
 Control payload fields appear in the following order:
 
-- `Ping`: ping ID (`u64`), send time (`u64`)
-- `Pong`: ping ID (`u64`), original send time (`u64`), receive time (`u64`), send time (`u64`)
-- `Clock sync`: client send, server receive, server send, and client receive times (four `u64` values)
-- `Probe`: probe ID (`u64`) followed by 0 to 1200 opaque bytes
-- `Delivery report`: lane ID (16 bytes), generation (`u64`), then data bytes, data packets, probe bytes, and probe
-  packets (four `u64` counters)
+- `Ping`: ping ID (`uvarint`), send time (`uvarint`)
+- `Pong`: ping ID (`uvarint`), original send time (`uvarint`), receive time (`uvarint`), send time (`uvarint`)
+- `Clock sync`: client send, server receive, server send, and client receive times (four `uvarint` values)
+- `Probe`: 0 to 1200 opaque bytes
+- `Delivery report`: lane ID (16 bytes), generation (`uvarint`), then data bytes, data packets, probe bytes, and probe
+  packets (four `uvarint` counters)
 - `Session created`: session ID (16 bytes), session secret (32 bytes), path group ID (16 bytes), server receive time
-  (`u64`), and server send time (`u64`)
-- `Lane accepted`: session ID (16 bytes), path group ID (16 bytes), server receive time (`u64`), and server send time
-  (`u64`)
+  (`uvarint`), and server send time (`uvarint`)
+- `Lane accepted`: session ID (16 bytes), path group ID (16 bytes), server receive time (`uvarint`), and server send
+  time (`uvarint`)
 - `Session close`: close reason (`u8`)
-- `Lane abandon`: lane ID (16 bytes) and generation (`u64`)
-- `Error`: code (`u16`), class (`u8`), scope (`u8`), lane ID (16 bytes), generation (`u64`), diagnostic length (`u16`),
-  and diagnostic bytes
+- `Lane abandon`: lane ID (16 bytes) and generation (`uvarint`)
+- `Error`: code (`uvarint`), class (`u8`), scope (`u8`), lane ID (16 bytes), generation (`uvarint`), and remaining
+  diagnostic bytes, limited to 512 printable-ASCII bytes
 
-Ping, pong, and probe IDs are nonzero. Ping and probe ID counters start at 1 for each connection generation and never
-wrap. Exhausting either counter ends that generation. Delivery reports and lane-abandon frames require a nonzero lane ID
-and generation. Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted requires nonzero
-session and path group IDs. Encoded receive and send timestamp pairs must not run backward.
+Integer fields retain their full unsigned 64-bit value range where their semantics permit it. Payloads with a fixed
+field sequence must end after their final field. Data, Probe, and Error consume their remaining content as explicitly
+specified above. The table's Data minimum includes the shortest recognized WireGuard packet.
+
+Ping and pong IDs are nonzero. Ping ID counters start at 1 for each connection generation and never wrap. Exhausting the
+counter ends that generation. Probes have no per-frame identifier. Delivery reports and lane-abandon frames require a
+nonzero lane ID and generation. Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted
+requires nonzero session and path group IDs. Encoded receive and send timestamp pairs must not run backward.
 
 Version 1 control enums are:
 
@@ -1526,9 +1543,9 @@ while session scope requires both fields to be zero. After lane admission, a lan
 carrying lane and its current generation. The `clock_skew` code is valid only in an admission rejection and is invalid
 in an in-session Error frame.
 
-The Data parser requires at least the 16-byte metadata prefix. Packet IDs and absolute deadlines must be nonzero.
-In-session validation additionally requires a recognized WireGuard packet, whose shortest valid form is a 32-byte
-transport-data packet.
+The Data parser requires two complete canonical integers. Packet IDs and absolute deadlines must be nonzero. In-session
+validation additionally requires a recognized WireGuard packet, whose shortest valid form is a 32-byte transport-data
+packet.
 
 The WireHop protocol accepts at most 65,535 bytes of UDP payload for one datagram. UDP ingress reserves one additional
 receive-buffer byte and drops any larger datagram, so an unsupported IPv6 UDP jumbogram cannot be truncated into an
@@ -1564,11 +1581,14 @@ the new generation. An additional lane updates the mapping without blocking traf
 never sends a clock-sync frame to the client. Later bidirectional clock updates use ping and pong. The receiver maps the
 sender's absolute deadline into its local protocol clock and drops an expired frame before writing its payload to UDP.
 
-Each lane permits one outstanding ping. A valid pong echoes both its ID and original send timestamp. The inactivity
-timeout starts only after the complete ping frame is written to the carrier. While the pong remains pending, valid
-received frames extend the budget. Three seconds without receive progress fails the generation. Timing requests use a
-1-second interval during real data transfer and exponential idle backoff capped at 15 seconds, which bounds idle traffic
-without delaying active-path measurements.
+Each lane permits one outstanding ping. A valid pong echoes both its ID and original send timestamp. A queued request
+cannot accept a pong until the carrier writer has generated that timestamp. Zero is a valid timestamp, so a separate
+state records whether the request has been built. A matching pong can arrive before the local write-completion callback,
+and a late callback cannot restore a completed request or change a newer request. The inactivity timeout starts only
+after the complete ping frame is written to the carrier. While the pong remains pending, valid received frames extend
+the budget. Three seconds without receive progress fails the generation. Timing requests use a 1-second interval during
+real data transfer and exponential idle backoff capped at 15 seconds, which bounds idle traffic without delaying
+active-path measurements.
 
 Clock samples are measurements rather than authorization data. The estimator rejects reversed spans and values outside
 safe signed arithmetic. Deadline checks use the latest edge of the mapped uncertainty interval, so asymmetric delay does
@@ -1590,20 +1610,35 @@ protocol payload bound, and the bounded control queue prevents probe generation 
 Each direction sends delivery reports containing the target lane identifier, connection generation, and separate
 cumulative counters for data-frame and probe bytes and packets. A report is triggered after 256 newly parsed data
 packets or 256 KiB of newly parsed data, and a 25 ms interval bounds the delay for smaller changes. All four counters
-start at zero for each connection generation and never wrap. Data bytes count the five-byte frame header, 16-byte Data
-metadata, and WireGuard packet. Probe bytes count the five-byte frame header, eight-byte probe ID, and opaque padding.
-The counters describe the exact prefix parsed from that generation's ordered carrier. Reported probe packets cannot
-exceed the number exposed to that generation's carrier writer, and their cumulative byte count must equal the packet
-count times that generation's fixed encoded Probe frame size.
+start at zero for each connection generation and never wrap. Data bytes count the actual encoded common header, Data
+metadata, and WireGuard packet. Probe bytes count the actual encoded common header and opaque payload. A default
+1200-byte Probe occupies 1203 encoded bytes. Shortest-form integer validation makes reconstructed frame sizes equal to
+the received wire sizes. The counters describe the exact prefix parsed from that generation's ordered carrier. Reported
+probe packets cannot exceed the number exposed to that generation's carrier writer, and their cumulative byte count must
+equal the packet count times that generation's fixed encoded Probe frame size. The sender's exposed-probe counter also
+never wraps. A batch that would overflow it ends the generation before any frame in that batch is written or any of its
+success callbacks run.
 
 A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
 risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Its counters
 describe carrier parsing progress and do not promise that the WireGuard target accepted or authenticated the payload.
 Exhausting a cumulative counter ends the owning connection generation instead of reusing a lower value.
 
-The single carrier writer gives internally generated control frames priority in bursts of at most eight writes. When
-WireGuard data is ready after such a burst, the writer sends one data batch before accepting another control burst. This
-keeps timing, feedback, and lifecycle controls prompt without allowing sustained control traffic to starve relay data.
+The single carrier writer gives internally generated controls priority in bursts of at most eight frames. It coalesces
+only already-queued controls by nonblocking dequeue, without a collection timer, and caps each batch by the burst's
+remaining frame budget. When WireGuard data is ready after such a burst, the writer sends one data batch before another
+control burst. Fairness counts frames rather than carrier writes.
+
+Ping, Pong, ClockSync, SessionClose, LaneAbandon, and Error end the current control batch. A boundary frame at the head
+is sent alone. A boundary frame after ordinary controls is the last frame in their batch. Queue order is preserved.
+Builders sample timestamps at the writer, and success callbacks run in queue order only after the complete carrier write
+succeeds. Probe exposure is published before the write because feedback can return on another lane before local
+completion. A builder or carrier failure ends the generation and does not imply per-frame transactional completion.
+
+Each control batch retains the carrier stall deadline. WebSocket receivers validate all frame boundaries in a complete
+message before exposing its first frame, and TLS must receive and authenticate a record before exposing its contents.
+Coalescing can therefore change receive latency even without a collection timer. The frame budget and timing boundaries
+bound this effect.
 
 A changed report snapshot is offered to its target lane and the best alternate lane when they are connected and not
 abandoning, including when either lane is degraded. The first completed carrier write marks the snapshot reported, and
@@ -1612,10 +1647,10 @@ report intervals. The sender releases only the matching prefix of its sent FIFO.
 the same prefix. A mixed, partially changed, or impossible active-generation report is a protocol violation. A wholly
 stale report from an older snapshot or generation is ignored.
 
-New packet IDs start at 1 and increase strictly within each session direction. The scheduler chooses the next ID after
-selecting eligible lanes and commits it only after at least one copy enters a lane transmission store. Every proactive
-duplicate or migrated copy preserves that ID. Exhausting the 64-bit identifier space requires session replacement rather
-than zero-value reuse.
+New packet IDs start at 1 and increase strictly within each session direction. The scheduler sizes the next candidate ID
+before selecting eligible lanes and commits it only after at least one copy enters a lane transmission store. Every
+proactive duplicate or migrated copy preserves that ID. Exhausting the 64-bit identifier space requires session
+replacement rather than zero-value reuse.
 
 ### Carrier mapping
 
@@ -1767,8 +1802,10 @@ outbound datagrams re-enter local ingress and form a UDP feedback loop.
 
 ### Carrier overhead and MTU
 
-Each datagram adds exactly 21 bytes of WireHop framing. TCP/IP, TLS, and WebSocket overhead depends on IP family, TCP
-options, record boundaries, and write coalescing. WireHop does not modify the WireGuard interface MTU.
+Each datagram adds a type byte, a canonical content length, a packet ID, and an absolute deadline. Their total encoded
+overhead depends on the values and datagram length, as defined in the frame protocol. TCP/IP, TLS, and WebSocket
+overhead depends on IP family, TCP options, record boundaries, and write coalescing. WireHop does not modify the
+WireGuard interface MTU.
 
 The WireGuard interface MTU must account for WireGuard, IP, and UDP overhead on every actual UDP leg, including the
 server-to-target path. Carrier framing is removed before UDP delivery and does not reduce that UDP path's payload
@@ -1780,6 +1817,18 @@ TCP carries a byte stream and does not preserve application-write boundaries as 
 segments even when its size is below the carrier MSS. Carrier overhead affects bandwidth use and buffering, while
 smaller inner packets can change loss recovery and latency. These performance effects require workload measurements and
 do not establish a requirement to fit each frame into one TCP segment.
+
+The outer TCP path still has its own PMTU and MSS constraints. TCP segmentation and reassembly carry complete WireHop
+frames across that path without subtracting carrier headers from the final UDP payload budget. A broken TCP PMTU
+mechanism can still stall the carrier, for example when large segments are dropped and required ICMP feedback is
+blocked. Operators must diagnose that outer path rather than derive a WireGuard MTU solely from its MSS. Reverse-proxy
+message limits and idle timeouts are separate carrier constraints.
+
+Probe traffic terminates at the receiving WireHop process and never crosses the server-to-target UDP leg. Successful
+probes therefore do not establish that leg's UDP path MTU. For a 1500-byte UDP path without additional IP headers, the
+WireGuard interface MTU limit is 1440 bytes over IPv4 or 1420 bytes over IPv6. These limits subtract the 20-byte or
+40-byte IP header, the 8-byte UDP header, and 32 bytes of WireGuard overhead. An explicit MTU of 1420 fits both families
+when all actual UDP legs support at least 1500 bytes.
 
 Direct forwarding adds no WireHop framing and does not change the WireGuard datagram length. It still crosses a
 userspace UDP boundary, but its MTU requirement is the native IP and UDP path to the target rather than a TCP-based

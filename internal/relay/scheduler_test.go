@@ -55,7 +55,7 @@ func TestSelectCandidatesUsesSerializationAndCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	lanes[full.registration.LaneID] = full
-	if full.canAccept(uint64(protocol.DataFrameOverhead + 32)) {
+	if full.canAccept(uint64(transmission.size)) {
 		t.Fatal("full retained store accepted another frame")
 	}
 }
@@ -81,7 +81,7 @@ func TestSelectCandidatesSeparatesQueuedAndUnreportedData(t *testing.T) {
 				payload := make([]byte, 1400)
 				copy(payload, transmission.data.Payload)
 				transmission.data.Payload = payload
-				transmission.size = protocol.DataFrameOverhead + len(payload)
+				transmission.size = dataFrameSize(transmission.data)
 				if err := store.push(transmission); err != nil {
 					t.Fatal(err)
 				}
@@ -172,7 +172,7 @@ func TestSelectCandidatesMatchesReference(t *testing.T) {
 
 func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 	payload := relayWireGuardPacket(wgpacket.HandshakeInitiation)
-	encodedSize := protocol.DataFrameOverhead + len(payload)
+	encodedSize := dataFrameSize(protocol.Data{PacketID: 1, DeadlineMicros: 1_000_000, Payload: payload})
 	budget, err := retention.NewBudget(retention.Limits{Packets: 2, Bytes: 2 * encodedSize})
 	if err != nil {
 		t.Fatal(err)
@@ -469,7 +469,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		}
 		if err := scheduler.ObserveDeliveryReport(ctx, source, protocol.DeliveryReport{
 			LaneID: registration.LaneID, Generation: registration.Generation,
-			DataPackets: 2, DataBytes: uint64(existing.size + protocol.DataFrameOverhead + len(controlPayload)),
+			DataPackets: 2, DataBytes: uint64(existing.size + dataFrameSize(control)),
 		}, 2000); err != nil {
 			t.Fatal(err)
 		}
@@ -600,7 +600,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	registration := schedulerRegistration(1, 1, store)
 	source := protocol.LaneGeneration{LaneID: registration.LaneID, Generation: registration.Generation}
 	registration.ValidateProbeProgress = func(packets, bytes uint64) bool {
-		return packets <= 1 && bytes == packets*uint64(protocol.ProbeFrameOverhead)
+		return packets <= 1 && bytes == packets*uint64(protocol.FrameSize(0))
 	}
 	invalidRegistration := registration
 	invalidRegistration.ValidateProbeProgress = nil
@@ -656,7 +656,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	}
 
 	report.ProbePackets = 1
-	report.ProbeBytes = uint64(protocol.ProbeFrameOverhead - 1)
+	report.ProbeBytes = uint64(protocol.FrameSize(0) - 1)
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 4000); !errors.Is(err, ErrInvalidDeliveryReport) {
 		t.Fatalf("invalid probe byte report error = %v, want %v", err, ErrInvalidDeliveryReport)
 	}
@@ -808,7 +808,7 @@ func TestScheduledLaneDeliveryRateRejectsCompressedFeedback(t *testing.T) {
 		payload := make([]byte, 4096)
 		copy(payload, transmission.data.Payload)
 		transmission.data.Payload = payload
-		frameBytes = uint64(protocol.DataFrameOverhead + len(payload))
+		frameBytes = uint64(dataFrameSize(transmission.data))
 		if err := store.push(transmission); err != nil {
 			t.Fatal(err)
 		}
@@ -857,7 +857,7 @@ func TestScheduledLaneDeliveryRateRejectsApplicationLimitedDecrease(t *testing.T
 }
 
 func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T) {
-	const transmissionCount = 80
+	const transmissionCount = 128
 	lane := schedulerLaneWithLimits(t, 1, 1, 1000, 1_000_000, packetqueue.Limits{
 		Packets: transmissionCount,
 		Bytes:   64 * 1024,
@@ -975,7 +975,7 @@ func TestSchedulerPendingPacketRetainsAggregateCapacity(t *testing.T) {
 
 func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {
 	const payloadSize = 32
-	encodedSize := protocol.DataFrameOverhead + payloadSize
+	encodedSize := dataFrameSize(protocol.Data{PacketID: 1, DeadlineMicros: 10_000, Payload: make([]byte, payloadSize)})
 	for _, test := range []struct {
 		name       string
 		byteLimit  int
@@ -1230,7 +1230,8 @@ func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
 			source := schedulerLane(t, 1, 1, 100_000, 1_000_000)
 			now := time.Now()
 			source.lastProgressAt = now.Add(-3 * time.Second)
-			if err := source.registration.Store.push(schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))); err != nil {
+			transmission := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))
+			if err := source.registration.Store.push(transmission); err != nil {
 				t.Fatal(err)
 			}
 			takeOneTransmission(t, source.registration.Store)
@@ -1257,7 +1258,7 @@ func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
 			}
 			completed := 0
 			scheduler.routeReport(lanes, protocol.DeliveryReport{
-				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1, DataBytes: 53,
+				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1, DataBytes: uint64(transmission.size),
 			}, func(ok bool) {
 				if ok {
 					completed++
@@ -1558,14 +1559,19 @@ func schedulerRegistration(id, group byte, store *TransmissionStore) LaneRegistr
 }
 
 func schedulerTransmission(packetID uint64, kind wgpacket.Kind, deadline time.Time) retainedTransmission {
-	payload := relayWireGuardPacket(kind)
+	data := protocol.Data{PacketID: packetID, DeadlineMicros: packetID + 1000, Payload: relayWireGuardPacket(kind)}
 	return retainedTransmission{
-		data: protocol.Data{
-			PacketID: packetID, DeadlineMicros: packetID + 1000, Payload: payload,
-		},
-		kind: kind, priority: packetPriority(kind.Control()), deadline: deadline,
-		size: protocol.DataFrameOverhead + len(payload),
+		data: data, kind: kind, priority: packetPriority(kind.Control()), deadline: deadline,
+		size: dataFrameSize(data),
 	}
+}
+
+func dataFrameSize(data protocol.Data) int {
+	size, err := protocol.DataFrameSize(data)
+	if err != nil {
+		panic(err)
+	}
+	return size
 }
 
 func takeOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data {
@@ -1608,5 +1614,77 @@ func awaitOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data 
 		case <-timeout.C:
 			t.Fatal("timed out waiting for transmission")
 		}
+	}
+}
+
+func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		id          uint64
+		deadline    uint64
+		payloadSize int
+		size        int
+	}{
+		{name: "OneByteID", id: 127, deadline: 128, payloadSize: 32, size: 37},
+		{name: "TwoByteID", id: 128, deadline: 128, payloadSize: 32, size: 38},
+		{name: "ThreeByteID", id: 16384, deadline: 128, payloadSize: 32, size: 39},
+		{name: "FullWidthID", id: math.MaxUint64, deadline: 128, payloadSize: 32, size: 46},
+		{name: "OneByteDeadline", id: 1, deadline: 127, payloadSize: 32, size: 36},
+		{name: "TwoByteDeadline", id: 1, deadline: 128, payloadSize: 32, size: 37},
+		{name: "FullWidthDeadline", id: 1, deadline: math.MaxUint64, payloadSize: 32, size: 45},
+		{name: "OneByteLength", id: 1, deadline: 128, payloadSize: 124, size: 129},
+		{name: "TwoByteLength", id: 1, deadline: 128, payloadSize: 125, size: 131},
+		{name: "TwoByteLengthMaximum", id: 1, deadline: 128, payloadSize: 16380, size: 16386},
+		{name: "ThreeByteLength", id: 1, deadline: 128, payloadSize: 16381, size: 16388},
+		{name: "MaximumFrame", id: math.MaxUint64, deadline: math.MaxUint64, payloadSize: 65535, size: 65559},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, fits := range []bool{true, false} {
+				ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 1, Bytes: protocol.MaxPacketSize})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer ingress.Close()
+				scheduler, err := NewScheduler(ingress)
+				if err != nil {
+					t.Fatal(err)
+				}
+				scheduler.packetID = tt.id - 1
+				limit := tt.size
+				if !fits {
+					limit--
+				}
+				lane := schedulerLaneWithLimits(t, 1, 1, 10, 1_000_000, packetqueue.Limits{Packets: 1, Bytes: limit})
+				defer func() { releaseTransmissions(lane.registration.Store.drain()) }()
+				payload := make([]byte, tt.payloadSize)
+				copy(payload, relayWireGuardPacket(wgpacket.TransportData))
+				if err := ingress.Push(packetqueue.Item[Packet]{Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: tt.deadline},
+					Size: len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second)}); err != nil {
+					t.Fatal(err)
+				}
+				var item packetqueue.Item[Packet]
+				if err := ingress.TryPop(&item); err != nil {
+					t.Fatal(err)
+				}
+				var preferred protocol.LaneID
+				scheduled, err := scheduler.schedule(map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane}, &preferred, &item)
+				if err != nil || scheduled != fits {
+					t.Fatalf("fits %t: scheduled %t, error %v", fits, scheduled, err)
+				}
+				if fits {
+					data := takeOneTransmission(t, lane.registration.Store)
+					wire, err := protocol.MarshalDataFrame(data)
+					if err != nil || data.PacketID != tt.id || data.DeadlineMicros != tt.deadline ||
+						len(wire) != tt.size || scheduler.packetID != tt.id {
+						t.Fatalf("candidate size or committed identity changed: %d, %v", len(wire), err)
+					}
+				} else {
+					if scheduler.packetID != tt.id-1 {
+						t.Fatal("failed admission advanced PacketID")
+					}
+					item.Release()
+				}
+			}
+		})
 	}
 }

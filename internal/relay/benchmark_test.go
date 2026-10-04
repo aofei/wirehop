@@ -3,9 +3,11 @@ package relay
 import (
 	"context"
 	"math"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
@@ -41,7 +43,7 @@ func BenchmarkSelectCandidates(b *testing.B) {
 		b.Cleanup(func() { releaseTransmissions(store.drain()) })
 		for packetIndex := range index {
 			transmission := schedulerTransmission(uint64(packetIndex+1), wgpacket.TransportData, deadline)
-			payload := make([]byte, 1500-protocol.DataFrameOverhead)
+			payload := make([]byte, 1452)
 			copy(payload, transmission.data.Payload)
 			transmission.data.Payload = payload
 			if err := store.push(transmission); err != nil {
@@ -101,7 +103,6 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 	var batch [1]protocol.Data
 	var ownership [1]Packet
 	var packets uint64
-	var bytes uint64
 	b.ReportAllocs()
 	b.SetBytes(int64(len(transmission.data.Payload)))
 	for b.Loop() {
@@ -110,13 +111,12 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 		if err := store.push(transmission); err != nil {
 			b.Fatal(err)
 		}
-		count, err := store.takeBatch(batch[:], ownership[:], transmission.size)
+		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes)
 		if err != nil || count != 1 {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}
 		releaseBatchOwnership(ownership[:count])
-		bytes += uint64(transmission.size)
-		if _, _, err := store.acknowledge(packets, bytes, uint64(store.now().UnixMicro())); err != nil {
+		if _, _, err := store.acknowledge(packets, store.sentBytes, uint64(store.now().UnixMicro())); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -142,8 +142,6 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 	}
 	var batch [maximumDataBatchFrames]protocol.Data
 	var ownership [maximumDataBatchFrames]Packet
-	var sentPackets uint64
-	var sentBytes uint64
 	b.ReportAllocs()
 	b.SetBytes(int64(len(transmission.data.Payload) * len(batch)))
 	for b.Loop() {
@@ -152,9 +150,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}
 		releaseBatchOwnership(ownership[:count])
-		sentPackets += uint64(count)
-		sentBytes += uint64(count * transmission.size)
-		if _, _, err := store.acknowledge(sentPackets, sentBytes, uint64(store.now().UnixMicro())); err != nil {
+		if _, _, err := store.acknowledge(store.sentPackets, store.sentBytes, uint64(store.now().UnixMicro())); err != nil {
 			b.Fatal(err)
 		}
 		for range count {
@@ -199,5 +195,44 @@ func BenchmarkReceiverDeliver(b *testing.B) {
 		if err := receiver.Deliver(context.Background(), data); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+type benchmarkStreamSink struct{}
+
+func (benchmarkStreamSink) Read([]byte) (int, error)         { panic("unexpected read") }
+func (benchmarkStreamSink) Write(value []byte) (int, error)  { return len(value), nil }
+func (benchmarkStreamSink) Close() error                     { return nil }
+func (benchmarkStreamSink) LocalAddr() net.Addr              { return nil }
+func (benchmarkStreamSink) RemoteAddr() net.Addr             { return nil }
+func (benchmarkStreamSink) SetDeadline(time.Time) error      { return nil }
+func (benchmarkStreamSink) SetReadDeadline(time.Time) error  { return nil }
+func (benchmarkStreamSink) SetWriteDeadline(time.Time) error { return nil }
+
+func BenchmarkLaneWriteControlBatch(b *testing.B) {
+	for _, tt := range []struct {
+		name  string
+		count int
+	}{{name: "Single", count: 1}, {name: "Eight", count: 8}} {
+		b.Run(tt.name, func(b *testing.B) {
+			lane := &Lane{carrier: carrier.NewStreamConn(benchmarkStreamSink{}), clock: &testClock{now: 1000},
+				control: make(chan controlWrite, maximumConsecutiveControlFrames), writeTimeout: time.Second}
+			frame := protocol.Frame{Type: protocol.FrameProbe, Payload: make([]byte, 1200)}
+			request := controlWrite{build: func(uint64) (protocol.Frame, error) { return frame, nil }}
+			ctx := context.Background()
+			if _, err := lane.writeControlBatch(ctx, request, maximumConsecutiveControlFrames); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				for range tt.count - 1 {
+					lane.control <- request
+				}
+				count, err := lane.writeControlBatch(ctx, request, maximumConsecutiveControlFrames)
+				if err != nil || count != tt.count {
+					b.Fatalf("count %d, error %v", count, err)
+				}
+			}
+		})
 	}
 }

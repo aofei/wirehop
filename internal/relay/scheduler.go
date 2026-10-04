@@ -286,7 +286,7 @@ func (s *Scheduler) CloseSession(ctx context.Context, reason protocol.CloseReaso
 	}
 }
 
-// RouteDeliveryReport routes cumulative feedback and invokes onAccepted after the carrier write completes.
+// RouteDeliveryReport queues cumulative feedback and its carrier-write completion callback.
 func (s *Scheduler) RouteDeliveryReport(report protocol.DeliveryReport, complete func(bool)) bool {
 	select {
 	case s.events <- schedulerEvent{kind: schedulerRouteReport, report: report, reportComplete: complete}:
@@ -552,17 +552,24 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 		return true, nil
 	}
 	deadlineMicros := uint64(remaining / time.Microsecond)
-	frameBytes := uint64(protocol.DataFrameOverhead + len(item.Value.Payload))
+	packetID := s.packetID + 1
+	if packetID == 0 {
+		return false, ErrCounterExhausted
+	}
+	size, err := protocol.DataFrameSize(protocol.Data{
+		PacketID: packetID, DeadlineMicros: item.Value.DeadlineMicros, Payload: item.Value.Payload,
+	})
+	if err != nil {
+		item.Release()
+		return true, nil
+	}
+	frameBytes := uint64(size)
 	candidates := selectCandidates(lanes, *preferred, item.Value.Kind.Control(), frameBytes, deadlineMicros)
 	if candidates.count == 0 {
 		if candidates.available {
 			item.Release()
 		}
 		return candidates.available, nil
-	}
-	packetID := s.packetID + 1
-	if packetID == 0 {
-		return false, ErrCounterExhausted
 	}
 	scheduled := false
 	for _, lane := range candidates.lanes[:candidates.count] {

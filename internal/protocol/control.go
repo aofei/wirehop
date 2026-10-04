@@ -1,30 +1,13 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 )
 
-const (
-	// timingPingSize is the exact encoded ping payload size.
-	timingPingSize = 16
-	// timingPongSize is the exact encoded pong payload size.
-	timingPongSize = 32
-	// clockSyncSize is the exact encoded clock synchronization payload size.
-	clockSyncSize = 32
-	// deliveryReportSize is the exact encoded delivery report payload size.
-	deliveryReportSize = 56
-	// sessionCreatedSize is the exact encoded session-created payload size.
-	sessionCreatedSize = 80
-	// laneAcceptedSize is the exact encoded lane-accepted payload size.
-	laneAcceptedSize = 48
-	// laneGenerationControlSize is the exact encoded abandon payload size.
-	laneGenerationControlSize = LaneIDSize + 8
-	// MaxProbePayloadSize bounds opaque probe traffic in one frame.
-	MaxProbePayloadSize = 1200
-	// ProbeFrameOverhead is the complete per-probe frame overhead excluding opaque padding.
-	ProbeFrameOverhead = frameHeaderSize + 8
-)
+// MaxProbePayloadSize bounds opaque probe traffic in one frame.
+const MaxProbePayloadSize = 1200
 
 var (
 	// ErrInvalidControlFrame indicates malformed control-frame fields or length.
@@ -44,20 +27,19 @@ func MarshalTimingPing(ping TimingPing) (Frame, error) {
 	if ping.ID == 0 {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := make([]byte, timingPingSize)
-	binary.BigEndian.PutUint64(payload[0:8], ping.ID)
-	binary.BigEndian.PutUint64(payload[8:16], ping.SendMicros)
+	payload := integerPayload(0, ping.ID, ping.SendMicros)
 	return Frame{Type: FramePing, Payload: payload}, nil
 }
 
 // ParseTimingPing parses a timing ping frame.
 func ParseTimingPing(frame Frame) (TimingPing, error) {
-	if frame.Type != FramePing || len(frame.Payload) != timingPingSize {
+	if frame.Type != FramePing {
 		return TimingPing{}, ErrInvalidControlFrame
 	}
-	ping := TimingPing{
-		ID:         binary.BigEndian.Uint64(frame.Payload[0:8]),
-		SendMicros: binary.BigEndian.Uint64(frame.Payload[8:16]),
+	var ping TimingPing
+	remaining, err := parseIntegers(frame.Payload, &ping.ID, &ping.SendMicros)
+	if err != nil || len(remaining) != 0 {
+		return TimingPing{}, ErrInvalidControlFrame
 	}
 	if ping.ID == 0 {
 		return TimingPing{}, ErrInvalidControlFrame
@@ -78,24 +60,19 @@ func MarshalTimingPong(pong TimingPong) (Frame, error) {
 	if pong.ID == 0 || pong.ReceiveMicros > pong.SendMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := make([]byte, timingPongSize)
-	binary.BigEndian.PutUint64(payload[0:8], pong.ID)
-	binary.BigEndian.PutUint64(payload[8:16], pong.PingSendMicros)
-	binary.BigEndian.PutUint64(payload[16:24], pong.ReceiveMicros)
-	binary.BigEndian.PutUint64(payload[24:32], pong.SendMicros)
+	payload := integerPayload(0, pong.ID, pong.PingSendMicros, pong.ReceiveMicros, pong.SendMicros)
 	return Frame{Type: FramePong, Payload: payload}, nil
 }
 
 // ParseTimingPong parses a timing pong frame.
 func ParseTimingPong(frame Frame) (TimingPong, error) {
-	if frame.Type != FramePong || len(frame.Payload) != timingPongSize {
+	if frame.Type != FramePong {
 		return TimingPong{}, ErrInvalidControlFrame
 	}
-	pong := TimingPong{
-		ID:             binary.BigEndian.Uint64(frame.Payload[0:8]),
-		PingSendMicros: binary.BigEndian.Uint64(frame.Payload[8:16]),
-		ReceiveMicros:  binary.BigEndian.Uint64(frame.Payload[16:24]),
-		SendMicros:     binary.BigEndian.Uint64(frame.Payload[24:32]),
+	var pong TimingPong
+	remaining, err := parseIntegers(frame.Payload, &pong.ID, &pong.PingSendMicros, &pong.ReceiveMicros, &pong.SendMicros)
+	if err != nil || len(remaining) != 0 {
+		return TimingPong{}, ErrInvalidControlFrame
 	}
 	if pong.ID == 0 || pong.ReceiveMicros > pong.SendMicros {
 		return TimingPong{}, ErrInvalidControlFrame
@@ -116,24 +93,19 @@ func MarshalClockSync(sync ClockSync) (Frame, error) {
 	if sync.ClientReceiveMicros < sync.ClientSendMicros || sync.ServerSendMicros < sync.ServerReceiveMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := make([]byte, clockSyncSize)
-	binary.BigEndian.PutUint64(payload[0:8], sync.ClientSendMicros)
-	binary.BigEndian.PutUint64(payload[8:16], sync.ServerReceiveMicros)
-	binary.BigEndian.PutUint64(payload[16:24], sync.ServerSendMicros)
-	binary.BigEndian.PutUint64(payload[24:32], sync.ClientReceiveMicros)
+	payload := integerPayload(0, sync.ClientSendMicros, sync.ServerReceiveMicros, sync.ServerSendMicros, sync.ClientReceiveMicros)
 	return Frame{Type: FrameClockSync, Payload: payload}, nil
 }
 
 // ParseClockSync parses a clock synchronization frame.
 func ParseClockSync(frame Frame) (ClockSync, error) {
-	if frame.Type != FrameClockSync || len(frame.Payload) != clockSyncSize {
+	if frame.Type != FrameClockSync {
 		return ClockSync{}, ErrInvalidControlFrame
 	}
-	sync := ClockSync{
-		ClientSendMicros:    binary.BigEndian.Uint64(frame.Payload[0:8]),
-		ServerReceiveMicros: binary.BigEndian.Uint64(frame.Payload[8:16]),
-		ServerSendMicros:    binary.BigEndian.Uint64(frame.Payload[16:24]),
-		ClientReceiveMicros: binary.BigEndian.Uint64(frame.Payload[24:32]),
+	var sync ClockSync
+	remaining, err := parseIntegers(frame.Payload, &sync.ClientSendMicros, &sync.ServerReceiveMicros, &sync.ServerSendMicros, &sync.ClientReceiveMicros)
+	if err != nil || len(remaining) != 0 {
+		return ClockSync{}, ErrInvalidControlFrame
 	}
 	if sync.ClientReceiveMicros < sync.ClientSendMicros || sync.ServerSendMicros < sync.ServerReceiveMicros {
 		return ClockSync{}, ErrInvalidControlFrame
@@ -143,37 +115,26 @@ func ParseClockSync(frame Frame) (ClockSync, error) {
 
 // Probe carries bounded opaque bytes for lane delivery measurement.
 type Probe struct {
-	ID      uint64
 	Payload []byte
 }
 
 // MarshalProbe returns a bounded probe frame.
 func MarshalProbe(probe Probe) (Frame, error) {
-	if probe.ID == 0 {
-		return Frame{}, ErrInvalidControlFrame
-	}
 	if len(probe.Payload) > MaxProbePayloadSize {
 		return Frame{}, ErrProbeTooLarge
 	}
-	payload := make([]byte, 8+len(probe.Payload))
-	binary.BigEndian.PutUint64(payload[0:8], probe.ID)
-	copy(payload[8:], probe.Payload)
-	return Frame{Type: FrameProbe, Payload: payload}, nil
+	return Frame{Type: FrameProbe, Payload: bytes.Clone(probe.Payload)}, nil
 }
 
 // ParseProbe parses a bounded probe frame.
 func ParseProbe(frame Frame) (Probe, error) {
-	if frame.Type != FrameProbe || len(frame.Payload) < 8 {
+	if frame.Type != FrameProbe {
 		return Probe{}, ErrInvalidControlFrame
 	}
-	if len(frame.Payload)-8 > MaxProbePayloadSize {
+	if len(frame.Payload) > MaxProbePayloadSize {
 		return Probe{}, ErrProbeTooLarge
 	}
-	probe := Probe{ID: binary.BigEndian.Uint64(frame.Payload[0:8]), Payload: frame.Payload[8:]}
-	if probe.ID == 0 {
-		return Probe{}, ErrInvalidControlFrame
-	}
-	return probe, nil
+	return Probe{Payload: frame.Payload}, nil
 }
 
 // DeliveryReport reports cumulative parsing progress for one lane generation and direction.
@@ -191,28 +152,22 @@ func MarshalDeliveryReport(report DeliveryReport) (Frame, error) {
 	if report.LaneID.IsZero() || report.Generation == 0 {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := make([]byte, deliveryReportSize)
-	copy(payload[0:16], report.LaneID[:])
-	binary.BigEndian.PutUint64(payload[16:24], report.Generation)
-	binary.BigEndian.PutUint64(payload[24:32], report.DataBytes)
-	binary.BigEndian.PutUint64(payload[32:40], report.DataPackets)
-	binary.BigEndian.PutUint64(payload[40:48], report.ProbeBytes)
-	binary.BigEndian.PutUint64(payload[48:56], report.ProbePackets)
+	payload := integerPayload(16, report.Generation, report.DataBytes, report.DataPackets, report.ProbeBytes, report.ProbePackets)
+	copy(payload[:LaneIDSize], report.LaneID[:])
 	return Frame{Type: FrameDeliveryReport, Payload: payload}, nil
 }
 
 // ParseDeliveryReport parses a cumulative delivery report frame.
 func ParseDeliveryReport(frame Frame) (DeliveryReport, error) {
-	if frame.Type != FrameDeliveryReport || len(frame.Payload) != deliveryReportSize {
+	if frame.Type != FrameDeliveryReport || len(frame.Payload) < 16 {
 		return DeliveryReport{}, ErrInvalidControlFrame
 	}
 	var report DeliveryReport
-	copy(report.LaneID[:], frame.Payload[0:16])
-	report.Generation = binary.BigEndian.Uint64(frame.Payload[16:24])
-	report.DataBytes = binary.BigEndian.Uint64(frame.Payload[24:32])
-	report.DataPackets = binary.BigEndian.Uint64(frame.Payload[32:40])
-	report.ProbeBytes = binary.BigEndian.Uint64(frame.Payload[40:48])
-	report.ProbePackets = binary.BigEndian.Uint64(frame.Payload[48:56])
+	copy(report.LaneID[:], frame.Payload[:LaneIDSize])
+	remaining, err := parseIntegers(frame.Payload[16:], &report.Generation, &report.DataBytes, &report.DataPackets, &report.ProbeBytes, &report.ProbePackets)
+	if err != nil || len(remaining) != 0 {
+		return DeliveryReport{}, ErrInvalidControlFrame
+	}
 	if report.LaneID.IsZero() || report.Generation == 0 {
 		return DeliveryReport{}, ErrInvalidControlFrame
 	}
@@ -234,26 +189,26 @@ func MarshalSessionCreated(created SessionCreated) (Frame, error) {
 		created.ReceiveMicros > created.SendMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := make([]byte, sessionCreatedSize)
-	copy(payload[0:16], created.SessionID[:])
+	payload := integerPayload(64, created.ReceiveMicros, created.SendMicros)
+	copy(payload[:16], created.SessionID[:])
 	copy(payload[16:48], created.SessionSecret[:])
 	copy(payload[48:64], created.PathGroupID[:])
-	binary.BigEndian.PutUint64(payload[64:72], created.ReceiveMicros)
-	binary.BigEndian.PutUint64(payload[72:80], created.SendMicros)
 	return Frame{Type: FrameSessionCreated, Payload: payload}, nil
 }
 
 // ParseSessionCreated parses a session-created control frame.
 func ParseSessionCreated(frame Frame) (SessionCreated, error) {
-	if frame.Type != FrameSessionCreated || len(frame.Payload) != sessionCreatedSize {
+	if frame.Type != FrameSessionCreated || len(frame.Payload) < 64 {
 		return SessionCreated{}, ErrInvalidControlFrame
 	}
 	var created SessionCreated
-	copy(created.SessionID[:], frame.Payload[0:16])
+	copy(created.SessionID[:], frame.Payload[:16])
 	copy(created.SessionSecret[:], frame.Payload[16:48])
 	copy(created.PathGroupID[:], frame.Payload[48:64])
-	created.ReceiveMicros = binary.BigEndian.Uint64(frame.Payload[64:72])
-	created.SendMicros = binary.BigEndian.Uint64(frame.Payload[72:80])
+	remaining, err := parseIntegers(frame.Payload[64:], &created.ReceiveMicros, &created.SendMicros)
+	if err != nil || len(remaining) != 0 {
+		return SessionCreated{}, ErrInvalidControlFrame
+	}
 	if created.SessionID.IsZero() || created.SessionSecret == (SessionSecret{}) || created.PathGroupID.IsZero() ||
 		created.ReceiveMicros > created.SendMicros {
 		return SessionCreated{}, ErrInvalidControlFrame
@@ -274,24 +229,24 @@ func MarshalLaneAccepted(accepted LaneAccepted) (Frame, error) {
 	if accepted.SessionID.IsZero() || accepted.PathGroupID.IsZero() || accepted.ReceiveMicros > accepted.SendMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := make([]byte, laneAcceptedSize)
-	copy(payload[0:16], accepted.SessionID[:])
+	payload := integerPayload(32, accepted.ReceiveMicros, accepted.SendMicros)
+	copy(payload[:16], accepted.SessionID[:])
 	copy(payload[16:32], accepted.PathGroupID[:])
-	binary.BigEndian.PutUint64(payload[32:40], accepted.ReceiveMicros)
-	binary.BigEndian.PutUint64(payload[40:48], accepted.SendMicros)
 	return Frame{Type: FrameLaneAccepted, Payload: payload}, nil
 }
 
 // ParseLaneAccepted parses a lane-accepted control frame.
 func ParseLaneAccepted(frame Frame) (LaneAccepted, error) {
-	if frame.Type != FrameLaneAccepted || len(frame.Payload) != laneAcceptedSize {
+	if frame.Type != FrameLaneAccepted || len(frame.Payload) < 32 {
 		return LaneAccepted{}, ErrInvalidControlFrame
 	}
 	var accepted LaneAccepted
-	copy(accepted.SessionID[:], frame.Payload[0:16])
+	copy(accepted.SessionID[:], frame.Payload[:16])
 	copy(accepted.PathGroupID[:], frame.Payload[16:32])
-	accepted.ReceiveMicros = binary.BigEndian.Uint64(frame.Payload[32:40])
-	accepted.SendMicros = binary.BigEndian.Uint64(frame.Payload[40:48])
+	remaining, err := parseIntegers(frame.Payload[32:], &accepted.ReceiveMicros, &accepted.SendMicros)
+	if err != nil || len(remaining) != 0 {
+		return LaneAccepted{}, ErrInvalidControlFrame
+	}
 	if accepted.SessionID.IsZero() || accepted.PathGroupID.IsZero() || accepted.ReceiveMicros > accepted.SendMicros {
 		return LaneAccepted{}, ErrInvalidControlFrame
 	}
@@ -342,20 +297,22 @@ func MarshalLaneAbandon(lane LaneGeneration) (Frame, error) {
 	if lane.LaneID.IsZero() || lane.Generation == 0 {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := make([]byte, laneGenerationControlSize)
-	copy(payload[0:16], lane.LaneID[:])
-	binary.BigEndian.PutUint64(payload[16:24], lane.Generation)
+	payload := integerPayload(16, lane.Generation)
+	copy(payload[:LaneIDSize], lane.LaneID[:])
 	return Frame{Type: FrameLaneAbandon, Payload: payload}, nil
 }
 
 // ParseLaneAbandon parses a generation-specific lane-abandon frame.
 func ParseLaneAbandon(frame Frame) (LaneGeneration, error) {
-	if frame.Type != FrameLaneAbandon || len(frame.Payload) != laneGenerationControlSize {
+	if frame.Type != FrameLaneAbandon || len(frame.Payload) < 16 {
 		return LaneGeneration{}, ErrInvalidControlFrame
 	}
 	var lane LaneGeneration
-	copy(lane.LaneID[:], frame.Payload[0:16])
-	lane.Generation = binary.BigEndian.Uint64(frame.Payload[16:24])
+	copy(lane.LaneID[:], frame.Payload[:LaneIDSize])
+	remaining, err := parseIntegers(frame.Payload[16:], &lane.Generation)
+	if err != nil || len(remaining) != 0 {
+		return LaneGeneration{}, ErrInvalidControlFrame
+	}
 	if lane.LaneID.IsZero() || lane.Generation == 0 {
 		return LaneGeneration{}, ErrInvalidControlFrame
 	}
@@ -384,35 +341,33 @@ func MarshalErrorFrame(value ErrorFrame) (Frame, error) {
 	if value.Scope == ErrorScopeSession && (!value.LaneID.IsZero() || value.Generation != 0) {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	diagnostic := []byte(value.Diagnostic)
-	payload := make([]byte, 30+len(diagnostic))
-	binary.BigEndian.PutUint16(payload[0:2], uint16(value.Code))
-	payload[2] = byte(value.Class)
-	payload[3] = byte(value.Scope)
-	copy(payload[4:20], value.LaneID[:])
-	binary.BigEndian.PutUint64(payload[20:28], value.Generation)
-	binary.BigEndian.PutUint16(payload[28:30], uint16(len(diagnostic)))
-	copy(payload[30:], diagnostic)
+	size := uvarintSize(uint64(value.Code)) + 2 + LaneIDSize + uvarintSize(value.Generation) + len(value.Diagnostic)
+	payload := make([]byte, 0, size)
+	payload = binary.AppendUvarint(payload, uint64(value.Code))
+	payload = append(payload, byte(value.Class), byte(value.Scope))
+	payload = append(payload, value.LaneID[:]...)
+	payload = binary.AppendUvarint(payload, value.Generation)
+	payload = append(payload, value.Diagnostic...)
 	return Frame{Type: FrameError, Payload: payload}, nil
 }
 
 // ParseErrorFrame parses an in-session error frame.
 func ParseErrorFrame(frame Frame) (ErrorFrame, error) {
-	if frame.Type != FrameError || len(frame.Payload) < 30 {
+	if frame.Type != FrameError {
 		return ErrorFrame{}, ErrInvalidControlFrame
 	}
-	diagnosticLength := int(binary.BigEndian.Uint16(frame.Payload[28:30]))
-	if diagnosticLength > MaxDiagnosticSize || len(frame.Payload) != 30+diagnosticLength {
+	code, width, err := parseUvarint(frame.Payload)
+	if err != nil || code > uint64(ErrorClockSkew) || len(frame.Payload)-width < 2+LaneIDSize {
 		return ErrorFrame{}, ErrInvalidControlFrame
 	}
-	value := ErrorFrame{
-		Code:       ErrorCode(binary.BigEndian.Uint16(frame.Payload[0:2])),
-		Class:      ErrorClass(frame.Payload[2]),
-		Scope:      ErrorScope(frame.Payload[3]),
-		Generation: binary.BigEndian.Uint64(frame.Payload[20:28]),
-		Diagnostic: string(frame.Payload[30:]),
+	payload := frame.Payload[width:]
+	value := ErrorFrame{Code: ErrorCode(code), Class: ErrorClass(payload[0]), Scope: ErrorScope(payload[1])}
+	copy(value.LaneID[:], payload[2:2+LaneIDSize])
+	diagnostic, err := parseIntegers(payload[2+LaneIDSize:], &value.Generation)
+	if err != nil || len(diagnostic) > MaxDiagnosticSize {
+		return ErrorFrame{}, ErrInvalidControlFrame
 	}
-	copy(value.LaneID[:], frame.Payload[4:20])
+	value.Diagnostic = string(diagnostic)
 	if !value.Code.Valid() || value.Code == ErrorClockSkew || !validErrorDisposition(value.Class, value.Scope) ||
 		!validDiagnostic(value.Diagnostic) {
 		return ErrorFrame{}, ErrInvalidControlFrame

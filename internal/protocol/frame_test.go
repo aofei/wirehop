@@ -3,11 +3,12 @@ package protocol
 import (
 	"bufio"
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"reflect"
 	"testing"
+	"testing/iotest"
 )
 
 func TestFrameRoundTrip(t *testing.T) {
@@ -16,7 +17,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(encoded, []byte{byte(FrameProbe), 0, 0, 0, 3, 1, 2, 3}) {
+	if !bytes.Equal(encoded, []byte{byte(FrameProbe), 3, 1, 2, 3}) {
 		t.Fatalf("MarshalFrame() = %v", encoded)
 	}
 
@@ -40,7 +41,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(empty, []byte{byte(FramePing), 0, 0, 0, 0}) {
+	if !bytes.Equal(empty, []byte{byte(FramePing), 0}) {
 		t.Fatalf("empty MarshalFrame() = %v", empty)
 	}
 }
@@ -51,7 +52,7 @@ func TestAppendFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(encoded, []byte{9, byte(FramePing), 0, 0, 0, 2, 1, 2}) {
+	if !bytes.Equal(encoded, []byte{9, byte(FramePing), 2, 1, 2}) {
 		t.Fatalf("AppendFrame() = %v", encoded)
 	}
 }
@@ -197,9 +198,9 @@ func TestFrameReaderReadBuffered(t *testing.T) {
 		wantErr   error
 	}{
 		{name: "Complete", encoded: encoded, buffered: len(encoded), available: true},
-		{name: "ShortHeader", encoded: encoded[:4], buffered: 4},
+		{name: "ShortHeader", encoded: encoded[:1], buffered: 1},
 		{name: "ShortContent", encoded: encoded[:len(encoded)-1], buffered: len(encoded) - 1},
-		{name: "TooLarge", encoded: []byte{byte(FramePing), 0, 1, 0, 16}, buffered: 5, wantErr: ErrFrameTooLarge},
+		{name: "TooLarge", encoded: []byte{byte(FramePing), 0x94, 0x80, 0x04}, buffered: 4, wantErr: ErrFrameTooLarge},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := bufio.NewReaderSize(bytes.NewReader(tt.encoded), len(encoded))
@@ -223,10 +224,10 @@ func TestFrameErrors(t *testing.T) {
 		encoded []byte
 		want    error
 	}{
-		{name: "TooLarge", encoded: []byte{byte(FramePing), 0, 1, 0, 16}, want: ErrFrameTooLarge},
-		{name: "UnknownType", encoded: []byte{255, 0, 0, 0, 0}, want: ErrInvalidFrameType},
-		{name: "ShortHeader", encoded: []byte{byte(FramePing), 0, 0, 0}, want: io.ErrUnexpectedEOF},
-		{name: "ShortContent", encoded: []byte{byte(FramePing), 0, 0, 0, 2, 1}, want: io.ErrUnexpectedEOF},
+		{name: "TooLarge", encoded: []byte{byte(FramePing), 0x94, 0x80, 0x04}, want: ErrFrameTooLarge},
+		{name: "UnknownType", encoded: []byte{255, 0}, want: ErrInvalidFrameType},
+		{name: "ShortHeader", encoded: []byte{byte(FramePing), 0x80}, want: io.ErrUnexpectedEOF},
+		{name: "ShortContent", encoded: []byte{byte(FramePing), 2, 1}, want: io.ErrUnexpectedEOF},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ReadFrame(bytes.NewReader(tt.encoded))
@@ -244,8 +245,8 @@ func TestParseFramesErrors(t *testing.T) {
 		want    error
 	}{
 		{name: "TrailingPrefix", message: []byte{0}, want: ErrTrailingFrameData},
-		{name: "ShortContent", message: []byte{byte(FramePing), 0, 0, 0, 2, 1}, want: ErrTrailingFrameData},
-		{name: "UnknownType", message: []byte{255, 0, 0, 0, 0}, want: ErrInvalidFrameType},
+		{name: "ShortContent", message: []byte{byte(FramePing), 2, 1}, want: ErrTrailingFrameData},
+		{name: "UnknownType", message: []byte{255, 0}, want: ErrInvalidFrameType},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ParseFrames(tt.message)
@@ -257,35 +258,20 @@ func TestParseFramesErrors(t *testing.T) {
 }
 
 func TestDataRoundTrip(t *testing.T) {
-	if DataFrameOverhead != 21 || MaxFrameContentSize != 65_551 || MaxEncodedFrameSize != 65_556 {
-		t.Fatalf("data layout constants = overhead %d, content %d, encoded %d",
-			DataFrameOverhead, MaxFrameContentSize, MaxEncodedFrameSize)
+	if Version != 1 || MaxFrameContentSize != 65_555 || MaxEncodedFrameSize != 65_559 {
+		t.Fatalf("protocol limits = version %d, content %d, encoded %d", Version, MaxFrameContentSize, MaxEncodedFrameSize)
 	}
-	want := Data{
-		PacketID:       11,
-		DeadlineMicros: 123456,
-		Payload:        []byte{1, 0, 0, 0, 9},
-	}
+	want := Data{PacketID: 11, DeadlineMicros: 123456, Payload: []byte{1, 0, 0, 0, 9}}
 	frame, err := MarshalData(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if frame.Type != FrameData || len(frame.Payload) != dataHeaderSize+len(want.Payload) {
+	if frame.Type != FrameData || !bytes.Equal(frame.Payload, []byte{11, 0xc0, 0xc4, 7, 1, 0, 0, 0, 9}) {
 		t.Fatalf("MarshalData() = %#v", frame)
 	}
-	if got := binary.BigEndian.Uint64(frame.Payload[0:8]); got != want.PacketID {
-		t.Fatalf("encoded packet ID = %d", got)
-	}
-	if got := binary.BigEndian.Uint64(frame.Payload[8:16]); got != want.DeadlineMicros {
-		t.Fatalf("encoded deadline = %d", got)
-	}
-
 	got, err := ParseData(frame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("ParseData() = %#v, want %#v", got, want)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseData() = %#v, %v, want %#v", got, err, want)
 	}
 	direct, err := MarshalDataFrame(want)
 	if err != nil {
@@ -295,12 +281,8 @@ func TestDataRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(direct, generic) {
+	if !bytes.Equal(direct, generic) || !bytes.Equal(direct[:2], []byte{byte(FrameData), 9}) {
 		t.Fatalf("MarshalDataFrame() = %v, want %v", direct, generic)
-	}
-	if direct[0] != byte(FrameData) ||
-		binary.BigEndian.Uint32(direct[1:frameHeaderSize]) != uint32(dataHeaderSize+len(want.Payload)) {
-		t.Fatalf("data frame header = %v", direct[:frameHeaderSize])
 	}
 	if size, err := DataFrameSize(want); err != nil || size != len(direct) {
 		t.Fatalf("DataFrameSize() = %d, %v, want %d", size, err, len(direct))
@@ -336,17 +318,37 @@ func TestDataErrors(t *testing.T) {
 
 func FuzzParseFrames(f *testing.F) {
 	f.Add([]byte(nil))
-	f.Add([]byte{byte(FramePing), 0, 0, 0, 0})
-	f.Add([]byte{byte(FrameProbe), 0, 0, 0, 1, 1})
+	f.Add([]byte{byte(FramePing), 0})
+	f.Add([]byte{byte(FrameProbe), 1, 1})
 	f.Fuzz(func(t *testing.T, message []byte) {
-		frames, err := ParseFrames(message)
-		if err != nil {
-			return
-		}
-		for _, frame := range frames {
-			if !frame.Type.Valid() || len(frame.Payload) > MaxFrameContentSize {
-				t.Fatalf("ParseFrames() returned invalid frame %#v", frame)
+		frames, parseErr := ParseFrames(message)
+		reader := bytes.NewReader(message)
+		var decoder FrameReader
+		var encoded []byte
+		count := 0
+		for {
+			frame, err := decoder.Read(reader)
+			if err != nil {
+				if parseErr == nil && (err != io.EOF || count != len(frames)) {
+					t.Fatalf("stream and message decoding differ: count %d, error %v", count, err)
+				}
+				if parseErr != nil && err == io.EOF {
+					t.Fatal("stream accepted a malformed message")
+				}
+				break
 			}
+			if parseErr == nil && (count >= len(frames) || frame.Type != frames[count].Type ||
+				!bytes.Equal(frame.Payload, frames[count].Payload)) {
+				t.Fatal("stream and message frames differ")
+			}
+			encoded, err = AppendFrame(encoded, frame)
+			if err != nil {
+				t.Fatalf("decoded frame cannot be encoded: %v", err)
+			}
+			count++
+		}
+		if parseErr == nil && !bytes.Equal(encoded, message) {
+			t.Fatal("accepted sequence differs from its canonical encoding")
 		}
 	})
 }
@@ -373,4 +375,158 @@ func FuzzParseData(f *testing.F) {
 			t.Fatal("data-frame round trip changed a valid payload")
 		}
 	})
+}
+
+func TestFrameReaderLengthBoundaries(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		size   int
+		header []byte
+	}{
+		{name: "Empty", header: []byte{byte(FrameData), 0}},
+		{name: "OneByte", size: 127, header: []byte{byte(FrameData), 0x7f}},
+		{name: "TwoBytes", size: 128, header: []byte{byte(FrameData), 0x80, 1}},
+		{name: "TwoByteMaximum", size: 16383, header: []byte{byte(FrameData), 0xff, 0x7f}},
+		{name: "ThreeBytes", size: 16384, header: []byte{byte(FrameData), 0x80, 0x80, 1}},
+		{name: "Maximum", size: 65555, header: []byte{byte(FrameData), 0x93, 0x80, 4}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := bytes.Repeat([]byte{0xa5}, tt.size)
+			encoded, err := MarshalFrame(Frame{Type: FrameData, Payload: payload})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(encoded[:len(tt.header)], tt.header) || len(encoded) != tt.size+len(tt.header) {
+				t.Fatalf("encoded size or header differs from vector: %d, %v", len(encoded), encoded[:len(tt.header)])
+			}
+			stream := iotest.OneByteReader(bytes.NewReader(append(bytes.Clone(encoded), byte(FrameProbe), 0)))
+			var decoder FrameReader
+			frame, err := decoder.Read(stream)
+			if err != nil || frame.Type != FrameData || !bytes.Equal(frame.Payload, payload) {
+				t.Fatalf("fragmented frame differs: %v", err)
+			}
+			next, err := decoder.Read(stream)
+			if err != nil || next.Type != FrameProbe || len(next.Payload) != 0 {
+				t.Fatalf("next frame = %#v, %v", next, err)
+			}
+		})
+	}
+}
+
+func TestFrameReaderReadBufferedPartialHeader(t *testing.T) {
+	encoded, err := MarshalFrame(Frame{Type: FrameData, Payload: make([]byte, 128)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cut := 0; cut <= len(encoded); cut++ {
+		reader := bufio.NewReaderSize(bytes.NewReader(encoded[:cut]), len(encoded))
+		reader.Peek(cut)
+		var decoder FrameReader
+		frame, ready, err := decoder.ReadBuffered(reader)
+		if err != nil || ready != (cut == len(encoded)) {
+			t.Fatalf("cut %d: ready %t, error %v", cut, ready, err)
+		}
+		if !ready && reader.Buffered() != cut {
+			t.Fatalf("partial frame consumed bytes at cut %d", cut)
+		}
+		if ready && len(frame.Payload) != 128 {
+			t.Fatal("complete payload changed")
+		}
+	}
+}
+
+func TestFrameCanonicalLength(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		header []byte
+		want   error
+	}{
+		{name: "NonminimalZero", header: []byte{byte(FrameProbe), 0x80, 0}, want: ErrInvalidInteger},
+		{name: "NonminimalOne", header: []byte{byte(FrameProbe), 0x81, 0, 9}, want: ErrInvalidInteger},
+		{name: "TooLarge", header: []byte{byte(FrameData), 0x94, 0x80, 4}, want: ErrFrameTooLarge},
+		{name: "TooLong", header: []byte{byte(FrameData), 0x80, 0x80, 0x80, 0}, want: ErrFrameTooLarge},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var decoder FrameReader
+			if _, err := decoder.Read(bytes.NewReader(tt.header)); !errors.Is(err, tt.want) {
+				t.Fatalf("Read() = %v", err)
+			}
+			if cap(decoder.content) != 0 {
+				t.Fatal("malformed length allocated content storage")
+			}
+			if _, err := ParseFrameSequence(tt.header); !errors.Is(err, tt.want) {
+				t.Fatalf("ParseFrameSequence() = %v", err)
+			}
+			reader := bufio.NewReader(bytes.NewReader(tt.header))
+			reader.Peek(len(tt.header))
+			if _, _, err := decoder.ReadBuffered(reader); !errors.Is(err, tt.want) {
+				t.Fatalf("ReadBuffered() = %v", err)
+			}
+		})
+	}
+}
+
+func TestDataFullWidthAndReusableEncoding(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		id, deadline uint64
+		payloadSize  int
+		overhead     int
+	}{
+		{name: "Small", id: 1, deadline: 1, payloadSize: 32, overhead: 4},
+		{name: "Ordinary", id: 8_640_000_000, deadline: 604_805_000_000, payloadSize: 1452, overhead: 14},
+		{name: "FullWidth", id: math.MaxUint64, deadline: math.MaxUint64, payloadSize: MaxPacketSize, overhead: 24},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := Data{PacketID: tt.id, DeadlineMicros: tt.deadline, Payload: bytes.Repeat([]byte{0x96}, tt.payloadSize)}
+			backing := bytes.Repeat([]byte{0x5a}, MaxEncodedFrameSize+1)
+			encoded, err := AppendDataFrame(backing[:1], data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if &encoded[0] != &backing[0] || encoded[0] != 0x5a || len(encoded)-1 != tt.payloadSize+tt.overhead {
+				t.Fatal("encoding changed prefix, capacity, or expected size")
+			}
+			frames, err := ParseFrames(encoded[1:])
+			if err != nil || len(frames) != 1 {
+				t.Fatalf("ParseFrames() = %v", err)
+			}
+			got, err := ParseData(frames[0])
+			if err != nil || !reflect.DeepEqual(got, data) {
+				t.Fatalf("ParseData() = %#v, %v", got, err)
+			}
+			if len(got.Payload) != 0 && &got.Payload[0] != &frames[0].Payload[len(frames[0].Payload)-len(got.Payload)] {
+				t.Fatal("parsed datagram did not borrow the original payload")
+			}
+		})
+	}
+}
+
+func TestParseDataMalformedIntegers(t *testing.T) {
+	for _, payload := range [][]byte{
+		nil, {1}, {0x81, 0, 1}, {1, 0x81, 0}, {1, 0x80},
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2, 1},
+	} {
+		if _, err := ParseData(Frame{Type: FrameData, Payload: payload}); !errors.Is(err, ErrInvalidDataFrame) {
+			t.Fatalf("ParseData(%v) = %v", payload, err)
+		}
+	}
+}
+
+func TestAppendFrameOverlappingPayload(t *testing.T) {
+	backing := bytes.Repeat([]byte{0xa5}, 32)
+	copy(backing, []byte{9, 1, 2, 3, 4})
+	encoded, err := AppendFrame(backing[:1], Frame{Type: FrameProbe, Payload: backing[1:5]})
+	if err != nil || !bytes.Equal(encoded, []byte{9, byte(FrameProbe), 4, 1, 2, 3, 4}) {
+		t.Fatalf("overlapping AppendFrame() = %v, %v", encoded, err)
+	}
+}
+
+func TestAppendDataFrameOverlappingPayload(t *testing.T) {
+	backing := bytes.Repeat([]byte{0xa5}, 32)
+	copy(backing, []byte{9, 1, 2, 3, 4})
+	encoded, err := AppendDataFrame(backing[:1], Data{PacketID: 1, DeadlineMicros: 2, Payload: backing[1:5]})
+	if err != nil || !bytes.Equal(encoded, []byte{9, byte(FrameData), 6, 1, 2, 1, 2, 3, 4}) {
+		t.Fatalf("overlapping AppendDataFrame() = %v, %v", encoded, err)
+	}
 }

@@ -6,17 +6,18 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"slices"
 )
 
 const (
 	// Version is the current WireHop wire protocol version.
 	Version uint16 = 1
-	// frameHeaderSize is the size of the frame type and content-length header.
-	frameHeaderSize = 5
+	// maximumFrameHeaderSize bounds the type byte and a canonical content length through MaxFrameContentSize.
+	maximumFrameHeaderSize = 4
 	// MaxFrameContentSize is the largest valid type-specific frame content.
-	MaxFrameContentSize = dataHeaderSize + MaxPacketSize
+	MaxFrameContentSize = maximumDataHeaderSize + MaxPacketSize
 	// MaxEncodedFrameSize is the largest valid frame including its common header.
-	MaxEncodedFrameSize = frameHeaderSize + MaxFrameContentSize
+	MaxEncodedFrameSize = maximumFrameHeaderSize + MaxFrameContentSize
 	// maximumRetainedFrameContentCapacity preserves ordinary packets without retaining exceptional high-water marks.
 	maximumRetainedFrameContentCapacity = 32 * 1024
 )
@@ -72,7 +73,7 @@ type Frame struct {
 
 // FrameReader incrementally decodes stream frames with connection-local reusable storage.
 type FrameReader struct {
-	header  [frameHeaderSize]byte
+	header  [maximumFrameHeaderSize]byte
 	content []byte
 }
 
@@ -98,11 +99,19 @@ func AppendFrame(destination []byte, frame Frame) ([]byte, error) {
 	}
 
 	offset := len(destination)
-	destination = append(destination, make([]byte, frameHeaderSize+len(frame.Payload))...)
+	size := FrameSize(len(frame.Payload))
+	destination = slices.Grow(destination, size)
+	destination = destination[:offset+size]
+	headerSize := size - len(frame.Payload)
+	copy(destination[offset+headerSize:], frame.Payload)
 	destination[offset] = byte(frame.Type)
-	binary.BigEndian.PutUint32(destination[offset+1:offset+frameHeaderSize], uint32(len(frame.Payload)))
-	copy(destination[offset+frameHeaderSize:], frame.Payload)
+	binary.PutUvarint(destination[offset+1:], uint64(len(frame.Payload)))
 	return destination, nil
+}
+
+// FrameSize returns the complete canonical encoded size for a validated frame-content length.
+func FrameSize(contentSize int) int {
+	return 1 + uvarintSize(uint64(contentSize)) + contentSize
 }
 
 // ReadFrame reads one complete typed and length-prefixed frame from reader.
@@ -111,52 +120,76 @@ func ReadFrame(reader io.Reader) (Frame, error) {
 	return frameReader.Read(reader)
 }
 
-// Read reads one frame whose payload remains valid until the next Read call.
+// Read reads one frame whose payload remains valid until the next Read or ReadBuffered call.
 func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
+	if _, err := io.ReadFull(reader, r.header[:1]); err != nil {
+		return Frame{}, err
+	}
+	if !FrameType(r.header[0]).Valid() {
+		return Frame{}, ErrInvalidFrameType
+	}
+	headerSize := 1
+	for headerSize < len(r.header) {
+		if _, err := io.ReadFull(reader, r.header[headerSize:headerSize+1]); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return Frame{}, err
+		}
+		headerSize++
+		if r.header[headerSize-1] < 0x80 {
+			break
+		}
+	}
+	length, _, err := frameHeader(r.header[:headerSize])
+	if err != nil {
+		return Frame{}, err
+	}
+	return r.readContent(reader, FrameType(r.header[0]), length)
+}
+
+// readContent reads a validated frame body into reusable connection-local storage.
+func (r *FrameReader) readContent(reader io.Reader, typeID FrameType, length int) (Frame, error) {
 	if cap(r.content) > maximumRetainedFrameContentCapacity {
 		r.content = nil
 	}
-	if _, err := io.ReadFull(reader, r.header[:]); err != nil {
-		return Frame{}, err
-	}
-	typeID := FrameType(r.header[0])
-	if !typeID.Valid() {
-		return Frame{}, ErrInvalidFrameType
-	}
-	contentLength := binary.BigEndian.Uint32(r.header[1:frameHeaderSize])
-	if contentLength > MaxFrameContentSize {
-		return Frame{}, ErrFrameTooLarge
-	}
-
-	length := int(contentLength)
 	if cap(r.content) < length {
 		r.content = make([]byte, length)
 	} else {
 		r.content = r.content[:length]
 	}
 	if _, err := io.ReadFull(reader, r.content); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return Frame{}, err
 	}
 	return Frame{Type: typeID, Payload: r.content}, nil
 }
 
-// ReadBuffered reads one complete frame only when it is already buffered.
+// ReadBuffered reads one complete frame only when it is already buffered. Its payload remains valid until the next
+// Read or ReadBuffered call.
 func (r *FrameReader) ReadBuffered(reader *bufio.Reader) (Frame, bool, error) {
-	if reader.Buffered() < frameHeaderSize {
+	if reader.Buffered() < 2 {
 		return Frame{}, false, nil
 	}
-	header, err := reader.Peek(frameHeaderSize)
+	header, err := reader.Peek(min(reader.Buffered(), maximumFrameHeaderSize))
 	if err != nil {
 		return Frame{}, false, err
 	}
-	encodedLength, err := frameLength(header)
+	contentLength, headerSize, err := frameHeader(header)
 	if err != nil {
+		if err == ErrTrailingFrameData {
+			return Frame{}, false, nil
+		}
 		return Frame{}, false, err
 	}
-	if reader.Buffered() < encodedLength {
+	if reader.Buffered() < headerSize+contentLength {
 		return Frame{}, false, nil
 	}
-	frame, err := r.Read(reader)
+	typeID := FrameType(header[0])
+	reader.Discard(headerSize)
+	frame, err := r.readContent(reader, typeID, contentLength)
 	return frame, true, err
 }
 
@@ -164,9 +197,13 @@ func (r *FrameReader) ReadBuffered(reader *bufio.Reader) (Frame, bool, error) {
 // alias message.
 func ParseFrameSequence(message []byte) (FrameSequence, error) {
 	for remaining := message; len(remaining) > 0; {
-		encodedLength, err := encodedFrameLength(remaining)
+		contentLength, headerSize, err := frameHeader(remaining)
 		if err != nil {
 			return FrameSequence{}, err
+		}
+		encodedLength := headerSize + contentLength
+		if encodedLength > len(remaining) {
+			return FrameSequence{}, ErrTrailingFrameData
 		}
 		remaining = remaining[encodedLength:]
 	}
@@ -179,8 +216,10 @@ func (s *FrameSequence) Next() (Frame, bool) {
 		return Frame{}, false
 	}
 	message := s.message[s.offset:]
-	encodedLength := frameHeaderSize + int(binary.BigEndian.Uint32(message[1:frameHeaderSize]))
-	frame := Frame{Type: FrameType(message[0]), Payload: message[frameHeaderSize:encodedLength]}
+	contentLength, width := binary.Uvarint(message[1:])
+	headerSize := 1 + width
+	encodedLength := headerSize + int(contentLength)
+	frame := Frame{Type: FrameType(message[0]), Payload: message[headerSize:encodedLength]}
 	s.offset += encodedLength
 	return frame, true
 }
@@ -207,29 +246,27 @@ func AppendFrames(destination []Frame, message []byte) ([]Frame, error) {
 	return destination, nil
 }
 
-// encodedFrameLength validates the first encoded frame in message and returns its complete byte length.
-func encodedFrameLength(message []byte) (int, error) {
-	encodedLength, err := frameLength(message)
-	if err != nil {
-		return 0, err
-	}
-	if encodedLength > len(message) {
-		return 0, ErrTrailingFrameData
-	}
-	return encodedLength, nil
-}
-
-// frameLength validates one frame header and returns its declared encoded length.
-func frameLength(message []byte) (int, error) {
-	if len(message) < frameHeaderSize {
-		return 0, ErrTrailingFrameData
+// frameHeader validates one bounded header and returns its content length and header size.
+func frameHeader(message []byte) (int, int, error) {
+	if len(message) < 2 {
+		return 0, 0, ErrTrailingFrameData
 	}
 	if !FrameType(message[0]).Valid() {
-		return 0, ErrInvalidFrameType
+		return 0, 0, ErrInvalidFrameType
 	}
-	contentLength := binary.BigEndian.Uint32(message[1:frameHeaderSize])
+	lengthBytes := message[1:min(len(message), maximumFrameHeaderSize)]
+	contentLength, width, err := parseUvarint(lengthBytes)
+	if err != nil {
+		if err == io.ErrUnexpectedEOF {
+			if len(lengthBytes) == maximumFrameHeaderSize-1 {
+				return 0, 0, ErrFrameTooLarge
+			}
+			return 0, 0, ErrTrailingFrameData
+		}
+		return 0, 0, err
+	}
 	if contentLength > MaxFrameContentSize {
-		return 0, ErrFrameTooLarge
+		return 0, 0, ErrFrameTooLarge
 	}
-	return frameHeaderSize + int(contentLength), nil
+	return int(contentLength), 1 + width, nil
 }

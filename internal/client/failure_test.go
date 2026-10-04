@@ -97,6 +97,7 @@ func TestLaneFailureEndsSession(t *testing.T) {
 		t.Fatal("retryable session-scoped admission error did not request session replacement")
 	}
 	if classifyLaneFailure(protocol.ErrUnsupportedVersion) != failureCloseLane ||
+		classifyLaneFailure(protocol.ErrInvalidInteger) != failureCloseLane ||
 		classifyLaneFailure(tls.RecordHeaderError{}) != failureCloseLane ||
 		classifyLaneFailure(os.ErrPermission) != failureCloseLane ||
 		classifyLaneFailure(relay.ErrUnexpectedFrame) != failureCloseLane ||

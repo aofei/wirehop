@@ -1072,6 +1072,7 @@ func TestShouldReportLaneError(t *testing.T) {
 		{name: "Authentication", err: protocol.ErrAuthenticationFailed},
 		{name: "PreAdmissionProtocolViolation", err: protocol.ErrInvalidFrameType},
 		{name: "ActiveProtocolViolation", err: &activeLaneError{cause: protocol.ErrInvalidFrameType}, want: true},
+		{name: "ActiveInvalidInteger", err: &activeLaneError{cause: protocol.ErrInvalidInteger}, want: true},
 		{name: "ActiveEndpointFailure", err: &activeLaneError{cause: relay.ErrEndpointFailure}, want: true},
 		{
 			name: "ActiveRemoteProtocolViolation",

@@ -31,6 +31,7 @@ jobs:
           go test ./internal/wgpacket -run '^$' -fuzz '^FuzzClassify$' -fuzztime 1000000x
           go test ./internal/wgpacket -run '^$' -fuzz '^FuzzReservedText$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseFrames$' -fuzztime 1000000x
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzParseUvarint$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseData$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseClientHello$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseServerHello$' -fuzztime 1000000x

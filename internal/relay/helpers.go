@@ -16,7 +16,7 @@ func IsProtocolViolation(err error) bool {
 		errors.Is(err, carrier.ErrInvalidWebSocketMessage) ||
 		errors.Is(err, protocol.ErrInvalidServerHello) || errors.Is(err, protocol.ErrInvalidFrameType) ||
 		errors.Is(err, protocol.ErrFrameTooLarge) || errors.Is(err, protocol.ErrTrailingFrameData) ||
-		errors.Is(err, protocol.ErrInvalidDataFrame) ||
+		errors.Is(err, protocol.ErrInvalidInteger) || errors.Is(err, protocol.ErrInvalidDataFrame) ||
 		errors.Is(err, protocol.ErrInvalidControlFrame) || errors.Is(err, protocol.ErrProbeTooLarge) ||
 		errors.Is(err, clockmap.ErrInvalidSample) || errors.Is(err, clockmap.ErrTimestampOverflow) ||
 		errors.Is(err, ErrInvalidWireGuardPacket) || errors.Is(err, ErrInvalidPacketDeadline) ||
