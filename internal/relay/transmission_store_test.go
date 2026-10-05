@@ -312,6 +312,53 @@ func TestTransmissionStoreExpiryDistinguishesQueuedAndSent(t *testing.T) {
 	}
 }
 
+func TestTransmissionStoreReclaimsUnorderedDeadlines(t *testing.T) {
+	now := time.Unix(100, 0)
+	store, err := newTransmissionStore(packetqueue.Limits{Packets: 3, Bytes: 4096}, func() time.Time {
+		return now
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	start := now
+	for _, transmission := range []retainedTransmission{
+		schedulerTransmission(1, wgpacket.TransportData, start.Add(3*time.Second)),
+		schedulerTransmission(2, wgpacket.TransportData, start.Add(time.Second)),
+		schedulerTransmission(3, wgpacket.TransportData, start.Add(2*time.Second)),
+	} {
+		if err := store.push(transmission); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now = start.Add(time.Second)
+	if err := store.push(schedulerTransmission(4, wgpacket.TransportData, start.Add(4*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	now = start.Add(2 * time.Second)
+	store.expireQueued(now)
+	if got := takeOneTransmission(t, store).PacketID; got != 1 {
+		t.Fatalf("oldest live PacketID = %d, want 1", got)
+	}
+	if err := store.push(schedulerTransmission(5, wgpacket.TransportData, start.Add(2500*time.Millisecond))); err != nil {
+		t.Fatal(err)
+	}
+	now = start.Add(2500 * time.Millisecond)
+	if err := store.push(schedulerTransmission(6, wgpacket.TransportData, start.Add(5*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if got := takeOneTransmission(t, store).PacketID; got != 4 {
+		t.Fatalf("queued FIFO PacketID = %d, want 4", got)
+	}
+	now = start.Add(10 * time.Second)
+	store.expireQueued(now)
+	retained := store.drain()
+	defer releaseTransmissions(retained)
+	if len(retained) != 2 || retained[0].data.PacketID != 1 || retained[1].data.PacketID != 4 {
+		t.Fatalf("expired sent prefix = %+v, want PacketIDs 1 and 4", retained)
+	}
+}
+
 func TestTransmissionStoreTakeBatchSkipsExpiredWork(t *testing.T) {
 	now := time.Unix(100, 0)
 	budget, err := retention.NewBudget(retention.Limits{Packets: 4, Bytes: 4096})
@@ -527,6 +574,7 @@ func TestTransmissionDequeCapacityRetention(t *testing.T) {
 				for index := range deque.items {
 					deque.items[index].deadline = time.Unix(100, 0)
 				}
+				deque.earliestDeadline = time.Unix(100, 0)
 				deque.removeExpired(time.Unix(101, 0))
 			},
 			retain: func(_ *testing.T, deque *transmissionDeque, count int) {
@@ -537,6 +585,7 @@ func TestTransmissionDequeCapacityRetention(t *testing.T) {
 						deque.items[index].deadline = time.Unix(100, 0)
 					}
 				}
+				deque.earliestDeadline = time.Unix(100, 0)
 				deque.removeExpired(time.Unix(101, 0))
 			},
 		},
@@ -717,6 +766,17 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 	packets := store.sent.len() + store.control.len() + store.normal.len()
 	bytes := 0
 	sentBytes := uint64(0)
+	for _, deque := range []*transmissionDeque{&store.control, &store.normal} {
+		if (deque.len() == 0) != deque.earliestDeadline.IsZero() {
+			t.Fatal("expiry bound does not match queued occupancy")
+		}
+		deque.each(func(transmission retainedTransmission) bool {
+			if transmission.deadline.Before(deque.earliestDeadline) {
+				t.Fatal("expiry bound is later than a queued deadline")
+			}
+			return true
+		})
+	}
 	validate := func(transmission retainedTransmission, sent bool) bool {
 		size, err := protocol.DataFrameSize(transmission.data)
 		if err != nil || size != transmission.size || !transmission.kind.Accepted() ||

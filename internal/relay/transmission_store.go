@@ -80,8 +80,10 @@ func (t *retainedTransmission) releasePacket() {
 
 // transmissionDeque is a compacting first-in, first-out transmission sequence.
 type transmissionDeque struct {
-	items []retainedTransmission
-	head  int
+	// earliestDeadline bounds queued expiry and is rebuilt when a scan is due.
+	earliestDeadline time.Time
+	items            []retainedTransmission
+	head             int
 }
 
 // peek returns the oldest transmission without removing it.
@@ -95,6 +97,9 @@ func (d *transmissionDeque) peek() (retainedTransmission, bool) {
 // push appends transmission to the deque.
 func (d *transmissionDeque) push(transmission retainedTransmission) {
 	d.items = append(d.items, transmission)
+	if len(d.items) == 1 || transmission.deadline.Before(d.earliestDeadline) {
+		d.earliestDeadline = transmission.deadline
+	}
 }
 
 // pop removes and returns the oldest transmission from the nonempty deque.
@@ -123,6 +128,7 @@ func (d *transmissionDeque) resetEmpty() {
 		d.items = d.items[:0]
 	}
 	d.head = 0
+	d.earliestDeadline = time.Time{}
 }
 
 // compact releases consumed capacity when enough of the backing slice is unused.
@@ -161,10 +167,15 @@ func (d *transmissionDeque) clear() {
 	clear(d.items)
 	d.items = nil
 	d.head = 0
+	d.earliestDeadline = time.Time{}
 }
 
 // removeExpired removes queued transmissions at or beyond their local deadlines.
 func (d *transmissionDeque) removeExpired(now time.Time) (int, int) {
+	if d.head == len(d.items) || now.Before(d.earliestDeadline) {
+		return 0, 0
+	}
+	d.earliestDeadline = time.Time{}
 	write := 0
 	removedPackets := 0
 	removedBytes := 0
@@ -173,8 +184,11 @@ func (d *transmissionDeque) removeExpired(now time.Time) (int, int) {
 		if !now.Before(transmission.deadline) {
 			removedPackets++
 			removedBytes += transmission.size
-			transmission.releasePacket()
+			d.items[read].releasePacket()
 			continue
+		}
+		if write == 0 || transmission.deadline.Before(d.earliestDeadline) {
+			d.earliestDeadline = transmission.deadline
 		}
 		d.items[write] = transmission
 		write++
@@ -374,7 +388,8 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 			sentMicros: sentMicros, firstSentMicros: s.firstSentMicros,
 			deliveredMicros: s.deliveredMicros, deliveredBytes: s.reportedBytes,
 		}
-		s.sent.push(transmission)
+		// Sent entries are never reclaimed by expiry and need no queued-deadline bound.
+		s.sent.items = append(s.sent.items, transmission)
 		s.sentPackets++
 		s.sentBytes += uint64(transmission.size)
 		destination[count] = transmission.data
@@ -505,6 +520,14 @@ func (s *TransmissionStore) canAccept(frameBytes uint64) bool {
 // atRisk reports whether retained work is predicted to miss a deadline in carrier order.
 func (s *TransmissionStore) atRisk(now time.Time, delay func(uint64) uint64) bool {
 	return s.assessDeadlines(now, delay).atRisk
+}
+
+// expireQueued reclaims overdue unsent work and returns the start of outstanding carrier progress.
+func (s *TransmissionStore) expireQueued(now time.Time) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeExpiredQueuedLocked(now)
+	return s.unreportedSince
 }
 
 // assessDeadlines reclaims queued expiry and evaluates retained work in one locked traversal.

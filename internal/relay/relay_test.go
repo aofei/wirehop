@@ -384,8 +384,17 @@ func TestDeliveryProgressRetriesUnsentClaim(t *testing.T) {
 	if !changed {
 		t.Fatal("initial progress was not claimed")
 	}
+	select {
+	case <-progress.notify:
+	default:
+		t.Fatal("initial progress did not publish a notification")
+	}
 	progress.complete(report, revision, false)
-	<-progress.notify
+	select {
+	case <-progress.notify:
+	default:
+		t.Fatal("failed completion did not publish a notification")
+	}
 	for range reportPacketThreshold {
 		if err := progress.addData(1); err != nil {
 			t.Fatal(err)
@@ -424,7 +433,11 @@ func TestDeliveryProgressThresholdNotification(t *testing.T) {
 					t.Fatal(err)
 				}
 				if index == 0 {
-					<-progress.notify
+					select {
+					case <-progress.notify:
+					default:
+						t.Fatal("initial progress did not publish a notification")
+					}
 				}
 				if index+1 == test.packets {
 					continue

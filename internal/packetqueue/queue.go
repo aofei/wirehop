@@ -113,13 +113,18 @@ func (i *Item[T]) releaseValue() {
 
 // deque is a compacting first-in, first-out item sequence.
 type deque[T any] struct {
-	items []Item[T]
-	head  int
+	// earliestDeadline is a conservative lower bound, rebuilt when an expiry scan is due.
+	earliestDeadline time.Time
+	items            []Item[T]
+	head             int
 }
 
 // push appends item to the deque.
 func (d *deque[T]) push(item Item[T]) {
 	d.items = append(d.items, item)
+	if len(d.items) == 1 || item.Deadline.Before(d.earliestDeadline) {
+		d.earliestDeadline = item.Deadline
+	}
 }
 
 // pop transfers the oldest item from the deque into destination.
@@ -147,6 +152,7 @@ func (d *deque[T]) resetEmpty() {
 		d.items = d.items[:0]
 	}
 	d.head = 0
+	d.earliestDeadline = time.Time{}
 }
 
 // compact releases consumed slots when enough of the backing slice is unused.
@@ -183,10 +189,15 @@ func (d *deque[T]) clear() {
 	clear(d.items)
 	d.items = nil
 	d.head = 0
+	d.earliestDeadline = time.Time{}
 }
 
 // removeExpired compacts the deque and returns released packet and byte capacity.
 func (d *deque[T]) removeExpired(now time.Time) (int, int) {
+	if d.head == len(d.items) || now.Before(d.earliestDeadline) {
+		return 0, 0
+	}
+	d.earliestDeadline = time.Time{}
 	write := 0
 	removedPackets := 0
 	removedBytes := 0
@@ -195,8 +206,11 @@ func (d *deque[T]) removeExpired(now time.Time) (int, int) {
 		if !now.Before(item.Deadline) {
 			removedPackets++
 			removedBytes += item.Size
-			item.releaseValue()
+			d.items[read].releaseValue()
 			continue
+		}
+		if write == 0 || item.Deadline.Before(d.earliestDeadline) {
+			d.earliestDeadline = item.Deadline
 		}
 		d.items[write] = item
 		write++
@@ -225,7 +239,6 @@ type Queue[T any] struct {
 	notify  chan struct{}
 	done    chan struct{}
 	closed  bool
-	expires time.Time
 }
 
 // New returns an empty queue using the process wall clock for deadline decisions.
@@ -357,9 +370,6 @@ func (q *Queue[T]) pushLocked(item Item[T], now time.Time) error {
 	}
 	q.packets++
 	q.bytes += item.Size
-	if q.expires.IsZero() || item.Deadline.Before(q.expires) {
-		q.expires = item.Deadline
-	}
 	return nil
 }
 
@@ -381,28 +391,34 @@ func (q *Queue[T]) removeExpiredLocked(now time.Time) {
 	removedPackets += controlPackets
 	removedBytes += controlBytes
 	q.releaseLocked(removedPackets, removedBytes)
-	q.expires = time.Time{}
-	for _, deque := range []*deque[T]{&q.normal, &q.control} {
-		for _, item := range deque.items[deque.head:] {
-			if q.expires.IsZero() || item.Deadline.Before(q.expires) {
-				q.expires = item.Deadline
-			}
-		}
-	}
 }
 
 // NextDeadline returns a conservative wake-up deadline for queued expiry, or zero when the queue is empty. A consumed
-// item's deadline can remain until [Queue.Expire] recomputes the next deadline.
+// item's deadline can remain until a due expiry scan recomputes its priority deque's bound.
 func (q *Queue[T]) NextDeadline() time.Time {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if !q.expires.IsZero() && !q.now().Before(q.expires) {
-		q.removeExpiredLocked(q.now())
+	deadline := q.nextDeadlineLocked()
+	if deadline.IsZero() {
+		return deadline
 	}
-	return q.expires
+	if now := q.now(); !now.Before(deadline) {
+		q.removeExpiredLocked(now)
+		return q.nextDeadlineLocked()
+	}
+	return deadline
 }
 
-// Expire releases all expired queued items and recomputes the next wake-up deadline. The queue owner drives this
+// nextDeadlineLocked returns the earliest nonzero priority bound while q.mu is held.
+func (q *Queue[T]) nextDeadlineLocked() time.Time {
+	normal, control := q.normal.earliestDeadline, q.control.earliestDeadline
+	if normal.IsZero() || !control.IsZero() && control.Before(normal) {
+		return control
+	}
+	return normal
+}
+
+// Expire releases expired queued items and refreshes any due expiry bounds. The queue owner drives this
 // operation with a one-shot timer so disconnected queues do not retain expired payloads or require idle polling.
 func (q *Queue[T]) Expire() {
 	q.mu.Lock()
@@ -532,7 +548,6 @@ func (q *Queue[T]) Close() {
 		q.releaseLocked(q.packets, q.bytes)
 		q.normal.clear()
 		q.control.clear()
-		q.expires = time.Time{}
 		close(q.done)
 	}
 }
@@ -557,9 +572,6 @@ func (q *Queue[T]) popPriorityLocked(priority Priority, destination *Item[T]) bo
 	if ok {
 		q.packets--
 		q.bytes -= destination.Size
-		if q.packets == 0 {
-			q.expires = time.Time{}
-		}
 	}
 	return ok
 }
@@ -571,9 +583,6 @@ func (q *Queue[T]) releaseLocked(packets, bytes int) {
 	}
 	q.packets -= packets
 	q.bytes -= bytes
-	if q.packets == 0 {
-		q.expires = time.Time{}
-	}
 	if q.budget != nil {
 		q.budget.Release(packets, bytes)
 	}

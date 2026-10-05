@@ -619,7 +619,8 @@ switch only when switch_gain > 2 ms
 ```
 
 Equal predictions use a stable lane identifier as the tie-break. They never use randomness. This stickiness prevents
-measurement noise from causing repeated lane changes.
+measurement noise from causing repeated lane changes. Candidate selection uses one pass over usable lanes while
+preserving path-group ranking, preferred-lane hysteresis, and distinct-group control duplication.
 
 Under sparse transport-data traffic, the preferred lane may carry every packet because its retained backlog remains
 empty. This is expected and avoids needless reordering. Under sustained load, assigning packets to the preferred lane
@@ -742,7 +743,7 @@ parsed carrier progress.
 
 Each lane direction has one bounded transmission store for queued and sent-but-unreported data. Retention preserves the
 packet metadata and payload needed for possible migration. A queued entry that expires before entering carrier order is
-reclaimed when it reaches the write-order head, under capacity pressure, or by the periodic deadline-risk scan. A sent
+reclaimed when it reaches the write-order head, under capacity pressure, or by periodic scheduler maintenance. A sent
 entry cannot be removed from the middle of an ordered TCP stream. Its deadline does not prove that the carrier has
 failed: the peer may already have delivered it while a parsing report is returning. It remains bounded by the store's
 packet and byte limits until parsing is reported or the generation closes.
@@ -756,6 +757,11 @@ Queued expiry reclaims its retained capacity. Once an entry enters the sent pref
 report or complete generation drain can release it. The transmission store is therefore also a per-lane feedback window.
 Sustainable throughput is bounded by that packet and byte window divided by the report return time. Delivery progress
 triggers a report after 256 data packets or 256 KiB, while the 25 ms interval bounds reporting delay under sparse load.
+The reporting timer is stopped once cumulative progress is fully reported. The first unreported data or probe change
+arms a one-shot timer, while threshold-triggered reports are immediate. A pending report schedules its next retry
+directly at four report intervals, 100 ms by default, without intermediate polling. Successful or failed report
+completion wakes the worker to update its next deadline.
+
 The default 16,384-packet and 32 MiB lane limits leave headroom for common bandwidth-delay products, and the shared
 process budget keeps their aggregate memory cost bounded. Deployments should validate these defaults against the
 intended path bandwidth and delivery-report return time.
@@ -766,6 +772,13 @@ shrink as occupancy falls. Retained metadata is separate from the charged packet
 
 The scheduler also drops a packet before assignment when no eligible lane predicts delivery before its deadline. It does
 not enqueue work that is already expected to arrive stale.
+
+Each queued priority deque maintains a conservative earliest-deadline bound to skip expiry scans before any retained
+entry can have expired. Partial dequeues may leave an earlier stale bound, which a due scan refreshes. Appending
+migrated work lowers the bound when its deadline precedes newer queued entries. The ingress expiry timer derives its
+next wakeup from these bounds without another full queue traversal. Complete deadline-risk traversal is reserved for
+lanes whose outstanding carrier progress has exceeded the path-aware stall guard. Scheduler maintenance still reclaims
+overdue unsent work on progressing lanes.
 
 Before rejecting fresh ingress for local or shared retention pressure, the queue reclaims its expired entries. A fresh
 control packet may evict the oldest unassigned transport packet to obtain local or shared capacity, or preempt one

@@ -9,6 +9,12 @@ import (
 )
 
 func TestQueueNextDeadline(t *testing.T) {
+	t.Run("NonFIFOExpiry", testQueueNextDeadlineNonFIFOExpiry)
+	t.Run("FailedControlPreemption", testQueueNextDeadlineFailedControlPreemption)
+	t.Run("PriorityBounds", testQueueNextDeadlinePriorityBounds)
+}
+
+func testQueueNextDeadlineNonFIFOExpiry(t *testing.T) {
 	now := time.Unix(100, 0)
 	queue, err := NewWithClock[int](Limits{Packets: 4, Bytes: 4}, func() time.Time { return now })
 	if err != nil {
@@ -47,7 +53,7 @@ func TestQueueNextDeadline(t *testing.T) {
 	}
 }
 
-func TestQueueNextDeadlineAfterFailedControlPreemption(t *testing.T) {
+func testQueueNextDeadlineFailedControlPreemption(t *testing.T) {
 	now := time.Unix(100, 0)
 	budget, err := retention.NewBudget(retention.Limits{Packets: 2, Bytes: 2})
 	if err != nil {
@@ -75,5 +81,79 @@ func TestQueueNextDeadlineAfterFailedControlPreemption(t *testing.T) {
 	}
 	if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: 1}) {
 		t.Fatalf("failed admission retained %+v, want only the other owner's capacity", got)
+	}
+}
+
+func testQueueNextDeadlinePriorityBounds(t *testing.T) {
+	start := time.Unix(100, 0)
+	now := start
+	budget, err := retention.NewBudget(retention.Limits{Packets: 6, Bytes: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, err := NewWithBudget[ownedQueueValue](Limits{Packets: 6, Bytes: 6}, budget,
+		func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	var releases [6]int
+	push := func(index int, priority Priority, lifetime time.Duration) {
+		t.Helper()
+		if err := queue.Push(Item[ownedQueueValue]{
+			Value: ownedQueueValue{releases: &releases[index]}, Size: 1,
+			Priority: priority, Deadline: start.Add(lifetime),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertDeadline := func(lifetime time.Duration) {
+		t.Helper()
+		if deadline := queue.NextDeadline(); !deadline.Equal(start.Add(lifetime)) {
+			t.Fatalf("next deadline = %v, want %v", deadline, start.Add(lifetime))
+		}
+	}
+	pop := func(index int) {
+		t.Helper()
+		var item Item[ownedQueueValue]
+		if err := queue.TryPop(&item); err != nil {
+			t.Fatal(err)
+		}
+		if item.Value.releases != &releases[index] {
+			t.Fatalf("priority FIFO value does not match index %d", index)
+		}
+		item.Release()
+	}
+	push(0, PriorityNormal, 3*time.Second)
+	push(1, PriorityNormal, time.Second)
+	push(2, PriorityNormal, 4*time.Second)
+	push(3, PriorityControl, 2*time.Second)
+	push(4, PriorityControl, 5*time.Second)
+	assertDeadline(time.Second)
+	pop(3)
+	now = start.Add(time.Second)
+	// The normal expiry exposes the consumed control deadline as a safe early wakeup.
+	assertDeadline(2 * time.Second)
+	now = start.Add(2 * time.Second)
+	assertDeadline(3 * time.Second)
+	// Migrated work lowers the bound even while other priority entries are retained.
+	push(5, PriorityNormal, 2500*time.Millisecond)
+	assertDeadline(2500 * time.Millisecond)
+	now = start.Add(2500 * time.Millisecond)
+	queue.Expire()
+	assertDeadline(3 * time.Second)
+	pop(4)
+	pop(0)
+	assertDeadline(3 * time.Second)
+	now = start.Add(3 * time.Second)
+	assertDeadline(4 * time.Second)
+	if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: 1}) {
+		t.Fatalf("retained usage before final expiry = %+v", got)
+	}
+	now = start.Add(4 * time.Second)
+	queue.Expire()
+	if !queue.NextDeadline().IsZero() || releases != ([6]int{1, 1, 1, 1, 1, 1}) ||
+		budget.Usage() != (retention.Usage{}) {
+		t.Fatalf("final releases = %v, retained usage = %+v", releases, budget.Usage())
 	}
 }

@@ -335,7 +335,7 @@ func (o *timingReportObserver) RouteDeliveryReport(_ protocol.DeliveryReport, co
 	return accepted
 }
 
-func TestLaneReport(t *testing.T) {
+func testLaneReportIdleAndRetry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
 		observer := &timingReportObserver{testLaneObserver: &testLaneObserver{}}

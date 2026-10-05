@@ -2,14 +2,14 @@ package client_test
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
-	"net/http/httptest"
 	"net/netip"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/aofei/wirehop/internal/client"
+	"github.com/aofei/wirehop/internal/laneurl"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/server"
 )
@@ -18,8 +18,16 @@ const relayBenchmarkWindowSize = 128
 
 // BenchmarkRelayPipeline measures sustained packet throughput with a fixed in-flight window.
 func BenchmarkRelayPipeline(b *testing.B) {
-	for _, carrierName := range []string{"TCP", "WebSocket"} {
-		b.Run(carrierName, func(b *testing.B) {
+	for _, test := range []struct {
+		name   string
+		scheme laneurl.Scheme
+	}{
+		{name: "TCP", scheme: laneurl.TCP},
+		{name: "TLS", scheme: laneurl.TLS},
+		{name: "WebSocket", scheme: laneurl.WS},
+		{name: "SecureWebSocket", scheme: laneurl.WSS},
+	} {
+		b.Run(test.name, func(b *testing.B) {
 			target, stopTarget := startEchoTarget(b)
 			defer stopTarget()
 			token := []byte("a-sufficiently-long-benchmark-authentication-token")
@@ -31,22 +39,21 @@ func BenchmarkRelayPipeline(b *testing.B) {
 				b.Fatal(err)
 			}
 			var laneURL string
+			var clientTLS *tls.Config
 			var stopServer func()
-			if carrierName == "TCP" {
-				address, stop := startRawServerInstance(b, serverInstance, nil)
-				laneURL = "tcp://" + address
-				stopServer = stop
+			if test.scheme.WebSocket() {
+				laneURL, clientTLS, stopServer = startWebSocketServerInstance(b, serverInstance, test.scheme.Secure())
 			} else {
-				ctx, cancel := context.WithCancel(context.Background())
-				httpServer := httptest.NewServer(serverInstance.WebSocketHandler(ctx))
-				laneURL = "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/_wirehop"
-				stopServer = func() {
-					cancel()
-					httpServer.Close()
+				var serverTLS *tls.Config
+				if test.scheme.Secure() {
+					serverTLS, clientTLS = testTLSConfigs(b)
 				}
+				address, stop := startRawServerInstance(b, serverInstance, serverTLS)
+				laneURL = string(test.scheme) + "://" + address
+				stopServer = stop
 			}
 			defer stopServer()
-			config := clientConfig(b, laneURL, target, token, nil)
+			config := clientConfig(b, laneURL, target, token, clientTLS)
 			config.IngressLimits = packetqueue.Limits{Packets: 1024, Bytes: 2 * 1024 * 1024}
 			config.LaneLimits = packetqueue.Limits{Packets: 1024, Bytes: 2 * 1024 * 1024}
 			instance, err := client.Start(context.Background(), config)

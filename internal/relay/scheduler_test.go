@@ -124,6 +124,41 @@ func TestSelectCandidatesAppliesDeadlineBeforePreference(t *testing.T) {
 	}
 }
 
+func TestSelectCandidatesGroupRankAndCutoff(t *testing.T) {
+	first := schedulerLane(t, 1, 1, 1000, 1_000_000)
+	second := schedulerLane(t, 2, 1, 1000, 1_000_000)
+	third := schedulerLane(t, 3, 1, 1000, 1_000_000)
+	lanes := map[protocol.LaneID]*scheduledLane{
+		first.registration.LaneID: first, second.registration.LaneID: second, third.registration.LaneID: third,
+	}
+	for _, test := range []struct {
+		name      string
+		preferred protocol.LaneID
+		control   bool
+		cutoff    uint64
+		want      [2]*scheduledLane
+		count     int
+	}{
+		{name: "SecondRankPreference", preferred: second.registration.LaneID, cutoff: 501,
+			want: [2]*scheduledLane{second}, count: 1},
+		{name: "ThirdRankPreference", preferred: third.registration.LaneID, cutoff: 501,
+			want: [2]*scheduledLane{first}, count: 1},
+		{name: "SameGroupControl", control: true, cutoff: 501,
+			want: [2]*scheduledLane{first, second}, count: 2},
+		{name: "TransportEqualCutoff", cutoff: 500},
+		{name: "ControlEqualCutoff", control: true, cutoff: 500},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for range 100 {
+				got := selectCandidates(lanes, test.preferred, test.control, 0, test.cutoff)
+				if !got.available || got.count != test.count || got.lanes != test.want {
+					t.Fatalf("candidates = %+v, want count %d and lanes %v", got, test.count, test.want)
+				}
+			}
+		})
+	}
+}
+
 func TestSelectCandidatesMatchesReference(t *testing.T) {
 	const laneCount = 32
 	lanes := make(map[protocol.LaneID]*scheduledLane, laneCount)
@@ -156,16 +191,59 @@ func TestSelectCandidatesMatchesReference(t *testing.T) {
 		if value := next() % (laneCount + 1); value != 0 {
 			preferred = protocol.LaneID{byte(value)}
 		}
-		control := next()&1 != 0
 		frameBytes := next() % 3001
 		maximumScore := next() % 30_001
 		if next()%5 == 0 {
 			maximumScore = math.MaxUint64
 		}
-		got := selectCandidates(lanes, preferred, control, frameBytes, maximumScore)
-		want := referenceSelectCandidates(lanes, preferred, control, frameBytes, maximumScore)
-		if got != want {
-			t.Fatalf("iteration %d selectCandidates() = %v, want %v", iteration, got, want)
+		for _, control := range []bool{false, true} {
+			got := selectCandidates(lanes, preferred, control, frameBytes, maximumScore)
+			want := referenceSelectCandidates(lanes, preferred, control, frameBytes, maximumScore)
+			if got != want {
+				t.Fatalf("iteration %d selectCandidates() = %v, want %v", iteration, got, want)
+			}
+		}
+	}
+}
+
+func TestSelectCandidatesExhaustiveGroupScores(t *testing.T) {
+	const laneCount = 4
+	var members [laneCount]*scheduledLane
+	lanes := make(map[protocol.LaneID]*scheduledLane, laneCount)
+	states := 1
+	for index := range members {
+		lane := schedulerLane(t, byte(index+1), 1, 0, 1_000_000)
+		members[index] = lane
+		lanes[lane.registration.LaneID] = lane
+		states *= 8
+	}
+	// Enumerate two groups and scores of zero, the hysteresis boundary, one beyond it, and infinity.
+	for state := range states {
+		remaining := state
+		for _, lane := range members {
+			choice := remaining % 8
+			remaining /= 8
+			lane.registration.PathGroupID = protocol.PathGroupID{byte(choice/4 + 1)}
+			lane.rttMicros = [4]uint64{0, 4000, 4002, 0}[choice%4]
+			lane.deliveryRate = 1_000_000
+			if choice%4 == 3 {
+				lane.deliveryRate = 0
+			}
+		}
+		for _, cutoff := range [...]uint64{0, 2000, 2001, math.MaxUint64} {
+			for _, preferred := range [...]protocol.LaneID{{}, {1}, {2}, {3}, {4}} {
+				got := selectCandidates(lanes, preferred, false, 0, cutoff)
+				want := referenceSelectCandidates(lanes, preferred, false, 0, cutoff)
+				if got != want {
+					t.Fatalf("state %d, cutoff %d, preferred %v: candidates = %v, want %v",
+						state, cutoff, preferred, got, want)
+				}
+			}
+			got := selectCandidates(lanes, protocol.LaneID{}, true, 0, cutoff)
+			want := referenceSelectCandidates(lanes, protocol.LaneID{}, true, 0, cutoff)
+			if got != want {
+				t.Fatalf("state %d, cutoff %d: control candidates = %v, want %v", state, cutoff, got, want)
+			}
 		}
 	}
 }

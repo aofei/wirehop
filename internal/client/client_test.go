@@ -1080,7 +1080,7 @@ func startWebSocketServer(t *testing.T, token []byte,
 	return startWebSocketServerInstance(t, instance, secure)
 }
 
-func startWebSocketServerInstance(t *testing.T, instance *server.Server,
+func startWebSocketServerInstance(t testing.TB, instance *server.Server,
 	secure bool) (string, *tls.Config, func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1164,7 +1164,7 @@ func waitForClientSession(t *testing.T, instance *client.Client) protocol.Sessio
 	}
 }
 
-func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
+func testTLSConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 	t.Helper()
 	temporary := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	certificate := temporary.TLS.Certificates[0]

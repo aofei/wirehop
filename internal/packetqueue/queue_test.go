@@ -488,6 +488,67 @@ func TestNewQueue(t *testing.T) {
 	}
 }
 
+func TestQueueReclaimsUnorderedDeadlines(t *testing.T) {
+	now := time.Unix(100, 0)
+	budget, err := retention.NewBudget(retention.Limits{Packets: 3, Bytes: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, err := NewWithBudget[ownedQueueValue](Limits{Packets: 3, Bytes: 3}, budget,
+		func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	var releases [7]int
+	push := func(index int, deadline time.Time) {
+		t.Helper()
+		if err := queue.Push(Item[ownedQueueValue]{
+			Value: ownedQueueValue{releases: &releases[index]}, Size: 1, Deadline: deadline,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := now
+	push(0, start.Add(3*time.Second))
+	push(1, start.Add(time.Second))
+	push(2, start.Add(2*time.Second))
+	now = start.Add(time.Second)
+	push(3, start.Add(4*time.Second))
+	now = start.Add(2 * time.Second)
+	push(4, start.Add(5*time.Second))
+	var item Item[ownedQueueValue]
+	if err := queue.TryPop(&item); err != nil {
+		t.Fatal(err)
+	}
+	if item.Value.releases != &releases[0] {
+		t.Fatal("expiry compaction changed the oldest live value")
+	}
+	item.Release()
+	// An older migrated deadline can be appended after newer queued work.
+	push(5, start.Add(2500*time.Millisecond))
+	now = start.Add(2500 * time.Millisecond)
+	push(6, start.Add(6*time.Second))
+	if releases != ([7]int{1, 1, 1, 0, 0, 1, 0}) {
+		t.Fatalf("releases after expiry = %v", releases)
+	}
+	if got := budget.Usage(); got != (retention.Usage{Packets: 3, Bytes: 3}) {
+		t.Fatalf("retained usage = %+v", got)
+	}
+	for _, index := range []int{3, 4, 6} {
+		if err := queue.TryPop(&item); err != nil {
+			t.Fatal(err)
+		}
+		if item.Value.releases != &releases[index] {
+			t.Fatalf("live FIFO value does not match index %d", index)
+		}
+		item.Release()
+	}
+	if releases != ([7]int{1, 1, 1, 1, 1, 1, 1}) || budget.Usage() != (retention.Usage{}) {
+		t.Fatalf("final releases = %v, retained usage = %+v", releases, budget.Usage())
+	}
+}
+
 func TestDequeCapacityRetention(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -519,6 +580,7 @@ func TestDequeCapacityRetention(t *testing.T) {
 				for index := range deque.items {
 					deque.items[index].Deadline = time.Unix(100, 0)
 				}
+				deque.earliestDeadline = time.Unix(100, 0)
 				deque.removeExpired(time.Unix(101, 0))
 			},
 			retain: func(_ *testing.T, deque *deque[int], count int) {
@@ -529,6 +591,7 @@ func TestDequeCapacityRetention(t *testing.T) {
 						deque.items[index].Deadline = time.Unix(100, 0)
 					}
 				}
+				deque.earliestDeadline = time.Unix(100, 0)
 				deque.removeExpired(time.Unix(101, 0))
 			},
 		},
@@ -672,8 +735,14 @@ func assertQueueRetentionInvariants(t *testing.T, queues []*Queue[int], held []I
 		queue.mu.Lock()
 		packets := 0
 		bytes := 0
-		visit := func(items []Item[int]) {
-			for _, item := range items {
+		visit := func(deque *deque[int]) {
+			if (deque.head == len(deque.items)) != deque.earliestDeadline.IsZero() {
+				t.Fatal("expiry bound does not match deque occupancy")
+			}
+			for _, item := range deque.items[deque.head:] {
+				if item.Deadline.Before(deque.earliestDeadline) {
+					t.Fatal("expiry bound is later than a retained deadline")
+				}
 				if item.retention != budget || item.retentionBytes != item.Size {
 					t.Fatalf("invalid queued retention: %+v", item)
 				}
@@ -681,8 +750,8 @@ func assertQueueRetentionInvariants(t *testing.T, queues []*Queue[int], held []I
 				bytes += item.Size
 			}
 		}
-		visit(queue.normal.items[queue.normal.head:])
-		visit(queue.control.items[queue.control.head:])
+		visit(&queue.normal)
+		visit(&queue.control)
 		if packets != queue.packets || bytes != queue.bytes {
 			t.Fatalf("queue accounting = %d packets and %d bytes, want %d and %d",
 				queue.packets, queue.bytes, packets, bytes)

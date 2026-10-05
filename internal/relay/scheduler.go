@@ -41,8 +41,6 @@ const (
 	minimumProgressStall = 250 * time.Millisecond
 	// progressStallReportMargin allows two report intervals beyond the measured round trips.
 	progressStallReportMargin = 2 * defaultReportInterval
-	// candidateGroupInlineCapacity covers the command's complete lane limit without heap allocation.
-	candidateGroupInlineCapacity = 16
 )
 
 // LaneRegistration makes one lane generation eligible for packet scheduling.
@@ -126,23 +124,6 @@ type laneCandidates struct {
 type scoredLane struct {
 	lane  *scheduledLane
 	score uint64
-}
-
-// laneCandidateGroup retains the two best currently usable lanes in one path group.
-type laneCandidateGroup struct {
-	id     protocol.PathGroupID
-	first  scoredLane
-	second scoredLane
-}
-
-// add retains candidate when it belongs to the group's best two lanes.
-func (g *laneCandidateGroup) add(candidate scoredLane) {
-	if scoredLaneBetter(candidate, g.first) {
-		g.second = g.first
-		g.first = candidate
-	} else if scoredLaneBetter(candidate, g.second) {
-		g.second = candidate
-	}
 }
 
 // scoredLaneBetter orders score snapshots by delivery prediction and stable lane identity.
@@ -636,81 +617,94 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 // selectCandidates returns lanes ordered for one transport packet or duplicated control packet.
 func selectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferred protocol.LaneID,
 	control bool, frameBytes, maximumScore uint64) laneCandidates {
-	var groupStorage [candidateGroupInlineCapacity]laneCandidateGroup
-	groups := groupStorage[:0]
+	if control {
+		return selectControlCandidates(lanes, frameBytes, maximumScore)
+	}
+	var preferredCandidate scoredLane
+	if lane := lanes[preferred]; lane != nil && !lane.degraded && !lane.abandoning &&
+		(frameBytes == 0 || lane.canAccept(frameBytes)) {
+		preferredCandidate = scoredLane{lane: lane, score: lane.score(frameBytes)}
+	}
+	result := laneCandidates{}
+	var first scoredLane
+	preferredBetter := 0
 	for _, lane := range lanes {
-		if lane.degraded || lane.abandoning || frameBytes > 0 && !lane.canAccept(frameBytes) {
+		if lane != preferredCandidate.lane &&
+			(lane.degraded || lane.abandoning || frameBytes > 0 && !lane.canAccept(frameBytes)) {
 			continue
 		}
-		groupIndex := -1
-		for index := range groups {
-			if groups[index].id == lane.registration.PathGroupID {
-				groupIndex = index
-				break
-			}
+		result.available = true
+		candidate := preferredCandidate
+		if lane != preferredCandidate.lane {
+			candidate = scoredLane{lane: lane, score: lane.score(frameBytes)}
 		}
-		if groupIndex < 0 {
-			groups = append(groups, laneCandidateGroup{id: lane.registration.PathGroupID})
-			groupIndex = len(groups) - 1
+		if preferredCandidate.lane != nil && lane != preferredCandidate.lane &&
+			lane.registration.PathGroupID == preferredCandidate.lane.registration.PathGroupID &&
+			scoredLaneBetter(candidate, preferredCandidate) {
+			preferredBetter++
 		}
-		groups[groupIndex].add(scoredLane{lane: lane, score: lane.score(frameBytes)})
-	}
-	result := laneCandidates{available: len(groups) > 0}
-	var first scoredLane
-	var preferredCandidate scoredLane
-	for index := range groups {
-		for _, candidate := range [...]scoredLane{groups[index].first, groups[index].second} {
-			if candidate.lane == nil {
-				continue
-			}
-			if candidate.lane.registration.LaneID == preferred {
-				preferredCandidate = candidate
-			}
-			if candidate.score < maximumScore && scoredLaneBetter(candidate, first) {
-				first = candidate
-			}
+		if candidate.score < maximumScore && scoredLaneBetter(candidate, first) {
+			first = candidate
 		}
 	}
 	if first.lane == nil {
 		return result
 	}
-	if !control {
-		preferredLimit := first.score
-		if preferredLimit <= math.MaxUint64-preferredLaneHysteresisMicros {
-			preferredLimit += preferredLaneHysteresisMicros
-		} else {
-			preferredLimit = math.MaxUint64
+	preferredLimit := first.score
+	if preferredLimit <= math.MaxUint64-preferredLaneHysteresisMicros {
+		preferredLimit += preferredLaneHysteresisMicros
+	} else {
+		preferredLimit = math.MaxUint64
+	}
+	if preferredCandidate.lane != nil && preferredBetter < 2 && preferredCandidate.score < maximumScore &&
+		preferredCandidate.score <= preferredLimit {
+		first = preferredCandidate
+	}
+	result.lanes[0] = first.lane
+	result.count = 1
+	return result
+}
+
+// selectControlCandidates keeps the fastest lane and the best alternate, preferring a distinct path group.
+func selectControlCandidates(lanes map[protocol.LaneID]*scheduledLane,
+	frameBytes, maximumScore uint64) laneCandidates {
+	result := laneCandidates{}
+	var first, second scoredLane
+	for _, lane := range lanes {
+		if lane.degraded || lane.abandoning || frameBytes > 0 && !lane.canAccept(frameBytes) {
+			continue
 		}
-		if preferredCandidate.lane != nil && preferredCandidate.score < maximumScore &&
-			preferredCandidate.score <= preferredLimit {
-			first = preferredCandidate
+		result.available = true
+		candidate := scoredLane{lane: lane, score: lane.score(frameBytes)}
+		if candidate.score >= maximumScore {
+			continue
 		}
+		if scoredLaneBetter(candidate, first) {
+			// A new fastest group makes the previous winner the best distinct alternate. Within the same
+			// group, preserve an existing distinct alternate or replace the slower same-group alternate.
+			if first.lane != nil && (lane.registration.PathGroupID != first.lane.registration.PathGroupID ||
+				second.lane == nil || second.lane.registration.PathGroupID == lane.registration.PathGroupID) {
+				second = first
+			}
+			first = candidate
+			continue
+		}
+		candidateDistinct := lane.registration.PathGroupID != first.lane.registration.PathGroupID
+		secondDistinct := second.lane != nil &&
+			second.lane.registration.PathGroupID != first.lane.registration.PathGroupID
+		if second.lane == nil || candidateDistinct && !secondDistinct ||
+			candidateDistinct == secondDistinct && scoredLaneBetter(candidate, second) {
+			second = candidate
+		}
+	}
+	if first.lane != nil {
 		result.lanes[0] = first.lane
 		result.count = 1
-		return result
-	}
-	var second scoredLane
-	for index := range groups {
-		for _, candidate := range [...]scoredLane{groups[index].first, groups[index].second} {
-			if candidate.lane == nil || candidate.lane == first.lane || candidate.score >= maximumScore {
-				continue
-			}
-			candidateDistinct := candidate.lane.registration.PathGroupID != first.lane.registration.PathGroupID
-			secondDistinct := second.lane != nil &&
-				second.lane.registration.PathGroupID != first.lane.registration.PathGroupID
-			if second.lane == nil || candidateDistinct && !secondDistinct ||
-				candidateDistinct == secondDistinct && scoredLaneBetter(candidate, second) {
-				second = candidate
-			}
+		if second.lane != nil {
+			result.lanes[1] = second.lane
+			result.count = 2
 		}
 	}
-	if second.lane == nil {
-		result.lanes[0] = first.lane
-		result.count = 1
-		return result
-	}
-	result.lanes = [2]*scheduledLane{first.lane, second.lane}
-	result.count = 2
 	return result
 }
 
@@ -910,6 +904,11 @@ func weightedAverage7(previous, sample uint64) uint64 {
 func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, now time.Time) {
 	for _, lane := range lanes {
 		if lane.abandoning {
+			continue
+		}
+		unreportedSince := lane.registration.Store.expireQueued(now)
+		if !laneProgressStalled(lane, now, unreportedSince) {
+			lane.degraded = false
 			continue
 		}
 		assessment := lane.registration.Store.assessDeadlines(now, lane.retentionDelay)
