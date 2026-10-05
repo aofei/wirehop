@@ -3,10 +3,15 @@ package carrier
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aofei/wirehop/internal/protocol"
+	"github.com/coder/websocket"
 )
 
 type benchmarkConn struct{}
@@ -89,5 +94,71 @@ func BenchmarkStreamConnReadFrame(b *testing.B) {
 			b.Fatalf("ReadFrame() = %#v, want %#v", frame, expected)
 		}
 		benchmarkFrameSink = frame
+	}
+}
+
+func BenchmarkWebSocketConnReadFrames(b *testing.B) {
+	for _, frameCount := range []int{1, 16} {
+		b.Run(strconv.Itoa(frameCount), func(b *testing.B) {
+			for _, cancelable := range []bool{false, true} {
+				name := "Background"
+				if cancelable {
+					name = "Cancelable"
+				}
+				b.Run(name, func(b *testing.B) {
+					var message []byte
+					for range frameCount {
+						var err error
+						message, err = protocol.AppendFrame(message, protocol.Frame{
+							Type: protocol.FrameProbe, Payload: make([]byte, 1420),
+						})
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+					done := make(chan struct{})
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						defer close(done)
+						connection, err := websocket.Accept(w, r, nil)
+						if err != nil {
+							return
+						}
+						defer connection.CloseNow()
+						for connection.Write(context.Background(), websocket.MessageBinary, message) == nil {
+						}
+					}))
+					b.Cleanup(server.Close)
+					connection, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					stream := NewWebSocketConn(connection)
+					b.Cleanup(func() {
+						stream.Close()
+						<-done
+					})
+					ctx := context.Background()
+					if cancelable {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithCancel(ctx)
+						b.Cleanup(cancel)
+					}
+					var frames [16]protocol.Frame
+					b.ReportAllocs()
+					b.SetBytes(int64(len(message)))
+					for b.Loop() {
+						for remaining := frameCount; remaining > 0; {
+							count, err := stream.ReadFrames(ctx, frames[:remaining])
+							if err != nil || count == 0 {
+								b.Fatalf("read batch = %d, %v", count, err)
+							}
+							remaining -= count
+							benchmarkFrameSink = frames[count-1]
+							clear(frames[:count])
+						}
+					}
+				})
+			}
+		})
 	}
 }

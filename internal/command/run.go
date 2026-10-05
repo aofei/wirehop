@@ -45,13 +45,13 @@ var (
 
 const (
 	// defaultHandshakeTimeout bounds carrier admission operations.
-	defaultHandshakeTimeout = 5 * time.Second
+	defaultHandshakeTimeout = 10 * time.Second
 	// listenerStartupTimeout bounds preparation of all required local listeners.
 	listenerStartupTimeout = 30 * time.Second
 	// defaultAuthenticationSkew bounds authenticated wall-clock timestamps.
 	defaultAuthenticationSkew = 2 * time.Minute
 	// defaultReconnectGrace retains detached server sessions.
-	defaultReconnectGrace = 30 * time.Second
+	defaultReconnectGrace = 2 * time.Minute
 	// defaultControlDeadline bounds WireGuard handshake and cookie packets.
 	defaultControlDeadline = 5 * time.Second
 	// defaultTransportDeadline permits ordinary TCP loss recovery while bounding retained WireGuard transport packets.

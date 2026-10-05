@@ -136,6 +136,26 @@ Help is written to standard output. Diagnostics and warning logs are written to 
 environment validation errors exit with status `2`, runtime failures exit with status `1`, and help or signal-driven
 graceful shutdown exits with status `0`.
 
+## Network interruption and mobile use
+
+Carrier connections can reconnect from a different client address while retaining the local UDP listener and session.
+The server keeps a detached session and its target UDP socket for 2 minutes by default. This is a best-effort cache:
+when session capacity is full, a new creation can evict the oldest detached session. Sessions with active lanes or
+accepted join reservations are protected. If the old session has expired or been evicted, the client creates another
+session.
+
+Runtime Ping inactivity and complete carrier writes have independent 10-second budgets. Receiving valid frames extends
+Ping liveness, but partial write progress does not extend the write budget. Packet lifetime remains five seconds, so a
+long outage does not replay a large stale backlog. These limits tolerate multi-second delay without promising
+uninterrupted service across every network transition. WireHop Ping maintains the carrier connection, not an external
+WireGuard UDP NAT mapping. Configure WireGuard's `PersistentKeepalive` separately when that UDP leg needs it.
+
+Linux and Darwin protocol clocks include system suspend. Established lanes and pending connection attempts compare that
+clock with Go runtime elapsed time to discard obsolete work after resume. Detection waits for a scheduled check, which
+can take up to 15 seconds on an idle lane when runtime timers pause. There is no native Android or iOS lifecycle or
+network-change integration. OS background execution restrictions still apply. Wi-Fi and cellular switching therefore
+uses connection failure and retry, with possible interruption rather than seamless connection migration.
+
 ## WireGuard MTU and UDP receive capacity
 
 ### WireGuard interface MTU

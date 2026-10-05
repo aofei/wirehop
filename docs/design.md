@@ -244,15 +244,17 @@ established. These datagrams enter the bounded session ingress queue with deadli
 
 Carrier preparation starts concurrently across all configured lanes. DNS resolution and first-hop TCP connection
 establishment race for every normally resolved carrier. A fixed-resolution lane bypasses DNS and uses the same IP on
-every reconnect generation. A `tls://` lane also completes its TLS handshake during preparation. WebSocket HTTP Upgrade,
-HTTPS proxy TLS, CONNECT negotiation, and any target-side WSS TLS handshake remain part of authenticated creation or
-join. One slow or unreachable lane therefore cannot block later declarations.
+every reconnect generation. A `tls://` lane also completes its TLS handshake during preparation. WebSocket lanes using a
+SOCKS proxy complete tunnel negotiation during preparation. HTTP Upgrade, HTTPS proxy TLS, HTTP CONNECT negotiation, and
+any target-side WSS TLS handshake remain part of authenticated creation or join. One slow or unreachable lane therefore
+cannot block later declarations.
 
-Authentication nonces, wall-clock timestamps, and clock-bootstrap monotonic send timestamps are generated only after the
-available preparation stage completes. For raw TCP and TLS lanes, this excludes DNS, TCP connect, and TLS setup from the
-four-timestamp sample. For WebSocket lanes, it excludes first-hop DNS and TCP connect. HTTPS proxy TLS, HTTP CONNECT or
-SOCKS tunnel negotiation, target TLS, and HTTP Upgrade remain after `t1` because authentication is carried by the
-Upgrade request itself, so the initial mapping conservatively includes those stages until later ping samples refresh it.
+Authentication nonces, wall-clock timestamps, and the monotonic admission-request field are generated only after carrier
+preparation completes. Raw TCP and TLS lanes use that monotonic field as `t1`, excluding DNS, TCP connect, and TLS setup
+from the four-timestamp sample. WebSocket lanes sample their clock-bootstrap `t1` separately when the HTTP transport
+reports that it has written the Upgrade request headers. First-hop DNS, TCP connect, proxy TLS, CONNECT or SOCKS tunnel
+negotiation, and target TLS therefore finish before that clock sample. The earlier monotonic request field remains part
+of admission encoding and join authentication. The later `t1` is sent in the first clock-sync frame.
 
 Local validation enforces the configured per-session lane limit before this concurrent work begins. Carrier preparation
 is therefore concurrent across the accepted configuration while remaining bounded by explicit resource policy.
@@ -430,7 +432,9 @@ lanes and accepted reservations reach zero. During that grace period it retains:
 - Bounded session ingress queued from the target UDP sockets
 
 Detached state does not suspend packet deadlines or queue limits. Retained packets and target replies continue to expire
-and are dropped when they cannot be delivered usefully.
+and are dropped when they cannot be delivered usefully. A one-shot ingress expiry timer releases expired payloads and
+their aggregate reservation even when no lane reconnects. The scheduler parks its periodic deadline-risk checks when no
+pending or retained lane work needs them.
 
 The client retains the session identifier, secret, path groups, lane generations, and direction-local packet ID,
 deduplication, and clock-mapping state while it is `disconnected`. A reconnecting lane first attempts a normal
@@ -461,8 +465,11 @@ complete a carrier write before closing its lanes. Connection loss alone is neve
 Closing a session closes every remaining member lane, invalidates and erases its ephemeral secret, and releases its
 target resolver state, UDP sockets, and retained packet state.
 
-The default reconnect grace is 30 seconds. Attached and detached sessions share the same global session limit, so a
-detached session cannot escape the server resource bound.
+The default reconnect grace is 2 minutes, starting when the final active lane and accepted reservation disappear.
+Attached, detached, and in-progress sessions share the same global session limit. At capacity, authenticated creation
+may evict the oldest detached session. Attached lanes and accepted join reservations are protected. Grace is therefore
+bounded best-effort retention rather than a guaranteed reservation. A join checks its protocol-clock grace deadline even
+when a sleeping server's ordinary timer has not fired yet.
 
 ## WireGuard packet awareness
 
@@ -700,6 +707,11 @@ Each session direction serializes writes to its UDP socket. This preserves the p
 socket deadlines are connection-wide, while the kernel would serialize writes to the same socket in any case. A packet
 waiting for the write slot is checked against the latest clock mapping again before delivery.
 
+Packet deadlines govern eligibility at the start of a UDP batch submission. Every new increasing-ID run and retry after
+a partial per-datagram failure rechecks the remaining packets against the protocol clock. The independent 1-second UDP
+operation deadline bounds local submission and is also capped by the caller's deadline. Packet lifetime is not a
+guarantee that submission or remote delivery completes before the mapped packet deadline.
+
 Deduplication uses a bounded direction-local sliding window. Its size must cover the configured reordering and migration
 budgets. A packet ID enters the window only after its UDP write completes successfully. A failed write leaves that
 packet ID available to a waiting duplicate or later migrated copy and cannot advance the retained window. Packets older
@@ -787,30 +799,54 @@ The command uses these time and traffic limits:
 | --- | ---: |
 | Authentication timestamp skew | 2 minutes |
 | First-hop DNS and TCP connection establishment | 30 seconds |
-| TLS handshake and ordinary carrier admission | 5 seconds |
-| Authenticated session creation including target preparation | 30-second target lookup plus 5-second admission budget |
-| Session creation attempt per candidate lane | 70 seconds, derived from dial, target lookup, and two handshake budgets |
+| TLS handshake, HTTP CONNECT, and SOCKS tunnel preparation | 10 seconds per stage |
+| Raw request writing, raw joins, and HTTP request writing | 10 seconds |
+| HTTP header reading and first clock-sync frame | 10 seconds |
+| Authenticated creation response including target preparation | 30-second target lookup plus 10-second response budget |
+| WebSocket first admission frame after Upgrade | 10 seconds |
+| Session creation attempt per candidate lane | 2 minutes, covering dial, target lookup, and six handshake budgets |
 | Server listener preparation, shared across all listeners | 30 seconds |
 | Initial and runtime target DNS lookup | 30 seconds |
-| Initial DNS backoff for server listeners and forward targets | 1 s initial ceiling, 5 s maximum ceiling, full jitter |
+| Initial DNS backoff for server listeners and forward targets | 1 second initial ceiling, 5 seconds maximum ceiling, full jitter |
 | Preparation failure reporting | 30-second quiet window, then at most one warning per minute on failed attempts |
-| Detached-session reconnect grace | 30 seconds |
+| Detached-session reconnect grace | 2 minutes, subject to capacity eviction |
 | WireGuard handshake and cookie packet lifetime | 5 seconds |
 | WireGuard transport packet lifetime | 5 seconds |
 | UDP delivery operation | 1 second |
 | Delivery-report trigger | 256 data packets, 256 KiB, or 25 milliseconds |
-| Deadline-risk abandonment check | 25 milliseconds |
-| Ping interval and timeout | 1 second active, idle backoff to 15 seconds, and 3-second receive inactivity timeout |
-| Carrier write operation | 3 seconds |
-| Probe interval and payload | Exponential idle backoff from 2 to 60 seconds and 1200 bytes |
+| Deadline-risk abandonment check while work exists | 25 milliseconds |
+| Ping interval and timeout | 1 second active, idle backoff to 15 seconds, and 10-second receive inactivity timeout |
+| Complete carrier write operation | 10 seconds |
+| WebSocket control-frame read or write | 5 seconds per operation, enforced by the WebSocket library |
+| Maximum clock-sample uncertainty | 5 seconds |
+| Resume clock-gap tolerance | 1 second |
+| Pending preparation resume check | 1 second, only while dialing or admitting |
+| Probe interval and payload | Exponential idle backoff from 2 seconds to 1 minute and 1200 bytes |
 | Initial lane RTT and delivery rate | 100 milliseconds and 1,000,000 bytes per second |
-| Reconnect backoff and stability reset | 100 ms initial, 5 s maximum, reset after 30 s healthy |
+| Reconnect backoff and stability reset | 100 milliseconds initial, 5 seconds maximum, reset after 30 seconds healthy |
 | Graceful client session-close attempt | 200 milliseconds |
+| TCP keepalive | Disabled on carrier sockets. WireHop owns lane liveness |
 
 The ping timeout starts after the request is written. Valid data and control frames extend its receive inactivity budget
 while the matching Pong waits behind earlier TCP data or retransmissions. A delayed Pong still has to match the
 outstanding identifier and send timestamp before updating the clock mapping. Once receive progress stops, the pending
-ping expires within three seconds. A blocked carrier write retains its independent operation deadline.
+ping expires within ten seconds. The write budget bounds the complete operation, and partial byte progress does not
+renew it. This permits multi-second retransmission and slow batches while keeping failure detection bounded. Packet
+freshness remains independent of connection tolerance. These defaults are operating policies, not guarantees that every
+recoverable network outage completes within ten seconds.
+
+WireHop Ping and Pong are binary application frames. WebSocket protocol Ping, Pong, and Close frames are handled by the
+WebSocket library, which bounds each control-frame read and write to five seconds. A reverse proxy's WebSocket Ping can
+therefore encounter a shorter failure budget than WireHop's application liveness policy. A control timeout remains a
+recoverable carrier failure. Reverse-proxy idle and read/write limits are independent deployment policies.
+
+Raw TLS handshakes finish before the server starts a fresh request-reading budget. Client WebSocket preparation has
+separate limits for proxy TLS, CONNECT or SOCKS tunneling, origin TLS, HTTP request writing, response headers, and the
+first admission frame. Response-header timing starts after the request is written. Creation permits 40 seconds for
+response headers or a raw creation response, while joins permit 10 seconds. A WebSocket attempt also has a combined cap
+covering its actual stages. The slowest supported creation route, WSS through an HTTPS proxy, fits the 2-minute
+candidate cap including the first-hop dial. Faster routes retain their smaller phase-derived cap. Successful request
+write deadlines are cleared before handing the upgraded connection to the relay.
 
 DNS and TCP dialing use the standard resolver and dialer, preserving configured nameserver fallback and dual-stack
 connection racing. Their budgets are independent of the short protocol-handshake limit. A five-second total lookup
@@ -825,6 +861,19 @@ ordinary admission budget. An abandoned HTTP request cancels its target preparat
 dedicated reader detects creator disconnection or premature data before the creation response. The reader is stopped and
 joined before normal frame reading begins. Attempt contexts bound preparation work without becoming the lifetime of a
 successful connection, listener, or retained target endpoint.
+
+### Time units
+
+Go duration literals use the largest standard `time` unit that represents the value with an integer multiplier. A
+multiplier of one is omitted. For example, use `2 * time.Minute`, `time.Minute`, `66 * time.Second`, and
+`1500 * time.Millisecond`. Derived budgets retain their meaningful arithmetic, such as the dial budget plus six
+handshake budgets. This is a project readability convention, not a change to timeout values or precision.
+
+Protocol monotonic timestamps and packet deadlines remain unsigned integer microseconds. Authentication timestamps
+remain Unix seconds. Conversions at these boundaries name the required unit explicitly, such as
+`uint64(5 * time.Minute / time.Microsecond)`. Wire-format test vectors retain exact integer values. External tools use
+their documented input units, including seconds for `sleep`, `timeout`, and `iperf3`. Documentation uses readable units,
+with full unit names in policy tables and explicit units in formulas.
 
 ## Connection abandonment and packet migration
 
@@ -1293,9 +1342,10 @@ it. Size classes retain buffers up to 32 KiB, and larger payload allocations are
 Linux receive staging uses a process-wide pool of 15-datagram vectors. Its capacity is chosen from `GOMAXPROCS` at
 initialization, with a minimum of two vectors and a maximum of 16. At the maximum, payload storage occupies 15 MiB plus
 vector metadata. A reader that cannot borrow a vector continues with scalar reads. Carrier frame and encoding buffers
-reuse capacities up to 32 KiB. Larger encoding buffers are discarded after writing. Frame readers discard oversized
-content buffers before reading another validated body, and WebSocket readers discard oversized message buffers before
-starting another message. These scratch buffers, size-class overhead, and kernel socket buffers are separate from the
+reuse capacities up to 32 KiB. Larger encoding buffers are discarded after writing. A nonempty carrier read that passes
+its initial cancellation check discards oversized content buffers from every frame reader, including readers unused by a
+smaller batch. WebSocket decoding uses a fixed 32 KiB buffered reader and retains only individual frame contents, never
+a complete message buffer. These scratch buffers, size-class overhead, and kernel socket buffers are separate from the
 retained relay-work budget.
 
 ### WebSocket transport
@@ -1571,10 +1621,15 @@ in-session frame sent from the client on that accepted connection generation, an
 Carrier ordering guarantees that the server parses it before any following data frame. Fresh data can follow in the next
 carrier write or WebSocket message without an acknowledgement or extra round trip.
 
-Ping and pong frames refresh the session clock mapping and provide lane-local RTT observations. Every valid join or ping
-sample replaces the current session mapping with that sample's offset and uncertainty. Mappings are not averaged across
-lanes. Path delay and delivery-rate estimates remain lane-local. A joining lane can use the existing session mapping
-immediately and collect its own path observations in the background.
+Ping and pong frames refresh the session clock mapping and provide lane-local RTT observations. A sample is usable only
+when its uncertainty is at most five seconds. Every usable join or ping sample replaces the current session mapping.
+Keeping an older, more precise sample indefinitely would ignore subsequent clock drift. A matching Pong with excessive
+uncertainty still proves receive liveness but updates neither the mapping nor RTT. An unusable initial clock sample
+fails admission as a recoverable timing failure. Mappings are not averaged across lanes. Path delay and delivery-rate
+estimates remain lane-local. A joining lane's usable admission sample refreshes the shared mapping immediately, while
+lane-specific RTT and delivery-rate observations continue in the background. For WebSocket admission, the client send
+timestamp is sampled when HTTP headers are written, after proxy and TLS preparation. Preparation delay does not enter
+that clock sample.
 
 Every accepted join produces the same four-timestamp sample, and the client sends exactly one clock-sync frame first on
 the new generation. An additional lane updates the mapping without blocking traffic on existing active lanes. The server
@@ -1586,7 +1641,7 @@ cannot accept a pong until the carrier writer has generated that timestamp. Zero
 state records whether the request has been built. A matching pong can arrive before the local write-completion callback,
 and a late callback cannot restore a completed request or change a newer request. The inactivity timeout starts only
 after the complete ping frame is written to the carrier. While the pong remains pending, valid received frames extend
-the budget. Three seconds without receive progress fails the generation. Timing requests use a 1-second interval during
+the budget. Ten seconds without receive progress fails the generation. Timing requests use a 1-second interval during
 real data transfer and exponential idle backoff capped at 15 seconds, which bounds idle traffic without delaying
 active-path measurements.
 
@@ -1600,24 +1655,33 @@ use the same protocol clock for local deadlines. Wall-clock adjustments cannot e
 expire fresh packets. On other platforms, suspend behavior follows the platform clock used by Go. These local deadline
 values have an arbitrary epoch and are never compared with wall time or passed to socket deadline APIs.
 
+Go runtime timers and socket deadlines can use a clock that pauses during system suspend. At normal Ping scheduling
+wakes, a lane compares protocol elapsed time with runtime elapsed time. A gap exceeding one second aborts the old
+generation and discards its unacknowledged TCP bytes. Pending client preparation checks the same gap once per second and
+cancels an obsolete attempt. These comparisons allow scheduling delays inside a clock sample. When both clocks advance
+during suspend, ordinary expired budgets provide recovery instead. This is not an OS network-change callback. Detection
+waits for the next scheduled wake, which can be up to the 15-second idle Ping interval after resume on a platform whose
+runtime timers pause. Process suspension, background execution restrictions, and display-off behavior are separate from
+system suspend. WireHop does not provide a native Android or iOS lifecycle integration.
+
 ### Delivery feedback and packet identity
 
 Probe frames contain opaque padding, are discarded by the receiving WireHop process, and are never written to UDP. A
-sender starts at a 2-second idle interval and backs off exponentially to 60 seconds while no real data is written. A
+sender starts at a 2-second idle interval and backs off exponentially to 1 minute while no real data is written. A
 completed real data write suppresses the next probe and restores the initial interval. The receiver enforces the
 protocol payload bound, and the bounded control queue prevents probe generation from growing an independent backlog.
 
 Each direction sends delivery reports containing the target lane identifier, connection generation, and separate
 cumulative counters for data-frame and probe bytes and packets. A report is triggered after 256 newly parsed data
-packets or 256 KiB of newly parsed data, and a 25 ms interval bounds the delay for smaller changes. All four counters
-start at zero for each connection generation and never wrap. Data bytes count the actual encoded common header, Data
-metadata, and WireGuard packet. Probe bytes count the actual encoded common header and opaque payload. A default
-1200-byte Probe occupies 1203 encoded bytes. Shortest-form integer validation makes reconstructed frame sizes equal to
-the received wire sizes. The counters describe the exact prefix parsed from that generation's ordered carrier. Reported
-probe packets cannot exceed the number exposed to that generation's carrier writer, and their cumulative byte count must
-equal the packet count times that generation's fixed encoded Probe frame size. The sender's exposed-probe counter also
-never wraps. A batch that would overflow it ends the generation before any frame in that batch is written or any of its
-success callbacks run.
+packets or 256 KiB of newly parsed data, and a 25 ms interval bounds the delay for smaller changes. The report timer
+runs only while unreported progress exists. All four counters start at zero for each connection generation and never
+wrap. Data bytes count the actual encoded common header, Data metadata, and WireGuard packet. Probe bytes count the
+actual encoded common header and opaque payload. A default 1200-byte Probe occupies 1203 encoded bytes. Shortest-form
+integer validation makes reconstructed frame sizes equal to the received wire sizes. The counters describe the exact
+prefix parsed from that generation's ordered carrier. Reported probe packets cannot exceed the number exposed to that
+generation's carrier writer, and their cumulative byte count must equal the packet count times that generation's fixed
+encoded Probe frame size. The sender's exposed-probe counter also never wraps. A batch that would overflow it ends the
+generation before any frame in that batch is written or any of its success callbacks run.
 
 A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
 risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Its counters
@@ -1635,10 +1699,12 @@ Builders sample timestamps at the writer, and success callbacks run in queue ord
 succeeds. Probe exposure is published before the write because feedback can return on another lane before local
 completion. A builder or carrier failure ends the generation and does not imply per-frame transactional completion.
 
-Each control batch retains the carrier stall deadline. WebSocket receivers validate all frame boundaries in a complete
-message before exposing its first frame, and TLS must receive and authenticate a record before exposing its contents.
-Coalescing can therefore change receive latency even without a collection timer. The frame budget and timing boundaries
-bound this effect.
+Each control batch retains the carrier stall deadline. WebSocket receivers expose each complete WireHop frame as it
+arrives, without waiting for the remaining WebSocket message or its closing fragment. A later malformed frame cannot
+undo a valid prefix already delivered. An incomplete frame at a normal WebSocket message boundary is a protocol
+violation. A transport disconnection before that boundary is a recoverable carrier failure. TLS still must receive and
+authenticate a complete record before exposing its contents. Coalescing can therefore change receive latency even
+without a collection timer. The frame budget and timing boundaries bound this effect.
 
 A changed report snapshot is offered to its target lane and the best alternate lane when they are connected and not
 abandoning, including when either lane is degraded. The first completed carrier write marks the snapshot reported, and
@@ -1656,7 +1722,10 @@ replacement rather than zero-value reuse.
 
 For WebSocket lanes, one nonempty binary message carries one or more complete WireHop frames. A WireHop frame does not
 span WebSocket messages. Text messages, empty messages, incomplete frames, and trailing partial frame bytes are protocol
-violations. For TCP and TLS lanes, length-prefixed frames are read directly from the ordered byte stream.
+violations. Decoding is incremental within a message, and cancellation belongs to the current read call rather than the
+call that opened that message. Clock-sync admission reads enforce their phase deadline independently of lane
+cancellation. The lane owner controls teardown, preserving abortive close when a generation must discard old stream
+bytes. For TCP and TLS lanes, length-prefixed frames are read directly from the ordered byte stream.
 
 ## CLI model
 

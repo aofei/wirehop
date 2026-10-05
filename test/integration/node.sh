@@ -70,6 +70,11 @@ fi
 case "$scenario" in
   tcp-latency) tc qdisc replace dev eth0 root netem delay 600ms ;;
   tcp-loss) tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 0.5% ;;
+  *-slow32|*-slow64|*-slow128)
+    rate=${scenario##*slow}
+    tc qdisc replace dev eth0 root handle 1: tbf rate "${rate}kbit" burst 4096 latency 1s
+    tc qdisc replace dev eth0 parent 1:1 handle 10: netem delay 100ms 20ms loss 0.2% limit 8
+    ;;
 esac
 
 if [ "$role" = server ]; then
@@ -100,6 +105,7 @@ fi
 duration=20
 case "$scenario" in
   *-rekey) duration=140 ;;
+  *-outage|*-roam) duration=40 ;;
 esac
 local_endpoint=127.0.0.1:51821
 case "$scenario" in
@@ -142,14 +148,32 @@ if [ "$scenario" = tcp-idle ]; then
   timeout 30 iperf3 -c "$remote_ip" -t 2 -J > /results/warmup.json
   sleep 35
 fi
-if [ "$scenario" = tcp-stall ]; then
-  (
-    sleep 5
-    tc qdisc replace dev eth0 root netem loss 100%
-    sleep 4
-    tc qdisc del dev eth0 root
-  ) &
-fi
+case "$scenario" in
+  *-stall|*-outage)
+    outage=4
+    if [ "${scenario##*-}" = outage ]; then outage=12; fi
+    (
+      sleep 5
+      tc qdisc replace dev eth0 root netem loss 100%
+      sleep "$outage"
+      tc qdisc del dev eth0 root
+      date +%s > /results/path-recovered.txt
+    ) &
+    ;;
+  *-roam)
+    (
+      sleep 5
+      original=$(ip -o -4 addr show dev eth0 | awk '{print $4}')
+      prefix=${original##*/}
+      address=${original%/*}
+      replacement=${address%.*}.250
+      ip addr del "$original" dev eth0
+      ip addr add "$replacement/$prefix" dev eth0
+      ip -o -4 addr show dev eth0 > /results/changed-address.txt
+      date +%s > /results/path-recovered.txt
+    ) &
+    ;;
+esac
 case "$scenario" in
   forward-prohibit|forward-blackhole)
     (

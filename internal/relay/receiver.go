@@ -21,7 +21,17 @@ var (
 	ErrInvalidPacketDeadline = errors.New("invalid packet deadline")
 	// ErrEndpointFailure indicates that a relay UDP endpoint could not be created, read, or written.
 	ErrEndpointFailure = errors.New("relay UDP endpoint failure")
+	// ErrStaleClockSample indicates timing uncertainty too large for useful packet freshness.
+	ErrStaleClockSample = errors.New("clock sample is too uncertain")
 )
+
+// maximumClockUncertainty bounds the expiry slack admitted by a timing sample.
+const maximumClockUncertainty = defaultPingTimeout / 2
+
+// ClockMappingUsable reports whether mapping has bounded uncertainty suitable for packet deadline enforcement.
+func ClockMappingUsable(mapping clockmap.Mapping) bool {
+	return mapping.UncertaintyMicros <= uint64(maximumClockUncertainty/time.Microsecond)
+}
 
 // ReceiverConfig defines session-shared inbound delivery state.
 type ReceiverConfig struct {
@@ -43,6 +53,7 @@ type Receiver struct {
 	deduplication   *dedup.Window
 	payloads        [datagram.MaximumBatchSize][]byte
 	packetIDs       [datagram.MaximumBatchSize]uint64
+	deadlines       [datagram.MaximumBatchSize]uint64
 }
 
 // NewReceiver validates config and returns session-shared inbound state.
@@ -67,11 +78,15 @@ func NewReceiver(config ReceiverConfig) (*Receiver, error) {
 	}, nil
 }
 
-// UpdateClock replaces the session mapping with one authenticated lane sample.
+// UpdateClock installs a fresh authenticated sample with bounded uncertainty. Older low-delay samples are not preferred
+// indefinitely because the peer clocks can drift between samples.
 func (r *Receiver) UpdateClock(mapping clockmap.Mapping) {
+	if !ClockMappingUsable(mapping) {
+		return
+	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.mapping = mapping
-	r.mu.Unlock()
 }
 
 // ValidateDeadline verifies that deadline maps into the receiver clock and respects the protocol lifetime bound.
@@ -132,10 +147,16 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	defer func() { <-r.writeSlot }()
+	// Bound cleanup to the largest used prefix, including partially validated runs.
+	buffered := 0
+	defer func() {
+		clear(r.payloads[:buffered])
+		clear(r.packetIDs[:buffered])
+		clear(r.deadlines[:buffered])
+		<-r.writeSlot
+	}()
 	r.mu.Lock()
 	mapping := r.mapping
-	nowMicros := r.clock.NowMicros()
 	r.mu.Unlock()
 	writeDeadline := time.Now().Add(r.udpWriteTimeout)
 	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(writeDeadline) {
@@ -144,11 +165,13 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 	for dataOffset := 0; dataOffset < len(data); {
 		accepted := 0
 		r.mu.Lock()
+		nowMicros := r.clock.NowMicros()
 		for dataOffset < len(data) {
 			packet := data[dataOffset]
 			expired, err := deadlineStatus(mapping, nowMicros, packet.DeadlineMicros)
 			if err != nil {
 				r.mu.Unlock()
+				buffered = max(buffered, accepted)
 				return err
 			}
 			if r.deduplication.Classify(packet.PacketID) != dedup.New || expired {
@@ -160,16 +183,16 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 			}
 			r.payloads[accepted] = packet.Payload
 			r.packetIDs[accepted] = packet.PacketID
+			r.deadlines[accepted] = packet.DeadlineMicros
 			accepted++
 			dataOffset++
 		}
 		r.mu.Unlock()
+		buffered = max(buffered, accepted)
 		if accepted == 0 {
 			continue
 		}
-		err := r.writeAcceptedBatch(ctx, r.payloads[:accepted], r.packetIDs[:accepted], writeDeadline)
-		clear(r.payloads[:accepted])
-		clear(r.packetIDs[:accepted])
+		err := r.writeAcceptedBatch(ctx, r.payloads[:accepted], r.packetIDs[:accepted], r.deadlines[:accepted], mapping, writeDeadline)
 		if err != nil {
 			return err
 		}
@@ -178,10 +201,30 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 }
 
 // writeAcceptedBatch writes one increasing PacketID run and records only its successful packets.
-func (r *Receiver) writeAcceptedBatch(ctx context.Context, payloads [][]byte, packetIDs []uint64,
-	writeDeadline time.Time) error {
+func (r *Receiver) writeAcceptedBatch(ctx context.Context, payloads [][]byte, packetIDs, deadlines []uint64,
+	mapping clockmap.Mapping, writeDeadline time.Time) error {
 	offset := 0
 	for offset < len(payloads) {
+		nowMicros := r.clock.NowMicros()
+		end := offset
+		for index := offset; index < len(payloads); index++ {
+			expired, err := deadlineStatus(mapping, nowMicros, deadlines[index])
+			if err != nil {
+				return err
+			}
+			if !expired {
+				payloads[end] = payloads[index]
+				packetIDs[end] = packetIDs[index]
+				deadlines[end] = deadlines[index]
+				end++
+			}
+		}
+		payloads = payloads[:end]
+		packetIDs = packetIDs[:end]
+		deadlines = deadlines[:end]
+		if offset == end {
+			break
+		}
 		written, err := datagram.WriteBatch(ctx, r.endpoint, payloads[offset:], writeDeadline)
 		if written > 0 {
 			r.mu.Lock()

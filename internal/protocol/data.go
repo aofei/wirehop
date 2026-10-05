@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"time"
 )
 
 const (
@@ -12,7 +13,7 @@ const (
 	// MaxPacketSize is the largest UDP datagram carried by WireHop.
 	MaxPacketSize = 65_535
 	// MaxPacketLifetimeMicros is the absolute wire-protocol packet lifetime limit.
-	MaxPacketLifetimeMicros = 5 * 60 * 1_000_000
+	MaxPacketLifetimeMicros = uint64(5 * time.Minute / time.Microsecond)
 )
 
 var (

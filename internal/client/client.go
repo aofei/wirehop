@@ -10,12 +10,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	neturl "net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aofei/backoff"
@@ -121,7 +123,7 @@ type pathGroupKey struct {
 // Start validates config, binds UDP immediately, and starts carrier session establishment.
 func Start(parent context.Context, config Config) (*Client, error) {
 	if config.SessionAttemptTimeout == 0 {
-		config.SessionAttemptTimeout = netsetup.DialTimeout + netsetup.ResolveTimeout + 2*config.HandshakeTimeout
+		config.SessionAttemptTimeout = netsetup.DialTimeout + netsetup.ResolveTimeout + 6*config.HandshakeTimeout
 	}
 	if config.MaxLanes == 0 {
 		config.MaxLanes = defaultMaxLanes
@@ -597,6 +599,8 @@ func (c *Client) retryCandidate(ctx context.Context, index int, failures chan<- 
 func (c *Client) createCandidate(ctx context.Context, index int) candidateResult {
 	attemptContext, cancel := context.WithTimeout(ctx, c.config.SessionAttemptTimeout)
 	defer cancel()
+	attemptContext, stopPreparation := c.preparationContext(attemptContext)
+	defer stopPreparation()
 	configured := c.lanes[index]
 	connection, err := c.prepareLane(attemptContext, configured.spec)
 	candidate := candidateResult{index: index, err: err}
@@ -607,6 +611,9 @@ func (c *Client) createCandidate(ctx context.Context, index int) candidateResult
 	}
 	if candidate.err != nil && ctx.Err() == nil && errors.Is(attemptContext.Err(), context.DeadlineExceeded) {
 		candidate.err = fmt.Errorf("%w: %w", ErrSessionAttemptTimeout, candidate.err)
+	}
+	if candidate.err != nil && errors.Is(context.Cause(attemptContext), monotime.ErrResumed) {
+		candidate.err = fmt.Errorf("%w: %w", monotime.ErrResumed, candidate.err)
 	}
 	return candidate
 }
@@ -718,12 +725,17 @@ func (c *Client) superviseLane(ctx context.Context, configured clientLane, sessi
 		accepted := initial
 		initial = nil
 		if accepted == nil {
-			connection, err := c.prepareLane(ctx, configured.spec)
+			preparation, stopPreparation := c.preparationContext(ctx)
+			connection, err := c.prepareLane(preparation, configured.spec)
 			var joined acceptedLane
 			if err == nil {
 				attempt := c.newCreationAttempt(configured, generation)
-				joined, err = c.openPreparedJoin(ctx, configured.spec.URL(), attempt, session, connection)
+				joined, err = c.openPreparedJoin(preparation, configured.spec.URL(), attempt, session, connection)
 			}
+			if err != nil && errors.Is(context.Cause(preparation), monotime.ErrResumed) {
+				err = fmt.Errorf("%w: %w", monotime.ErrResumed, err)
+			}
+			stopPreparation()
 			if err != nil {
 				if !attached && sessionGoneFailure(err) {
 					return &unattachedSessionGoneError{cause: err}
@@ -836,7 +848,8 @@ func (c *Client) prepareLane(ctx context.Context, spec lanespec.Spec) (net.Conn,
 	if err != nil {
 		return nil, fmt.Errorf("dial %s lane first hop: %w", url.Scheme(), err)
 	}
-	stopClose := context.AfterFunc(ctx, func() { connection.Close() })
+	firstHop := connection
+	stopClose := context.AfterFunc(ctx, func() { firstHop.Close() })
 	defer stopClose()
 	if tcp, ok := connection.(*net.TCPConn); ok {
 		if err := carrier.ConfigureTCP(tcp); err != nil {
@@ -848,6 +861,15 @@ func (c *Client) prepareLane(ctx context.Context, spec lanespec.Spec) (net.Conn,
 	targetAddress := spec.DialAddress()
 	if route.proxy == nil {
 		targetAddress = firstHopAddress
+	}
+	if route.proxy != nil && (route.proxy.Scheme == "socks5" || route.proxy.Scheme == "socks5h") {
+		tunneled, err := c.prepareSOCKS(ctx, connection, route.proxy, targetAddress)
+		if err != nil {
+			connection.Close()
+			return nil, fmt.Errorf("prepare SOCKS lane tunnel: %w", err)
+		}
+		connection = tunneled
+		route.proxy = nil
 	}
 	return &preparedWebSocketConnection{
 		Conn: connection, proxy: route.proxy, firstHopAddress: firstHopAddress, targetAddress: targetAddress,
@@ -1054,7 +1076,7 @@ func (c *Client) createWebSocketSession(ctx context.Context,
 	if err != nil {
 		return nil, creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
 	}
-	connection, response, handshakeContext, cancel, err := c.dialWebSocket(ctx, url, headers, prepared, netsetup.ResolveTimeout+c.config.HandshakeTimeout)
+	connection, response, handshakeContext, cancel, clientSendMicros, err := c.dialWebSocket(ctx, url, headers, prepared, netsetup.ResolveTimeout+c.config.HandshakeTimeout)
 	defer cancel()
 	if err != nil {
 		if response != nil {
@@ -1072,7 +1094,9 @@ func (c *Client) createWebSocketSession(ctx context.Context,
 		}
 		return nil, creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
 	}
-	frame, err := connection.ReadFrame(handshakeContext)
+	frameContext, cancelFrame := context.WithTimeout(handshakeContext, c.config.HandshakeTimeout)
+	defer cancelFrame()
+	frame, err := connection.ReadFrame(frameContext)
 	clientReceiveMicros := c.config.Clock.NowMicros()
 	if err != nil {
 		connection.Close()
@@ -1087,7 +1111,7 @@ func (c *Client) createWebSocketSession(ctx context.Context,
 		sessionID: created.SessionID, sessionSecret: created.SessionSecret,
 		receiveMicros: created.ReceiveMicros, sendMicros: created.SendMicros,
 	}
-	mapping, syncFrame, err := completeCreation(attempt.monotonicMicros, clientReceiveMicros, result)
+	mapping, syncFrame, err := completeCreation(clientSendMicros, clientReceiveMicros, result)
 	if err != nil {
 		connection.Close()
 		return nil, creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
@@ -1110,7 +1134,7 @@ func (c *Client) joinWebSocketSession(ctx context.Context, url laneurl.URL, atte
 	if err != nil {
 		return acceptedLane{}, err
 	}
-	connection, response, handshakeContext, cancel, err := c.dialWebSocket(ctx, url, headers, prepared, c.config.HandshakeTimeout)
+	connection, response, handshakeContext, cancel, clientSendMicros, err := c.dialWebSocket(ctx, url, headers, prepared, c.config.HandshakeTimeout)
 	defer cancel()
 	if err != nil {
 		if response != nil {
@@ -1126,7 +1150,9 @@ func (c *Client) joinWebSocketSession(ctx context.Context, url laneurl.URL, atte
 		}
 		return acceptedLane{}, err
 	}
-	frame, err := connection.ReadFrame(handshakeContext)
+	frameContext, cancelFrame := context.WithTimeout(handshakeContext, c.config.HandshakeTimeout)
+	defer cancelFrame()
+	frame, err := connection.ReadFrame(frameContext)
 	clientReceiveMicros := c.config.Clock.NowMicros()
 	if err != nil {
 		connection.Close()
@@ -1141,7 +1167,7 @@ func (c *Client) joinWebSocketSession(ctx context.Context, url laneurl.URL, atte
 		sessionID:     accepted.SessionID,
 		receiveMicros: accepted.ReceiveMicros, sendMicros: accepted.SendMicros,
 	}
-	mapping, initialFrame, err := completeCreation(attempt.monotonicMicros, clientReceiveMicros, result)
+	mapping, initialFrame, err := completeCreation(clientSendMicros, clientReceiveMicros, result)
 	if err != nil {
 		connection.Close()
 		return acceptedLane{}, err
@@ -1181,19 +1207,53 @@ func authenticatedWebSocketRejection(response *http.Response, attempt creationAt
 // dialWebSocket performs an HTTP/1.1 binary WebSocket handshake over a configured TCP socket. The admission owner closes
 // prepared on failure, even if the HTTP transport has not consumed it.
 func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
-	headers http.Header, prepared net.Conn, timeout time.Duration) (carrier.Conn, *http.Response, context.Context, context.CancelFunc, error) {
+	headers http.Header, prepared net.Conn, timeout time.Duration) (carrier.Conn, *http.Response, context.Context, context.CancelFunc, uint64, error) {
 	preparedWebSocket := prepared.(*preparedWebSocketConnection)
-	handshakeContext, cancel := context.WithTimeout(ctx, timeout)
 	proxyURL := preparedWebSocket.proxy
+	budget := timeout + 2*c.config.HandshakeTimeout
+	if url.Scheme() == laneurl.WSS {
+		budget += c.config.HandshakeTimeout
+		if proxyURL != nil {
+			budget += c.config.HandshakeTimeout
+		}
+	}
+	if proxyURL != nil && proxyURL.Scheme == "https" {
+		budget += c.config.HandshakeTimeout
+	}
+	handshakeContext, cancel := context.WithTimeout(ctx, budget)
+	deadlineContext := handshakeContext
+	var clientSendMicros atomic.Uint64
+	requestWritten := make(chan error, 1)
+	deadlineErrors := make(chan error, 1)
+	handshakeContext = httptrace.WithClientTrace(handshakeContext, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) {
+			if err := preparedWebSocket.SetWriteDeadline(operationDeadline(deadlineContext, c.config.HandshakeTimeout)); err != nil {
+				deadlineErrors <- err
+				cancel()
+			}
+		},
+		WroteHeaders: func() { clientSendMicros.Store(c.config.Clock.NowMicros()) },
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			err := info.Err
+			if err == nil {
+				err = preparedWebSocket.SetWriteDeadline(time.Time{})
+			}
+			requestWritten <- err
+		},
+	})
 	httpTransport := &http.Transport{
 		Proxy: http.ProxyURL(proxyURL), ForceAttemptHTTP2: false,
 		TLSHandshakeTimeout:    c.config.HandshakeTimeout,
+		ResponseHeaderTimeout:  timeout,
 		MaxResponseHeaderBytes: maximumWebSocketResponseHeaderBytes,
 		OnProxyConnectResponse: func(_ context.Context, _ *neturl.URL, _ *http.Request, response *http.Response) error {
 			if response.StatusCode != http.StatusOK {
 				return &proxyConnectError{statusCode: response.StatusCode}
 			}
-			return nil
+			return preparedWebSocket.SetDeadline(time.Time{})
+		},
+		GetProxyConnectHeader: func(ctx context.Context, _ *neturl.URL, _ string) (http.Header, error) {
+			return nil, preparedWebSocket.SetDeadline(operationDeadline(ctx, c.config.HandshakeTimeout))
 		},
 	}
 	availableConnection := net.Conn(preparedWebSocket)
@@ -1237,16 +1297,31 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 		Subprotocols: []string{wsheader.Subprotocol}, CompressionMode: websocket.CompressionDisabled,
 	})
 	httpTransport.CloseIdleConnections()
+	if err == nil {
+		select {
+		case err = <-requestWritten:
+		case <-handshakeContext.Done():
+			err = context.Cause(handshakeContext)
+		}
+	}
+	select {
+	case deadlineErr := <-deadlineErrors:
+		err = errors.Join(err, deadlineErr)
+	default:
+	}
 	if err != nil {
-		return nil, response, handshakeContext, cancel, &webSocketHandshakeError{cause: err}
+		if webSocket != nil {
+			webSocket.CloseNow()
+		}
+		return nil, response, handshakeContext, cancel, 0, &webSocketHandshakeError{cause: err}
 	}
 	if webSocket.Subprotocol() != wsheader.Subprotocol {
 		webSocket.CloseNow()
-		return nil, response, handshakeContext, cancel, ErrUnexpectedServerResponse
+		return nil, response, handshakeContext, cancel, 0, ErrUnexpectedServerResponse
 	}
 	connection := carrier.NewWebSocketConn(webSocket)
 	connection.SetNetworkConnection(preparedWebSocket)
-	return connection, response, handshakeContext, cancel, nil
+	return connection, response, handshakeContext, cancel, clientSendMicros.Load(), nil
 }
 
 // webSocketFirstHop returns the direct destination or configured HTTP proxy socket address.
@@ -1489,6 +1564,9 @@ func completeCreation(clientSendMicros,
 	})
 	if err != nil {
 		return clockmap.Mapping{}, protocol.Frame{}, err
+	}
+	if !relay.ClockMappingUsable(mapping) {
+		return clockmap.Mapping{}, protocol.Frame{}, relay.ErrStaleClockSample
 	}
 	syncFrame, err := protocol.MarshalClockSync(protocol.ClockSync{
 		ClientSendMicros: clientSendMicros, ServerReceiveMicros: result.receiveMicros,

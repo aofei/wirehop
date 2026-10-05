@@ -183,6 +183,13 @@ func TestFrameReaderReleasesLargeBuffer(t *testing.T) {
 	if !bytes.Equal(frame.Payload, []byte{1}) || cap(frameReader.content) > maximumRetainedFrameContentCapacity {
 		t.Fatalf("small frame = %#v, buffer capacity = %d", frame, cap(frameReader.content))
 	}
+	reader = bytes.NewReader(large)
+	if _, err := frameReader.Read(reader); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := frameReader.Read(reader); !errors.Is(err, io.EOF) || cap(frameReader.content) != 0 {
+		t.Fatalf("EOF retained large payload: error %v, capacity %d", err, cap(frameReader.content))
+	}
 }
 
 func TestFrameReaderReadBuffered(t *testing.T) {

@@ -60,10 +60,15 @@ func main() {
 		if err == nil && udp && (flow.End.Sent.Bytes == 0 || flow.End.Received.Bytes < flow.End.Sent.Bytes-flow.End.Sent.Bytes/20) {
 			err = fmt.Errorf("UDP delivery lost more than five percent of the controlled offered load")
 		}
-		if err == nil && (strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole")) {
-			_, err = os.Stat(filepath.Join(directory, "route-recovered.txt"))
+		if err == nil && (strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") ||
+			strings.HasSuffix(scenario, "-stall") || strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam")) {
+			marker := "path-recovered.txt"
+			if strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") {
+				marker = "route-recovered.txt"
+			}
+			_, err = os.Stat(filepath.Join(directory, marker))
 			if err == nil && (len(flow.Intervals) == 0 || flow.Intervals[len(flow.Intervals)-1].Sum.Bytes == 0) {
-				err = fmt.Errorf("TCP flow did not resume after route recovery")
+				err = fmt.Errorf("TCP flow did not resume after path recovery")
 			}
 		}
 		if err == nil {
@@ -92,7 +97,7 @@ func main() {
 
 // verifyCarrier detects unexpected reconnects in scenarios that should retain one admitted carrier.
 func verifyCarrier(directory, scenario string) error {
-	if scenario == "tcp-stall" {
+	if strings.HasSuffix(scenario, "-stall") || strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam") {
 		return nil
 	}
 	if scenario == "tcp-multipath" || scenario == "tcp-mixed" {

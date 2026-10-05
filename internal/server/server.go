@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/hmac"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -284,12 +285,19 @@ func (s *Server) WebSocketConnContext(parent context.Context, connection net.Con
 // createSession reserves capacity and prepares a target under ctx. The retained session belongs to parent.
 func (s *Server) createSession(ctx, parent context.Context, endpointTarget target.Endpoint) (*serverSession, error) {
 	s.mu.Lock()
+	var evicted *serverSession
 	if len(s.sessions)+s.creating >= s.config.MaxSessions {
-		s.mu.Unlock()
-		return nil, ErrSessionLimit
+		evicted = s.evictDetachedLocked()
+		if evicted == nil {
+			s.mu.Unlock()
+			return nil, ErrSessionLimit
+		}
 	}
 	s.creating++
 	s.mu.Unlock()
+	if evicted != nil {
+		evicted.close()
+	}
 	inserted := false
 	defer func() {
 		if !inserted {
@@ -323,6 +331,35 @@ func (s *Server) createSession(ctx, parent context.Context, endpointTarget targe
 	s.mu.Unlock()
 	session.start()
 	return session, nil
+}
+
+// evictDetachedLocked reserves capacity by canceling the oldest detached session. Attached lanes and accepted join
+// reservations are protected. The caller holds s.mu and closes the returned session after releasing it.
+func (s *Server) evictDetachedLocked() *serverSession {
+	for {
+		var oldest *serverSession
+		var oldestDetach *detachState
+		for _, session := range s.sessions {
+			session.mu.Lock()
+			detach := session.detach
+			if detach != nil && len(session.lanes) == 0 && session.reservations == 0 &&
+				(oldestDetach == nil || detach.expires.Before(oldestDetach.expires)) {
+				oldest, oldestDetach = session, detach
+			}
+			session.mu.Unlock()
+		}
+		if oldest == nil {
+			return nil
+		}
+		oldest.mu.Lock()
+		if oldest.detach == oldestDetach && len(oldest.lanes) == 0 && oldest.reservations == 0 {
+			oldest.cancel()
+			delete(s.sessions, oldest.id)
+			oldest.mu.Unlock()
+			return oldest
+		}
+		oldest.mu.Unlock()
+	}
 }
 
 // findSession returns one retained attached or detached session.
@@ -455,6 +492,14 @@ func (s *Server) serveConnection(ctx context.Context, connection net.Conn, relea
 	if tcp, ok := connection.(*net.TCPConn); ok {
 		if err := carrier.ConfigureTCP(tcp); err != nil {
 			return reportLaneError(fmt.Errorf("configure accepted TCP connection: %w", err))
+		}
+	}
+	if secure, ok := connection.(*tls.Conn); ok {
+		handshakeContext, cancel := context.WithTimeout(ctx, s.config.HandshakeTimeout)
+		err := secure.HandshakeContext(handshakeContext)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("perform server TLS handshake: %w", err)
 		}
 	}
 	if err := connection.SetDeadline(operationDeadline(ctx, s.config.HandshakeTimeout)); err != nil {

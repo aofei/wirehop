@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/lanespec"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/relay"
@@ -97,7 +98,7 @@ func TestStartSessionAttemptTimeout(t *testing.T) {
 		timeout time.Duration
 		want    time.Duration
 	}{
-		{name: "Default", want: 62 * time.Second},
+		{name: "Default", want: 66 * time.Second},
 		{name: "Explicit", timeout: time.Second, want: time.Second},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -265,7 +266,7 @@ func TestResolvedWSPreservesLogicalIdentity(t *testing.T) {
 	}
 	spec := testLaneSpec(t, "url=ws://relay.example:"+port+"/_wirehop,resolve=127.0.0.1")
 	var proxySelections atomic.Int32
-	instance := &Client{config: Config{
+	instance := &Client{config: Config{Clock: monotime.New(),
 		Dialer: &net.Dialer{}, HandshakeTimeout: time.Second,
 		Proxy: func(*http.Request) (*neturl.URL, error) {
 			proxySelections.Add(1)
@@ -276,7 +277,7 @@ func TestResolvedWSPreservesLogicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, response, _, cancel, err := instance.dialWebSocket(
+	connection, response, _, cancel, _, err := instance.dialWebSocket(
 		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
@@ -326,7 +327,7 @@ func TestResolvedWSSPreservesLogicalIdentity(t *testing.T) {
 	)
 	roots := x509.NewCertPool()
 	roots.AddCert(target.Certificate())
-	instance := &Client{config: Config{
+	instance := &Client{config: Config{Clock: monotime.New(),
 		Dialer: &net.Dialer{}, TLSConfig: &tls.Config{RootCAs: roots}, HandshakeTimeout: time.Second,
 		Proxy: func(*http.Request) (*neturl.URL, error) {
 			return nil, nil
@@ -336,7 +337,7 @@ func TestResolvedWSSPreservesLogicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, response, _, cancel, err := instance.dialWebSocket(
+	connection, response, _, cancel, _, err := instance.dialWebSocket(
 		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
@@ -371,7 +372,7 @@ func TestDialWebSocketRejectsMissingSubprotocolPromptly(t *testing.T) {
 	defer target.Close()
 	defer close(release)
 	spec := testLaneSpec(t, "ws"+strings.TrimPrefix(target.URL, "http"))
-	instance := &Client{config: Config{
+	instance := &Client{config: Config{Clock: monotime.New(),
 		Dialer: &net.Dialer{}, HandshakeTimeout: 10 * time.Second,
 		Proxy: func(*http.Request) (*neturl.URL, error) {
 			return nil, nil
@@ -382,7 +383,7 @@ func TestDialWebSocketRejectsMissingSubprotocolPromptly(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	connection, response, _, cancel, err := instance.dialWebSocket(
+	connection, response, _, cancel, _, err := instance.dialWebSocket(
 		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
@@ -446,12 +447,12 @@ func TestDialWebSocketRejectsRedirect(t *testing.T) {
 	defer httpServer.Close()
 	spec := testLaneSpec(t, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/_wirehop")
 	url := spec.URL()
-	instance := &Client{config: Config{Dialer: &net.Dialer{}, HandshakeTimeout: time.Second}}
+	instance := &Client{config: Config{Clock: monotime.New(), Dialer: &net.Dialer{}, HandshakeTimeout: time.Second}}
 	prepared, err := instance.prepareLane(context.Background(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, response, _, cancel, err := instance.dialWebSocket(
+	connection, response, _, cancel, _, err := instance.dialWebSocket(
 		context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
@@ -472,12 +473,12 @@ func TestDialWebSocketBoundsResponseHeaders(t *testing.T) {
 	defer httpServer.Close()
 	spec := testLaneSpec(t, "ws"+strings.TrimPrefix(httpServer.URL, "http")+"/_wirehop")
 	url := spec.URL()
-	instance := &Client{config: Config{Dialer: &net.Dialer{}, HandshakeTimeout: time.Second}}
+	instance := &Client{config: Config{Clock: monotime.New(), Dialer: &net.Dialer{}, HandshakeTimeout: time.Second}}
 	prepared, err := instance.prepareLane(context.Background(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, _, _, cancel, err := instance.dialWebSocket(context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout)
+	connection, _, _, cancel, _, err := instance.dialWebSocket(context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout)
 	cancel()
 	requestError, ok := errors.AsType[*neturl.Error](err)
 	if connection != nil || !ok || !strings.Contains(requestError.Err.Error(), "response headers exceeded") {
@@ -504,7 +505,7 @@ func TestPreparedWebSocketRetainsProxySelection(t *testing.T) {
 	spec := testLaneSpec(t, "ws://localhost:"+port+"/_wirehop")
 	url := spec.URL()
 	var selections atomic.Int32
-	instance := &Client{config: Config{
+	instance := &Client{config: Config{Clock: monotime.New(),
 		Dialer: &net.Dialer{}, HandshakeTimeout: time.Second,
 		Proxy: func(*http.Request) (*neturl.URL, error) {
 			if selections.Add(1) != 1 {
@@ -526,7 +527,7 @@ func TestPreparedWebSocketRetainsProxySelection(t *testing.T) {
 		t.Fatalf("prepared WebSocket endpoints = %q, %q, want %q",
 			preparedWebSocket.firstHopAddress, preparedWebSocket.targetAddress, wantEndpoint)
 	}
-	connection, _, _, cancel, err := instance.dialWebSocket(
+	connection, _, _, cancel, _, err := instance.dialWebSocket(
 		context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()
@@ -564,7 +565,7 @@ func testPreparedWebSocketClosesOnAdmissionFailure(t *testing.T, mode, scheme, f
 		laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1}, generation: 1,
 		nonce: protocol.Nonce{1}, unixSeconds: time.Now().Unix(),
 	}
-	instance := &Client{config: Config{
+	instance := &Client{config: Config{Clock: monotime.New(),
 		Token: []byte("test-token"), Target: target.MustParse("127.0.0.1:51820"), HandshakeTimeout: time.Second,
 	}}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -617,6 +618,7 @@ func testPreparedWebSocketClosesOnAdmissionFailure(t *testing.T, mode, scheme, f
 
 func TestDialWebSocketThroughHTTPSProxy(t *testing.T) {
 	target := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		time.Sleep(600 * time.Millisecond)
 		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
 			Subprotocols: []string{wsheader.Subprotocol},
 		})
@@ -634,6 +636,7 @@ func TestDialWebSocketThroughHTTPSProxy(t *testing.T) {
 			return
 		}
 		proxyResumptions <- request.TLS.DidResume
+		time.Sleep(600 * time.Millisecond)
 		upstream, err := net.Dial("tcp", request.Host)
 		if err != nil {
 			http.Error(writer, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
@@ -675,7 +678,7 @@ func TestDialWebSocketThroughHTTPSProxy(t *testing.T) {
 	roots.AddCert(proxy.Certificate())
 	spec := testLaneSpec(t, "wss"+strings.TrimPrefix(target.URL, "https")+"/_wirehop")
 	url := spec.URL()
-	instance := &Client{config: Config{
+	instance := &Client{config: Config{Clock: monotime.New(),
 		Dialer: &net.Dialer{}, Proxy: http.ProxyURL(proxyURL), TLSConfig: &tls.Config{
 			RootCAs: roots, MaxVersion: tls.VersionTLS12,
 			ClientSessionCache: tls.NewLRUClientSessionCache(4),
@@ -687,7 +690,8 @@ func TestDialWebSocketThroughHTTPSProxy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		connection, response, _, cancel, err := instance.dialWebSocket(
+		startedMicros := instance.config.Clock.NowMicros()
+		connection, response, _, cancel, sentMicros, err := instance.dialWebSocket(
 			context.Background(), url, make(http.Header), prepared, instance.config.HandshakeTimeout,
 		)
 		cancel()
@@ -696,6 +700,9 @@ func TestDialWebSocketThroughHTTPSProxy(t *testing.T) {
 		}
 		if response == nil || response.StatusCode != http.StatusSwitchingProtocols {
 			t.Fatalf("WebSocket response = %v", response)
+		}
+		if sentMicros-startedMicros < uint64(600*time.Millisecond/time.Microsecond) {
+			t.Fatalf("HTTP send timestamp included proxy preparation: elapsed %d microseconds", sentMicros-startedMicros)
 		}
 		if err := connection.Close(); err != nil {
 			t.Fatal(err)
@@ -707,7 +714,20 @@ func TestDialWebSocketThroughHTTPSProxy(t *testing.T) {
 }
 
 func TestDialWebSocketThroughSOCKS5Proxy(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	for _, proxyScheme := range []string{"socks5", "socks5h"} {
+		for _, secure := range []bool{false, true} {
+			name := strings.ToUpper(proxyScheme) + "WS"
+			if secure {
+				name += "S"
+			}
+			t.Run(name, func(t *testing.T) { testDialWebSocketThroughSOCKS5Proxy(t, proxyScheme, secure) })
+		}
+	}
+}
+
+func testDialWebSocketThroughSOCKS5Proxy(t *testing.T, proxyScheme string, secure bool) {
+	t.Helper()
+	target := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
 			Subprotocols: []string{wsheader.Subprotocol},
 		})
@@ -717,6 +737,11 @@ func TestDialWebSocketThroughSOCKS5Proxy(t *testing.T) {
 		defer connection.CloseNow()
 		connection.Read(request.Context())
 	}))
+	if secure {
+		target.StartTLS()
+	} else {
+		target.Start()
+	}
 	defer target.Close()
 	_, port, err := net.SplitHostPort(target.Listener.Addr().String())
 	if err != nil {
@@ -732,19 +757,27 @@ func TestDialWebSocketThroughSOCKS5Proxy(t *testing.T) {
 	go func() {
 		proxyDone <- serveSOCKS5Connection(proxy, target.Listener.Addr().String(), requested)
 	}()
-	proxyURL, err := neturl.Parse("socks5://" + proxy.Addr().String())
+	proxyURL, err := neturl.Parse(proxyScheme + "://" + proxy.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec := testLaneSpec(t, "ws://relay.example:"+port+"/_wirehop")
-	instance := &Client{config: Config{
+	scheme := "ws"
+	roots := x509.NewCertPool()
+	if secure {
+		scheme = "wss"
+		roots.AddCert(target.Certificate())
+	}
+	spec := testLaneSpec(t, scheme+"://relay.example:"+port+"/_wirehop")
+	instance := &Client{config: Config{Clock: monotime.New(),
 		Dialer: &net.Dialer{}, Proxy: http.ProxyURL(proxyURL), HandshakeTimeout: time.Second,
+		TLSConfig: &tls.Config{RootCAs: roots, ServerName: "example.com"},
 	}}
 	prepared, err := instance.prepareLane(context.Background(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, response, _, cancel, err := instance.dialWebSocket(
+	defer prepared.Close()
+	connection, response, _, cancel, _, err := instance.dialWebSocket(
 		context.Background(), spec.URL(), make(http.Header), prepared, instance.config.HandshakeTimeout,
 	)
 	cancel()

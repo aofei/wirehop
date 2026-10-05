@@ -307,7 +307,15 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		}
 	}()
 	ticker := time.NewTicker(abandonmentCheckInterval)
+	ticker.Stop()
 	defer ticker.Stop()
+	checking := false
+	var check <-chan time.Time
+	expiry := time.NewTimer(time.Hour)
+	expiry.Stop()
+	defer expiry.Stop()
+	var expiryReady <-chan time.Time
+	var expiryAt time.Time
 	var preferred protocol.LaneID
 	var pending packetqueue.Item[Packet]
 	var preempted packetqueue.Item[Packet]
@@ -394,12 +402,44 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 				progressed = true
 			}
 		}
+		needsCheck := hasPending || hasPreempted
+		if !needsCheck {
+			for _, lane := range lanes {
+				if packets, _ := lane.registration.Store.backlog(); packets > 0 {
+					needsCheck = true
+					break
+				}
+			}
+		}
+		if needsCheck != checking {
+			checking = needsCheck
+			if checking {
+				ticker.Reset(abandonmentCheckInterval)
+				check = ticker.C
+			} else {
+				ticker.Stop()
+				check = nil
+			}
+		}
+		if next := s.ingress.NextDeadline(); !next.Equal(expiryAt) {
+			expiryAt = next
+			if next.IsZero() {
+				expiry.Stop()
+				expiryReady = nil
+			} else {
+				expiry.Reset(max(0, next.Sub(s.ingress.Now())))
+				expiryReady = expiry.C
+			}
+		}
 		if progressed && !hasPending {
 			select {
 			case event := <-s.events:
 				s.applyEvent(lanes, &preferred, event, s.ingress.Now())
-			case <-ticker.C:
+			case <-check:
 				s.checkAbandonment(lanes, s.ingress.Now())
+			case <-expiryReady:
+				s.ingress.Expire()
+				expiryAt = time.Time{}
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
@@ -410,8 +450,11 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		case event := <-s.events:
 			s.applyEvent(lanes, &preferred, event, s.ingress.Now())
 		case <-s.ingress.Ready():
-		case <-ticker.C:
+		case <-check:
 			s.checkAbandonment(lanes, s.ingress.Now())
+		case <-expiryReady:
+			s.ingress.Expire()
+			expiryAt = time.Time{}
 		case <-ctx.Done():
 			return ctx.Err()
 		}

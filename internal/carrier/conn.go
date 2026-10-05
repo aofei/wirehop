@@ -3,7 +3,6 @@ package carrier
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,7 +42,8 @@ type Conn interface {
 	Close() error
 }
 
-// frameBatchReader extends [Conn] with ordered frames already available at one message boundary.
+// frameBatchReader extends [Conn] with complete ordered frames already available. A nonzero count can accompany an
+// error, in which case callers must process the returned prefix before handling the error.
 type frameBatchReader interface {
 	ReadFrames(context.Context, []protocol.Frame) (int, error)
 }
@@ -138,18 +138,36 @@ func NewStreamConn(conn net.Conn) *StreamConn {
 type WebSocketConn struct {
 	conn              *websocket.Conn
 	networkConnection net.Conn
-	readBuffer        bytes.Buffer
-	readSequence      protocol.FrameSequence
+	messageReader     *bufio.Reader
+	messageOpen       bool
+	messageHasFrames  bool
+	message           webSocketMessageReader
+	frameReaders      [maximumStreamReadBatchFrames]protocol.FrameReader
 	writeBuffer       []byte
 	writeMu           sync.Mutex
 	closeOnce         sync.Once
 	closeErr          error
 }
 
+// webSocketMessageReader distinguishes a valid message boundary from a truncated underlying TCP connection.
+type webSocketMessageReader struct {
+	reader io.Reader
+	ended  bool
+}
+
+// Read tracks only the exact EOF emitted for the end of a WebSocket message.
+func (r *webSocketMessageReader) Read(buffer []byte) (int, error) {
+	count, err := r.reader.Read(buffer)
+	if err == io.EOF {
+		r.ended = true
+	}
+	return count, err
+}
+
 // NewWebSocketConn wraps one WebSocket while preserving its message boundaries.
 func NewWebSocketConn(connection *websocket.Conn) *WebSocketConn {
 	connection.SetReadLimit(WebSocketReadLimit)
-	return &WebSocketConn{conn: connection}
+	return &WebSocketConn{conn: connection, messageReader: bufio.NewReaderSize(nil, streamReadBufferSize)}
 }
 
 // SetNetworkConnection retains the underlying connection for direct deadlines and abortive teardown.
@@ -157,7 +175,7 @@ func (c *WebSocketConn) SetNetworkConnection(connection net.Conn) {
 	c.networkConnection = connection
 }
 
-// ReadFrame returns the next frame from one complete binary WebSocket message.
+// ReadFrame returns the next complete frame without waiting for the end of its binary WebSocket message.
 func (c *WebSocketConn) ReadFrame(ctx context.Context) (protocol.Frame, error) {
 	var frames [1]protocol.Frame
 	count, err := c.ReadFrames(ctx, frames[:])
@@ -167,7 +185,8 @@ func (c *WebSocketConn) ReadFrame(ctx context.Context) (protocol.Frame, error) {
 	return protocol.Frame{}, err
 }
 
-// ReadFrames returns one blocking frame plus the rest of its current WebSocket message.
+// ReadFrames returns one blocking frame plus complete frames already buffered in its binary WebSocket message. Valid
+// prefixes can be delivered before a later malformed tail or message-size violation closes the lane.
 func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame) (int, error) {
 	if len(frames) == 0 {
 		return 0, nil
@@ -175,56 +194,89 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	count := 0
-	for count < len(frames) {
-		frame, ok := c.readSequence.Next()
-		if ok {
-			frames[count] = frame
-			count++
+	for index := range c.frameReaders {
+		c.frameReaders[index].Reset()
+	}
+	if ctx.Done() != nil {
+		stop := context.AfterFunc(ctx, func() { c.Close() })
+		defer stop()
+	}
+	for {
+		if !c.messageOpen {
+			if err := c.readMessage(); err != nil {
+				if ctx.Err() != nil {
+					return 0, ctx.Err()
+				}
+				return 0, err
+			}
+		}
+		frame, err := c.frameReaders[0].Read(c.messageReader)
+		if err == io.EOF && c.message.ended {
+			c.messageOpen = false
+			c.messageReader.Reset(nil)
+			c.message.reader = nil
+			if !c.messageHasFrames {
+				return 0, ErrInvalidWebSocketMessage
+			}
 			continue
 		}
-		if count > 0 {
-			return count, nil
+		if err != nil {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 0, c.readFrameError(err)
 		}
-		if err := c.readMessage(ctx); err != nil {
-			return 0, err
+		c.messageHasFrames = true
+		frames[0] = frame
+		count := 1
+		for count < min(len(frames), len(c.frameReaders)) {
+			frame, available, err := c.frameReaders[count].ReadBuffered(c.messageReader)
+			if err != nil {
+				return count, c.readFrameError(err)
+			}
+			if !available {
+				break
+			}
+			frames[count] = frame
+			count++
 		}
+		return count, nil
 	}
-	return count, nil
 }
 
-// readMessage reads and parses the next complete binary WebSocket message.
-func (c *WebSocketConn) readMessage(ctx context.Context) error {
-	c.readSequence = protocol.FrameSequence{}
-	c.resetReadBuffer()
-	messageType, reader, err := c.conn.Reader(ctx)
+// readMessage starts the next binary message without consuming its complete payload.
+func (c *WebSocketConn) readMessage() error {
+	// A message can span calls with different deadlines, including admission followed by normal relay traffic.
+	// ReadFrames owns cancellation for each call, and Close interrupts the message's stable reader context.
+	messageType, reader, err := c.conn.Reader(context.Background())
 	if err != nil {
-		if errors.Is(err, websocket.ErrMessageTooBig) {
-			return fmt.Errorf("%w: %v", ErrInvalidWebSocketMessage, err)
-		}
-		return fmt.Errorf("read WebSocket carrier message: %w", err)
+		return webSocketReadError(err)
 	}
 	if messageType != websocket.MessageBinary {
 		return ErrInvalidWebSocketMessage
 	}
-	if _, err := c.readBuffer.ReadFrom(reader); err != nil {
-		c.resetReadBuffer()
-		if errors.Is(err, websocket.ErrMessageTooBig) {
-			return fmt.Errorf("%w: %v", ErrInvalidWebSocketMessage, err)
-		}
-		return fmt.Errorf("read WebSocket carrier message: %w", err)
-	}
-	message := c.readBuffer.Bytes()
-	if len(message) == 0 {
-		c.resetReadBuffer()
-		return ErrInvalidWebSocketMessage
-	}
-	c.readSequence, err = protocol.ParseFrameSequence(message)
-	if err != nil {
-		c.resetReadBuffer()
-		return fmt.Errorf("parse WebSocket carrier message: %w", err)
-	}
+	c.message = webSocketMessageReader{reader: reader}
+	c.messageReader.Reset(&c.message)
+	c.messageOpen = true
+	c.messageHasFrames = false
 	return nil
+}
+
+// webSocketReadError preserves protocol boundaries and classifies message-size failures.
+func webSocketReadError(err error) error {
+	if errors.Is(err, websocket.ErrMessageTooBig) {
+		return fmt.Errorf("%w: %v", ErrInvalidWebSocketMessage, err)
+	}
+	return fmt.Errorf("read WebSocket carrier frame: %w", err)
+}
+
+// readFrameError treats an incomplete frame at a valid message boundary as a protocol violation. Interrupted network
+// reads retain their transport error so a recoverable disconnection never becomes a permanent lane rejection.
+func (c *WebSocketConn) readFrameError(err error) error {
+	if c.message.ended && errors.Is(err, io.ErrUnexpectedEOF) {
+		return protocol.ErrTrailingFrameData
+	}
+	return webSocketReadError(err)
 }
 
 // WriteFrames writes one nonempty sequence as one binary WebSocket message.
@@ -370,6 +422,9 @@ func (c *StreamConn) ReadFrames(ctx context.Context, frames []protocol.Frame) (i
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	for index := range c.frameReaders {
+		c.frameReaders[index].Reset()
+	}
 	if err := c.conn.SetReadDeadline(contextDeadline(ctx)); err != nil {
 		return 0, fmt.Errorf("set carrier read deadline: %w", err)
 	}
@@ -502,15 +557,6 @@ func reusableBuffer(buffer []byte) []byte {
 	return buffer[:0]
 }
 
-// resetReadBuffer prepares WebSocket read storage while releasing exceptional historical capacity.
-func (c *WebSocketConn) resetReadBuffer() {
-	if c.readBuffer.Cap() > maximumRetainedBufferCapacity {
-		c.readBuffer = bytes.Buffer{}
-		return
-	}
-	c.readBuffer.Reset()
-}
-
 // setAbortiveClose configures the TCP socket under known connection wrappers to discard pending bytes on close.
 func setAbortiveClose(connection net.Conn) error {
 	for connection != nil {
@@ -533,6 +579,9 @@ func setAbortiveClose(connection net.Conn) error {
 func ConfigureTCP(conn *net.TCPConn) error {
 	if err := conn.SetNoDelay(true); err != nil {
 		return fmt.Errorf("enable TCP_NODELAY: %w", err)
+	}
+	if err := conn.SetKeepAlive(false); err != nil {
+		return fmt.Errorf("disable redundant TCP keepalive: %w", err)
 	}
 	return nil
 }

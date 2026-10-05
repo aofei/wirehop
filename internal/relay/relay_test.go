@@ -385,6 +385,7 @@ func TestDeliveryProgressRetriesUnsentClaim(t *testing.T) {
 		t.Fatal("initial progress was not claimed")
 	}
 	progress.complete(report, revision, false)
+	<-progress.notify
 	for range reportPacketThreshold {
 		if err := progress.addData(1); err != nil {
 			t.Fatal(err)
@@ -421,6 +422,9 @@ func TestDeliveryProgressThresholdNotification(t *testing.T) {
 			for index := range test.packets {
 				if err := progress.addData(test.bytes); err != nil {
 					t.Fatal(err)
+				}
+				if index == 0 {
+					<-progress.notify
 				}
 				if index+1 == test.packets {
 					continue
@@ -1642,8 +1646,8 @@ func TestLaneDataWriteFailureRetainsSentPrefix(t *testing.T) {
 
 func TestLaneDefaultWriteTimeout(t *testing.T) {
 	lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
-	if lane.writeTimeout != 3*time.Second {
-		t.Fatalf("write timeout = %v, want 3s", lane.writeTimeout)
+	if lane.writeTimeout != 10*time.Second {
+		t.Fatalf("write timeout = %v, want 10s", lane.writeTimeout)
 	}
 }
 

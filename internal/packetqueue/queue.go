@@ -225,6 +225,7 @@ type Queue[T any] struct {
 	notify  chan struct{}
 	done    chan struct{}
 	closed  bool
+	expires time.Time
 }
 
 // New returns an empty queue using the process wall clock for deadline decisions.
@@ -356,6 +357,9 @@ func (q *Queue[T]) pushLocked(item Item[T], now time.Time) error {
 	}
 	q.packets++
 	q.bytes += item.Size
+	if q.expires.IsZero() || item.Deadline.Before(q.expires) {
+		q.expires = item.Deadline
+	}
 	return nil
 }
 
@@ -377,6 +381,33 @@ func (q *Queue[T]) removeExpiredLocked(now time.Time) {
 	removedPackets += controlPackets
 	removedBytes += controlBytes
 	q.releaseLocked(removedPackets, removedBytes)
+	q.expires = time.Time{}
+	for _, deque := range []*deque[T]{&q.normal, &q.control} {
+		for _, item := range deque.items[deque.head:] {
+			if q.expires.IsZero() || item.Deadline.Before(q.expires) {
+				q.expires = item.Deadline
+			}
+		}
+	}
+}
+
+// NextDeadline returns a conservative wake-up deadline for queued expiry, or zero when the queue is empty. A consumed
+// item's deadline can remain until [Queue.Expire] recomputes the next deadline.
+func (q *Queue[T]) NextDeadline() time.Time {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.expires.IsZero() && !q.now().Before(q.expires) {
+		q.removeExpiredLocked(q.now())
+	}
+	return q.expires
+}
+
+// Expire releases all expired queued items and recomputes the next wake-up deadline. The queue owner drives this
+// operation with a one-shot timer so disconnected queues do not retain expired payloads or require idle polling.
+func (q *Queue[T]) Expire() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.removeExpiredLocked(q.now())
 }
 
 // evictNormalLocked evicts the oldest normal item and reports whether one existed.
@@ -501,6 +532,7 @@ func (q *Queue[T]) Close() {
 		q.releaseLocked(q.packets, q.bytes)
 		q.normal.clear()
 		q.control.clear()
+		q.expires = time.Time{}
 		close(q.done)
 	}
 }
@@ -525,6 +557,9 @@ func (q *Queue[T]) popPriorityLocked(priority Priority, destination *Item[T]) bo
 	if ok {
 		q.packets--
 		q.bytes -= destination.Size
+		if q.packets == 0 {
+			q.expires = time.Time{}
+		}
 	}
 	return ok
 }
@@ -536,6 +571,9 @@ func (q *Queue[T]) releaseLocked(packets, bytes int) {
 	}
 	q.packets -= packets
 	q.bytes -= bytes
+	if q.packets == 0 {
+		q.expires = time.Time{}
+	}
 	if q.budget != nil {
 		q.budget.Release(packets, bytes)
 	}

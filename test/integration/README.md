@@ -19,10 +19,15 @@ sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-results
 Use `GOARCH=amd64` for an x86-64 engine. Each run requires a fresh results directory. To reuse an equivalent tool image,
 set `WIREHOP_TEST_IMAGE`. It must provide `sh`, `ip`, `wg`, `tc`, `nstat`, `iperf3`, `openssl`, and `timeout`.
 
-The default matrix contains 29 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
-1.2-second RTT, 0.5% loss with delay and jitter, a four-second one-way outage, bidirectional TCP, an idle interval
-followed by a new burst, and 140-second TCP flows spanning an actual kernel WireGuard rekey. Each scenario uses fresh
-endpoints. The ordinary cases run for 20 seconds. Select a subset by passing case names:
+The default matrix contains 52 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
+1.2-second RTT, 0.5% loss with delay and jitter, four-second and twelve-second one-way outages, client address
+replacement, 32, 64, and 128 kbit/s carrier links, bidirectional TCP, an idle interval followed by a new burst, and
+140-second TCP flows spanning an actual kernel WireGuard rekey. Each scenario uses fresh endpoints. Ordinary cases run
+for 20 seconds. Twelve-second outage and address-replacement cases run for 40 seconds and require transfer progress
+after recovery. Address replacement changes the container's carrier-facing address, forcing recovery from an obsolete
+TCP connection. The rate-limited cases add 100 ms one-way delay, 20 ms jitter, and 0.2% loss with an eight-packet netem
+queue. They test continued connectivity at low capacity, not comparative mobile throughput or battery consumption.
+Select a subset by passing case names:
 
 ```sh
 sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-smoke tcp-latency tcp-loss tcp-stall
@@ -42,14 +47,14 @@ WireGuard. At least 95% of the offered bytes must arrive. Iperf3 still uses one 
 
 The verifier rejects incomplete transfers and zero-byte results. Ordinary single-lane cases also check the client's TCP
 active-open count to detect unexpected reconnect attempts. Server passive-open counts can include discarded child
-sockets during concurrent handshake processing and are retained only as supporting evidence. The outage case permits
-reconnection. The parallel-lane cases permit concurrent admission attempts but require both configured carriers before
-and after the flow, with no additional carrier connection attempts during the flow. Rekey cases require a later kernel
-handshake while the same iperf3 TCP flow remains active. Results preserve iperf3 JSON, kernel counters, socket receive
-limits, handshake timestamps, software versions, and WireHop diagnostics. Compare goodput, retransmissions, and
-`UdpRcvbufErrors` across repeated runs on the same engine. Kernel counters are namespace totals, so `TcpOutRsts` alone
-cannot identify an outer carrier reset. The tests use MTU 1420 and fixed public test keys exclusively inside the
-isolated network.
+sockets during concurrent handshake processing and are retained only as supporting evidence. Outage and address-change
+cases permit reconnection. The parallel-lane cases permit concurrent admission attempts but require both configured
+carriers before and after the flow, with no additional carrier connection attempts during the flow. Rekey cases require
+a later kernel handshake while the same iperf3 TCP flow remains active. Results preserve iperf3 JSON, kernel counters,
+socket receive limits, handshake timestamps, software versions, and WireHop diagnostics. Compare goodput,
+retransmissions, and `UdpRcvbufErrors` across repeated runs on the same engine. Kernel counters are namespace totals, so
+`TcpOutRsts` alone cannot identify an outer carrier reset. The tests use MTU 1420 and fixed public test keys exclusively
+inside the isolated network.
 
 These cases establish connectivity and recovery under the specified faults. Their endpoint-egress netem settings and
 short flows do not establish comparative WAN throughput or multipath capacity aggregation. For performance comparisons,
@@ -73,5 +78,5 @@ docker run --rm --network none --read-only --cap-add NET_ADMIN \
 ```
 
 The route test is skipped during ordinary `go test` runs. CI runs the socket recovery tests in isolation and selects
-thirteen representative kernel flow cases. The complete matrix remains available through `run.sh` without case
-arguments.
+seventeen representative kernel flow cases, including low-rate TCP/WSS, a twelve-second interruption, and address
+replacement. The complete matrix remains available through `run.sh` without case arguments.

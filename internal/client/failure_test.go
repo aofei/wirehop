@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -18,16 +19,17 @@ import (
 
 	"github.com/aofei/wirehop/internal/lanespec"
 	"github.com/aofei/wirehop/internal/laneurl"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/relay"
 )
 
 type notifyingClock struct {
-	called chan struct{}
+	calls atomic.Int32
 }
 
 func (c *notifyingClock) NowMicros() uint64 {
-	c.called <- struct{}{}
+	c.calls.Add(1)
 	return 1
 }
 
@@ -163,7 +165,7 @@ func TestClientSuperviseLaneReportsProlongedRetries(t *testing.T) {
 			t.Fatal(err)
 		}
 		output := make(retryLogWriter, 8)
-		instance := &Client{config: Config{
+		instance := &Client{config: Config{Clock: monotime.New(),
 			Logger: slog.New(slog.NewTextHandler(output, nil)),
 			Dialer: &net.Dialer{Control: func(string, string, syscall.RawConn) error {
 				return errors.New("simulated unavailable carrier")
@@ -186,7 +188,7 @@ func TestClientSuperviseLaneReportsProlongedRetries(t *testing.T) {
 		if len(output) != 1 {
 			t.Fatalf("prolonged lane retry messages = %d, want 1", len(output))
 		}
-		time.Sleep(60 * time.Second)
+		time.Sleep(time.Minute)
 		synctest.Wait()
 		if len(output) != 2 {
 			t.Fatalf("rate-limited lane retry messages = %d, want 2", len(output))
@@ -307,17 +309,16 @@ func TestReconnectAttemptAfterUptime(t *testing.T) {
 }
 
 func TestSuperviseLaneTimestampsAfterPreparation(t *testing.T) {
-	clock := &notifyingClock{called: make(chan struct{}, 1)}
+	clock := &notifyingClock{}
 	instance := &Client{config: Config{Clock: clock, Dialer: &net.Dialer{
 		ControlContext: func(context.Context, string, string, syscall.RawConn) error { return ErrLaneRejected },
 	}}}
 	err := instance.superviseLane(t.Context(), clientLane{
 		spec: testLaneSpec(t, "tcp://127.0.0.1:51820"), laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1},
 	}, creationResult{}, nil, nil, nil)
-	select {
-	case <-clock.called:
-		t.Fatal("join timestamp was observed before carrier preparation completed")
-	default:
+	// Resume detection samples once. Admission must not sample a timestamp before preparation completes.
+	if got := clock.calls.Load(); got != 1 {
+		t.Fatalf("clock reads before failed preparation = %d, want 1", got)
 	}
 	if !errors.Is(err, ErrLaneRejected) {
 		t.Fatalf("superviseLane() error = %v, want %v", err, ErrLaneRejected)
@@ -327,7 +328,7 @@ func TestSuperviseLaneTimestampsAfterPreparation(t *testing.T) {
 func TestSuperviseLanePreparationCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	instance := &Client{config: Config{Dialer: &net.Dialer{}}}
+	instance := &Client{config: Config{Clock: monotime.New(), Dialer: &net.Dialer{}}}
 	configured := clientLane{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}
 	result := make(chan error, 1)
 	go func() {
@@ -347,7 +348,7 @@ func TestClientRetryCandidate(t *testing.T) {
 	t.Run("TerminalRejection", func(t *testing.T) {
 		attempts := 0
 		instance := &Client{
-			config: Config{
+			config: Config{Clock: monotime.New(),
 				SessionAttemptTimeout: time.Second,
 				Dialer: &net.Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
 					attempts++
@@ -366,7 +367,7 @@ func TestClientRetryCandidate(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			attempts := 0
 			instance := &Client{
-				config: Config{
+				config: Config{Clock: monotime.New(),
 					SessionAttemptTimeout: time.Second,
 					Dialer: &net.Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
 						attempts++
@@ -403,7 +404,7 @@ func TestClientCreateCandidate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				instance := &Client{
-					config: Config{
+					config: Config{Clock: monotime.New(),
 						SessionAttemptTimeout: time.Second,
 						Dialer: &net.Dialer{ControlContext: func(ctx context.Context, _, _ string, _ syscall.RawConn) error {
 							<-ctx.Done()

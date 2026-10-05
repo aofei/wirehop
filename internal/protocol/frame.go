@@ -120,8 +120,9 @@ func ReadFrame(reader io.Reader) (Frame, error) {
 	return frameReader.Read(reader)
 }
 
-// Read reads one frame whose payload remains valid until the next Read or ReadBuffered call.
+// Read reads one frame whose payload remains valid until the next Read, ReadBuffered, or Reset call.
 func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
+	r.Reset()
 	if _, err := io.ReadFull(reader, r.header[:1]); err != nil {
 		return Frame{}, err
 	}
@@ -150,9 +151,6 @@ func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
 
 // readContent reads a validated frame body into reusable connection-local storage.
 func (r *FrameReader) readContent(reader io.Reader, typeID FrameType, length int) (Frame, error) {
-	if cap(r.content) > maximumRetainedFrameContentCapacity {
-		r.content = nil
-	}
 	if cap(r.content) < length {
 		r.content = make([]byte, length)
 	} else {
@@ -168,8 +166,9 @@ func (r *FrameReader) readContent(reader io.Reader, typeID FrameType, length int
 }
 
 // ReadBuffered reads one complete frame only when it is already buffered. Its payload remains valid until the next
-// Read or ReadBuffered call.
+// Read, ReadBuffered, or Reset call.
 func (r *FrameReader) ReadBuffered(reader *bufio.Reader) (Frame, bool, error) {
+	r.Reset()
 	if reader.Buffered() < 2 {
 		return Frame{}, false, nil
 	}
@@ -191,6 +190,15 @@ func (r *FrameReader) ReadBuffered(reader *bufio.Reader) (Frame, bool, error) {
 	reader.Discard(headerSize)
 	frame, err := r.readContent(reader, typeID, contentLength)
 	return frame, true, err
+}
+
+// Reset invalidates the previous payload and releases exceptional historical capacity while preserving ordinary buffers.
+func (r *FrameReader) Reset() {
+	if cap(r.content) > maximumRetainedFrameContentCapacity {
+		r.content = nil
+	} else {
+		r.content = r.content[:0]
+	}
 }
 
 // ParseFrameSequence validates one complete frame sequence and returns an allocation-free iterator whose frame payloads

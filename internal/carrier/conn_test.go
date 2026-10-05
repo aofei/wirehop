@@ -333,7 +333,13 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 			}
 			defer connection.CloseNow()
 			var frames [2]protocol.Frame
-			count, err := NewWebSocketConn(connection).ReadFrames(request.Context(), frames[:])
+			stream := NewWebSocketConn(connection)
+			count := 0
+			for count < len(frames) && err == nil {
+				var read int
+				read, err = stream.ReadFrames(request.Context(), frames[count:])
+				count += read
+			}
 			if err == nil && count != len(frames) {
 				err = errors.New("maximum message lost a frame")
 			}
@@ -421,7 +427,10 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 				return
 			}
 			defer connection.Close(websocket.StatusNormalClosure, "")
-			_, err = NewWebSocketConn(connection).ReadFrame(request.Context())
+			stream := NewWebSocketConn(connection)
+			for err == nil {
+				_, err = stream.ReadFrame(request.Context())
+			}
 			result <- err
 		}))
 		defer server.Close()
@@ -432,7 +441,12 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer connection.Close(websocket.StatusNormalClosure, "")
-		if err := connection.Write(ctx, websocket.MessageBinary, make([]byte, WebSocketReadLimit+1)); err != nil {
+		encoded, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameProbe, Payload: make([]byte, 1200)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := bytes.Repeat(encoded, WebSocketReadLimit/len(encoded)+1)
+		if err := connection.Write(ctx, websocket.MessageBinary, message); err != nil {
 			t.Fatal(err)
 		}
 		if err := <-result; !errors.Is(err, ErrInvalidWebSocketMessage) {
@@ -622,7 +636,10 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 					return
 				}
 				defer connection.CloseNow()
-				_, err = NewWebSocketConn(connection).ReadFrame(request.Context())
+				stream := NewWebSocketConn(connection)
+				for err == nil {
+					_, err = stream.ReadFrame(request.Context())
+				}
 				result <- err
 			}))
 			defer server.Close()
@@ -642,103 +659,6 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 				t.Fatalf("ReadFrame() error = %v, want %v", err, tt.want)
 			}
 		})
-	}
-}
-
-func TestWebSocketConnReleasesLargeReadBuffer(t *testing.T) {
-	large, err := protocol.MarshalFrame(protocol.Frame{
-		Type: protocol.FrameData, Payload: make([]byte, maximumRetainedBufferCapacity+1),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	small, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FramePing, Payload: []byte{1}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := make(chan error, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		connection, err := websocket.Accept(writer, request, nil)
-		if err == nil {
-			defer connection.CloseNow()
-			err = connection.Write(request.Context(), websocket.MessageBinary, large)
-		}
-		if err == nil {
-			err = connection.Write(request.Context(), websocket.MessageBinary, small)
-		}
-		result <- err
-	}))
-	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stream := NewWebSocketConn(connection)
-	defer stream.Close()
-	frame, err := stream.ReadFrame(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(frame.Payload) != maximumRetainedBufferCapacity+1 ||
-		stream.readBuffer.Cap() <= maximumRetainedBufferCapacity {
-		t.Fatalf("large frame payload length = %d, read buffer capacity = %d",
-			len(frame.Payload), stream.readBuffer.Cap())
-	}
-	frame, err = stream.ReadFrame(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(frame.Payload, []byte{1}) || stream.readBuffer.Cap() > maximumRetainedBufferCapacity {
-		t.Fatalf("small frame = %#v, read buffer capacity = %d", frame, stream.readBuffer.Cap())
-	}
-	if err := <-result; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestWebSocketConnReleasesLargeReadBufferBeforeReadFailure(t *testing.T) {
-	large, err := protocol.MarshalFrame(protocol.Frame{
-		Type: protocol.FrameData, Payload: make([]byte, maximumRetainedBufferCapacity+1),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := make(chan error, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		connection, err := websocket.Accept(writer, request, nil)
-		if err != nil {
-			result <- err
-			return
-		}
-		err = connection.Write(request.Context(), websocket.MessageBinary, large)
-		connection.CloseNow()
-		result <- err
-	}))
-	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stream := NewWebSocketConn(connection)
-	defer stream.Close()
-	if _, err := stream.ReadFrame(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if stream.readBuffer.Cap() <= maximumRetainedBufferCapacity {
-		t.Fatalf("large read buffer capacity = %d", stream.readBuffer.Cap())
-	}
-	if _, err := stream.ReadFrame(ctx); err == nil {
-		t.Fatal("ReadFrame() succeeded after peer close")
-	}
-	if stream.readBuffer.Cap() > maximumRetainedBufferCapacity {
-		t.Fatalf("read buffer capacity after failure = %d", stream.readBuffer.Cap())
-	}
-	if err := <-result; err != nil {
-		t.Fatal(err)
 	}
 }
 

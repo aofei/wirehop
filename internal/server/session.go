@@ -39,7 +39,8 @@ type laneHistory struct {
 
 // detachState identifies and owns one detached-session expiry interval.
 type detachState struct {
-	timer *time.Timer
+	timer   *time.Timer
+	expires time.Time
 }
 
 // serverSession owns one logical target endpoint and shared data plane across lane generations.
@@ -123,6 +124,11 @@ func (s *serverSession) reserveLane(laneID protocol.LaneID, generation uint64,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ctx.Err() != nil {
+		return ErrSessionClosed
+	}
+	if s.detach != nil && !monotime.Time(s.owner.config.Clock.NowMicros()).Before(s.detach.expires) {
+		s.cancel()
+		go s.close()
 		return ErrSessionClosed
 	}
 	history, known := s.history[laneID]
@@ -271,7 +277,7 @@ func (s *serverSession) startDetachTimerLocked() {
 	if len(s.lanes) != 0 || s.reservations != 0 || s.detach != nil || s.ctx.Err() != nil {
 		return
 	}
-	detach := new(detachState)
+	detach := &detachState{expires: monotime.Time(s.owner.config.Clock.NowMicros()).Add(s.owner.config.ReconnectGrace)}
 	s.detach = detach
 	detach.timer = time.AfterFunc(s.owner.config.ReconnectGrace, func() { s.expireDetached(detach) })
 }

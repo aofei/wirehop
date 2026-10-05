@@ -11,6 +11,7 @@ import (
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
@@ -66,9 +67,9 @@ const (
 	// maximumIdlePingInterval bounds timing-request backoff without real data writes.
 	maximumIdlePingInterval = 15 * time.Second
 	// defaultPingTimeout bounds idle black-hole detection without reacting to one delayed response.
-	defaultPingTimeout = 3 * time.Second
+	defaultPingTimeout = 10 * time.Second
 	// defaultCarrierWriteTimeout bounds one blocked stream or WebSocket write operation.
-	defaultCarrierWriteTimeout = 3 * time.Second
+	defaultCarrierWriteTimeout = 10 * time.Second
 	// defaultProbeInterval validates an otherwise idle lane and its feedback path.
 	defaultProbeInterval = 2 * time.Second
 	// maximumIdleProbeInterval bounds representative probe backoff without real data writes.
@@ -234,7 +235,7 @@ func (l *Lane) Run(ctx context.Context) error {
 		l.reportProtocolViolation(parent, err)
 	}
 	cancel()
-	if errors.Is(context.Cause(parent), ErrLaneAbandoned) {
+	if errors.Is(context.Cause(parent), ErrLaneAbandoned) || errors.Is(err, monotime.ErrResumed) {
 		if aborter, ok := l.carrier.(carrierAborter); ok {
 			aborter.Abort()
 		} else {
@@ -282,6 +283,7 @@ func (l *Lane) runPart(results chan<- error, run func() error) {
 
 // ping periodically queues one lane-local timing request.
 func (l *Lane) ping(ctx context.Context) error {
+	resume := monotime.NewResumeDetector(l.clock.NowMicros)
 	phase := lanePhase(l.laneID, l.generation, l.pingInterval/4)
 	nextPingAt := time.Now().Add(phase)
 	timer := time.NewTimer(phase)
@@ -300,6 +302,9 @@ func (l *Lane) ping(ctx context.Context) error {
 		}
 
 		now := time.Now()
+		if resume.Resumed() {
+			return monotime.ErrResumed
+		}
 		if currentDataWrites := l.dataWrites.Load(); currentDataWrites != observedDataWrites {
 			observedDataWrites = currentDataWrites
 			dataActive = true
@@ -678,13 +683,14 @@ func (l *Lane) read(ctx context.Context) error {
 	readContext := carrierContext
 	var cancelSync context.CancelFunc
 	if clockSyncPending {
-		readContext, cancelSync = context.WithTimeout(ctx, l.clockSyncTimeout)
+		// Run owns teardown on lane cancellation. Only this phase deadline may cancel the carrier read directly.
+		readContext, cancelSync = context.WithTimeout(carrierContext, l.clockSyncTimeout)
 		defer cancelSync()
 	}
 	var frames [datagram.MaximumBatchSize]protocol.Frame
 	for {
 		count, err := carrier.ReadFrames(readContext, l.carrier, frames[:])
-		if err != nil {
+		if err != nil && count == 0 {
 			return err
 		}
 		for index := 0; index < count; {
@@ -717,6 +723,9 @@ func (l *Lane) read(ctx context.Context) error {
 			index++
 		}
 		clear(frames[:count])
+		if err != nil {
+			return err
+		}
 	}
 }
 
@@ -774,8 +783,10 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 		if err != nil {
 			return err
 		}
-		l.receiver.UpdateClock(mapping.Inverse())
-		l.observer.ObserveTiming(l.laneID, l.generation, pong, receiveMicros)
+		if ClockMappingUsable(mapping) {
+			l.receiver.UpdateClock(mapping.Inverse())
+			l.observer.ObserveTiming(l.laneID, l.generation, pong, receiveMicros)
+		}
 		return nil
 	case protocol.FrameClockSync:
 		if !*clockSyncPending {
@@ -847,6 +858,9 @@ func (l *Lane) readClockSync(frame protocol.Frame) error {
 	if err != nil {
 		return err
 	}
+	if !ClockMappingUsable(mapping) {
+		return ErrStaleClockSample
+	}
 	l.receiver.UpdateClock(mapping)
 	return nil
 }
@@ -870,20 +884,53 @@ func (l *Lane) readPing(frame protocol.Frame) error {
 	return nil
 }
 
-// report periodically emits changed cumulative delivery progress.
+// report arms feedback deadlines only while unreported progress exists.
 func (l *Lane) report(ctx context.Context) error {
-	ticker := time.NewTicker(l.reportInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(l.reportInterval)
+	timer.Stop()
+	defer timer.Stop()
+	var ready <-chan time.Time
+	var due time.Time
 	for {
 		select {
-		case <-ticker.C:
+		case <-ready:
+			due = time.Time{}
 			l.queueDeliveryReport()
 		case <-l.progress.notify:
-			l.queueDeliveryReport()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+		now := time.Now()
+		delay, changed := l.progress.reportDelay(now, l.reportInterval)
+		if !changed {
+			timer.Stop()
+			ready = nil
+			due = time.Time{}
+			continue
+		}
+		next := now.Add(delay)
+		if due.IsZero() || next.Before(due) {
+			due = next
+			timer.Reset(max(0, due.Sub(now)))
+			ready = timer.C
+		}
 	}
+}
+
+// reportDelay describes the next feedback deadline without polling an idle progress accumulator.
+func (p *deliveryProgress) reportDelay(now time.Time, interval time.Duration) (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.revision == p.reported {
+		return 0, false
+	}
+	if p.pendingRevision != 0 {
+		return max(0, 4*interval-now.Sub(p.pendingAt)), true
+	}
+	if p.thresholdReachedLocked() {
+		return 0, true
+	}
+	return interval, true
 }
 
 // queueDeliveryReport claims and queues the newest cumulative delivery progress.
@@ -910,7 +957,7 @@ func (p *deliveryProgress) addData(bytes int) error {
 	p.dataBytes += uint64(bytes)
 	p.dataPackets++
 	p.revision++
-	p.notifyThresholdLocked()
+	p.notifyProgressLocked()
 	return nil
 }
 
@@ -924,6 +971,7 @@ func (p *deliveryProgress) addProbe(bytes int) error {
 	p.probeBytes += uint64(bytes)
 	p.probePackets++
 	p.revision++
+	p.notifyProgressLocked()
 	return nil
 }
 
@@ -956,16 +1004,13 @@ func (p *deliveryProgress) complete(report protocol.DeliveryReport, revision uin
 		p.pendingRevision = 0
 		p.pendingAt = time.Time{}
 	}
-	shouldNotify := sent && p.thresholdReachedLocked()
 	p.mu.Unlock()
-	if shouldNotify {
-		p.signal()
-	}
+	p.signal()
 }
 
-// notifyThresholdLocked signals when unreported data reaches either immediate-feedback threshold.
-func (p *deliveryProgress) notifyThresholdLocked() {
-	if p.pendingRevision == 0 && p.thresholdReachedLocked() {
+// notifyProgressLocked signals the first unreported change and either immediate-feedback data threshold.
+func (p *deliveryProgress) notifyProgressLocked() {
+	if p.pendingRevision == 0 && (p.revision-p.reported == 1 || p.thresholdReachedLocked()) {
 		p.signal()
 	}
 }

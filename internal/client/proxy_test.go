@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aofei/wirehop/internal/monotime"
 )
 
 func TestDialWebSocketProxyRejection(t *testing.T) {
@@ -54,7 +56,7 @@ func TestDialWebSocketProxyRejection(t *testing.T) {
 					if secure {
 						roots.AddCert(proxy.Certificate())
 					}
-					instance := &Client{config: Config{
+					instance := &Client{config: Config{Clock: monotime.New(),
 						Dialer: &net.Dialer{}, Proxy: http.ProxyURL(proxyURL), HandshakeTimeout: time.Second,
 						TLSConfig: &tls.Config{RootCAs: roots, ServerName: "relay.example"},
 					}}
@@ -64,7 +66,7 @@ func TestDialWebSocketProxyRejection(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer prepared.Close()
-					connection, _, _, cancel, err := instance.dialWebSocket(
+					connection, _, _, cancel, _, err := instance.dialWebSocket(
 						context.Background(), spec.URL(), make(http.Header), prepared, time.Second,
 					)
 					cancel()
