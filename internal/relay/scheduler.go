@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
@@ -52,12 +53,14 @@ type LaneRegistration struct {
 	Abandon               context.CancelFunc
 	SendControl           func(protocol.Frame, func()) bool
 	ValidateProbeProgress func(uint64, uint64) bool
+	// InitialTiming seeds RTT from usable admission timing known before registration.
+	InitialTiming *clockmap.Sample
 }
 
 // LaneObserver receives cumulative lane feedback parsed by any carrier reader.
 type LaneObserver interface {
 	ObserveDeliveryReport(context.Context, protocol.LaneGeneration, protocol.DeliveryReport, uint64) error
-	ObserveTiming(protocol.LaneID, uint64, protocol.TimingPong, uint64)
+	ObserveTiming(protocol.LaneID, uint64, clockmap.Sample)
 	ObserveLaneAbandon(context.Context, protocol.LaneGeneration) error
 	RouteDeliveryReport(protocol.DeliveryReport, func(bool)) bool
 }
@@ -89,7 +92,7 @@ type schedulerEvent struct {
 	laneID         protocol.LaneID
 	generation     uint64
 	report         protocol.DeliveryReport
-	pong           protocol.TimingPong
+	timing         clockmap.Sample
 	receiveMicros  uint64
 	reportComplete func(bool)
 	frame          protocol.Frame
@@ -217,11 +220,10 @@ func (s *Scheduler) ObserveDeliveryReport(ctx context.Context, source protocol.L
 }
 
 // ObserveTiming applies one lane RTT observation without blocking a carrier reader.
-func (s *Scheduler) ObserveTiming(laneID protocol.LaneID, generation uint64, pong protocol.TimingPong,
-	receiveMicros uint64) {
+func (s *Scheduler) ObserveTiming(laneID protocol.LaneID, generation uint64, sample clockmap.Sample) {
 	select {
 	case s.events <- schedulerEvent{
-		kind: schedulerTiming, laneID: laneID, generation: generation, pong: pong, receiveMicros: receiveMicros,
+		kind: schedulerTiming, laneID: laneID, generation: generation, timing: sample,
 	}:
 	default:
 	}
@@ -456,6 +458,9 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			registration: event.registration, rttMicros: defaultInitialRTTMicros,
 			deliveryRate: defaultInitialRateBytesPerSecond, lastProgressAt: now,
 		}
+		if event.registration.InitialTiming != nil {
+			replacement.applyTiming(*event.registration.InitialTiming)
+		}
 		lanes[event.registration.LaneID] = replacement
 		if current != nil {
 			current.registration.Abandon()
@@ -478,19 +483,22 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			event.result <- nil
 			return
 		}
-		if err := lane.applyReport(event.report, event.receiveMicros, now); err != nil {
+		progressed, err := lane.applyReport(event.report, event.receiveMicros, now)
+		if err != nil {
 			event.result <- err
 			return
 		}
-		lane.feedbackDelayMicros = 0
-		if source := lanes[event.laneID]; source != nil && source.registration.Generation == event.generation {
-			lane.feedbackDelayMicros = source.minimumRTTMicros / 2
+		if progressed {
+			lane.feedbackDelayMicros = 0
+			if source := lanes[event.laneID]; source != nil && source.registration.Generation == event.generation {
+				lane.feedbackDelayMicros = source.minimumRTTMicros / 2
+			}
 		}
 		event.result <- nil
 	case schedulerTiming:
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation {
-			lane.applyTiming(event.pong, event.receiveMicros)
+			lane.applyTiming(event.timing)
 		}
 	case schedulerRouteReport:
 		s.routeReport(lanes, event.report, event.reportComplete)
@@ -817,39 +825,40 @@ func (l *scheduledLane) enqueueTransmission(transmission retainedTransmission) b
 	return l.registration.Store.push(transmission) == nil
 }
 
-// applyReport releases the reported carrier prefix and updates delivery-rate estimates.
-func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicros uint64, receiveTime time.Time) error {
+// applyReport releases the reported carrier prefix and returns whether validated progress advanced.
+func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicros uint64,
+	receiveTime time.Time) (bool, error) {
 	if !l.registration.ValidateProbeProgress(report.ProbePackets, report.ProbeBytes) {
-		return ErrInvalidDeliveryReport
+		return false, ErrInvalidDeliveryReport
 	}
 	dataDirection, err := cumulativeDirection(
 		report.DataPackets, report.DataBytes, l.lastDataPackets, l.lastDataBytes,
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	probeDirection, err := cumulativeDirection(
 		report.ProbePackets, report.ProbeBytes, l.lastProbePackets, l.lastProbeBytes,
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if dataDirection < 0 || probeDirection < 0 {
 		if dataDirection > 0 || probeDirection > 0 {
-			return ErrInvalidDeliveryReport
+			return false, ErrInvalidDeliveryReport
 		}
-		return nil
+		return false, nil
 	}
 	if dataDirection == 0 && probeDirection == 0 {
-		return nil
+		return false, nil
 	}
 	deliveryConstrained := l.registration.Store.deliveryConstrained()
 	sample, stale, err := l.registration.Store.acknowledge(report.DataPackets, report.DataBytes, receiveMicros)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if stale {
-		return nil
+		return false, nil
 	}
 	l.updateDeliveryRate(sample, deliveryConstrained)
 	l.lastDataBytes = report.DataBytes
@@ -858,7 +867,7 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	l.lastProbePackets = report.ProbePackets
 	l.lastProgressAt = receiveTime
 	l.degraded = false
-	return nil
+	return true, nil
 }
 
 // updateDeliveryRate uses a send-bounded sample without reducing capacity from an application-limited sample.
@@ -873,12 +882,12 @@ func (l *scheduledLane) updateDeliveryRate(sample deliverySample, deliveryConstr
 }
 
 // applyTiming updates a bounded RTT exponential moving average.
-func (l *scheduledLane) applyTiming(pong protocol.TimingPong, receiveMicros uint64) {
-	if receiveMicros < pong.PingSendMicros || pong.SendMicros < pong.ReceiveMicros {
+func (l *scheduledLane) applyTiming(sample clockmap.Sample) {
+	if sample.LocalReceiveMicros < sample.LocalSendMicros || sample.RemoteSendMicros < sample.RemoteReceiveMicros {
 		return
 	}
-	roundTrip := receiveMicros - pong.PingSendMicros
-	processing := pong.SendMicros - pong.ReceiveMicros
+	roundTrip := sample.LocalReceiveMicros - sample.LocalSendMicros
+	processing := sample.RemoteSendMicros - sample.RemoteReceiveMicros
 	if processing < roundTrip {
 		roundTrip -= processing
 	} else {

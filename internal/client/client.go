@@ -803,6 +803,14 @@ func advanceGeneration(generation *uint64) error {
 func (c *Client) runLaneGeneration(ctx context.Context, configured clientLane, generation uint64,
 	accepted acceptedLane, receiver *relay.Receiver, scheduler *relay.Scheduler) error {
 	defer accepted.connection.Close()
+	syncFrame, err := protocol.ParseClockSync(accepted.initialFrame)
+	if err != nil {
+		return err
+	}
+	timing := clockmap.Sample{
+		LocalSendMicros: syncFrame.ClientSendMicros, RemoteReceiveMicros: syncFrame.ServerReceiveMicros,
+		RemoteSendMicros: syncFrame.ServerSendMicros, LocalReceiveMicros: syncFrame.ClientReceiveMicros,
+	}
 	store, err := relay.NewTransmissionStoreWithBudget(c.config.LaneLimits, c.retention, c.queue.Now)
 	if err != nil {
 		return err
@@ -820,7 +828,8 @@ func (c *Client) runLaneGeneration(ctx context.Context, configured clientLane, g
 	}
 	if err := scheduler.Register(ctx, relay.LaneRegistration{
 		LaneID: configured.laneID, Generation: generation, PathGroupID: configured.pathGroupID, Store: store,
-		Abandon: abandon, SendControl: lane.SendControl, ValidateProbeProgress: lane.ValidateProbeProgress,
+		InitialTiming: &timing,
+		Abandon:       abandon, SendControl: lane.SendControl, ValidateProbeProgress: lane.ValidateProbeProgress,
 	}); err != nil {
 		return err
 	}

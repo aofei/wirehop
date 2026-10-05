@@ -11,6 +11,20 @@ import (
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
 
+func BenchmarkDeliveryProgressAddData(b *testing.B) {
+	for _, packets := range []int{1, 16} {
+		b.Run(strconv.Itoa(packets), func(b *testing.B) {
+			progress := deliveryProgress{notify: make(chan struct{}, 1)}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := progress.addData(uint64(packets), uint64(packets)*1466); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkSaturatedIngress(b *testing.B) {
 	for _, packets := range []int{64, 1024, 16384} {
 		b.Run(strconv.Itoa(packets), func(b *testing.B) {

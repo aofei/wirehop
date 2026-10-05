@@ -733,7 +733,7 @@ func (l *Lane) read(ctx context.Context) error {
 func (l *Lane) readDataBatch(ctx context.Context, frames []protocol.Frame) error {
 	var data [datagram.MaximumBatchSize]protocol.Data
 	var deadlines [datagram.MaximumBatchSize]uint64
-	var sizes [datagram.MaximumBatchSize]int
+	var frameBytes uint64
 	for index, frame := range frames {
 		packet, err := protocol.ParseData(frame)
 		if err != nil {
@@ -742,21 +742,15 @@ func (l *Lane) readDataBatch(ctx context.Context, frames []protocol.Frame) error
 		if !wgpacket.Classify(packet.Payload).Accepted() {
 			return ErrInvalidWireGuardPacket
 		}
-		frameSize, err := protocol.DataFrameSize(packet)
-		if err != nil {
-			return err
-		}
 		data[index] = packet
 		deadlines[index] = packet.DeadlineMicros
-		sizes[index] = frameSize
+		frameBytes += uint64(protocol.FrameSize(len(frame.Payload)))
 	}
 	if err := l.receiver.ValidateDeadlines(deadlines[:len(frames)]); err != nil {
 		return err
 	}
-	for _, frameSize := range sizes[:len(frames)] {
-		if err := l.progress.addData(frameSize); err != nil {
-			return err
-		}
+	if err := l.progress.addData(uint64(len(frames)), frameBytes); err != nil {
+		return err
 	}
 	l.recordReceive()
 	return l.receiver.deliverBatch(ctx, data[:len(frames)])
@@ -776,16 +770,17 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 			return ErrUnexpectedPong
 		}
 		receiveMicros := l.clock.NowMicros()
-		mapping, err := clockmap.Estimate(clockmap.Sample{
+		sample := clockmap.Sample{
 			LocalSendMicros: pong.PingSendMicros, RemoteReceiveMicros: pong.ReceiveMicros,
 			RemoteSendMicros: pong.SendMicros, LocalReceiveMicros: receiveMicros,
-		})
+		}
+		mapping, err := clockmap.Estimate(sample)
 		if err != nil {
 			return err
 		}
 		if ClockMappingUsable(mapping) {
 			l.receiver.UpdateClock(mapping.Inverse())
-			l.observer.ObserveTiming(l.laneID, l.generation, pong, receiveMicros)
+			l.observer.ObserveTiming(l.laneID, l.generation, sample)
 		}
 		return nil
 	case protocol.FrameClockSync:
@@ -851,10 +846,11 @@ func (l *Lane) readClockSync(frame protocol.Frame) error {
 	if err != nil {
 		return err
 	}
-	mapping, err := clockmap.Estimate(clockmap.Sample{
+	sample := clockmap.Sample{
 		LocalSendMicros: syncFrame.ClientSendMicros, RemoteReceiveMicros: syncFrame.ServerReceiveMicros,
 		RemoteSendMicros: syncFrame.ServerSendMicros, LocalReceiveMicros: syncFrame.ClientReceiveMicros,
-	})
+	}
+	mapping, err := clockmap.Estimate(sample)
 	if err != nil {
 		return err
 	}
@@ -862,6 +858,7 @@ func (l *Lane) readClockSync(frame protocol.Frame) error {
 		return ErrStaleClockSample
 	}
 	l.receiver.UpdateClock(mapping)
+	l.observer.ObserveTiming(l.laneID, l.generation, sample)
 	return nil
 }
 
@@ -947,15 +944,15 @@ func (l *Lane) queueDeliveryReport() {
 	}
 }
 
-// addData records one parsed data frame in carrier order.
-func (p *deliveryProgress) addData(bytes int) error {
+// addData atomically records one validated batch of consecutive data frames in carrier order.
+func (p *deliveryProgress) addData(packets, bytes uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if uint64(bytes) > ^uint64(0)-p.dataBytes || p.dataPackets == ^uint64(0) || p.revision == ^uint64(0) {
+	if bytes > ^uint64(0)-p.dataBytes || packets > ^uint64(0)-p.dataPackets || p.revision == ^uint64(0) {
 		return ErrCounterExhausted
 	}
-	p.dataBytes += uint64(bytes)
-	p.dataPackets++
+	p.dataBytes += bytes
+	p.dataPackets += packets
 	p.revision++
 	p.notifyProgressLocked()
 	return nil

@@ -543,7 +543,7 @@ Each usable lane direction maintains these scheduling estimates:
 - Smoothed round trip time and the generation's minimum observed round trip time
 - Estimated delivery rate
 - Unsent and total retained encoded bytes
-- Return-delay estimate from the carrier that most recently supplied valid delivery feedback
+- Return-delay estimate from the carrier that most recently advanced validated cumulative delivery feedback
 
 The session clock mapping is shared by all lanes in that session. RTT, delivery rate, and retained backlog remain
 lane-local and direction-local. Preferred-lane state is also direction-local, so observations in one direction do not
@@ -575,8 +575,9 @@ retained byte as additional unsent work can overstate delay and cause unnecessar
 The feedback event records its incoming carrier identity and generation separately from the data generation named in the
 report. The return-delay correction uses that carrier's minimum observed RTT, keeping transient congestion out of the
 deducted propagation estimate. If the incoming generation is no longer registered or has no RTT observation, the
-correction is zero. Valid cumulative progress still releases its reported data in either case. New generations start
-with no minimum RTT or feedback-delay history.
+correction is zero. Valid cumulative progress still releases its reported data in either case. Duplicate and wholly
+stale reports preserve the correction, delivery-rate estimate, and progress timestamp. New generations start with no
+feedback-delay history and initialize their minimum RTT from usable admission timing when available.
 
 Deadline-risk assessment uses the complete retained prefix without deducting feedback delay. Packet expiry, cumulative
 report validation, aggregate retention accounting, and generation abandonment continue to govern retained ownership.
@@ -605,8 +606,12 @@ all lanes remain healthy.
 
 Each lane sends its first timing request within a stable phase spread over the first quarter of the active ping
 interval. Timing requests back off exponentially while no real data is written and return to the active interval when
-traffic resumes. The first valid RTT sample replaces the conservative startup estimate directly. Later RTT samples and
-accepted delivery-rate samples use a seven-to-one previous-to-new weighted average.
+traffic resumes. The client initializes RTT from the admission's four timestamps when registering the generation. The
+server submits the same sample after validating its initial ClockSync frame. This subtracts server processing time and
+requires no additional exchange. Runtime timing observations, including the server's admission sample, are nonblocking
+and may be skipped when the scheduler event queue is full. A generation without applied timing starts at 100 ms, and its
+first valid RTT sample replaces that estimate directly. Later RTT samples and accepted delivery-rate samples use a
+seven-to-one previous-to-new weighted average.
 
 Each session direction maintains one preferred lane for sparse traffic. The scheduler keeps that lane when it is
 healthy, can meet the current packet's deadline, and another lane's predicted advantage is no larger than the fixed 2 ms
@@ -1695,6 +1700,11 @@ prefix parsed from that generation's ordered carrier. Reported probe packets can
 generation's carrier writer, and their cumulative byte count must equal the packet count times that generation's fixed
 encoded Probe frame size. The sender's exposed-probe counter also never wraps. A batch that would overflow it ends the
 generation before any frame in that batch is written or any of its success callbacks run.
+
+A consecutive received Data batch is fully validated before its packet and encoded-byte totals enter the progress
+accumulator under one lock. Feedback can observe the previous prefix or the complete validated batch. A counter
+overflow rejects the complete batch without changing its counters or submitting its packets to UDP. This adds no batch
+collection wait and does not change the report thresholds or their timer.
 
 A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
 risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Its counters

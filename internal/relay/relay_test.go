@@ -61,7 +61,7 @@ func TestLaneReadControlDeliveryReportSource(t *testing.T) {
 	}
 }
 
-func (*testLaneObserver) ObserveTiming(protocol.LaneID, uint64, protocol.TimingPong, uint64) {}
+func (*testLaneObserver) ObserveTiming(protocol.LaneID, uint64, clockmap.Sample) {}
 
 func (*testLaneObserver) ObserveLaneAbandon(context.Context, protocol.LaneGeneration) error {
 	return nil
@@ -358,14 +358,14 @@ func TestLanePhase(t *testing.T) {
 
 func TestDeliveryProgressTracksCarrierOrder(t *testing.T) {
 	progress := deliveryProgress{}
-	if err := progress.addData(10); err != nil {
+	if err := progress.addData(1, 10); err != nil {
 		t.Fatal(err)
 	}
-	if err := progress.addData(20); err != nil {
+	if err := progress.addData(16, 20); err != nil {
 		t.Fatal(err)
 	}
 	report, revision, changed := progress.claim(protocol.LaneID{1}, 2, time.Now(), time.Second)
-	if report.DataBytes != 30 || report.DataPackets != 2 || revision != 2 || !changed {
+	if report.DataBytes != 30 || report.DataPackets != 17 || revision != 2 || !changed {
 		t.Fatalf("claim() = %+v, revision %d, changed %t", report, revision, changed)
 	}
 	progress.complete(report, revision, true)
@@ -376,7 +376,7 @@ func TestDeliveryProgressTracksCarrierOrder(t *testing.T) {
 
 func TestDeliveryProgressRetriesUnsentClaim(t *testing.T) {
 	progress := deliveryProgress{notify: make(chan struct{}, 1)}
-	if err := progress.addData(10); err != nil {
+	if err := progress.addData(1, 10); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
@@ -396,7 +396,7 @@ func TestDeliveryProgressRetriesUnsentClaim(t *testing.T) {
 		t.Fatal("failed completion did not publish a notification")
 	}
 	for range reportPacketThreshold {
-		if err := progress.addData(1); err != nil {
+		if err := progress.addData(1, 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -429,7 +429,7 @@ func TestDeliveryProgressThresholdNotification(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			progress := deliveryProgress{notify: make(chan struct{}, 1)}
 			for index := range test.packets {
-				if err := progress.addData(test.bytes); err != nil {
+				if err := progress.addData(1, uint64(test.bytes)); err != nil {
 					t.Fatal(err)
 				}
 				if index == 0 {
@@ -458,14 +458,40 @@ func TestDeliveryProgressThresholdNotification(t *testing.T) {
 }
 
 func TestDeliveryProgressRejectsCounterOverflow(t *testing.T) {
-	t.Run("DataBytes", func(t *testing.T) {
-		progress := deliveryProgress{dataBytes: ^uint64(0)}
-		if err := progress.addData(1); !errors.Is(err, ErrCounterExhausted) {
-			t.Fatalf("addData() error = %v, want %v", err, ErrCounterExhausted)
+	for _, test := range []struct {
+		name        string
+		dataBytes   uint64
+		dataPackets uint64
+		revision    uint64
+	}{
+		{name: "DataBytes", dataBytes: ^uint64(0) - 15},
+		{name: "DataPackets", dataPackets: ^uint64(0) - 15},
+		{name: "Revision", revision: ^uint64(0)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			progress := deliveryProgress{
+				dataBytes: test.dataBytes, dataPackets: test.dataPackets, revision: test.revision,
+				notify: make(chan struct{}, 1),
+			}
+			if err := progress.addData(16, 16); !errors.Is(err, ErrCounterExhausted) {
+				t.Fatalf("addData() error = %v, want %v", err, ErrCounterExhausted)
+			}
+			if progress.dataBytes != test.dataBytes || progress.dataPackets != test.dataPackets ||
+				progress.revision != test.revision || len(progress.notify) != 0 {
+				t.Fatal("rejected batch changed counters or published progress")
+			}
+		})
+	}
+
+	t.Run("ExactDataLimit", func(t *testing.T) {
+		progress := deliveryProgress{
+			dataBytes: ^uint64(0) - 16, dataPackets: ^uint64(0) - 16, revision: ^uint64(0) - 1,
 		}
-		if progress.dataPackets != 0 || progress.revision != 0 {
-			t.Fatalf("progress changed after rejected data: packets %d, revision %d",
-				progress.dataPackets, progress.revision)
+		if err := progress.addData(16, 16); err != nil {
+			t.Fatal(err)
+		}
+		if progress.dataBytes != ^uint64(0) || progress.dataPackets != ^uint64(0) || progress.revision != ^uint64(0) {
+			t.Fatal("last representable batch was not recorded exactly")
 		}
 	})
 
@@ -479,6 +505,290 @@ func TestDeliveryProgressRejectsCounterOverflow(t *testing.T) {
 				progress.probeBytes, progress.revision)
 		}
 	})
+}
+
+func TestLaneReadDataBatch(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		kind          string
+		largePacket   bool
+		widePacketID  bool
+		priorProgress bool
+		err           error
+	}{
+		{name: "ValidBatch"},
+		{name: "MaximumPacket", largePacket: true},
+		{name: "FullWidthPacketID", widePacketID: true},
+		{name: "MalformedLastFrame", kind: "frame", err: protocol.ErrInvalidDataFrame},
+		{name: "NoncanonicalLastID", kind: "integer", err: protocol.ErrInvalidDataFrame},
+		{name: "InvalidLastPacket", kind: "packet", err: ErrInvalidWireGuardPacket},
+		{name: "InvalidLastDeadline", kind: "deadline", err: ErrInvalidPacketDeadline},
+		{name: "CounterOverflow", kind: "counter", err: ErrCounterExhausted},
+		{name: "MalformedAfterReportedPrefix", kind: "frame", priorProgress: true, err: protocol.ErrInvalidDataFrame},
+		{name: "NoncanonicalAfterReportedPrefix", kind: "integer", priorProgress: true, err: protocol.ErrInvalidDataFrame},
+		{name: "InvalidPacketAfterReportedPrefix", kind: "packet", priorProgress: true, err: ErrInvalidWireGuardPacket},
+		{name: "InvalidDeadlineAfterReportedPrefix", kind: "deadline", priorProgress: true, err: ErrInvalidPacketDeadline},
+		{name: "CounterOverflowAfterReportedPrefix", kind: "counter", priorProgress: true, err: ErrCounterExhausted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := newTestEndpoint()
+			endpoint.writes = make(chan []byte, datagram.MaximumBatchSize)
+			lane := newTestLane(t, newTestCarrier(), endpoint)
+			if test.priorProgress {
+				prefix, err := protocol.MarshalData(protocol.Data{
+					PacketID: 1, DeadlineMicros: 1_000_000, Payload: relayWireGuardPacket(wgpacket.TransportData),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := lane.readDataBatch(t.Context(), []protocol.Frame{prefix}); err != nil {
+					t.Fatal(err)
+				}
+				report, revision, changed := lane.progress.claim(lane.laneID, lane.generation, time.Now(), time.Second)
+				if !changed || report.DataPackets != 1 {
+					t.Fatal("accepted prefix was not available for feedback")
+				}
+				lane.progress.complete(report, revision, true)
+				if len(endpoint.writes) != 1 || len(lane.progress.notify) != 1 {
+					t.Fatal("accepted prefix did not deliver data and notify the report worker")
+				}
+				<-endpoint.writes
+				<-lane.progress.notify
+			}
+			var frames [datagram.MaximumBatchSize]protocol.Frame
+			var bytes uint64
+			for index := range frames {
+				packet := protocol.Data{
+					PacketID: uint64(index + 1), DeadlineMicros: 1_000_000,
+					Payload: relayWireGuardPacket(wgpacket.TransportData),
+				}
+				if test.priorProgress {
+					packet.PacketID++
+				}
+				if test.largePacket {
+					packet.Payload = make([]byte, protocol.MaxPacketSize)
+					packet.Payload[0] = 4
+				}
+				if test.widePacketID {
+					packet.PacketID += 1 << 63
+				}
+				if index == len(frames)-1 {
+					switch test.kind {
+					case "packet":
+						packet.Payload = []byte{0}
+					case "deadline":
+						packet.DeadlineMicros = protocol.MaxPacketLifetimeMicros + 2_000_000
+					}
+				}
+				frame, err := protocol.MarshalData(packet)
+				if err != nil {
+					t.Fatal(err)
+				}
+				frames[index] = frame
+				encoded, err := protocol.MarshalDataFrame(packet)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bytes += uint64(len(encoded))
+			}
+			if test.kind == "frame" {
+				frames[len(frames)-1].Payload = nil
+			}
+			if test.kind == "integer" {
+				last := &frames[len(frames)-1]
+				last.Payload = append([]byte{0x90, 0}, last.Payload[1:]...)
+			}
+			if test.kind == "counter" {
+				lane.progress.dataPackets = ^uint64(0) - uint64(len(frames)) + 1
+			}
+			beforePackets := lane.progress.dataPackets
+			beforeBytes := lane.progress.dataBytes
+			beforeRevision := lane.progress.revision
+			err := lane.readDataBatch(t.Context(), frames[:])
+			if !errors.Is(err, test.err) {
+				t.Fatalf("readDataBatch() error = %v, want %v", err, test.err)
+			}
+			if test.err == nil {
+				if lane.progress.dataPackets != uint64(len(frames)) || lane.progress.dataBytes != bytes ||
+					lane.progress.revision != 1 || len(endpoint.writes) != len(frames) {
+					t.Fatal("validated batch did not record and deliver its exact prefix")
+				}
+			} else {
+				if lane.progress.dataPackets != beforePackets || lane.progress.dataBytes != beforeBytes ||
+					lane.progress.revision != beforeRevision || len(endpoint.writes) != 0 || len(lane.progress.notify) != 0 {
+					t.Fatal("invalid batch changed parse progress or delivered UDP data")
+				}
+				if test.priorProgress {
+					if _, changed := lane.progress.reportDelay(time.Now(), time.Second); changed {
+						t.Fatal("rejected batch made the completed prefix reportable again")
+					}
+					packet, err := protocol.ParseData(frames[0])
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := lane.receiver.Deliver(t.Context(), packet); err != nil {
+						t.Fatal(err)
+					}
+					if len(endpoint.writes) != 1 {
+						t.Fatal("rejected batch changed deduplication state")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		batchSize int
+		firstID   uint64
+	}{
+		{name: "SingleFrame", batchSize: 1, firstID: 1},
+		{name: "UnevenBatches", batchSize: 7, firstID: 120},
+		{name: "MaximumBatch", batchSize: datagram.MaximumBatchSize, firstID: 1 << 63},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const packetCount = 32
+			endpoint := newTestEndpoint()
+			endpoint.writes = make(chan []byte, datagram.MaximumBatchSize)
+			lane := newTestLane(t, newTestCarrier(), endpoint)
+			sender := schedulerLaneWithLimits(t, 1, 1, 1000, 1_000_000,
+				packetqueue.Limits{Packets: packetCount, Bytes: 1024 * 1024})
+			store := sender.registration.Store
+			now := time.UnixMicro(1000)
+			store.now = func() time.Time { return now }
+			t.Cleanup(func() { releaseTransmissions(store.drain()) })
+			var frames [packetCount]protocol.Frame
+			var encodedBytes [packetCount + 1]uint64
+			payloadSizes := [...]int{32, 123, 124, 16_379, 16_380, protocol.MaxPacketSize}
+			for index := range frames {
+				transmission := schedulerTransmission(test.firstID+uint64(index), wgpacket.TransportData, now.Add(time.Second))
+				transmission.data.DeadlineMicros = 1_000_000
+				transmission.data.Payload = make([]byte, payloadSizes[index%len(payloadSizes)])
+				transmission.data.Payload[0] = 4
+				transmission.data.Payload[4] = byte(index)
+				if err := store.push(transmission); err != nil {
+					t.Fatal(err)
+				}
+				packet := takeOneTransmission(t, store)
+				frame, err := protocol.MarshalData(packet)
+				if err != nil {
+					t.Fatal(err)
+				}
+				frames[index] = frame
+				encoded, err := protocol.MarshalDataFrame(packet)
+				if err != nil {
+					t.Fatal(err)
+				}
+				encodedBytes[index+1] = encodedBytes[index] + uint64(len(encoded))
+			}
+			for offset := 0; offset < len(frames); {
+				end := min(offset+test.batchSize, len(frames))
+				if err := lane.readDataBatch(t.Context(), frames[offset:end]); err != nil {
+					t.Fatal(err)
+				}
+				report, revision, changed := lane.progress.claim(lane.laneID, lane.generation, now, time.Second)
+				if !changed || report.DataPackets != uint64(end) || report.DataBytes != encodedBytes[end] {
+					t.Fatalf("received prefix report = %+v, changed %t", report, changed)
+				}
+				if progressed, err := sender.applyReport(report, uint64(now.UnixMicro()), now); err != nil || !progressed {
+					t.Fatalf("prefix acknowledgement = %t, %v", progressed, err)
+				}
+				if packets, bytes := store.backlog(); packets != packetCount-end ||
+					bytes != encodedBytes[packetCount]-encodedBytes[end] {
+					t.Fatalf("retained suffix = %d packets, %d bytes", packets, bytes)
+				}
+				lane.progress.complete(report, revision, true)
+				for index := offset; index < end; index++ {
+					if payload := <-endpoint.writes; payload[4] != byte(index) {
+						t.Fatalf("UDP delivery marker = %d, want %d", payload[4], index)
+					}
+				}
+				offset = end
+				now = now.Add(time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestLaneReadDataBatchDelivery(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		duplicate  bool
+		expired    bool
+		writeFails bool
+		canceled   bool
+		wantWrites int
+		err        error
+	}{
+		{name: "Delivered", wantWrites: 3},
+		{name: "Duplicate", duplicate: true, wantWrites: 2},
+		{name: "Expired", expired: true},
+		{name: "EndpointFailure", writeFails: true, err: ErrEndpointFailure},
+		{name: "CanceledDelivery", canceled: true, err: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := newTestEndpoint()
+			lane := newTestLane(t, newTestCarrier(), endpoint)
+			if test.writeFails {
+				lane.receiver.endpoint = &failOnceEndpoint{testEndpoint: endpoint}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if test.canceled {
+				lane.receiver.writeSlot <- struct{}{}
+				cancel()
+			}
+			var frames [3]protocol.Frame
+			var encodedBytes uint64
+			for index := range frames {
+				packet := protocol.Data{
+					PacketID: uint64(index + 1), DeadlineMicros: 1_000_000,
+					Payload: relayWireGuardPacket(wgpacket.TransportData),
+				}
+				if test.duplicate && index == 1 {
+					packet.PacketID = 1
+				}
+				if test.expired {
+					packet.DeadlineMicros = 999
+				}
+				frame, err := protocol.MarshalData(packet)
+				if err != nil {
+					t.Fatal(err)
+				}
+				frames[index] = frame
+				encoded, err := protocol.MarshalDataFrame(packet)
+				if err != nil {
+					t.Fatal(err)
+				}
+				encodedBytes += uint64(len(encoded))
+			}
+			if err := lane.readDataBatch(ctx, frames[:]); !errors.Is(err, test.err) {
+				t.Fatalf("readDataBatch() error = %v, want %v", err, test.err)
+			}
+			if lane.progress.dataPackets != uint64(len(frames)) || lane.progress.dataBytes != encodedBytes ||
+				lane.progress.revision != 1 || len(endpoint.writes) != test.wantWrites {
+				t.Fatal("UDP delivery outcome changed the fully parsed carrier prefix")
+			}
+			if test.canceled {
+				<-lane.receiver.writeSlot
+			}
+			if test.expired || test.writeFails || test.canceled {
+				packet, err := protocol.ParseData(frames[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				packet.DeadlineMicros = 1_000_000
+				if err := lane.receiver.Deliver(t.Context(), packet); err != nil {
+					t.Fatal(err)
+				}
+				if len(endpoint.writes) != test.wantWrites+1 {
+					t.Fatal("undelivered packet was committed to deduplication")
+				}
+			}
+		})
+	}
 }
 
 func TestLaneProbeNeeded(t *testing.T) {

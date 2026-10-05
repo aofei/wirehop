@@ -42,7 +42,7 @@ func TestLaneReport(t *testing.T) {
 			defer cancel()
 			result := make(chan error, 1)
 			go func() { result <- lane.report(ctx) }()
-			if err := lane.progress.addData(10); err != nil {
+			if err := lane.progress.addData(1, 10); err != nil {
 				t.Fatal(err)
 			}
 			synctest.Wait()
@@ -56,7 +56,7 @@ func TestLaneReport(t *testing.T) {
 			default:
 				t.Fatal("initial routing attempt was not made")
 			}
-			if err := lane.progress.addData(20); err != nil {
+			if err := lane.progress.addData(1, 20); err != nil {
 				t.Fatal(err)
 			}
 			synctest.Sleep(4*lane.reportInterval - time.Nanosecond)
@@ -126,7 +126,7 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 		}
 		synctest.Sleep(time.Second)
 		assertNoReport()
-		if err := lane.progress.addData(10); err != nil {
+		if err := lane.progress.addData(16, 160); err != nil {
 			t.Fatal(err)
 		}
 		assertNoReport()
@@ -134,7 +134,7 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 		assertNoReport()
 		synctest.Sleep(time.Nanosecond)
 		first := readReport()
-		if first.report.DataPackets != 1 || first.report.DataBytes != 10 {
+		if first.report.DataPackets != 16 || first.report.DataBytes != 160 {
 			t.Fatalf("sparse report = %+v", first.report)
 		}
 		// Changes arriving during a pending write remain coalesced until its retry interval.
@@ -152,14 +152,14 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 		// A late completion must not clear a newer pending claim.
 		first.complete(true)
 		assertNoReport()
-		if err := lane.progress.addData(20); err != nil {
+		if err := lane.progress.addData(1, 20); err != nil {
 			t.Fatal(err)
 		}
 		retry.complete(true)
 		assertNoReport()
 		synctest.Sleep(lane.reportInterval)
 		next := readReport()
-		if next.report.DataPackets != 2 || next.report.DataBytes != 30 {
+		if next.report.DataPackets != 17 || next.report.DataBytes != 180 {
 			t.Fatalf("progress after pending completion = %+v", next.report)
 		}
 		next.complete(true)
@@ -178,33 +178,33 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 		}
 		probe.complete(true)
 		assertNoReport()
-		for range reportPacketThreshold {
-			if err := lane.progress.addData(1); err != nil {
+		for range reportPacketThreshold / 16 {
+			if err := lane.progress.addData(16, 16); err != nil {
 				t.Fatal(err)
 			}
 		}
 		threshold := readReport()
-		if threshold.report.DataPackets != reportPacketThreshold+2 {
+		if threshold.report.DataPackets != reportPacketThreshold+17 {
 			t.Fatalf("immediate threshold report = %+v", threshold.report)
 		}
 		threshold.complete(true)
 		assertNoReport()
-		if err := lane.progress.addData(reportByteThreshold); err != nil {
+		if err := lane.progress.addData(16, reportByteThreshold); err != nil {
 			t.Fatal(err)
 		}
 		byteThreshold := readReport()
-		if byteThreshold.report.DataBytes != 30+reportPacketThreshold+reportByteThreshold {
+		if byteThreshold.report.DataBytes != 180+reportPacketThreshold+reportByteThreshold {
 			t.Fatalf("immediate byte threshold report = %+v", byteThreshold.report)
 		}
 		// A threshold reached during a pending write becomes immediate when that write completes.
-		if err := lane.progress.addData(reportByteThreshold); err != nil {
+		if err := lane.progress.addData(16, reportByteThreshold); err != nil {
 			t.Fatal(err)
 		}
 		assertNoReport()
 		byteThreshold.complete(true)
 		pendingThreshold := readReport()
-		if pendingThreshold.report.DataBytes != 30+reportPacketThreshold+2*reportByteThreshold ||
-			pendingThreshold.report.DataPackets != reportPacketThreshold+4 {
+		if pendingThreshold.report.DataBytes != 180+reportPacketThreshold+2*reportByteThreshold ||
+			pendingThreshold.report.DataPackets != reportPacketThreshold+49 {
 			t.Fatalf("threshold accumulated during a pending write = %+v", pendingThreshold.report)
 		}
 		pendingThreshold.complete(true)

@@ -370,7 +370,7 @@ func testLaneReportIdleAndRetry(t *testing.T) {
 		if observer.reports.Load() != 3 {
 			t.Fatalf("completed report continued retrying: %d", observer.reports.Load())
 		}
-		if err := lane.progress.addData(reportByteThreshold); err != nil {
+		if err := lane.progress.addData(1, reportByteThreshold); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()
@@ -386,47 +386,159 @@ func testLaneReportIdleAndRetry(t *testing.T) {
 
 type prefixErrorCarrier struct {
 	*testCarrier
-	frame protocol.Frame
+	frames []protocol.Frame
 }
 
 func (c *prefixErrorCarrier) ReadFrames(_ context.Context, frames []protocol.Frame) (int, error) {
-	frames[0] = c.frame
-	return 1, io.ErrUnexpectedEOF
+	return copy(frames, c.frames), io.ErrUnexpectedEOF
 }
 
 func TestLaneReadValidPrefixBeforeError(t *testing.T) {
-	connection := &prefixErrorCarrier{testCarrier: newTestCarrier()}
-	endpoint := newTestEndpoint()
-	lane := newTestLane(t, connection.testCarrier, endpoint)
-	lane.carrier = connection
-	payload := relayWireGuardPacket(wgpacket.TransportData)
-	frame, err := protocol.MarshalData(protocol.Data{
-		PacketID: 1, DeadlineMicros: lane.clock.NowMicros() + 1_000_000, Payload: payload,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	connection.frame = frame
-	if err := lane.read(t.Context()); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("trailing carrier error = %v", err)
-	}
-	select {
-	case received := <-endpoint.writes:
-		if len(received) != len(payload) {
-			t.Fatalf("valid prefix payload length = %d, want %d", len(received), len(payload))
-		}
-	default:
-		t.Fatal("carrier error discarded a complete valid data frame")
+	for _, test := range []struct {
+		name        string
+		dataPackets int
+		probe       bool
+		clockSync   bool
+		invalidTail bool
+		err         error
+	}{
+		{name: "Scalar", dataPackets: 1, err: io.ErrUnexpectedEOF},
+		{name: "MaximumBatch", dataPackets: datagram.MaximumBatchSize, err: io.ErrUnexpectedEOF},
+		{name: "InterleavedProbe", dataPackets: 15, probe: true, err: io.ErrUnexpectedEOF},
+		{name: "InitialClockSync", dataPackets: 15, clockSync: true, err: io.ErrUnexpectedEOF},
+		{name: "InvalidControlTail", dataPackets: 15, invalidTail: true, err: protocol.ErrInvalidControlFrame},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connection := &prefixErrorCarrier{testCarrier: newTestCarrier()}
+			endpoint := newTestEndpoint()
+			endpoint.writes = make(chan []byte, datagram.MaximumBatchSize)
+			lane := newTestLane(t, connection.testCarrier, endpoint)
+			lane.carrier = connection
+			observer := &timingSampleObserver{testLaneObserver: &testLaneObserver{}}
+			lane.observer = observer
+			confirmed := false
+			if test.clockSync {
+				lane.clockSyncTimeout = time.Second
+				lane.clockSynced = func() { confirmed = true }
+				frame, err := protocol.MarshalClockSync(protocol.ClockSync{
+					ClientSendMicros: 1, ServerReceiveMicros: 2, ServerSendMicros: 2, ClientReceiveMicros: 3,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				connection.frames = append(connection.frames, frame)
+			}
+			var dataBytes uint64
+			for index := 0; index < test.dataPackets; index++ {
+				payload := relayWireGuardPacket(wgpacket.TransportData)
+				payload[4] = byte(index)
+				frame, err := protocol.MarshalData(protocol.Data{
+					PacketID: uint64(index + 1), DeadlineMicros: lane.clock.NowMicros() + 1_000_000, Payload: payload,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				connection.frames = append(connection.frames, frame)
+				encoded, err := protocol.MarshalFrame(frame)
+				if err != nil {
+					t.Fatal(err)
+				}
+				dataBytes += uint64(len(encoded))
+				if test.probe && index == 6 {
+					probe, err := protocol.MarshalProbe(protocol.Probe{Payload: make([]byte, 32)})
+					if err != nil {
+						t.Fatal(err)
+					}
+					connection.frames = append(connection.frames, probe)
+				}
+			}
+			if test.invalidTail {
+				connection.frames = append(connection.frames, protocol.Frame{Type: protocol.FramePong})
+			}
+			if err := lane.read(t.Context()); !errors.Is(err, test.err) {
+				t.Fatalf("read() error = %v, want %v", err, test.err)
+			}
+			if lane.progress.dataPackets != uint64(test.dataPackets) || lane.progress.dataBytes != dataBytes ||
+				len(endpoint.writes) != test.dataPackets {
+				t.Fatal("trailing carrier or control error discarded a complete valid prefix")
+			}
+			if test.probe && (lane.progress.probePackets != 1 || lane.progress.probeBytes != 34) {
+				t.Fatal("interleaved probe was omitted or counted as data")
+			}
+			if test.clockSync && (!confirmed || observer.samples != 1) {
+				t.Fatal("initial clock synchronization did not confirm and observe the generation")
+			}
+			for index := 0; index < test.dataPackets; index++ {
+				if payload := <-endpoint.writes; payload[4] != byte(index) {
+					t.Fatalf("UDP delivery marker = %d, want %d", payload[4], index)
+				}
+			}
+		})
 	}
 }
 
 type timingSampleObserver struct {
 	*testLaneObserver
 	samples int
+	sample  clockmap.Sample
 }
 
-func (o *timingSampleObserver) ObserveTiming(protocol.LaneID, uint64, protocol.TimingPong, uint64) {
+func (o *timingSampleObserver) ObserveTiming(_ protocol.LaneID, _ uint64, sample clockmap.Sample) {
 	o.samples++
+	o.sample = sample
+}
+
+func TestLaneReadClockSync(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		sync      protocol.ClockSync
+		malformed bool
+		err       error
+	}{
+		{name: "AdmissionSample", sync: protocol.ClockSync{
+			ClientSendMicros: 1000, ServerReceiveMicros: 9000, ServerSendMicros: 11_000, ClientReceiveMicros: 7000,
+		}},
+		{name: "MalformedSample", malformed: true, err: protocol.ErrInvalidControlFrame},
+		{name: "MaximumUncertainty", sync: protocol.ClockSync{
+			ClientReceiveMicros: 2 * uint64(maximumClockUncertainty/time.Microsecond),
+		}},
+		{name: "TimestampOverflow", sync: protocol.ClockSync{
+			ClientSendMicros: 1 << 63, ClientReceiveMicros: 1 << 63,
+		}, err: clockmap.ErrTimestampOverflow},
+		{name: "StaleSample", sync: protocol.ClockSync{
+			ClientReceiveMicros: 2*uint64(maximumClockUncertainty/time.Microsecond) + 1,
+		}, err: ErrStaleClockSample},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
+			observer := &timingSampleObserver{testLaneObserver: &testLaneObserver{}}
+			lane.observer = observer
+			frame, err := protocol.MarshalClockSync(test.sync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.malformed {
+				frame.Payload = nil
+			}
+			err = lane.readClockSync(frame)
+			if !errors.Is(err, test.err) {
+				t.Fatalf("readClockSync() error = %v, want %v", err, test.err)
+			}
+			if test.err != nil {
+				if observer.samples != 0 {
+					t.Fatal("rejected admission timing reached the scheduler")
+				}
+				return
+			}
+			want := clockmap.Sample{
+				LocalSendMicros: test.sync.ClientSendMicros, RemoteReceiveMicros: test.sync.ServerReceiveMicros,
+				RemoteSendMicros: test.sync.ServerSendMicros, LocalReceiveMicros: test.sync.ClientReceiveMicros,
+			}
+			if observer.samples != 1 || observer.sample != want {
+				t.Fatalf("observed admission timing = %+v, want %+v", observer.sample, want)
+			}
+		})
+	}
 }
 
 func TestLaneReadControlPongUncertainty(t *testing.T) {
