@@ -110,7 +110,7 @@ func BenchmarkWebSocketConnReadFrames(b *testing.B) {
 					for range frameCount {
 						var err error
 						message, err = protocol.AppendFrame(message, protocol.Frame{
-							Type: protocol.FrameProbe, Payload: make([]byte, 1420),
+							Type: protocol.FrameDeliveryReport, Payload: make([]byte, 1420),
 						})
 						if err != nil {
 							b.Fatal(err)

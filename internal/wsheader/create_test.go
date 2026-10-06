@@ -13,8 +13,8 @@ import (
 
 func TestCreateRoundTrip(t *testing.T) {
 	request := Create{
-		Token: "secret-token", Target: target.MustParse("wg.example.com:51820"), LaneID: protocol.LaneID{1},
-		Generation: 2, PathGroupID: protocol.PathGroupID{3}, Nonce: protocol.Nonce{4}, UnixSeconds: 5,
+		Token: "secret-token", Target: target.MustParse("wg.example.com:51820"), LaneID: protocol.LaneID(1),
+		Generation: 2, PathGroupID: protocol.PathGroupID(3), Nonce: protocol.Nonce{4}, UnixSeconds: 5,
 		MonotonicMicros: 6,
 	}
 	headers, err := Headers(request)
@@ -33,8 +33,8 @@ func TestCreateRoundTrip(t *testing.T) {
 
 func TestCreateErrors(t *testing.T) {
 	valid := Create{
-		Token: "token", Target: target.MustParse("wg.example.com:51820"), LaneID: protocol.LaneID{1},
-		Generation: 1, PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{1}, UnixSeconds: 1,
+		Token: "token", Target: target.MustParse("wg.example.com:51820"), LaneID: protocol.LaneID(1),
+		Generation: 1, PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: 1,
 	}
 	for _, mutate := range []func(*Create){
 		func(value *Create) { value.Token = "" },
@@ -42,9 +42,9 @@ func TestCreateErrors(t *testing.T) {
 		func(value *Create) { value.Token = "token value" },
 		func(value *Create) { value.Token = "token=bad" },
 		func(value *Create) { value.Target = target.Endpoint{} },
-		func(value *Create) { value.LaneID = protocol.LaneID{} },
+		func(value *Create) { value.LaneID = protocol.LaneID(0) },
 		func(value *Create) { value.Generation = 0 },
-		func(value *Create) { value.PathGroupID = protocol.PathGroupID{} },
+		func(value *Create) { value.PathGroupID = protocol.PathGroupID(0) },
 		func(value *Create) { value.Nonce = protocol.Nonce{} },
 		func(value *Create) { value.UnixSeconds = 0 },
 	} {

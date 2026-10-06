@@ -210,7 +210,8 @@ func (s *serverSession) runLane(connection carrier.Conn, laneID protocol.LaneID,
 	}
 	if err := s.scheduler.Register(s.ctx, relay.LaneRegistration{
 		LaneID: laneID, Generation: generation, PathGroupID: pathGroupID, Store: store,
-		Abandon: abandon, SendControl: lane.SendControl, ValidateProbeProgress: lane.ValidateProbeProgress,
+		Abandon: abandon, SendControl: lane.SendControl,
+		ValidatePingProgress: lane.ValidatePingProgress, SendDeliveryReport: lane.SendDeliveryReport,
 	}); err != nil {
 		cancelLane(context.Canceled)
 		return err

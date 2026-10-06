@@ -92,7 +92,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 		t.Fatal(err)
 	}
 	transmission.data.Payload = packet.Payload
-	transmission.packet = newPacket(packet, transmission.data.DeadlineMicros)
+	transmission.packet = packet
 	wantPayload := string(transmission.data.Payload)
 	if err := store.push(transmission); err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 	}
 	defer ownership[0].Release()
 	if acknowledge {
-		if _, _, err := store.acknowledge(store.sentPackets, store.sentBytes, uint64(store.now().UnixMicro())); err != nil {
+		if _, _, err := store.acknowledge(store.sentPackets, uint64(store.now().UnixMicro())); err != nil {
 			t.Fatal(err)
 		}
 	} else {
@@ -150,7 +150,7 @@ func TestTransmissionStoreAggregateBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseBatchOwnership(ownership[:count])
-	if _, _, err := first.acknowledge(1, uint64(first.sentBytes), uint64(first.now().UnixMicro())); err != nil {
+	if _, _, err := first.acknowledge(1, uint64(first.now().UnixMicro())); err != nil {
 		t.Fatal(err)
 	}
 	if err := second.push(transmission); err != nil {
@@ -226,7 +226,7 @@ func TestTransmissionStoreCarrierOrderAndAcknowledgement(t *testing.T) {
 		t.Fatalf("retained backlog = %d packets, %d bytes", packets, bytes)
 	}
 
-	if _, _, err := store.acknowledge(2, uint64(control.size+normalFirst.size+1), uint64(store.now().UnixMicro())); !errors.Is(
+	if _, _, err := store.acknowledge(4, uint64(store.now().UnixMicro())); !errors.Is(
 		err, ErrInvalidDeliveryReport,
 	) {
 		t.Fatalf("mismatched acknowledgement error = %v, want %v", err, ErrInvalidDeliveryReport)
@@ -234,26 +234,17 @@ func TestTransmissionStoreCarrierOrderAndAcknowledgement(t *testing.T) {
 	if packets, _ := store.backlog(); packets != 3 {
 		t.Fatalf("invalid acknowledgement released backlog, packets = %d", packets)
 	}
-	_, stale, err := store.acknowledge(2, uint64(control.size+normalFirst.size), uint64(store.now().UnixMicro()))
+	_, stale, err := store.acknowledge(2, uint64(store.now().UnixMicro()))
 	if err != nil || stale {
 		t.Fatalf("acknowledge() = stale %t, error %v", stale, err)
 	}
 	if packets, bytes := store.backlog(); packets != 1 || bytes != uint64(normalSecond.size) {
 		t.Fatalf("remaining backlog = %d packets, %d bytes", packets, bytes)
 	}
-	if _, stale, err := store.acknowledge(1, uint64(control.size), uint64(store.now().UnixMicro())); err != nil || !stale {
+	if _, stale, err := store.acknowledge(1, uint64(store.now().UnixMicro())); err != nil || !stale {
 		t.Fatalf("stale acknowledge = %t, %v", stale, err)
 	}
-	if _, _, err := store.acknowledge(1, uint64(control.size+normalFirst.size), uint64(store.now().UnixMicro())); !errors.Is(
-		err, ErrInvalidDeliveryReport,
-	) {
-		t.Fatalf("partially changed acknowledgement error = %v, want %v", err, ErrInvalidDeliveryReport)
-	}
-	if _, _, err := store.acknowledge(1, uint64(control.size+normalFirst.size+normalSecond.size), uint64(store.now().UnixMicro())); !errors.Is(
-		err, ErrInvalidDeliveryReport,
-	) {
-		t.Fatalf("mixed acknowledgement error = %v, want %v", err, ErrInvalidDeliveryReport)
-	}
+
 }
 
 func TestTransmissionStoreCapacityIncludesSentPrefix(t *testing.T) {
@@ -271,7 +262,7 @@ func TestTransmissionStoreCapacityIncludesSentPrefix(t *testing.T) {
 	)); !errors.Is(err, packetqueue.ErrFull) {
 		t.Fatalf("push() error = %v, want %v", err, packetqueue.ErrFull)
 	}
-	if _, _, err := store.acknowledge(1, uint64(transmission.size), uint64(store.now().UnixMicro())); err != nil {
+	if _, _, err := store.acknowledge(1, uint64(store.now().UnixMicro())); err != nil {
 		t.Fatal(err)
 	}
 	if !store.canAccept(uint64(transmission.size)) {
@@ -486,11 +477,11 @@ func TestTransmissionStoreDeliveryConstrained(t *testing.T) {
 	if err := store.push(first); err != nil {
 		t.Fatal(err)
 	}
-	if !store.deliveryConstrained() {
+	if !store.deliveryConstrained(uint64(store.limits.Bytes)) {
 		t.Fatal("queued work did not constrain delivery")
 	}
 	takeOneTransmission(t, store)
-	if store.deliveryConstrained() {
+	if store.deliveryConstrained(uint64(store.limits.Bytes)) {
 		t.Fatal("small sent prefix constrained an application-limited sample")
 	}
 	second := schedulerTransmission(2, wgpacket.TransportData, time.Now().Add(time.Second))
@@ -498,7 +489,7 @@ func TestTransmissionStoreDeliveryConstrained(t *testing.T) {
 		t.Fatal(err)
 	}
 	takeOneTransmission(t, store)
-	if !store.deliveryConstrained() {
+	if !store.deliveryConstrained(uint64(store.limits.Bytes)) {
 		t.Fatal("half-full retained window did not constrain delivery")
 	}
 }
@@ -706,12 +697,12 @@ func testTransmissionStoreStateMachine(t *testing.T, budget *retention.Budget) {
 			if store.sent.len() > 0 {
 				count = next() % (uint64(store.sent.len()) + 1)
 			}
-			size, ok := store.sent.prefixSize(count)
+			_, ok := store.sent.prefixSize(count)
 			if !ok {
 				t.Fatal("valid sent prefix was rejected")
 			}
 			if _, stale, err := store.acknowledge(
-				store.reportedPackets+count, store.reportedBytes+size, uint64(store.now().UnixMicro())); err != nil || stale {
+				store.reportedPackets+count, uint64(store.now().UnixMicro())); err != nil || stale {
 				t.Fatalf("acknowledge() = stale %t, error %v", stale, err)
 			}
 		case 4:
@@ -719,13 +710,13 @@ func testTransmissionStoreStateMachine(t *testing.T, budget *retention.Budget) {
 			store.assessDeadlines(now, func(uint64) uint64 { return 0 })
 		case 5:
 			if store.reportedPackets > 0 {
-				if _, stale, err := store.acknowledge(0, 0, uint64(store.now().UnixMicro())); err != nil || !stale {
+				if _, stale, err := store.acknowledge(0, uint64(store.now().UnixMicro())); err != nil || !stale {
 					t.Fatalf("stale acknowledge() = stale %t, error %v", stale, err)
 				}
 			}
 		case 6:
 			if _, _, err := store.acknowledge(
-				store.reportedPackets, store.reportedBytes+1, uint64(store.now().UnixMicro())); !errors.Is(err, ErrInvalidDeliveryReport) {
+				store.sentPackets+1, uint64(store.now().UnixMicro())); !errors.Is(err, ErrInvalidDeliveryReport) {
 				t.Fatalf("partial acknowledge() error = %v, want %v", err, ErrInvalidDeliveryReport)
 			}
 		}

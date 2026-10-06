@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 )
 
 const (
@@ -11,10 +12,6 @@ const (
 	SessionIDSize = 16
 	// SessionSecretSize is the encoded size of an ephemeral session secret.
 	SessionSecretSize = 32
-	// LaneIDSize is the encoded size of a stable lane identifier.
-	LaneIDSize = 16
-	// PathGroupIDSize is the encoded size of a session-scoped path group identifier.
-	PathGroupIDSize = 16
 	// NonceSize is the encoded size of a handshake nonce.
 	NonceSize = 12
 )
@@ -26,10 +23,10 @@ type SessionID [SessionIDSize]byte
 type SessionSecret [SessionSecretSize]byte
 
 // LaneID identifies one stable lane across connection generations.
-type LaneID [LaneIDSize]byte
+type LaneID uint64
 
 // PathGroupID identifies one session-scoped scheduling path group.
-type PathGroupID [PathGroupIDSize]byte
+type PathGroupID uint64
 
 // Nonce prevents replay of one authenticated handshake.
 type Nonce [NonceSize]byte
@@ -48,20 +45,6 @@ func NewSessionSecret() SessionSecret {
 	return secret
 }
 
-// NewLaneID returns a cryptographically random stable lane identifier.
-func NewLaneID() LaneID {
-	var id LaneID
-	fillRandom(id[:])
-	return id
-}
-
-// NewPathGroupID returns a cryptographically random path group identifier.
-func NewPathGroupID() PathGroupID {
-	var id PathGroupID
-	fillRandom(id[:])
-	return id
-}
-
 // NewNonce returns a cryptographically random handshake nonce.
 func NewNonce() Nonce {
 	var nonce Nonce
@@ -74,14 +57,14 @@ func (id SessionID) String() string {
 	return hex.EncodeToString(id[:])
 }
 
-// String returns the lowercase hexadecimal lane identifier.
+// String returns the canonical decimal lane identifier.
 func (id LaneID) String() string {
-	return hex.EncodeToString(id[:])
+	return strconv.FormatUint(uint64(id), 10)
 }
 
-// String returns the lowercase hexadecimal path group identifier.
+// String returns the canonical decimal path group identifier.
 func (id PathGroupID) String() string {
-	return hex.EncodeToString(id[:])
+	return strconv.FormatUint(uint64(id), 10)
 }
 
 // String returns the lowercase hexadecimal handshake nonce.
@@ -96,12 +79,12 @@ func (id SessionID) IsZero() bool {
 
 // IsZero reports whether the lane identifier is unset.
 func (id LaneID) IsZero() bool {
-	return id == LaneID{}
+	return id == 0
 }
 
 // IsZero reports whether the path group identifier is unset.
 func (id PathGroupID) IsZero() bool {
-	return id == PathGroupID{}
+	return id == 0
 }
 
 // ParseSessionID parses a lowercase or uppercase hexadecimal session identifier.
@@ -113,22 +96,22 @@ func ParseSessionID(value string) (SessionID, error) {
 	return id, nil
 }
 
-// ParseLaneID parses a lowercase or uppercase hexadecimal lane identifier.
+// ParseLaneID parses a nonzero canonical decimal lane identifier.
 func ParseLaneID(value string) (LaneID, error) {
-	var id LaneID
-	if err := decodeHex(value, id[:]); err != nil {
-		return LaneID{}, fmt.Errorf("parse lane ID: %w", err)
+	id, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || id == 0 || strconv.FormatUint(id, 10) != value {
+		return 0, fmt.Errorf("invalid lane ID %q", value)
 	}
-	return id, nil
+	return LaneID(id), nil
 }
 
-// ParsePathGroupID parses a lowercase or uppercase hexadecimal path group identifier.
+// ParsePathGroupID parses a nonzero canonical decimal path group identifier.
 func ParsePathGroupID(value string) (PathGroupID, error) {
-	var id PathGroupID
-	if err := decodeHex(value, id[:]); err != nil {
-		return PathGroupID{}, fmt.Errorf("parse path group ID: %w", err)
+	id, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || id == 0 || strconv.FormatUint(id, 10) != value {
+		return 0, fmt.Errorf("invalid path group ID %q", value)
 	}
-	return id, nil
+	return PathGroupID(id), nil
 }
 
 // ParseNonce parses a lowercase or uppercase hexadecimal handshake nonce.

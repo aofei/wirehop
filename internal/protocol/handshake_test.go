@@ -2,11 +2,14 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/aofei/wirehop/internal/target"
 )
@@ -41,7 +44,7 @@ func TestClientHello(t *testing.T) {
 			if want := clientHelloMinimumSize + len(hello.Target.String()); len(encoded) != want {
 				t.Fatalf("MarshalClientHello() length = %d, want %d", len(encoded), want)
 			}
-			if hello.Target == maximumTarget && len(encoded) != MaxClientHelloSize {
+			if hello.Target == maximumTarget && len(encoded) > MaxClientHelloSize {
 				t.Fatalf("maximum MarshalClientHello() length = %d, want %d", len(encoded), MaxClientHelloSize)
 			}
 			got, err := ParseClientHello(encoded)
@@ -74,9 +77,9 @@ func TestClientHelloErrors(t *testing.T) {
 		{name: "UnknownMode", edit: func(hello *ClientHello) { hello.Mode = 255 }, want: ErrInvalidClientHello},
 		{name: "ZeroTimestamp", edit: func(hello *ClientHello) { hello.UnixSeconds = 0 }, want: ErrInvalidClientHello},
 		{name: "ZeroNonce", edit: func(hello *ClientHello) { hello.Nonce = Nonce{} }, want: ErrInvalidClientHello},
-		{name: "ZeroLane", edit: func(hello *ClientHello) { hello.LaneID = LaneID{} }, want: ErrInvalidClientHello},
+		{name: "ZeroLane", edit: func(hello *ClientHello) { hello.LaneID = LaneID(0) }, want: ErrInvalidClientHello},
 		{name: "ZeroGeneration", edit: func(hello *ClientHello) { hello.Generation = 0 }, want: ErrInvalidClientHello},
-		{name: "ZeroPathGroup", edit: func(hello *ClientHello) { hello.PathGroupID = PathGroupID{} }, want: ErrInvalidClientHello},
+		{name: "ZeroPathGroup", edit: func(hello *ClientHello) { hello.PathGroupID = PathGroupID(0) }, want: ErrInvalidClientHello},
 		{name: "CreateWithSession", edit: func(hello *ClientHello) { hello.SessionID = testSessionID(1) }, want: ErrInvalidClientHello},
 		{name: "CreateWithoutTarget", edit: func(hello *ClientHello) { hello.Target = target.Endpoint{} }, want: ErrInvalidClientHello},
 		{name: "JoinWithTarget", edit: func(hello *ClientHello) { hello.Mode = HelloJoin; hello.SessionID = testSessionID(1) }, want: ErrInvalidClientHello},
@@ -103,10 +106,10 @@ func TestClientHelloErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded[92] = 255
-	encoded[93] = 255
+	encoded[6] = 255
+	encoded[7] = 255
 	if _, err := ParseClientHello(encoded); !errors.Is(err, ErrInvalidClientHello) {
-		t.Fatalf("ParseClientHello() target length error = %v, want %v", err, ErrInvalidClientHello)
+		t.Fatalf("ParseClientHello() body length error = %v, want %v", err, ErrInvalidClientHello)
 	}
 	domain := testClientHello(HelloCreate, SessionID{}, target.MustParse("wg.example.com:51820"))
 	if err := SignClientHello(&domain, []byte("test key")); err != nil {
@@ -116,7 +119,7 @@ func TestClientHelloErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded[94] = 'W'
+	encoded[clientHelloMinimumSize-sha256.Size] = 'W'
 	if _, err := ParseClientHello(encoded); !errors.Is(err, ErrInvalidClientHello) {
 		t.Fatalf("ParseClientHello() noncanonical target error = %v, want %v", err, ErrInvalidClientHello)
 	}
@@ -143,10 +146,10 @@ func TestClientHelloAuthenticatesEveryEncodedByte(t *testing.T) {
 }
 
 func TestReadClientHelloRejectsUnsupportedVersionBeforeVariableBody(t *testing.T) {
-	header := make([]byte, clientHelloUnsignedFixedSize)
+	header := make([]byte, helloHeaderSize)
 	copy(header[:4], clientMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], Version+1)
-	binary.BigEndian.PutUint16(header[92:94], uint16(target.MaxTextSize))
+	binary.BigEndian.PutUint16(header[6:8], uint16(target.MaxTextSize))
 	if _, err := ReadClientHello(bytes.NewReader(header)); !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("ReadClientHello() error = %v, want %v", err, ErrUnsupportedVersion)
 	}
@@ -181,7 +184,7 @@ func TestServerHello(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := 146 + len(hello.Diagnostic); len(encoded) != want {
+			if want := serverHelloMinimumSize + len(hello.Diagnostic); len(encoded) != want {
 				t.Fatalf("MarshalServerHello() length = %d, want %d", len(encoded), want)
 			}
 			got, err := ParseServerHello(encoded)
@@ -249,7 +252,7 @@ func TestServerHelloRejectsInconsistentErrorScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded[114] = '\n'
+	encoded[serverHelloMinimumSize-sha256.Size] = '\n'
 	if _, err := ParseServerHello(encoded); !errors.Is(err, ErrInvalidServerHello) {
 		t.Fatalf("ParseServerHello() error = %v for control-byte diagnostic", err)
 	}
@@ -272,7 +275,7 @@ func TestServerHelloAuthenticatesRequestAndTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, offset := range []int{8, 20} {
+	for _, offset := range []int{9, 21} {
 		modified := append([]byte(nil), encoded...)
 		modified[offset] ^= 1
 		parsed, err := ParseServerHello(modified)
@@ -310,45 +313,83 @@ func TestServerHelloAuthenticatesEveryEncodedByte(t *testing.T) {
 }
 
 func FuzzParseClientHello(f *testing.F) {
-	hello := testClientHello(HelloCreate, SessionID{}, target.MustParse("192.0.2.1:51820"))
-	if err := SignClientHello(&hello, []byte("test key")); err != nil {
-		f.Fatal(err)
+	maximumTarget := target.MustParse(strings.Join([]string{
+		strings.Repeat("a", 63), strings.Repeat("b", 63), strings.Repeat("c", 63), strings.Repeat("d", 61),
+	}, ".") + ":65535")
+	for _, hello := range []ClientHello{
+		testClientHello(HelloCreate, SessionID{}, target.MustParse("192.0.2.1:51820")),
+		testClientHello(HelloCreate, SessionID{}, target.MustParse("[2001:db8::1]:51820")),
+		testClientHello(HelloCreate, SessionID{}, maximumTarget),
+		testClientHello(HelloJoin, testSessionID(1), target.Endpoint{}),
+	} {
+		for _, selector := range []uint64{1, math.MaxUint64} {
+			hello.LaneID = LaneID(selector)
+			hello.Generation = selector
+			hello.PathGroupID = PathGroupID(selector)
+			if err := SignClientHello(&hello, []byte("test key")); err != nil {
+				f.Fatal(err)
+			}
+			encoded, err := MarshalClientHello(hello)
+			if err != nil {
+				f.Fatal(err)
+			}
+			f.Add(encoded)
+		}
 	}
-	encoded, err := MarshalClientHello(hello)
-	if err != nil {
-		f.Fatal(err)
-	}
-	f.Add(encoded)
+	f.Add([]byte(nil))
 	f.Fuzz(func(t *testing.T, input []byte) {
 		parsed, err := ParseClientHello(input)
-		if err == nil {
-			if _, err := MarshalClientHello(parsed); err != nil {
-				t.Fatalf("parsed hello cannot be marshaled: %v", err)
-			}
+		if err != nil {
+			return
+		}
+		encoded, err := MarshalClientHello(parsed)
+		if err != nil || !bytes.Equal(encoded, input) {
+			t.Fatalf("accepted client hello changed during canonical encoding: %v", err)
+		}
+		stream := bytes.NewReader(append(bytes.Clone(input), 0x42))
+		got, err := ReadClientHello(iotest.OneByteReader(stream))
+		if err != nil || got != parsed || stream.Len() != 1 {
+			t.Fatalf("fragmented client hello differs: error %v, remaining %d", err, stream.Len())
 		}
 	})
 }
 
 func FuzzParseServerHello(f *testing.F) {
-	hello := ServerHello{
-		Result: ServerSessionCreated, RequestNonce: testNonce(4), ServerUnixSeconds: 1_700_000_000,
-		SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: testPathGroupID(3),
-		ReceiveMicros: 100, SendMicros: 110,
+	for _, hello := range []ServerHello{
+		{Result: ServerSessionCreated, RequestNonce: testNonce(4), ServerUnixSeconds: 1_700_000_000,
+			SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: math.MaxUint64,
+			ReceiveMicros: 100, SendMicros: 110},
+		{Result: ServerLaneAccepted, RequestNonce: testNonce(4), ServerUnixSeconds: 1_700_000_000,
+			SessionID: testSessionID(1), PathGroupID: math.MaxUint64, ReceiveMicros: 100, SendMicros: 110},
+		{Result: ServerRejected, RequestNonce: testNonce(4), ServerUnixSeconds: 1_700_000_000,
+			ErrorCode: ErrorInternal, ErrorClass: ErrorRetryable, ErrorScope: ErrorScopeLane,
+			Diagnostic: strings.Repeat("x", MaxDiagnosticSize)},
+		{Result: ServerRejected, ServerUnixSeconds: 1_700_000_000,
+			ErrorCode: ErrorUnsupportedVersion, ErrorClass: ErrorLaneRejected, ErrorScope: ErrorScopeLane},
+	} {
+		if err := SignServerHello(&hello, []byte("test key")); err != nil {
+			f.Fatal(err)
+		}
+		encoded, err := MarshalServerHello(hello)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(encoded)
 	}
-	if err := SignServerHello(&hello, []byte("test key")); err != nil {
-		f.Fatal(err)
-	}
-	encoded, err := MarshalServerHello(hello)
-	if err != nil {
-		f.Fatal(err)
-	}
-	f.Add(encoded)
+	f.Add([]byte(nil))
 	f.Fuzz(func(t *testing.T, input []byte) {
 		parsed, err := ParseServerHello(input)
-		if err == nil {
-			if _, err := MarshalServerHello(parsed); err != nil {
-				t.Fatalf("parsed server hello cannot be marshaled: %v", err)
-			}
+		if err != nil {
+			return
+		}
+		encoded, err := MarshalServerHello(parsed)
+		if err != nil || !bytes.Equal(encoded, input) {
+			t.Fatalf("accepted server hello changed during canonical encoding: %v", err)
+		}
+		stream := bytes.NewReader(append(bytes.Clone(input), 0x42))
+		got, err := ReadServerHello(iotest.OneByteReader(stream))
+		if err != nil || got != parsed || stream.Len() != 1 {
+			t.Fatalf("fragmented server hello differs: error %v, remaining %d", err, stream.Len())
 		}
 	})
 }
@@ -373,15 +414,11 @@ func testSessionSecret(value byte) SessionSecret {
 }
 
 func testLaneID(value byte) LaneID {
-	var id LaneID
-	id[0] = value
-	return id
+	return LaneID(value)
 }
 
 func testPathGroupID(value byte) PathGroupID {
-	var id PathGroupID
-	id[0] = value
-	return id
+	return PathGroupID(value)
 }
 
 func testNonce(value byte) Nonce {

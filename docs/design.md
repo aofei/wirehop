@@ -276,13 +276,13 @@ frame within the handshake timeout.
 Other lanes wait for their canceled candidate attempts to finish, then establish fresh connections and join the selected
 session concurrently. Candidate connections are not reused for joins because they may already have sent a creation
 request or expired during admission. Cleanup of other candidates does not gate forwarding on the selected lane.
-Background ping and probe timers use stable lane-based phase offsets so concurrent lane startup does not create a
-synchronized control burst.
+Background ping timers use stable lane-based phase offsets so concurrent lane startup does not create a synchronized
+control burst.
 
 ### Data-plane activation
 
 WireHop starts useful forwarding as soon as one lane is safely usable. It never waits for every configured lane, a
-second lane, a probe interval, or a final connected-lane count.
+second lane, a timing interval, or a final connected-lane count.
 
 The initial data-plane gate requires all of the following:
 
@@ -331,7 +331,7 @@ sequenceDiagram
 
 Other lanes join as they become ready and send a clock-sync frame first on each generation. Their preparation and
 admission never gate forwarding on the creator lane. Each accepted generation becomes `active` immediately after this
-gate with conservative RTT and delivery-rate estimates. It does not wait for a probe.
+gate with conservative RTT and delivery-rate estimates. It does not wait for a timing request.
 
 ### Availability behavior
 
@@ -557,7 +557,7 @@ For packet `p` and candidate lane `i`, the baseline prediction is:
 ```text
 queued_time_i = (unsent_bytes_i + frame_size(p)) / estimated_delivery_rate_i
 retained_time_i = (retained_bytes_i + frame_size(p)) / estimated_delivery_rate_i
-feedback_delay_i = feedback_carrier_minimum_rtt / 2
+feedback_delay_i = report_delay + feedback_carrier_minimum_rtt / 2
 
 predicted_arrival_i =
   now + max(
@@ -573,32 +573,31 @@ propagation. Sent-but-unreported bytes can include packets already parsed while 
 retained byte as additional unsent work can overstate delay and cause unnecessary lane changes.
 
 The feedback event records its incoming carrier identity and generation separately from the data generation named in the
-report. The return-delay correction uses that carrier's minimum observed RTT, keeping transient congestion out of the
-deducted propagation estimate. If the incoming generation is no longer registered or has no RTT observation, the
-correction is zero. Valid cumulative progress still releases its reported data in either case. Duplicate and wholly
-stale reports preserve the correction, delivery-rate estimate, and progress timestamp. New generations start with no
-feedback-delay history and initialize their minimum RTT from usable admission timing when available.
+report. The return-delay correction combines the reported construction delay with that carrier's minimum observed RTT,
+keeping transient network congestion out of the deducted propagation estimate. If the incoming generation is no longer
+registered or has no RTT observation, the propagation correction is zero. The reported construction delay remains
+available. Valid cumulative progress still releases its reported data in either case. Duplicate and wholly stale reports
+preserve the correction, delivery-rate estimate, and progress timestamp. New generations start with no feedback-delay
+history and initialize their minimum RTT from usable admission timing when available.
 
 Deadline-risk assessment uses the complete retained prefix without deducting feedback delay. Packet expiry, cumulative
 report validation, aggregate retention accounting, and generation abandonment continue to govern retained ownership.
 
-Sparse probes validate an idle carrier and its cross-lane delivery-report path. Their interval backs off exponentially
-while the lane remains idle, and any completed real data write restores the initial interval. Probes do not update the
-capacity estimate. Each committed data transmission records its send time, send-interval anchor, and preceding
-cumulative delivery count and time. Valid feedback samples the bytes delivered since the last acknowledged
-transmission's recorded delivery count. The sampling interval is the longer of the corresponding send and feedback
-intervals. Feedback arriving in a burst therefore cannot inflate capacity merely by shortening the interval between
-reports. Starting a new flight with no unreported data resets both time anchors, excluding idle time. Migrated packets
-receive fresh sampling metadata when committed to their new generation.
+Timing requests validate idle carriers and their cross-lane report paths without padding traffic. Each committed data
+transmission records its send time, send-interval anchor, and preceding cumulative delivery count and time. Valid
+feedback samples the bytes delivered since the last acknowledged transmission's recorded delivery count. The sampling
+interval is the longer of the corresponding send and feedback intervals. Feedback arriving in a burst therefore cannot
+inflate capacity merely by shortening the interval between reports. Starting a new flight with no unreported data resets
+both time anchors, excluding idle time. Migrated packets receive fresh metadata when committed to a new generation.
 
 Delivery rate changes only for samples covering at least 4 KiB of real data over a positive interval. Duplicate, stale,
 and invalid reports do not change the sampling anchors. Valid cumulative progress with an earlier receive timestamp
 still releases its exact retained prefix, without producing a rate sample or moving the delivery-time anchor backwards.
 A sample above the current estimate can increase it immediately. A lower sample decreases the estimate only when its
-completing report arrives while unsent work exists or at least half of the lane's packet or byte retention window is
-occupied. Pressure is sampled before that report releases acknowledged data. A lower application-limited offered rate
-therefore cannot be mistaken for a reduction in path capacity, while sustained sender pressure can still detect a real
-capacity drop.
+completing report arrives while unsent work exists or at least half of the lane's hard packet limit or current estimated
+byte window is occupied. Pressure is sampled before that report releases acknowledged data. A lower application-limited
+offered rate therefore cannot be mistaken for a reduction in path capacity, while sustained sender pressure can still
+detect a real capacity drop.
 
 The half-RTT term approximates one-way delay, and application-limited traffic can preserve an outdated capacity estimate
 after a path slows. Directional asymmetry and stale estimates can therefore cause suboptimal packet placement even while
@@ -610,12 +609,14 @@ traffic resumes. The client initializes RTT from the admission's four timestamps
 server submits the same sample after validating its initial ClockSync frame. This subtracts server processing time and
 requires no additional exchange. Runtime timing observations, including the server's admission sample, are nonblocking
 and may be skipped when the scheduler event queue is full. A generation without applied timing starts at 100 ms, and its
-first valid RTT sample replaces that estimate directly. Later RTT samples and accepted delivery-rate samples use a
-seven-to-one previous-to-new weighted average.
+first valid RTT sample replaces that estimate directly. The first accepted capacity sample also replaces its startup
+estimate directly. Later RTT samples and accepted delivery-rate samples use a seven-to-one previous-to-new weighted
+average.
 
-Each session direction maintains one preferred lane for sparse traffic. The scheduler keeps that lane when it is
-healthy, can meet the current packet's deadline, and another lane's predicted advantage is no larger than the fixed 2 ms
-switching margin:
+Each session direction maintains one preferred lane. A healthy preferred lane in the best candidate's path group is kept
+while it has no unsent write backlog, has capacity, and can meet the deadline. Already committed but unreported work
+alone does not force same-path striping. Otherwise, the scheduler keeps that lane when it is healthy, can meet the
+current packet's deadline, and another lane's predicted advantage is no larger than the fixed 2 ms switching margin:
 
 ```text
 switch_gain = preferred_predicted_arrival - best_predicted_arrival
@@ -628,15 +629,15 @@ measurement noise from causing repeated lane changes. Candidate selection uses o
 preserving path-group ranking, preferred-lane hysteresis, and distinct-group control duplication.
 
 Under sparse transport-data traffic, the preferred lane may carry every packet because its retained backlog remains
-empty. This is expected and avoids needless reordering. Under sustained load, assigning packets to the preferred lane
-increases its retained backlog until another eligible lane predicts an earlier arrival beyond the switching margin.
-Traffic then spills across lanes according to their observed RTT, real-data delivery rate, and outstanding work.
+empty. This is expected and avoids needless reordering. Under sustained load, actual write backlog or a full estimated
+feedback window permits another eligible lane to predict an earlier arrival beyond the switching margin. Traffic then
+spills across lanes according to their observed RTT, real-data delivery rate, and outstanding work.
 
 This spillover does not guarantee capacity aggregation. Inner TCP congestion control can keep offered traffic below the
 level that would consistently favor a higher-delay lane, even when that lane has substantially more available bandwidth.
-Occasional lane changes can still introduce reordering and reduce inner TCP goodput. Since idle probes do not measure
-capacity, an underused lane may also retain its conservative startup delivery-rate estimate. Evaluate each lane alone as
-well as the combined configuration with the actual workload.
+Occasional lane changes can still introduce reordering and reduce inner TCP goodput. Since timing requests do not
+measure capacity, an underused lane may also retain its conservative startup delivery-rate estimate. Evaluate each lane
+alone as well as the combined configuration with the actual workload.
 
 WireHop cannot determine whether encrypted transport data contains bulk, interactive, or control traffic. Scheduling
 therefore uses observable packet timing, size, deadlines, and lane behavior rather than inferred inner payload
@@ -671,9 +672,10 @@ eligible for WireGuard packet scheduling. The eligible pair can change as predic
 change. Other connected lanes remain liveness-monitored and may carry session control or delivery feedback. Lanes from
 different path groups compete using the same per-lane predictions.
 
-The pair is selected independently for each packet. Across successive decisions, more than two members can receive
-transport data and retain unreported work at the same time. The candidate limit does not cap a group's active TCP
-congestion windows or aggregate in-flight data at two connections.
+A healthy preferred lane without unsent backlog can remain selected even outside that pair. Otherwise, the pair is
+selected independently for each packet. Across successive decisions, more than two members can receive transport data
+and retain unreported work at the same time. The candidate limit does not cap a group's active TCP congestion windows or
+aggregate in-flight data at two connections.
 
 Two configured lanes in one path group isolate TCP sequence spaces and permit progress around one stalled stream. They
 do not prove that the underlying path has additional bandwidth. Large numbers of parallel TCP connections are not a
@@ -681,8 +683,8 @@ supported strategy for taking an unfair share of a shared bottleneck.
 
 WireHop cannot portably couple congestion windows managed by independent kernel TCP implementations and does not claim
 the bottleneck fairness guarantees of a transport with native coupled congestion control. Every configured connection
-also retains its own ping, probe, session-lifecycle control, and delivery-feedback activity. Operators must account for
-all configured lanes when evaluating shared-bottleneck contention and resource cost.
+also retains its own ping, session-lifecycle control, and delivery-feedback activity. Operators must account for all
+configured lanes when evaluating shared-bottleneck contention and resource cost.
 
 One lane is the default when reachability and capacity are sufficient. Two repeated declarations in one path group are
 recommended when isolating a single TCP stream stall matters. Additional path groups are useful only when measurements
@@ -725,6 +727,12 @@ than the retained window are dropped rather than causing unbounded identifier hi
 
 WireGuard itself can handle duplicate packets, but WireHop suppresses unnecessary duplicates to reduce load and noise.
 
+WireHop's packet-ID window is independent from WireGuard's encrypted transport counter window. Successful relay UDP
+submission cannot prevent WireGuard from rejecting a packet that arrives too far behind newer authenticated counters,
+even when the relay deadline remains valid. A larger relay retention or deduplication budget therefore does not widen
+WireGuard's tolerance for cross-path reordering. The kernel receiver enforces this in its
+[counter validation](https://git.zx2c4.com/wireguard-linux/tree/drivers/net/wireguard/receive.c).
+
 ## Queue and deadline policy
 
 Each direction has a bounded session ingress queue before lane assignment, and each lane has a bounded transmission
@@ -735,16 +743,17 @@ transmission stores, so opening more sessions or lanes cannot multiply retained 
 charged at its payload size in ingress and at its complete encoded Data-frame size after lane assignment. Moving a
 packet between those states transfers and resizes the same reservation without an unaccounted gap.
 
-Each packet carries an absolute deadline in the sender's protocol clock, expressed in process-relative monotonic
-microseconds. The sender computes it once at UDP ingress from the packet-class lifetime, rounded up to whole
-microseconds. Queueing and scheduling use the same deadline and clock through a local time representation. The receiver
-maps the protocol deadline into its own protocol clock and drops the packet only when the complete clock-uncertainty
-interval proves that the deadline has expired.
+Each packet carries an absolute deadline in the sender's process-relative monotonic clock. Runtime calculations use
+microseconds. The wire deadline rounds up to milliseconds, extending it by at most 999 microseconds. The sender computes
+it once at UDP ingress from the packet-class lifetime, rounded up to whole microseconds. Queueing and scheduling use the
+same deadline and clock through a local time representation. The receiver maps the protocol deadline into its own
+protocol clock and drops the packet only when the complete clock-uncertainty interval proves that the deadline has
+expired.
 
 The wire protocol permits at most five minutes of packet lifetime. A receiver rejects a deadline when its earliest
-plausible mapped value is more than five minutes in the future. A deadline that cannot be translated without timestamp
-overflow is also a protocol violation. Expired but otherwise valid data is silently dropped after being counted as
-parsed carrier progress.
+plausible mapped value is more than five minutes plus the 999-microsecond rounding allowance in the future. A deadline
+that cannot be translated without timestamp overflow is also a protocol violation. Expired but otherwise valid data is
+silently dropped after being counted as parsed carrier progress.
 
 Each lane direction has one bounded transmission store for queued and sent-but-unreported data. Retention preserves the
 packet metadata and payload needed for possible migration. A queued entry that expires before entering carrier order is
@@ -760,16 +769,16 @@ success releases retained capacity.
 
 Queued expiry reclaims its retained capacity. Once an entry enters the sent prefix, only a valid cumulative delivery
 report or complete generation drain can release it. The transmission store is therefore also a per-lane feedback window.
-Sustainable throughput is bounded by that packet and byte window divided by the report return time. Delivery progress
-triggers a report after 256 data packets or 256 KiB, while the 25 ms interval bounds reporting delay under sparse load.
-The reporting timer is stopped once cumulative progress is fully reported. The first unreported data or probe change
-arms a one-shot timer, while threshold-triggered reports are immediate. A pending report schedules its next retry
-directly at four report intervals, 100 ms by default, without intermediate polling. Successful or failed report
-completion wakes the worker to update its next deadline.
+Sustainable throughput is bounded by that packet and byte window divided by the report return time. Reports trigger at
+256 Data frames or 256 KiB, with an adaptive interval bounded by 25 milliseconds. Report workers use one-shot timers
+only while progress or a retry remains pending.
 
-The default 16,384-packet and 32 MiB lane limits leave headroom for common bandwidth-delay products, and the shared
-process budget keeps their aggregate memory cost bounded. Deployments should validate these defaults against the
-intended path bandwidth and delivery-report return time.
+The default hard limits are 65,536 packets and 32 MiB per lane direction. After the first accepted capacity sample, an
+estimated byte window bounds retention to two feedback cycles plus a 64 KiB write batch. A feedback cycle is the larger
+of the lane RTT and half that RTT plus the latest report return-delay estimate, with 25 milliseconds of reporting
+headroom. The estimated window has a 256 KiB floor and never exceeds the configured hard byte limit. Before capacity is
+observed, the configured hard limits permit startup sampling. The packet ceiling protects small-packet workloads, and
+the shared process budget bounds total retained memory. Deployments still need to measure their intended workload.
 
 An emptied transmission deque retains at most 512 metadata slots. This accommodates one 256-packet report batch plus
 in-flight progress without repeated allocation and copying under steady traffic. Larger historical capacities still
@@ -803,7 +812,7 @@ The command uses these packet and resource limits:
 | Creation replay nonces | 65,536 |
 | Join replay nonces per session | 4096 |
 | Session ingress queue per direction | 1024 packets and 4 MiB |
-| Combined transmission store per lane direction | 16,384 packets and 32 MiB |
+| Combined transmission store per lane direction | 65,536 packets and 32 MiB |
 | Aggregate retained relay work per client process | 131,072 packets and 256 MiB |
 | Aggregate retained relay work per server process | 262,144 packets and 256 MiB |
 | Deduplication window per session direction | 1,048,576 packet IDs in a 128 KiB sliding bitmap |
@@ -831,7 +840,7 @@ The command uses these time and traffic limits:
 | WireGuard handshake and cookie packet lifetime | 5 seconds |
 | WireGuard transport packet lifetime | 5 seconds |
 | UDP delivery operation | 1 second |
-| Delivery-report trigger | 256 data packets, 256 KiB, or 25 milliseconds |
+| Delivery-report trigger | 256 Data frames, 256 KiB, or RTT/4 clamped to 1 to 25 milliseconds |
 | Deadline-risk abandonment check while work exists | 25 milliseconds |
 | Ping interval and timeout | 1 second active, idle backoff to 15 seconds, and 10-second receive inactivity timeout |
 | Complete carrier write operation | 10 seconds |
@@ -839,7 +848,6 @@ The command uses these time and traffic limits:
 | Maximum clock-sample uncertainty | 5 seconds |
 | Resume clock-gap tolerance | 1 second |
 | Pending preparation resume check | 1 second, only while dialing or admitting |
-| Probe interval and payload | Exponential idle backoff from 2 seconds to 1 minute and 1200 bytes |
 | Initial lane RTT and delivery rate | 100 milliseconds and 1,000,000 bytes per second |
 | Reconnect backoff and stability reset | 100 milliseconds initial, 5 seconds maximum, reset after 30 seconds healthy |
 | Graceful client session-close attempt | 200 milliseconds |
@@ -887,11 +895,12 @@ multiplier of one is omitted. For example, use `2 * time.Minute`, `time.Minute`,
 `1500 * time.Millisecond`. Derived budgets retain their meaningful arithmetic, such as the dial budget plus six
 handshake budgets. This is a project readability convention, not a change to timeout values or precision.
 
-Protocol monotonic timestamps and packet deadlines remain unsigned integer microseconds. Authentication timestamps
-remain Unix seconds. Conversions at these boundaries name the required unit explicitly, such as
-`uint64(5 * time.Minute / time.Microsecond)`. Wire-format test vectors retain exact integer values. External tools use
-their documented input units, including seconds for `sleep`, `timeout`, and `iperf3`. Documentation uses readable units,
-with full unit names in policy tables and explicit units in formulas.
+Protocol timing samples and runtime packet deadlines use unsigned integer microseconds. Encoded Data deadlines use
+unsigned integer milliseconds rounded up from runtime deadlines. Authentication timestamps remain Unix seconds.
+Conversions at these boundaries name the required unit explicitly, such as `uint64(5 * time.Minute / time.Microsecond)`.
+Wire-format test vectors retain exact integer values. External tools use their documented input units, including seconds
+for `sleep`, `timeout`, and `iperf3`. Documentation uses readable units, with full unit names in policy tables and
+explicit units in formulas.
 
 ## Connection abandonment and packet migration
 
@@ -1226,12 +1235,14 @@ timestamp. A creation request relies on its bearer token and the carrier's secur
 therefore require `wss://` rather than `ws://`.
 
 The join HMAC input concatenates a one-byte method length, method bytes, a two-byte path length, escaped path bytes,
-session ID (16 bytes), lane ID (16 bytes), generation (`u64`), path group ID (16 bytes), nonce (12 bytes), Unix
-timestamp (`u64`), and monotonic send time (`u64`). Lengths and integers use network byte order.
+session ID (16 bytes), lane ID (`uvarint`), generation (`uvarint`), path group ID (`uvarint`), nonce (12 bytes), Unix
+timestamp (`u64`), and monotonic send time (`u64`). Fixed-width lengths and timestamps use network byte order.
 
-Clients encode identifiers, nonces, and HMAC tags as fixed-width lowercase hexadecimal. Receivers accept either
-hexadecimal case. Generations, Unix timestamps, and monotonic microsecond values use base-10 integers. The creation
-target uses its canonical logical `HOST:PORT` form.
+Clients encode session IDs, nonces, and HMAC tags as fixed-width lowercase hexadecimal. Receivers accept either
+hexadecimal case. Lane and path group IDs are positive unsigned 64-bit selectors encoded in canonical decimal without
+leading zeroes. The client assigns them in configuration order and preserves them across reconnects. They are not
+credentials. Generations, Unix timestamps, and monotonic microsecond values use base-10 integers. The creation target
+uses its canonical logical `HOST:PORT` form.
 
 WebSocket admission uses HTTP `GET`. Lane URLs and admission requests use an exact path with no query component,
 including an empty trailing query marker. The canonical escaped path is limited to 8 KiB so it fits the direct server's
@@ -1329,7 +1340,7 @@ Fast-path behavior:
 - Bound one data batch to 16 frames and a target of 64 KiB before the final admitted frame
 - Keep application queues and unconfirmed retention bounded independently from kernel socket buffers
 - Use an abortive TCP close for an abandoned generation so unacknowledged stale bytes are discarded
-- Bound each WebSocket binary message to two maximum encoded frames, or 131,118 bytes, on receipt
+- Bound each WebSocket binary message to two maximum encoded frames, or 131,114 bytes, on receipt
 
 Socket write success only means that the local kernel or TLS stack accepted bytes. It never counts as peer delivery or
 as permission to release retained backlog and packet state.
@@ -1435,50 +1446,58 @@ rejection as an unpadded base64url `WireHop-Rejection` response header because r
 HTTP status remains a conventional summary for intermediaries. In-session error frames carry the full code, class,
 scope, optional lane generation, and bounded diagnostic.
 
-Admission hello integers use network byte order. The raw client hello is 126 plus `N` bytes, where `N` is the canonical
-target length and is zero for a join:
+Admission messages use an eight-byte preface followed by a bounded authenticated body. The preface contains four magic
+bytes, a big-endian `u16` version, and a big-endian `u16` body length. The body length includes the HMAC tag and
+excludes the preface. Readers reject an unknown preface or an out-of-bounds body length before reading or allocating the
+body. Fixed-width timestamps use network byte order. Lane IDs, generations, path group IDs, and error codes use
+canonical `uvarint` encoding as defined below.
+
+The raw client hello has this layout. `V` is the combined size of its three variable integers, and `N` is the target
+length:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 4 | Magic `WHOP` |
-| 4 | 2 | Protocol version |
-| 6 | 1 | Mode: `1` create or `2` join |
-| 7 | 1 | Reserved zero byte |
-| 8 | 8 | Unix timestamp in seconds |
-| 16 | 8 | Client monotonic send time in microseconds |
-| 24 | 12 | Nonce |
-| 36 | 16 | Stable lane ID |
-| 52 | 8 | Connection generation |
-| 60 | 16 | Path group ID |
-| 76 | 16 | Session ID, zero for create |
-| 92 | 2 | Target length `N` |
-| 94 | N | Canonical target text, absent for join |
-| 94 + N | 32 | HMAC-SHA256 tag |
+| 4 | 2 | Protocol version `1` |
+| 6 | 2 | Authenticated body length |
+| 8 | 1 | Mode: `1` create or `2` join |
+| 9 | 8 | Unix timestamp in seconds |
+| 17 | 8 | Client monotonic send time in microseconds |
+| 25 | 12 | Nonce |
+| 37 | 16 | Session ID, zero for create |
+| 53 | V | Lane ID, generation, and path group ID as three `uvarint` values |
+| 53 + V | N | Canonical target text, absent for join |
+| 53 + V + N | 32 | HMAC-SHA256 tag |
 
-The target is canonical ASCII `HOST:PORT` text and is limited to 259 bytes. A creation hello is therefore at most 385
-bytes. A join uses a zero target length and contains no target bytes. The complete variable prefix, target, and
-authentication tag are consumed as one hello. The HMAC covers every byte before the tag. The raw server hello is 146
-bytes plus a diagnostic of at most 512 bytes:
+The target is the remaining unsigned body after the three integers. It is canonical ASCII `HOST:PORT` text, limited to
+259 bytes. A join has no target. A hello occupies `85 + V + N` bytes, with an absolute maximum of 374 bytes. An ordinary
+join with single-byte lane, generation, and group values occupies 88 bytes. The HMAC covers every byte before the tag,
+including the preface and body length.
+
+The raw server hello uses the following layout. `V` is the combined size of the group and error-code integers, and `N`
+is the diagnostic length:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 4 | Magic `WHOR` |
-| 4 | 2 | Protocol version |
-| 6 | 1 | Result: `1` created, `2` accepted, or `3` rejected |
-| 7 | 1 | Reserved zero byte |
-| 8 | 12 | Echoed request nonce |
-| 20 | 8 | Server Unix timestamp in seconds |
-| 28 | 16 | Session ID |
-| 44 | 32 | Session secret for creation only |
-| 76 | 16 | Path group ID |
-| 92 | 8 | Server receive time in microseconds |
-| 100 | 8 | Server send time in microseconds |
-| 108 | 2 | Error code |
-| 110 | 1 | Error class |
-| 111 | 1 | Error scope |
-| 112 | 2 | Diagnostic length |
-| 114 | N | Diagnostic bytes |
-| 114 + N | 32 | HMAC-SHA256 tag |
+| 4 | 2 | Protocol version `1` |
+| 6 | 2 | Authenticated body length |
+| 8 | 1 | Result: `1` created, `2` accepted, or `3` rejected |
+| 9 | 12 | Echoed request nonce |
+| 21 | 8 | Server Unix timestamp in seconds |
+| 29 | 16 | Session ID |
+| 45 | 32 | Session secret for creation only |
+| 77 | 8 | Server receive time in microseconds |
+| 85 | 8 | Server send time in microseconds |
+| 93 | 1 | Error class |
+| 94 | 1 | Error scope |
+| 95 | V | Path group ID and error code as two `uvarint` values |
+| 95 + V | N | Remaining unsigned body as diagnostic text |
+| 95 + V + N | 32 | HMAC-SHA256 tag |
+
+An ordinary successful response occupies 129 bytes. The reader's absolute allocation bound is 659 bytes, including a
+512-byte diagnostic and full-width integer slots. Semantic validation further constrains the error code and requires a
+rejection's path group to be zero.
 
 Every client hello requires a positive Unix timestamp, nonzero nonce, lane ID, generation, and path group ID. Create
 mode requires a zero session ID and a valid target. Join mode requires a nonzero session ID and a zero target.
@@ -1506,23 +1525,24 @@ least-significant group first, and its high bit indicates another byte. Zero occ
 most ten bytes, and the tenth byte can contain only bit 0. Nonminimal encodings, overflow, and values outside a field's
 semantic bounds are protocol violations. Integers must be complete within their containing frame or WebSocket message. A
 stream that ends partway through a header or payload fails with unexpected EOF. These rules apply to every `uvarint`
-field, including content lengths. The authenticated admission hellos use the fixed-width big-endian layouts above.
+field, including content lengths. Admission hellos use the explicitly mixed fixed-width and variable-width layouts
+above.
 
-The content length excludes the common header. It occupies one to three bytes and cannot exceed 65,555 bytes. The common
-header therefore occupies two to four bytes, and the maximum encoded frame is 65,559 bytes. A reader validates the
+The content length excludes the common header. It occupies one to three bytes and cannot exceed 65,553 bytes. The common
+header therefore occupies two to four bytes, and the maximum encoded frame is 65,557 bytes. A reader validates the
 bounded header before allocating content storage. Data content contains:
 
 | Order | Encoding | Field |
 | ---: | --- | --- |
 | 1 | `uvarint` | Direction-local packet ID |
-| 2 | `uvarint` | Absolute deadline in sender monotonic microseconds |
+| 2 | `uvarint` | Absolute deadline in sender monotonic milliseconds, rounded up |
 | 3 | Remaining bytes | WireGuard packet |
 
 Let `U(x)` be the shortest unsigned LEB128 length of `x`, and let `P` be the WireGuard datagram length. Data content
-length is `L = U(packet_id) + U(deadline_micros) + P`. Its complete encoded length is `1 + U(L) + L`, and its
-per-datagram overhead is `1 + U(L) + U(packet_id) + U(deadline_micros)`. The overhead ranges from 4 to 24 bytes. For
-example, a 1452-byte datagram with a five-byte packet ID and six-byte deadline has 14 bytes of overhead. The maximum
-occurs with two ten-byte metadata fields and a three-byte content length.
+length is `L = U(packet_id) + U(deadline_millis) + P`. Its complete encoded length is `1 + U(L) + L`, and its
+per-datagram overhead is `1 + U(L) + U(packet_id) + U(deadline_millis)`. The overhead ranges from 4 to 22 bytes. For
+example, a 1452-byte datagram with a five-byte packet ID and five-byte deadline has 13 bytes of overhead. The maximum
+occurs with a ten-byte packet ID, an eight-byte representable deadline, and a three-byte content length.
 
 A generic frame parser can skip or reject a complete frame without interpreting Data fields. A separate WireGuard packet
 length is unnecessary because the packet occupies the rest of the Data content after the two integers. The lane
@@ -1535,17 +1555,16 @@ Protocol version 1 frame types and phase constraints are:
 
 | ID | Frame | Payload size | Allowed use |
 | ---: | --- | ---: | --- |
-| 1 | Data | 34 to 65,555 bytes | Both directions after admission |
+| 1 | Data | 34 to 65,553 bytes | Both directions after admission |
 | 2 | Ping | 2 to 20 bytes | Both directions after admission |
 | 3 | Pong | 4 to 40 bytes | Both directions after admission |
 | 4 | Clock sync | 4 to 40 bytes | Client to server, first post-admission frame |
-| 5 | Probe | 0 to 1200 bytes | Both directions after admission |
-| 6 | Delivery report | 21 to 66 bytes | Both directions after admission |
-| 7 | Session created | 66 to 84 bytes | Server to client, first WebSocket create response |
-| 8 | Lane accepted | 34 to 52 bytes | Server to client, first WebSocket join response |
-| 9 | Session close | 1 byte | Client to server after admission |
-| 10 | Lane abandon | 17 to 26 bytes | Both directions after admission |
-| 11 | Error | 20 to 541 bytes | Both directions after admission |
+| 5 | Delivery report | 5 to 50 bytes | Both directions after admission |
+| 6 | Session created | 51 to 78 bytes | Server to client, first WebSocket create response |
+| 7 | Lane accepted | 19 to 46 bytes | Server to client, first WebSocket join response |
+| 8 | Session close | 1 byte | Client to server after admission |
+| 9 | Lane abandon | 2 to 20 bytes | Both directions after admission |
+| 10 | Error | 5 to 535 bytes | Both directions after admission |
 
 In the client-to-server direction, no other in-session frame may precede the generation's clock-sync frame. The
 server-to-client direction may carry in-session frames immediately after admission.
@@ -1559,26 +1578,25 @@ Control payload fields appear in the following order:
 - `Ping`: ping ID (`uvarint`), send time (`uvarint`)
 - `Pong`: ping ID (`uvarint`), original send time (`uvarint`), receive time (`uvarint`), send time (`uvarint`)
 - `Clock sync`: client send, server receive, server send, and client receive times (four `uvarint` values)
-- `Probe`: 0 to 1200 opaque bytes
-- `Delivery report`: lane ID (16 bytes), generation (`uvarint`), then data bytes, data packets, probe bytes, and probe
-  packets (four `uvarint` counters)
-- `Session created`: session ID (16 bytes), session secret (32 bytes), path group ID (16 bytes), server receive time
+- `Delivery report`: lane ID, generation, cumulative Data-frame count, latest parsed Ping ID, and report delay in
+  microseconds (five `uvarint` values)
+- `Session created`: session ID (16 bytes), session secret (32 bytes), path group ID (`uvarint`), server receive time
   (`uvarint`), and server send time (`uvarint`)
-- `Lane accepted`: session ID (16 bytes), path group ID (16 bytes), server receive time (`uvarint`), and server send
+- `Lane accepted`: session ID (16 bytes), path group ID (`uvarint`), server receive time (`uvarint`), and server send
   time (`uvarint`)
 - `Session close`: close reason (`u8`)
-- `Lane abandon`: lane ID (16 bytes) and generation (`uvarint`)
-- `Error`: code (`uvarint`), class (`u8`), scope (`u8`), lane ID (16 bytes), generation (`uvarint`), and remaining
+- `Lane abandon`: lane ID and generation (two `uvarint` values)
+- `Error`: code (`uvarint`), class (`u8`), scope (`u8`), lane ID (`uvarint`), generation (`uvarint`), and remaining
   diagnostic bytes, limited to 512 printable-ASCII bytes
 
 Integer fields retain their full unsigned 64-bit value range where their semantics permit it. Payloads with a fixed
-field sequence must end after their final field. Data, Probe, and Error consume their remaining content as explicitly
-specified above. The table's Data minimum includes the shortest recognized WireGuard packet.
+field sequence must end after their final field. Data and Error consume their remaining content as explicitly specified
+above. The table's Data minimum includes the shortest recognized WireGuard packet.
 
 Ping and pong IDs are nonzero. Ping ID counters start at 1 for each connection generation and never wrap. Exhausting the
-counter ends that generation. Probes have no per-frame identifier. Delivery reports and lane-abandon frames require a
-nonzero lane ID and generation. Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted
-requires nonzero session and path group IDs. Encoded receive and send timestamp pairs must not run backward.
+counter ends that generation. Delivery reports and lane-abandon frames require a nonzero lane ID and generation.
+Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted requires nonzero session and path
+group IDs. Encoded receive and send timestamp pairs must not run backward.
 
 Version 1 control enums are:
 
@@ -1663,6 +1681,13 @@ the budget. Ten seconds without receive progress fails the generation. Timing re
 real data transfer and exponential idle backoff capped at 15 seconds, which bounds idle traffic without delaying
 active-path measurements.
 
+Each lane reserves a separate one-slot Pong queue, so ordinary control queue pressure cannot drop a timing response. The
+single writer prefers a ready Pong at the start of each eight-frame control burst, then prefers ordinary controls in the
+remaining budget. Continuous timing requests therefore cannot starve queued reports or local Pings. A peer cannot issue
+its next Ping until it receives the previous Pong. That response has already left the reserved queue, even if the local
+carrier write has not returned. An additional Ping while that queue is occupied violates the one-outstanding-request
+rule and fails the generation instead of silently discarding a response.
+
 Clock samples are measurements rather than authorization data. The estimator rejects reversed spans and values outside
 safe signed arithmetic. Deadline checks use the latest edge of the mapped uncertainty interval, so asymmetric delay does
 not make the receiver drop a packet earlier than the sample supports.
@@ -1684,32 +1709,31 @@ system suspend. WireHop does not provide a native Android or iOS lifecycle integ
 
 ### Delivery feedback and packet identity
 
-Probe frames contain opaque padding, are discarded by the receiving WireHop process, and are never written to UDP. A
-sender starts at a 2-second idle interval and backs off exponentially to 1 minute while no real data is written. A
-completed real data write suppresses the next probe and restores the initial interval. The receiver enforces the
-protocol payload bound, and the bounded control queue prevents probe generation from growing an independent backlog.
+Each direction reports the lane identifier, connection generation, cumulative number of parsed Data frames, latest
+parsed Ping ID, and report-construction delay. Counts start at zero for each generation and never wrap. A parsed Ping
+requests immediate feedback, including over an alternate lane, so the same small timing request tests both carrier
+liveness and the cross-lane feedback path. No padding frame or independent probe worker is needed. Ping traffic does not
+estimate capacity.
 
-Each direction sends delivery reports containing the target lane identifier, connection generation, and separate
-cumulative counters for data-frame and probe bytes and packets. A report is triggered after 256 newly parsed data
-packets or 256 KiB of newly parsed data, and a 25 ms interval bounds the delay for smaller changes. The report timer
-runs only while unreported progress exists. All four counters start at zero for each connection generation and never
-wrap. Data bytes count the actual encoded common header, Data metadata, and WireGuard packet. Probe bytes count the
-actual encoded common header and opaque payload. A default 1200-byte Probe occupies 1203 encoded bytes. Shortest-form
-integer validation makes reconstructed frame sizes equal to the received wire sizes. The counters describe the exact
-prefix parsed from that generation's ordered carrier. Reported probe packets cannot exceed the number exposed to that
-generation's carrier writer, and their cumulative byte count must equal the packet count times that generation's fixed
-encoded Probe frame size. The sender's exposed-probe counter also never wraps. A batch that would overflow it ends the
-generation before any frame in that batch is written or any of its success callbacks run.
+The receiver still accumulates exact encoded Data bytes internally for its 256 KiB trigger. It reports after 256 newly
+parsed Data frames or 256 KiB. The first change after idle is eager. Sustained smaller changes wait at most the shorter
+of 25 milliseconds and one quarter of the latest usable RTT, with a 1-millisecond minimum timer interval. The timer
+stops when all progress is reported. A pending snapshot retries after four current report intervals if no copy
+completes. The delay field measures time from the newest parse in that snapshot to its construction by the carrying
+lane's writer. It includes report timer and control queue delay, but excludes the following carrier write and network
+propagation.
 
 A consecutive received Data batch is fully validated before its packet and encoded-byte totals enter the progress
-accumulator under one lock. Feedback can observe the previous prefix or the complete validated batch. A counter
-overflow rejects the complete batch without changing its counters or submitting its packets to UDP. This adds no batch
-collection wait and does not change the report thresholds or their timer.
+accumulator under one lock. Feedback can observe the previous prefix or the complete validated batch. Counter overflow
+rejects the complete batch without changing progress or submitting packets to UDP. This adds no batch collection wait.
 
 A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
-risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Its counters
-describe carrier parsing progress and do not promise that the WireGuard target accepted or authenticated the payload.
-Exhausting a cumulative counter ends the owning connection generation instead of reusing a lower value.
+risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Reports
+acknowledge carrier parsing and do not promise UDP submission or WireGuard authentication. The sender reconstructs
+acknowledged bytes from its exact retained FIFO prefix, so a redundant cumulative byte field is unnecessary. A future
+Data count or a Ping ID not yet exposed to the target generation's writer is a protocol violation. Data and Ping
+progress must advance monotonically together. A mixed regression and advance is invalid, while a duplicate or wholly
+stale snapshot is ignored without changing capacity, timing, or ownership.
 
 The single carrier writer gives internally generated controls priority in bursts of at most eight frames. It coalesces
 only already-queued controls by nonblocking dequeue, without a collection timer, and caps each batch by the burst's
@@ -1717,10 +1741,12 @@ remaining frame budget. When WireGuard data is ready after such a burst, the wri
 control burst. Fairness counts frames rather than carrier writes.
 
 Ping, Pong, ClockSync, SessionClose, LaneAbandon, and Error end the current control batch. A boundary frame at the head
-is sent alone. A boundary frame after ordinary controls is the last frame in their batch. Queue order is preserved.
-Builders sample timestamps at the writer, and success callbacks run in queue order only after the complete carrier write
-succeeds. Probe exposure is published before the write because feedback can return on another lane before local
-completion. A builder or carrier failure ends the generation and does not imply per-frame transactional completion.
+is sent alone. A boundary frame after ordinary controls is the last frame in their batch. Ordinary control queue order
+is preserved, while the reserved Pong queue has priority at the start of a control burst. Builders sample timestamps at
+the writer, and success callbacks run in queue order only after the complete carrier write succeeds. Ping exposure is
+published before writing because feedback can return on another lane before local completion. A rejected queue admission
+does not consume a Ping ID. A builder or carrier failure ends the generation and does not imply per-frame transactional
+completion.
 
 Each control batch retains the carrier stall deadline. WebSocket receivers expose each complete WireHop frame as it
 arrives, without waiting for the remaining WebSocket message or its closing fragment. A later malformed frame cannot
@@ -1729,12 +1755,11 @@ violation. A transport disconnection before that boundary is a recoverable carri
 authenticate a complete record before exposing its contents. Coalescing can therefore change receive latency even
 without a collection timer. The frame budget and timing boundaries bound this effect.
 
-A changed report snapshot is offered to its target lane and the best alternate lane when they are connected and not
-abandoning, including when either lane is degraded. The first completed carrier write marks the snapshot reported, and
-duplicate callbacks are coalesced. If no copy completes, the cumulative snapshot becomes eligible again after four
-report intervals. The sender releases only the matching prefix of its sent FIFO. Packet and byte counters must identify
-the same prefix. A mixed, partially changed, or impossible active-generation report is a protocol violation. A wholly
-stale report from an older snapshot or generation is ignored.
+A changed report snapshot is offered to its target lane and the best alternate lane when connected and not abandoning.
+Each writer constructs its own delay value for that same cumulative snapshot. The first completed carrier write marks
+the snapshot reported, and duplicate callbacks are coalesced. If no copy completes, the snapshot becomes eligible again
+after four report intervals. Only valid matching-generation progress or complete generation drain releases the sent
+FIFO. Reports from an obsolete generation are ignored.
 
 New packet IDs start at 1 and increase strictly within each session direction. The scheduler sizes the next candidate ID
 before selecting eligible lanes and commits it only after at least one copy enters a lane transmission store. Every
@@ -1916,11 +1941,11 @@ mechanism can still stall the carrier, for example when large segments are dropp
 blocked. Operators must diagnose that outer path rather than derive a WireGuard MTU solely from its MSS. Reverse-proxy
 message limits and idle timeouts are separate carrier constraints.
 
-Probe traffic terminates at the receiving WireHop process and never crosses the server-to-target UDP leg. Successful
-probes therefore do not establish that leg's UDP path MTU. For a 1500-byte UDP path without additional IP headers, the
-WireGuard interface MTU limit is 1440 bytes over IPv4 or 1420 bytes over IPv6. These limits subtract the 20-byte or
-40-byte IP header, the 8-byte UDP header, and 32 bytes of WireGuard overhead. An explicit MTU of 1420 fits both families
-when all actual UDP legs support at least 1500 bytes.
+Timing requests terminate at the receiving WireHop process and never cross the server-to-target UDP leg. Successful
+timing exchanges therefore do not establish that leg's UDP path MTU. For a 1500-byte UDP path without additional IP
+headers, the WireGuard interface MTU limit is 1440 bytes over IPv4 or 1420 bytes over IPv6. These limits subtract the
+20-byte or 40-byte IP header, the 8-byte UDP header, and 32 bytes of WireGuard overhead. An explicit MTU of 1420 fits
+both families when all actual UDP legs support at least 1500 bytes.
 
 Direct forwarding adds no WireHop framing and does not change the WireGuard datagram length. It still crosses a
 userspace UDP boundary, but its MTU requirement is the native IP and UDP path to the target rather than a TCP-based
@@ -2049,7 +2074,7 @@ below.
 - One malformed lane declaration among otherwise valid declarations prevents all network activity
 - An unreachable first lane does not block a later creator
 - One fast lane becomes usable while other lanes remain slow or unreachable
-- The sole accepted lane forwards without waiting for a probe interval
+- The sole accepted lane forwards without waiting for a timing interval
 - A stalled admission does not block a healthy candidate on any carrier scheme
 - A recoverable candidate failure retries without waiting for another candidate's stalled preparation or admission
 - Unselected candidates release their admissions, sessions, and target sockets without reconnect grace
@@ -2105,5 +2130,5 @@ below.
 - CPU usage
 - Memory usage
 - Carrier bytes per WireGuard payload byte
-- Probe traffic overhead
+- Idle timing and feedback traffic overhead
 - Effective goodput after framing, WebSocket, and TLS overhead

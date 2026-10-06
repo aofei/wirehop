@@ -15,8 +15,6 @@ import (
 const (
 	// headerSessionID carries the retained session identifier.
 	headerSessionID = "WireHop-Session-ID"
-	// joinCanonicalSize is the exact authenticated join input size excluding method and path bytes.
-	joinCanonicalSize = 1 + 2 + protocol.SessionIDSize + protocol.LaneIDSize + 8 + protocol.PathGroupIDSize + protocol.NonceSize + 8 + 8
 )
 
 // Join is one WebSocket lane join request.
@@ -182,26 +180,17 @@ func marshalJoinUnsigned(request Join) ([]byte, error) {
 		request.PathGroupID.IsZero() || request.Nonce == (protocol.Nonce{}) || request.UnixSeconds <= 0 {
 		return nil, ErrInvalid
 	}
-	encoded := make([]byte, joinCanonicalSize+len(request.Method)+len(request.Path))
+	encoded := make([]byte, 1, 96+len(request.Method)+len(request.Path))
 	encoded[0] = byte(len(request.Method))
-	copy(encoded[1:], request.Method)
-	offset := 1 + len(request.Method)
-	binary.BigEndian.PutUint16(encoded[offset:offset+2], uint16(len(request.Path)))
-	offset += 2
-	copy(encoded[offset:], request.Path)
-	offset += len(request.Path)
-	copy(encoded[offset:], request.SessionID[:])
-	offset += protocol.SessionIDSize
-	copy(encoded[offset:], request.LaneID[:])
-	offset += protocol.LaneIDSize
-	binary.BigEndian.PutUint64(encoded[offset:offset+8], request.Generation)
-	offset += 8
-	copy(encoded[offset:], request.PathGroupID[:])
-	offset += protocol.PathGroupIDSize
-	copy(encoded[offset:], request.Nonce[:])
-	offset += protocol.NonceSize
-	binary.BigEndian.PutUint64(encoded[offset:offset+8], uint64(request.UnixSeconds))
-	offset += 8
-	binary.BigEndian.PutUint64(encoded[offset:offset+8], request.MonotonicMicros)
+	encoded = append(encoded, request.Method...)
+	encoded = binary.BigEndian.AppendUint16(encoded, uint16(len(request.Path)))
+	encoded = append(encoded, request.Path...)
+	encoded = append(encoded, request.SessionID[:]...)
+	encoded = binary.AppendUvarint(encoded, uint64(request.LaneID))
+	encoded = binary.AppendUvarint(encoded, request.Generation)
+	encoded = binary.AppendUvarint(encoded, uint64(request.PathGroupID))
+	encoded = append(encoded, request.Nonce[:]...)
+	encoded = binary.BigEndian.AppendUint64(encoded, uint64(request.UnixSeconds))
+	encoded = binary.BigEndian.AppendUint64(encoded, request.MonotonicMicros)
 	return encoded, nil
 }

@@ -13,8 +13,8 @@ import (
 func TestJoinRoundTrip(t *testing.T) {
 	secret := protocol.SessionSecret{9}
 	join := Join{
-		Method: "GET", Path: "/_wirehop", SessionID: protocol.SessionID{1}, LaneID: protocol.LaneID{2},
-		Generation: 3, PathGroupID: protocol.PathGroupID{4}, Nonce: protocol.Nonce{5}, UnixSeconds: 6,
+		Method: "GET", Path: "/_wirehop", SessionID: protocol.SessionID{1}, LaneID: protocol.LaneID(2),
+		Generation: 3, PathGroupID: protocol.PathGroupID(4), Nonce: protocol.Nonce{5}, UnixSeconds: 6,
 		MonotonicMicros: 7,
 	}
 	if err := SignJoin(&join, secret); err != nil {
@@ -60,8 +60,8 @@ func TestJoinPathBoundary(t *testing.T) {
 	secret := protocol.SessionSecret{1}
 	join := Join{
 		Method: http.MethodGet, Path: "/" + strings.Repeat("a", MaxPathSize-1),
-		SessionID: protocol.SessionID{1}, LaneID: protocol.LaneID{2}, Generation: 3,
-		PathGroupID: protocol.PathGroupID{4}, Nonce: protocol.Nonce{5}, UnixSeconds: 6,
+		SessionID: protocol.SessionID{1}, LaneID: protocol.LaneID(2), Generation: 3,
+		PathGroupID: protocol.PathGroupID(4), Nonce: protocol.Nonce{5}, UnixSeconds: 6,
 	}
 	if err := SignJoin(&join, secret); err != nil {
 		t.Fatalf("SignJoin() boundary error = %v", err)

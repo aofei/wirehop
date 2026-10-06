@@ -1,13 +1,13 @@
 package relay
 
 import (
-	"cmp"
 	"errors"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -36,7 +36,7 @@ type retainedTransmission struct {
 	migrated bool
 	size     int
 	budget   *retention.Budget
-	packet   Packet
+	packet   datagram.Packet
 	delivery deliverySnapshot
 }
 
@@ -393,7 +393,7 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 		s.sentPackets++
 		s.sentBytes += uint64(transmission.size)
 		destination[count] = transmission.data
-		ownership[count] = transmission.packet.Retain()
+		ownership[count] = newPacket(transmission.packet.Retain(), transmission.data.DeadlineMicros)
 		count++
 		bytes += transmission.size
 	}
@@ -428,36 +428,31 @@ func (s *TransmissionStore) nextQueuedLocked(now time.Time) (*transmissionDeque,
 }
 
 // acknowledge releases the exact cumulative sent prefix and samples its delivery in the store's deadline clock.
-func (s *TransmissionStore) acknowledge(packets, bytes, receiveMicros uint64) (deliverySample, bool, error) {
+func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (deliverySample, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || packets < s.reportedPackets {
 		return deliverySample{}, true, nil
 	}
-	direction, err := cumulativeDirection(packets, bytes, s.reportedPackets, s.reportedBytes)
-	if err != nil {
-		return deliverySample{}, false, err
-	}
-	if direction <= 0 {
-		return deliverySample{}, direction < 0, nil
+	if packets == s.reportedPackets {
+		return deliverySample{}, false, nil
 	}
 	deltaPackets := packets - s.reportedPackets
-	if deltaPackets > uint64(s.sent.len()) || packets > s.sentPackets || bytes > s.sentBytes {
+	if deltaPackets > uint64(s.sent.len()) || packets > s.sentPackets {
 		return deliverySample{}, false, ErrInvalidDeliveryReport
 	}
 	releasedBytes, ok := s.sent.prefixSize(deltaPackets)
-	if !ok || releasedBytes != bytes-s.reportedBytes {
+	if !ok {
 		return deliverySample{}, false, ErrInvalidDeliveryReport
 	}
+	bytes := s.reportedBytes + releasedBytes
 	acknowledged := s.sent.items[s.sent.head : s.sent.head+int(deltaPackets)]
 	delivery := acknowledged[len(acknowledged)-1].delivery
 	var sample deliverySample
-	if receiveMicros > s.deliveredMicros && receiveMicros >= delivery.sentMicros &&
-		delivery.sentMicros >= delivery.firstSentMicros {
+	if receiveMicros > s.deliveredMicros && receiveMicros >= delivery.sentMicros && delivery.sentMicros >= delivery.firstSentMicros {
 		sample = deliverySample{
-			bytes: bytes - delivery.deliveredBytes,
-			intervalMicros: max(receiveMicros-delivery.deliveredMicros,
-				delivery.sentMicros-delivery.firstSentMicros),
+			bytes:          bytes - delivery.deliveredBytes,
+			intervalMicros: max(receiveMicros-delivery.deliveredMicros, delivery.sentMicros-delivery.firstSentMicros),
 		}
 	}
 	for index := range acknowledged {
@@ -475,16 +470,6 @@ func (s *TransmissionStore) acknowledge(packets, bytes, receiveMicros uint64) (d
 	return sample, false, nil
 }
 
-// cumulativeDirection compares paired packet and byte counters while rejecting an impossible partial change.
-func cumulativeDirection(packets, bytes, previousPackets, previousBytes uint64) (int, error) {
-	packetDirection := cmp.Compare(packets, previousPackets)
-	byteDirection := cmp.Compare(bytes, previousBytes)
-	if packetDirection != byteDirection {
-		return 0, ErrInvalidDeliveryReport
-	}
-	return packetDirection, nil
-}
-
 // backlog returns the current queued and sent-unreported packet and byte totals.
 func (s *TransmissionStore) backlog() (int, uint64) {
 	return int(s.backlogPackets.Load()), s.backlogBytes.Load()
@@ -499,13 +484,13 @@ func (s *TransmissionStore) deliveryBacklog() (uint64, uint64) {
 }
 
 // deliveryConstrained reports whether queued work or retained occupancy makes a lower rate sample meaningful.
-func (s *TransmissionStore) deliveryConstrained() bool {
+func (s *TransmissionStore) deliveryConstrained(windowBytes uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	queued := s.control.len()+s.normal.len() > 0
 	halfPackets := s.limits.Packets/2 + s.limits.Packets%2
-	halfBytes := s.limits.Bytes/2 + s.limits.Bytes%2
-	return queued || s.packets >= halfPackets || s.bytes >= halfBytes
+	halfBytes := windowBytes/2 + windowBytes%2
+	return queued || s.packets >= halfPackets || uint64(s.bytes) >= halfBytes
 }
 
 // canAccept reports whether current retained work leaves capacity for one encoded frame.

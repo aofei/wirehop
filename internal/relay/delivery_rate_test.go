@@ -18,19 +18,19 @@ func TestTransmissionStoreDeliverySample(t *testing.T) {
 	sendDeliverySamplePacket(t, store, 1)
 	now = time.UnixMicro(51_000)
 	sendDeliverySamplePacket(t, store, 2)
-	sample, stale, err := store.acknowledge(1, 4096, 101_000)
+	sample, stale, err := store.acknowledge(1, 101_000)
 	if err != nil || stale || sample != (deliverySample{bytes: 4096, intervalMicros: 100_000}) {
 		t.Fatalf("first acknowledgement = %+v, stale %t, error %v", sample, stale, err)
 	}
 	now = time.UnixMicro(102_000)
 	sendDeliverySamplePacket(t, store, 3)
-	sample, stale, err = store.acknowledge(3, 3*4096, 152_000)
+	sample, stale, err = store.acknowledge(3, 152_000)
 	if err != nil || stale || sample != (deliverySample{bytes: 2 * 4096, intervalMicros: 101_000}) {
 		t.Fatalf("send-limited sample = %+v, stale %t, error %v", sample, stale, err)
 	}
 	now = time.UnixMicro(2_000_000)
 	sendDeliverySamplePacket(t, store, 4)
-	sample, stale, err = store.acknowledge(4, 4*4096, 2_010_000)
+	sample, stale, err = store.acknowledge(4, 2_010_000)
 	if err != nil || stale || sample != (deliverySample{bytes: 4096, intervalMicros: 10_000}) {
 		t.Fatalf("sample after idle = %+v, stale %t, error %v", sample, stale, err)
 	}
@@ -40,16 +40,15 @@ func TestTransmissionStoreDeliverySamplePreservesProgress(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		packets    uint64
-		bytes      uint64
 		receive    uint64
 		stale      bool
 		err        error
 		sampleSize uint64
 	}{
-		{name: "Duplicate", packets: 1, bytes: 4096, receive: 200_000, sampleSize: 3 * 4096},
+		{name: "Duplicate", packets: 1, receive: 200_000, sampleSize: 3 * 4096},
 		{name: "Stale", receive: 200_000, stale: true, sampleSize: 3 * 4096},
-		{name: "Invalid", packets: 2, bytes: 8193, receive: 200_000, err: ErrInvalidDeliveryReport, sampleSize: 3 * 4096},
-		{name: "EarlierReceiveTime", packets: 2, bytes: 8192, receive: 100_000, sampleSize: 2 * 4096},
+		{name: "Invalid", packets: 4, receive: 200_000, err: ErrInvalidDeliveryReport, sampleSize: 3 * 4096},
+		{name: "EarlierReceiveTime", packets: 2, receive: 100_000, sampleSize: 2 * 4096},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.UnixMicro(1000)
@@ -58,16 +57,16 @@ func TestTransmissionStoreDeliverySamplePreservesProgress(t *testing.T) {
 				now = time.UnixMicro(sent)
 				sendDeliverySamplePacket(t, store, uint64(index+1))
 			}
-			if _, _, err := store.acknowledge(1, 4096, 101_000); err != nil {
+			if _, _, err := store.acknowledge(1, 101_000); err != nil {
 				t.Fatal(err)
 			}
-			sample, stale, err := store.acknowledge(test.packets, test.bytes, test.receive)
+			sample, stale, err := store.acknowledge(test.packets, test.receive)
 			if !errors.Is(err, test.err) || stale != test.stale || sample != (deliverySample{}) {
 				t.Fatalf("non-sampling report = %+v, stale %t, error %v", sample, stale, err)
 			}
 			now = time.UnixMicro(112_000)
 			sendDeliverySamplePacket(t, store, 4)
-			sample, stale, err = store.acknowledge(4, 4*4096, 220_000)
+			sample, stale, err = store.acknowledge(4, 220_000)
 			want := deliverySample{bytes: test.sampleSize, intervalMicros: 119_000}
 			if err != nil || stale || sample != want {
 				t.Fatalf("next valid report = %+v, stale %t, error %v, want %+v", sample, stale, err, want)
@@ -93,7 +92,7 @@ func TestTransmissionStoreDeliverySampleClockRange(t *testing.T) {
 			now := monotime.Time(test.start)
 			store := newDeliverySampleStore(t, &now)
 			sendDeliverySamplePacket(t, store, 1)
-			sample, stale, err := store.acknowledge(1, 4096, test.start+1000)
+			sample, stale, err := store.acknowledge(1, test.start+1000)
 			want := deliverySample{bytes: 4096, intervalMicros: 1000}
 			if err != nil || stale || sample != want {
 				t.Fatalf("clock sample = %+v, stale %t, error %v, want %+v", sample, stale, err, want)
@@ -119,7 +118,7 @@ func TestTransmissionStoreDeliverySampleMigratedPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 	takeOneTransmission(t, destination)
-	sample, stale, err := destination.acknowledge(1, 4096, 12_000)
+	sample, stale, err := destination.acknowledge(1, 12_000)
 	want := deliverySample{bytes: 4096, intervalMicros: 1000}
 	if err != nil || stale || sample != want {
 		t.Fatalf("migrated sample = %+v, stale %t, error %v, want %+v", sample, stale, err, want)

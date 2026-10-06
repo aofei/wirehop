@@ -201,9 +201,8 @@ func feedbackLane(t *testing.T, connection *linkedCarrier, endpoint *testEndpoin
 	}
 	lane, err := NewLane(LaneConfig{
 		Carrier: connection, Receiver: receiver, Store: store, Clock: &testClock{now: 1000},
-		Observer: scheduler, LaneID: protocol.LaneID{1}, Generation: 1,
-		ReportInterval: time.Hour, PingInterval: time.Hour, PingTimeout: 2 * time.Hour,
-		ProbeInterval: time.Hour,
+		Observer: scheduler, LaneID: protocol.LaneID(1), Generation: 1,
+		ReportInterval: time.Second, PingInterval: time.Hour, PingTimeout: 2 * time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -216,8 +215,8 @@ func registerFeedbackLane(t *testing.T, ctx context.Context, scheduler *Schedule
 	store *TransmissionStore) {
 	t.Helper()
 	err := scheduler.Register(ctx, LaneRegistration{
-		LaneID: protocol.LaneID{1}, Generation: 1, PathGroupID: protocol.PathGroupID{1}, Store: store,
-		Abandon: func() {}, SendControl: lane.SendControl, ValidateProbeProgress: lane.ValidateProbeProgress,
+		LaneID: protocol.LaneID(1), Generation: 1, PathGroupID: protocol.PathGroupID(1), Store: store,
+		Abandon: func() {}, SendControl: lane.SendControl, ValidatePingProgress: lane.ValidatePingProgress, SendDeliveryReport: lane.SendDeliveryReport,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -35,7 +35,7 @@ func BenchmarkSelectCandidates(b *testing.B) {
 	lanes := make(map[protocol.LaneID]*scheduledLane, 16)
 	deadline := time.Now().Add(time.Hour)
 	for index := range 16 {
-		laneID := protocol.LaneID{byte(index + 1)}
+		laneID := protocol.LaneID(byte(index + 1))
 		store, err := NewTransmissionStore(packetqueue.Limits{Packets: 1024, Bytes: 16 * 1024 * 1024})
 		if err != nil {
 			b.Fatal(err)
@@ -61,7 +61,7 @@ func BenchmarkSelectCandidates(b *testing.B) {
 		}
 		lanes[laneID] = &scheduledLane{
 			registration: LaneRegistration{
-				LaneID: laneID, PathGroupID: protocol.PathGroupID{byte(index/2 + 1)}, Store: store,
+				LaneID: laneID, PathGroupID: protocol.PathGroupID(byte(index/2 + 1)), Store: store,
 			},
 			rttMicros: uint64(10_000 + index*250), deliveryRate: 10_000_000,
 		}
@@ -69,14 +69,14 @@ func BenchmarkSelectCandidates(b *testing.B) {
 	b.Run("Transport", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			selected := selectCandidates(lanes, protocol.LaneID{2}, false, 1500, math.MaxUint64)
+			selected := selectCandidates(lanes, protocol.LaneID(2), false, 1500, math.MaxUint64)
 			benchmarkCandidateSink = selected.lanes[0].score(1500)
 		}
 	})
 	b.Run("Control", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			selected := selectCandidates(lanes, protocol.LaneID{}, true, 1500, math.MaxUint64)
+			selected := selectCandidates(lanes, protocol.LaneID(0), true, 1500, math.MaxUint64)
 			benchmarkCandidateSink = selected.lanes[selected.count-1].score(1500)
 		}
 	})
@@ -116,7 +116,7 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}
 		releaseBatchOwnership(ownership[:count])
-		if _, _, err := store.acknowledge(packets, store.sentBytes, uint64(store.now().UnixMicro())); err != nil {
+		if _, _, err := store.acknowledge(packets, uint64(store.now().UnixMicro())); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -150,7 +150,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}
 		releaseBatchOwnership(ownership[:count])
-		if _, _, err := store.acknowledge(store.sentPackets, store.sentBytes, uint64(store.now().UnixMicro())); err != nil {
+		if _, _, err := store.acknowledge(store.sentPackets, uint64(store.now().UnixMicro())); err != nil {
 			b.Fatal(err)
 		}
 		for range count {
@@ -217,7 +217,7 @@ func BenchmarkLaneWriteControlBatch(b *testing.B) {
 		b.Run(tt.name, func(b *testing.B) {
 			lane := &Lane{carrier: carrier.NewStreamConn(benchmarkStreamSink{}), clock: &testClock{now: 1000},
 				control: make(chan controlWrite, maximumConsecutiveControlFrames), writeTimeout: time.Second}
-			frame := protocol.Frame{Type: protocol.FrameProbe, Payload: make([]byte, 1200)}
+			frame := protocol.Frame{Type: protocol.FrameDeliveryReport, Payload: make([]byte, 1200)}
 			request := controlWrite{build: func(uint64) (protocol.Frame, error) { return frame, nil }}
 			ctx := context.Background()
 			if _, err := lane.writeControlBatch(ctx, request, maximumConsecutiveControlFrames); err != nil {

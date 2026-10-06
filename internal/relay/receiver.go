@@ -259,7 +259,7 @@ func deadlineStatus(mapping clockmap.Mapping, receiverNowMicros, senderDeadlineM
 		return false, fmt.Errorf("%w: %w", ErrInvalidPacketDeadline, err)
 	}
 	if earliestDeadline > receiverNowMicros &&
-		earliestDeadline-receiverNowMicros > protocol.MaxPacketLifetimeMicros {
+		earliestDeadline-receiverNowMicros > protocol.MaxPacketLifetimeMicros+protocol.DeadlineResolutionMicros-1 {
 		return false, ErrInvalidPacketDeadline
 	}
 	return receiverNowMicros >= latestDeadline, nil

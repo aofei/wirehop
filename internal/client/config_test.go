@@ -562,7 +562,7 @@ func testPreparedWebSocketClosesOnAdmissionFailure(t *testing.T, mode, scheme, f
 	t.Helper()
 	url := testLaneSpec(t, strings.ToLower(scheme)+"://relay.example/_wirehop").URL()
 	attempt := creationAttempt{
-		laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1}, generation: 1,
+		laneID: protocol.LaneID(1), pathGroupID: protocol.PathGroupID(1), generation: 1,
 		nonce: protocol.Nonce{1}, unixSeconds: time.Now().Unix(),
 	}
 	instance := &Client{config: Config{Clock: monotime.New(),

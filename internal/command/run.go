@@ -63,7 +63,7 @@ const (
 	// defaultIngressBytes bounds one session ingress queue by byte count.
 	defaultIngressBytes = 4 * 1024 * 1024
 	// defaultLanePackets bounds one lane queue by packet count.
-	defaultLanePackets = 16_384
+	defaultLanePackets = 65_536
 	// defaultLaneBytes bounds one lane queue by byte count.
 	defaultLaneBytes = 32 * 1024 * 1024
 	// defaultRetainedPackets bounds aggregate server packet retention.

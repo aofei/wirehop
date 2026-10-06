@@ -42,10 +42,10 @@ func (o *testLaneObserver) ObserveDeliveryReport(_ context.Context, source proto
 func TestLaneReadControlDeliveryReportSource(t *testing.T) {
 	observer := &testLaneObserver{}
 	lane := &Lane{
-		laneID: protocol.LaneID{2}, generation: 7, clock: &testClock{now: 12345}, observer: observer,
+		laneID: protocol.LaneID(2), generation: 7, clock: &testClock{now: 12345}, observer: observer,
 	}
 	report := protocol.DeliveryReport{
-		LaneID: protocol.LaneID{3}, Generation: 9, DataPackets: 1, DataBytes: 64,
+		LaneID: protocol.LaneID(3), Generation: 9, DataPackets: 1,
 	}
 	frame, err := protocol.MarshalDeliveryReport(report)
 	if err != nil {
@@ -67,7 +67,7 @@ func (*testLaneObserver) ObserveLaneAbandon(context.Context, protocol.LaneGenera
 	return nil
 }
 
-func (o *testLaneObserver) RouteDeliveryReport(report protocol.DeliveryReport, complete func(bool)) bool {
+func (o *testLaneObserver) RouteDeliveryReport(report protocol.DeliveryReport, _ time.Time, complete func(bool)) bool {
 	frame, err := protocol.MarshalDeliveryReport(report)
 	if err != nil {
 		return false
@@ -347,11 +347,11 @@ func TestPacketValidation(t *testing.T) {
 
 func TestLanePhase(t *testing.T) {
 	spread := time.Second
-	first := lanePhase(protocol.LaneID{1}, 1, spread)
-	if first < 0 || first >= spread || first != lanePhase(protocol.LaneID{1}, 1, spread) {
+	first := lanePhase(protocol.LaneID(1), 1, spread)
+	if first < 0 || first >= spread || first != lanePhase(protocol.LaneID(1), 1, spread) {
 		t.Fatalf("lanePhase() = %v", first)
 	}
-	if lanePhase(protocol.LaneID{1}, 1, 0) != 0 {
+	if lanePhase(protocol.LaneID(1), 1, 0) != 0 {
 		t.Fatal("lanePhase() returned a phase without spread")
 	}
 }
@@ -364,57 +364,65 @@ func TestDeliveryProgressTracksCarrierOrder(t *testing.T) {
 	if err := progress.addData(16, 20); err != nil {
 		t.Fatal(err)
 	}
-	report, revision, changed := progress.claim(protocol.LaneID{1}, 2, time.Now(), time.Second)
-	if report.DataBytes != 30 || report.DataPackets != 17 || revision != 2 || !changed {
-		t.Fatalf("claim() = %+v, revision %d, changed %t", report, revision, changed)
+	snapshot, changed := progress.claim(1, 2, time.Now(), time.Second)
+	if snapshot.dataBytes != 30 || snapshot.report.DataPackets != 17 || snapshot.revision != 2 || !changed {
+		t.Fatalf("claim() = %+v, changed %t", snapshot, changed)
 	}
-	progress.complete(report, revision, true)
-	if _, _, changed := progress.claim(protocol.LaneID{1}, 2, time.Now(), time.Second); changed {
+	progress.complete(snapshot, true)
+	if _, changed := progress.claim(1, 2, time.Now(), time.Second); changed {
 		t.Fatal("reported progress remained changed")
 	}
 }
 
 func TestDeliveryProgressRetriesUnsentClaim(t *testing.T) {
-	progress := deliveryProgress{notify: make(chan struct{}, 1)}
-	if err := progress.addData(1, 10); err != nil {
-		t.Fatal(err)
+	for _, test := range []struct {
+		name              string
+		additionalPackets int
+	}{
+		{name: "UnchangedProgress"},
+		{name: "ChangedProgress", additionalPackets: reportPacketThreshold},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			progress := deliveryProgress{notify: make(chan struct{}, 1)}
+			if err := progress.addData(1, 10); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now()
+			snapshot, changed := progress.claim(protocol.LaneID(1), 1, now, time.Second)
+			if !changed {
+				t.Fatal("initial progress was not claimed")
+			}
+			select {
+			case <-progress.notify:
+			default:
+				t.Fatal("initial progress did not publish a notification")
+			}
+			progress.complete(snapshot, false)
+			select {
+			case <-progress.notify:
+			default:
+				t.Fatal("failed completion did not publish a notification")
+			}
+			for range test.additionalPackets {
+				if err := progress.addData(1, 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-progress.notify:
+				t.Fatal("pending failed claim published an immediate retry notification")
+			default:
+			}
+			if _, changed := progress.claim(protocol.LaneID(1), 1, now.Add(time.Second-time.Nanosecond), time.Second); changed {
+				t.Fatal("pending progress was claimed before its retry interval")
+			}
+			retry, changed := progress.claim(protocol.LaneID(1), 1, now.Add(time.Second), time.Second)
+			if !changed || retry.report.DataPackets != uint64(1+test.additionalPackets) {
+				t.Fatalf("retry = %+v, changed %t", retry, changed)
+			}
+			progress.complete(retry, true)
+		})
 	}
-	now := time.Now()
-	report, revision, changed := progress.claim(protocol.LaneID{1}, 1, now, time.Second)
-	if !changed {
-		t.Fatal("initial progress was not claimed")
-	}
-	select {
-	case <-progress.notify:
-	default:
-		t.Fatal("initial progress did not publish a notification")
-	}
-	progress.complete(report, revision, false)
-	select {
-	case <-progress.notify:
-	default:
-		t.Fatal("failed completion did not publish a notification")
-	}
-	for range reportPacketThreshold {
-		if err := progress.addData(1, 1); err != nil {
-			t.Fatal(err)
-		}
-	}
-	select {
-	case <-progress.notify:
-		t.Fatal("pending failed claim published an immediate retry notification")
-	default:
-	}
-	if _, _, changed := progress.claim(protocol.LaneID{1}, 1, now.Add(time.Second-time.Nanosecond), time.Second); changed {
-		t.Fatal("pending progress was claimed before its retry interval")
-	}
-	retryReport, retryRevision, changed := progress.claim(
-		protocol.LaneID{1}, 1, now.Add(time.Second), time.Second,
-	)
-	if !changed {
-		t.Fatal("pending progress was not reclaimed after its retry interval")
-	}
-	progress.complete(retryReport, retryRevision, true)
 }
 
 func TestDeliveryProgressThresholdNotification(t *testing.T) {
@@ -495,14 +503,13 @@ func TestDeliveryProgressRejectsCounterOverflow(t *testing.T) {
 		}
 	})
 
-	t.Run("ProbePackets", func(t *testing.T) {
-		progress := deliveryProgress{probePackets: ^uint64(0)}
-		if err := progress.addProbe(1); !errors.Is(err, ErrCounterExhausted) {
-			t.Fatalf("addProbe() error = %v, want %v", err, ErrCounterExhausted)
+	t.Run("PingRevision", func(t *testing.T) {
+		progress := deliveryProgress{revision: ^uint64(0)}
+		if err := progress.addPing(1); !errors.Is(err, ErrCounterExhausted) {
+			t.Fatal(err)
 		}
-		if progress.probeBytes != 0 || progress.revision != 0 {
-			t.Fatalf("progress changed after rejected probe: bytes %d, revision %d",
-				progress.probeBytes, progress.revision)
+		if progress.pingID != 0 {
+			t.Fatal("rejected ping changed progress")
 		}
 	})
 }
@@ -544,11 +551,11 @@ func TestLaneReadDataBatch(t *testing.T) {
 				if err := lane.readDataBatch(t.Context(), []protocol.Frame{prefix}); err != nil {
 					t.Fatal(err)
 				}
-				report, revision, changed := lane.progress.claim(lane.laneID, lane.generation, time.Now(), time.Second)
-				if !changed || report.DataPackets != 1 {
+				snapshot, changed := lane.progress.claim(lane.laneID, lane.generation, time.Now(), time.Second)
+				if !changed || snapshot.report.DataPackets != 1 {
 					t.Fatal("accepted prefix was not available for feedback")
 				}
-				lane.progress.complete(report, revision, true)
+				lane.progress.complete(snapshot, true)
 				if len(endpoint.writes) != 1 || len(lane.progress.notify) != 1 {
 					t.Fatal("accepted prefix did not deliver data and notify the report worker")
 				}
@@ -688,18 +695,18 @@ func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
 				if err := lane.readDataBatch(t.Context(), frames[offset:end]); err != nil {
 					t.Fatal(err)
 				}
-				report, revision, changed := lane.progress.claim(lane.laneID, lane.generation, now, time.Second)
-				if !changed || report.DataPackets != uint64(end) || report.DataBytes != encodedBytes[end] {
-					t.Fatalf("received prefix report = %+v, changed %t", report, changed)
+				snapshot, changed := lane.progress.claim(lane.laneID, lane.generation, now, time.Second)
+				if !changed || snapshot.report.DataPackets != uint64(end) || snapshot.dataBytes != encodedBytes[end] {
+					t.Fatalf("received prefix report = %+v, changed %t", snapshot, changed)
 				}
-				if progressed, err := sender.applyReport(report, uint64(now.UnixMicro()), now); err != nil || !progressed {
+				if progressed, err := sender.applyReport(snapshot.report, uint64(now.UnixMicro()), now); err != nil || !progressed {
 					t.Fatalf("prefix acknowledgement = %t, %v", progressed, err)
 				}
 				if packets, bytes := store.backlog(); packets != packetCount-end ||
 					bytes != encodedBytes[packetCount]-encodedBytes[end] {
 					t.Fatalf("retained suffix = %d packets, %d bytes", packets, bytes)
 				}
-				lane.progress.complete(report, revision, true)
+				lane.progress.complete(snapshot, true)
 				for index := offset; index < end; index++ {
 					if payload := <-endpoint.writes; payload[4] != byte(index) {
 						t.Fatalf("UDP delivery marker = %d, want %d", payload[4], index)
@@ -791,65 +798,29 @@ func TestLaneReadDataBatchDelivery(t *testing.T) {
 	}
 }
 
-func TestLaneProbeNeeded(t *testing.T) {
-	lane := &Lane{}
-	observed := uint64(0)
-	if !lane.probeNeeded(&observed) {
-		t.Fatal("idle lane did not request a probe")
+func TestDeliveryProgressAddPing(t *testing.T) {
+	progress := deliveryProgress{}
+	if err := progress.addPing(2); err != nil {
+		t.Fatal(err)
 	}
-	lane.dataWrites.Add(1)
-	needed := lane.probeNeeded(&observed)
-	if needed || observed != 1 {
-		t.Fatalf("data write did not suppress probe or update observation: needed %t, observed %d",
-			needed, observed)
+	for _, identifier := range []uint64{0, 1, 2} {
+		if err := progress.addPing(identifier); !errors.Is(err, protocol.ErrInvalidControlFrame) {
+			t.Fatal(err)
+		}
 	}
-	if !lane.probeNeeded(&observed) {
-		t.Fatal("lane did not resume probing after one idle interval")
+	if progress.pingID != 2 || progress.revision != 1 {
+		t.Fatal("invalid ping changed progress")
 	}
 }
 
-func TestLaneProbeProgressValidation(t *testing.T) {
-	const probeSize = 32
-	carrier := &blockingFrameCarrier{
-		testCarrier: newTestCarrier(), writeEntered: make(chan struct{}),
+func TestLaneValidatePingProgress(t *testing.T) {
+	lane := &Lane{}
+	if !lane.ValidatePingProgress(0) || lane.ValidatePingProgress(1) {
+		t.Fatal("unexposed ping accepted")
 	}
-	lane := &Lane{
-		carrier: carrier, clock: &testClock{now: 1}, writeTimeout: time.Second, probeSize: probeSize,
-	}
-	frame, err := protocol.MarshalProbe(protocol.Probe{Payload: make([]byte, probeSize)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	frameBytes := uint64(protocol.FrameSize(probeSize))
-	if lane.ValidateProbeProgress(1, frameBytes) {
-		t.Fatal("probe progress was accepted before the probe reached the carrier writer")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan error, 1)
-	go func() {
-		_, err := lane.writeControlBatch(ctx, controlWrite{
-			build: func(uint64) (protocol.Frame, error) { return frame, nil },
-		}, maximumConsecutiveControlFrames)
-		result <- err
-	}()
-	select {
-	case <-carrier.writeEntered:
-	case <-time.After(time.Second):
-		t.Fatal("probe did not reach the carrier writer")
-	}
-	if !lane.ValidateProbeProgress(1, frameBytes) {
-		t.Fatal("exact probe progress was rejected while the carrier write was in progress")
-	}
-	if lane.ValidateProbeProgress(1, frameBytes-1) {
-		t.Fatal("probe progress with an invalid byte count was accepted")
-	}
-	if lane.ValidateProbeProgress(2, 2*frameBytes) {
-		t.Fatal("progress for an unwritten probe was accepted")
-	}
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("blocked probe write error = %v, want %v", err, context.Canceled)
+	lane.exposedPingID.Store(2)
+	if !lane.ValidatePingProgress(1) || !lane.ValidatePingProgress(2) || lane.ValidatePingProgress(3) {
+		t.Fatal("ping progress does not match the exposed request bound")
 	}
 }
 
@@ -978,7 +949,7 @@ func TestLanePingResumesActiveInterval(t *testing.T) {
 		pingTimeout  = 50 * time.Millisecond
 	)
 	lane := &Lane{
-		clock: &testClock{now: 1000}, laneID: protocol.LaneID{1}, generation: 1,
+		clock: &testClock{now: 1000}, laneID: protocol.LaneID(1), generation: 1,
 		control: make(chan controlWrite, 1), pingInterval: pingInterval, pingTimeout: pingTimeout,
 		pingChanged: make(chan struct{}, 1),
 	}
@@ -1350,7 +1321,7 @@ func TestReceiverDeadlineValidation(t *testing.T) {
 	if err := receiver.ValidateDeadline(clock.now + protocol.MaxPacketLifetimeMicros); err != nil {
 		t.Fatalf("maximum deadline error = %v", err)
 	}
-	if err := receiver.ValidateDeadline(clock.now + protocol.MaxPacketLifetimeMicros + 1); !errors.Is(
+	if err := receiver.ValidateDeadline(clock.now + protocol.MaxPacketLifetimeMicros + protocol.DeadlineResolutionMicros); !errors.Is(
 		err, ErrInvalidPacketDeadline,
 	) {
 		t.Fatalf("future deadline error = %v, want %v", err, ErrInvalidPacketDeadline)
@@ -1389,7 +1360,7 @@ func TestNewLaneRequiresObserver(t *testing.T) {
 	}
 	if _, err := NewLane(LaneConfig{
 		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock,
-		LaneID: protocol.LaneID{1}, Generation: 1,
+		LaneID: protocol.LaneID(1), Generation: 1,
 	}); !errors.Is(err, ErrInvalidLane) {
 		t.Fatalf("NewLane() error = %v, want %v", err, ErrInvalidLane)
 	}
@@ -1448,10 +1419,10 @@ func TestLane(t *testing.T) {
 					sawPong = true
 				case protocol.FrameDeliveryReport:
 					report, err := protocol.ParseDeliveryReport(frame)
-					if err != nil || report.DataPackets != 2 {
+					if err != nil || report.DataPackets > 2 {
 						t.Fatalf("report = %+v, %v", report, err)
 					}
-					sawReport = true
+					sawReport = report.DataPackets == 2 && report.PingID == 7
 				}
 			}
 		case <-deadline:
@@ -1489,7 +1460,7 @@ func TestLaneProtocolErrorIsPreserved(t *testing.T) {
 			t.Fatal(err)
 		}
 		if remote.Code != protocol.ErrorProtocolViolation || remote.Class != protocol.ErrorLaneRejected ||
-			remote.Scope != protocol.ErrorScopeLane || remote.LaneID != (protocol.LaneID{1}) || remote.Generation != 1 {
+			remote.Scope != protocol.ErrorScopeLane || remote.LaneID != (protocol.LaneID(1)) || remote.Generation != 1 {
 			t.Fatalf("protocol error frame = %+v", remote)
 		}
 	case <-time.After(time.Second):
@@ -1543,7 +1514,7 @@ func TestLaneRequiresInitialClockSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
+		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
 		Generation: 1, ClockSyncTimeout: time.Second,
 	})
 	if err != nil {
@@ -1637,7 +1608,7 @@ func TestLaneAcceptsSessionCloseOnlyWhenConfigured(t *testing.T) {
 func TestLaneRejectsMisdirectedError(t *testing.T) {
 	frame, err := protocol.MarshalErrorFrame(protocol.ErrorFrame{
 		Code: protocol.ErrorProtocolViolation, Class: protocol.ErrorLaneRejected, Scope: protocol.ErrorScopeLane,
-		LaneID: protocol.LaneID{2}, Generation: 1, Diagnostic: "misdirected",
+		LaneID: protocol.LaneID(2), Generation: 1, Diagnostic: "misdirected",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1660,7 +1631,7 @@ func TestLaneAppliesRemoteErrorScope(t *testing.T) {
 	}{
 		{name: "Lane", value: protocol.ErrorFrame{
 			Code: protocol.ErrorProtocolViolation, Class: protocol.ErrorLaneRejected,
-			Scope: protocol.ErrorScopeLane, LaneID: protocol.LaneID{1}, Generation: 1,
+			Scope: protocol.ErrorScopeLane, LaneID: protocol.LaneID(1), Generation: 1,
 		}},
 		{name: "Session", value: protocol.ErrorFrame{
 			Code: protocol.ErrorUnavailable, Class: protocol.ErrorRetryable, Scope: protocol.ErrorScopeSession,
@@ -1711,7 +1682,7 @@ func TestLanePingTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
+		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
 		Generation: 1, PingInterval: 5 * time.Millisecond, PingTimeout: 15 * time.Millisecond,
 	})
 	if err != nil {
@@ -1746,7 +1717,7 @@ func TestLanePingTimeoutPreemptsIdleBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
+		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
 		Generation: 1, PingInterval: pingInterval, PingTimeout: pingTimeout,
 	})
 	if err != nil {
@@ -1798,7 +1769,7 @@ func TestLanePingTimeoutStartsAfterCarrierWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
+		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
 		Generation: 1, InitialFrames: []protocol.Frame{initial}, PingInterval: 5 * time.Millisecond,
 		PingTimeout: 15 * time.Millisecond, WriteTimeout: 250 * time.Millisecond,
 	})
@@ -1905,7 +1876,7 @@ func TestLaneWriteTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
+		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
 		Generation: 1, WriteTimeout: -time.Second,
 	}); !errors.Is(err, ErrInvalidLane) {
 		t.Fatalf("NewLane() error = %v, want %v", err, ErrInvalidLane)
@@ -1915,7 +1886,7 @@ func TestLaneWriteTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
+		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
 		Generation: 1, InitialFrames: []protocol.Frame{initialFrame}, WriteTimeout: 10 * time.Millisecond,
 	})
 	if err != nil {
@@ -1987,7 +1958,7 @@ func TestLaneRejectsMismatchedPong(t *testing.T) {
 		t.Fatal(err)
 	}
 	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID{1},
+		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
 		Generation: 1, PingInterval: 5 * time.Millisecond, PingTimeout: 100 * time.Millisecond,
 	})
 	if err != nil {
@@ -2061,7 +2032,7 @@ func newTestLane(t *testing.T, carrier *testCarrier, endpoint *testEndpoint) *La
 	if err != nil {
 		t.Fatal(err)
 	}
-	laneID := protocol.LaneID{1}
+	laneID := protocol.LaneID(1)
 	clock := &testClock{now: 1000}
 	receiver, err := NewReceiver(ReceiverConfig{Endpoint: endpoint, Clock: clock, DeduplicationSize: 64})
 	if err != nil {

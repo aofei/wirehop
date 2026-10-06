@@ -19,14 +19,19 @@ sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-results
 Use `GOARCH=amd64` for an x86-64 engine. Each run requires a fresh results directory. To reuse an equivalent tool image,
 set `WIREHOP_TEST_IMAGE`. It must provide `sh`, `ip`, `wg`, `tc`, `nstat`, `iperf3`, `openssl`, and `timeout`.
 
-The default matrix contains 52 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
+The default matrix contains 54 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
 1.2-second RTT, 0.5% loss with delay and jitter, four-second and twelve-second one-way outages, client address
 replacement, 32, 64, and 128 kbit/s carrier links, bidirectional TCP, an idle interval followed by a new burst, and
 140-second TCP flows spanning an actual kernel WireGuard rekey. Each scenario uses fresh endpoints. Ordinary cases run
 for 20 seconds. Twelve-second outage and address-replacement cases run for 40 seconds and require transfer progress
 after recovery. Address replacement changes the container's carrier-facing address, forcing recovery from an obsolete
 TCP connection. The rate-limited cases add 100 ms one-way delay, 20 ms jitter, and 0.2% loss with an eight-packet netem
-queue. They test continued connectivity at low capacity, not comparative mobile throughput or battery consumption.
+queue. They test continued connectivity at low capacity, not comparative mobile throughput or battery consumption. The
+`tcp-asymmetric` case uses distinct TCP path groups with 5 ms one-way delay at 100 Mbit/s and 150 ms one-way delay at 20
+Mbit/s. `tcp-asymmetric-stall` additionally interrupts only the faster path for four seconds. These cases check
+completed delivery and recovery with unequal paths. They do not guarantee uninterrupted inner TCP progress during a
+carrier stall.
+
 Select a subset by passing case names:
 
 ```sh
@@ -48,9 +53,10 @@ WireGuard. At least 95% of the offered bytes must arrive. Iperf3 still uses one 
 The verifier rejects incomplete transfers and zero-byte results. Ordinary single-lane cases also check the client's TCP
 active-open count to detect unexpected reconnect attempts. Server passive-open counts can include discarded child
 sockets during concurrent handshake processing and are retained only as supporting evidence. Outage and address-change
-cases permit reconnection. The parallel-lane cases permit concurrent admission attempts but require both configured
-carriers before and after the flow, with no additional carrier connection attempts during the flow. Rekey cases require
-a later kernel handshake while the same iperf3 TCP flow remains active. Results preserve iperf3 JSON, kernel counters,
+cases permit reconnection. Healthy parallel-lane cases permit concurrent admission attempts but require both configured
+carriers before and after the flow, with no additional carrier connection attempts during the flow. The asymmetric stall
+case requires both carriers before fault injection and permits recovery through a new connection. Rekey cases require a
+later kernel handshake while the same iperf3 TCP flow remains active. Results preserve iperf3 JSON, kernel counters,
 socket receive limits, handshake timestamps, software versions, and WireHop diagnostics. Compare goodput,
 retransmissions, and `UdpRcvbufErrors` across repeated runs on the same engine. Kernel counters are namespace totals, so
 `TcpOutRsts` alone cannot identify an outer carrier reset. The tests use MTU 1420 and fixed public test keys exclusively

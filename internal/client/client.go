@@ -829,7 +829,8 @@ func (c *Client) runLaneGeneration(ctx context.Context, configured clientLane, g
 	if err := scheduler.Register(ctx, relay.LaneRegistration{
 		LaneID: configured.laneID, Generation: generation, PathGroupID: configured.pathGroupID, Store: store,
 		InitialTiming: &timing,
-		Abandon:       abandon, SendControl: lane.SendControl, ValidateProbeProgress: lane.ValidateProbeProgress,
+		Abandon:       abandon, SendControl: lane.SendControl,
+		ValidatePingProgress: lane.ValidatePingProgress, SendDeliveryReport: lane.SendDeliveryReport,
 	}); err != nil {
 		return err
 	}
@@ -1591,15 +1592,15 @@ func completeCreation(clientSendMicros,
 func buildLanes(specs []lanespec.Spec, wallClock func() time.Time) []clientLane {
 	groups := make(map[pathGroupKey]protocol.PathGroupID)
 	lanes := make([]clientLane, 0, len(specs))
-	for _, spec := range specs {
+	for index, spec := range specs {
 		key := pathGroupKey{url: spec.URL().String(), resolveIP: spec.ResolveIP()}
 		group := groups[key]
 		if group.IsZero() {
-			group = protocol.NewPathGroupID()
+			group = protocol.PathGroupID(len(groups) + 1)
 			groups[key] = group
 		}
 		lanes = append(lanes, clientLane{
-			spec: spec, laneID: protocol.NewLaneID(), pathGroupID: group,
+			spec: spec, laneID: protocol.LaneID(index + 1), pathGroupID: group,
 			authenticationClock: newAuthenticationClock(wallClock),
 		})
 	}

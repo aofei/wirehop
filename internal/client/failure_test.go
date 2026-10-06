@@ -72,7 +72,7 @@ func TestLaneFailureEndsSession(t *testing.T) {
 	}
 	remoteLane := &relay.RemoteError{Value: protocol.ErrorFrame{
 		Code: protocol.ErrorProtocolViolation, Class: protocol.ErrorLaneRejected, Scope: protocol.ErrorScopeLane,
-		LaneID: protocol.LaneID{1}, Generation: 1,
+		LaneID: protocol.LaneID(1), Generation: 1,
 	}}
 	if classifyLaneFailure(remoteLane) != failureCloseLane {
 		t.Fatal("typed lane-scoped rejection did not close only its lane")
@@ -86,7 +86,7 @@ func TestLaneFailureEndsSession(t *testing.T) {
 	}
 	remoteLaneRetry := &relay.RemoteError{Value: protocol.ErrorFrame{
 		Code: protocol.ErrorUnavailable, Class: protocol.ErrorRetryable, Scope: protocol.ErrorScopeLane,
-		LaneID: protocol.LaneID{1}, Generation: 1,
+		LaneID: protocol.LaneID(1), Generation: 1,
 	}}
 	if classifyLaneFailure(remoteLaneRetry) != failureRetry || sessionReplacementFailure(remoteLaneRetry) {
 		t.Fatal("retryable lane-scoped error escaped its lane")
@@ -135,7 +135,7 @@ func TestLogDisabledLaneRedactsRemoteDiagnostic(t *testing.T) {
 	}
 	instance.logDisabledLane(0, &relay.RemoteError{Value: protocol.ErrorFrame{
 		Code: protocol.ErrorProtocolViolation, Class: protocol.ErrorLaneRejected, Scope: protocol.ErrorScopeLane,
-		LaneID: protocol.LaneID{1}, Generation: 1, Diagnostic: "private diagnostic",
+		LaneID: protocol.LaneID(1), Generation: 1, Diagnostic: "private diagnostic",
 	}})
 	logged := output.String()
 	for _, value := range []string{
@@ -175,7 +175,7 @@ func TestClientSuperviseLaneReportsProlongedRetries(t *testing.T) {
 		defer cancel()
 		result := make(chan error, 1)
 		go func() {
-			result <- instance.superviseLane(ctx, clientLane{spec: spec, laneID: protocol.LaneID{1}},
+			result <- instance.superviseLane(ctx, clientLane{spec: spec, laneID: protocol.LaneID(1)},
 				creationResult{}, nil, nil, nil)
 		}()
 		time.Sleep(29 * time.Second)
@@ -314,7 +314,7 @@ func TestSuperviseLaneTimestampsAfterPreparation(t *testing.T) {
 		ControlContext: func(context.Context, string, string, syscall.RawConn) error { return ErrLaneRejected },
 	}}}
 	err := instance.superviseLane(t.Context(), clientLane{
-		spec: testLaneSpec(t, "tcp://127.0.0.1:51820"), laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1},
+		spec: testLaneSpec(t, "tcp://127.0.0.1:51820"), laneID: protocol.LaneID(1), pathGroupID: protocol.PathGroupID(1),
 	}, creationResult{}, nil, nil, nil)
 	// Resume detection samples once. Admission must not sample a timestamp before preparation completes.
 	if got := clock.calls.Load(); got != 1 {

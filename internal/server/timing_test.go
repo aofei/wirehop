@@ -45,7 +45,7 @@ func TestServerCreateSessionCapacity(t *testing.T) {
 				session.mu.Lock()
 				session.confirmed = true
 				if name == "ProtectActiveLanes" {
-					session.lanes[protocol.LaneID{1}] = sessionLane{generation: 1, cancel: func() {}}
+					session.lanes[protocol.LaneID(1)] = sessionLane{generation: 1, cancel: func() {}}
 				}
 				session.startDetachTimerLocked()
 				session.mu.Unlock()
@@ -53,7 +53,7 @@ func TestServerCreateSessionCapacity(t *testing.T) {
 			}
 			if name == "ProtectReservedJoin" {
 				for _, session := range sessions {
-					if err := session.reserveLane(protocol.LaneID{1}, 1, protocol.PathGroupID{1}); err != nil {
+					if err := session.reserveLane(protocol.LaneID(1), 1, protocol.PathGroupID(1)); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -91,12 +91,12 @@ func TestServerSessionReserveLaneExpiredGrace(t *testing.T) {
 	session.startDetachTimerLocked()
 	session.mu.Unlock()
 	clock.now.Store(119_000_000)
-	if err := session.reserveLane(protocol.LaneID{1}, 1, protocol.PathGroupID{1}); err != nil {
+	if err := session.reserveLane(protocol.LaneID(1), 1, protocol.PathGroupID(1)); err != nil {
 		t.Fatalf("join after 119 seconds = %v", err)
 	}
 	session.rejectReservedLane()
 	clock.now.Store(240_000_000)
-	if err := session.reserveLane(protocol.LaneID{1}, 2, protocol.PathGroupID{1}); !errors.Is(err, ErrSessionClosed) {
+	if err := session.reserveLane(protocol.LaneID(1), 2, protocol.PathGroupID(1)); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("join after protocol-clock grace elapsed = %v", err)
 	}
 }
@@ -125,8 +125,8 @@ func TestServerServeConnectionTLSPhaseBudgets(t *testing.T) {
 		synctest.Sleep(600 * time.Millisecond)
 		hello := protocol.ClientHello{
 			Mode: protocol.HelloCreate, UnixSeconds: 3000, MonotonicMicros: 1,
-			Nonce: protocol.Nonce{1}, LaneID: protocol.LaneID{1}, Generation: 1,
-			PathGroupID: protocol.PathGroupID{1}, Target: endpoint,
+			Nonce: protocol.Nonce{1}, LaneID: protocol.LaneID(1), Generation: 1,
+			PathGroupID: protocol.PathGroupID(1), Target: endpoint,
 		}
 		if err := protocol.SignClientHello(&hello, token); err != nil {
 			t.Fatal(err)

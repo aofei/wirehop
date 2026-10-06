@@ -70,6 +70,15 @@ fi
 case "$scenario" in
   tcp-latency) tc qdisc replace dev eth0 root netem delay 600ms ;;
   tcp-loss) tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 0.5% ;;
+  tcp-asymmetric|tcp-asymmetric-stall)
+    tc qdisc replace dev eth0 root handle 1: prio bands 3
+    tc qdisc add dev eth0 parent 1:1 handle 10: netem delay 5ms rate 100mbit limit 1000
+    tc qdisc add dev eth0 parent 1:2 handle 20: netem delay 150ms rate 20mbit limit 1000
+    for field in sport dport; do
+      tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51822 0xffff flowid 1:1
+      tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51823 0xffff flowid 1:2
+    done
+    ;;
   *-slow32|*-slow64|*-slow128)
     rate=${scenario##*slow}
     tc qdisc replace dev eth0 root handle 1: tbf rate "${rate}kbit" burst 4096 latency 1s
@@ -98,6 +107,9 @@ if [ "$role" = server ]; then
   if [ "$scenario" = tcp-mixed ]; then
     set -- "$@" --allow-insecure --listen wss://:51823
   fi
+  case "$scenario" in
+    tcp-asymmetric|tcp-asymmetric-stall) set -- "$@" --listen tcp://:51823 ;;
+  esac
   touch /results/ready
   exec /wirehop server --listen "$scheme://:51822" --allow-target "$target" "$@"
 fi
@@ -134,6 +146,9 @@ case "$scheme" in
     if [ "$scenario" = tcp-multipath ]; then
       set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51822"
     fi
+    case "$scenario" in
+      tcp-asymmetric|tcp-asymmetric-stall) set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51823" ;;
+    esac
     if [ "$scenario" = tcp-fwmark ]; then set -- "$@" --fwmark 51820; fi
     if [ "$scenario" = tcp-mixed ]; then
       set -- "$@" --tls-server-name wirehop.test --lane "wss://$WIREHOP_TEST_SERVER:51823"
@@ -149,6 +164,15 @@ if [ "$scenario" = tcp-idle ]; then
   sleep 35
 fi
 case "$scenario" in
+  tcp-asymmetric-stall)
+    (
+      sleep 5
+      tc qdisc replace dev eth0 parent 1:1 handle 10: netem loss 100%
+      sleep 4
+      tc qdisc replace dev eth0 parent 1:1 handle 10: netem delay 5ms rate 100mbit limit 1000
+      date +%s > /results/path-recovered.txt
+    ) &
+    ;;
   *-stall|*-outage)
     outage=4
     if [ "${scenario##*-}" = outage ]; then outage=12; fi

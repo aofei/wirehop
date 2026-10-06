@@ -42,7 +42,7 @@ func BenchmarkDataEncoding(b *testing.B) {
 }
 
 func BenchmarkFrameReader(b *testing.B) {
-	encoded, err := MarshalFrame(Frame{Type: FrameProbe, Payload: make([]byte, 1420)})
+	encoded, err := MarshalFrame(Frame{Type: FrameDeliveryReport, Payload: make([]byte, 1420)})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func BenchmarkFrameReader(b *testing.B) {
 }
 
 func BenchmarkAppendFrames(b *testing.B) {
-	encoded, err := MarshalFrame(Frame{Type: FrameProbe, Payload: make([]byte, 1420)})
+	encoded, err := MarshalFrame(Frame{Type: FrameDeliveryReport, Payload: make([]byte, 1420)})
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -53,6 +53,10 @@ func TestRejectionErrors(t *testing.T) {
 		t.Fatalf("ParseRejection() duplicate error = %v, want %v", err, ErrInvalid)
 	}
 	headers = make(http.Header)
+	rejection.Diagnostic = "x"
+	if err := protocol.SignServerHello(&rejection, []byte("test key")); err != nil {
+		t.Fatal(err)
+	}
 	if err := SetRejection(headers, rejection); err != nil {
 		t.Fatal(err)
 	}

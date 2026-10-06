@@ -11,7 +11,7 @@ results=$(cd "$2" && pwd)
 scripts=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 shift 2
 if [ "$#" -eq 0 ]; then
-  set -- native forward tcp tls ws wss tcp-multipath tcp-latency tcp-loss tcp-stall tcp-bidir tcp-idle \
+  set -- native forward tcp tls ws wss tcp-multipath tcp-asymmetric tcp-asymmetric-stall tcp-latency tcp-loss tcp-stall tcp-bidir tcp-idle \
     tcp-rekey forward-rekey forward-prohibit forward-blackhole tcp-prohibit tcp-blackhole \
     native-udp forward-udp tcp-udp wss-udp tcp-ipv6 wss-ipv6 forward-ipv6 tcp-inner-ipv6 tcp-fwmark forward-fwmark tcp-mixed \
     tcp-slow32 tcp-slow64 tcp-slow128 tcp-outage tcp-roam \
@@ -44,7 +44,7 @@ else
 fi
 for scenario in "$@"; do
   case "$scenario" in
-    native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
+    native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-asymmetric|tcp-asymmetric-stall|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
     forward-prohibit|forward-blackhole|tcp-prohibit|tcp-blackhole|native-udp|forward-udp|tcp-udp|wss-udp|\
     tcp-ipv6|wss-ipv6|forward-ipv6|tcp-inner-ipv6|tcp-fwmark|forward-fwmark|tcp-mixed|\
     tcp-slow32|tcp-slow64|tcp-slow128|tcp-outage|tcp-roam|\

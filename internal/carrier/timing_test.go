@@ -22,7 +22,7 @@ func TestWebSocketConnReadFrames(t *testing.T) {
 		written := make(chan error, 1)
 		finished := make(chan error, 1)
 		payload := bytes.Repeat([]byte{42}, 6000)
-		frame, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameProbe, Payload: payload})
+		frame, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameDeliveryReport, Payload: payload})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -75,11 +75,11 @@ func TestWebSocketConnReadFrames(t *testing.T) {
 	})
 
 	t.Run("ValidPrefixBeforeMalformedTail", func(t *testing.T) {
-		prefix, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameProbe, Payload: []byte{7}})
+		prefix, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameDeliveryReport, Payload: []byte{7}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		message := append(prefix, byte(protocol.FrameProbe), 0x80, 0)
+		message := append(prefix, byte(protocol.FrameDeliveryReport), 0x80, 0)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			connection, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -193,7 +193,7 @@ func TestWebSocketConnReadCancellation(t *testing.T) {
 
 func TestWebSocketConnReadTransportTruncation(t *testing.T) {
 	type connectionKey struct{}
-	encoded, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameProbe, Payload: make([]byte, 12000)})
+	encoded, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameDeliveryReport, Payload: make([]byte, 12000)})
 	if err != nil {
 		t.Fatal(err)
 	}

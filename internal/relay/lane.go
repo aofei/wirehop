@@ -70,12 +70,6 @@ const (
 	defaultPingTimeout = 10 * time.Second
 	// defaultCarrierWriteTimeout bounds one blocked stream or WebSocket write operation.
 	defaultCarrierWriteTimeout = 10 * time.Second
-	// defaultProbeInterval validates an otherwise idle lane and its feedback path.
-	defaultProbeInterval = 2 * time.Second
-	// maximumIdleProbeInterval bounds representative probe backoff without real data writes.
-	maximumIdleProbeInterval = time.Minute
-	// defaultProbeSize provides representative bounded idle carrier traffic.
-	defaultProbeSize = 1200
 	// maximumDataBatchFrames bounds nonblocking carrier write coalescing.
 	maximumDataBatchFrames = 16
 	// targetDataBatchBytes stops nonblocking coalescing after a compact write budget.
@@ -106,8 +100,6 @@ type LaneConfig struct {
 	PingInterval     time.Duration
 	PingTimeout      time.Duration
 	WriteTimeout     time.Duration
-	ProbeInterval    time.Duration
-	ProbeSize        int
 }
 
 // Lane runs one full-duplex carrier generation with one carrier writer.
@@ -125,14 +117,15 @@ type Lane struct {
 	clockSyncTimeout  time.Duration
 	clockSynced       func()
 	control           chan controlWrite
+	pong              chan controlWrite
 	reportInterval    time.Duration
 	pingInterval      time.Duration
 	pingTimeout       time.Duration
 	writeTimeout      time.Duration
-	probeInterval     time.Duration
-	probeSize         int
 	dataWrites        atomic.Uint64
-	probeWrites       atomic.Uint64
+	activeData        atomic.Bool
+	exposedPingID     atomic.Uint64
+	reportRTTMicros   atomic.Uint64
 	controlBatch      [maximumConsecutiveControlFrames]protocol.Frame
 	dataBatch         [maximumDataBatchFrames]protocol.Data
 	dataOwnership     [maximumDataBatchFrames]Packet
@@ -157,8 +150,10 @@ type deliveryProgress struct {
 	mu                  sync.Mutex
 	dataBytes           uint64
 	dataPackets         uint64
-	probeBytes          uint64
-	probePackets        uint64
+	pingID              uint64
+	parsedAt            time.Time
+	firstChangedAt      time.Time
+	eager               bool
 	revision            uint64
 	reported            uint64
 	reportedDataBytes   uint64
@@ -189,15 +184,8 @@ func NewLane(config LaneConfig) (*Lane, error) {
 	if config.WriteTimeout == 0 {
 		config.WriteTimeout = defaultCarrierWriteTimeout
 	}
-	if config.ProbeInterval == 0 {
-		config.ProbeInterval = defaultProbeInterval
-	}
-	if config.ProbeSize == 0 {
-		config.ProbeSize = defaultProbeSize
-	}
 	if config.ControlCapacity < 1 || config.ReportInterval <= 0 || config.PingInterval <= 0 ||
-		config.PingTimeout <= config.PingInterval || config.WriteTimeout <= 0 || config.ClockSyncTimeout < 0 ||
-		config.ProbeInterval <= 0 || config.ProbeSize < 0 || config.ProbeSize > protocol.MaxProbePayloadSize {
+		config.PingTimeout <= config.PingInterval || config.WriteTimeout <= 0 || config.ClockSyncTimeout < 0 {
 		return nil, ErrInvalidLane
 	}
 	initialFrames := append([]protocol.Frame(nil), config.InitialFrames...)
@@ -206,9 +194,9 @@ func NewLane(config LaneConfig) (*Lane, error) {
 		observer: config.Observer, sessionClose: config.SessionClose, sessionFailure: config.SessionFailure,
 		laneID: config.LaneID, generation: config.Generation, initialFrames: initialFrames,
 		clockSyncTimeout: config.ClockSyncTimeout, clockSynced: config.ClockSynced,
-		control: make(chan controlWrite, config.ControlCapacity), reportInterval: config.ReportInterval,
-		pingInterval: config.PingInterval, pingTimeout: config.PingTimeout, writeTimeout: config.WriteTimeout,
-		probeInterval: config.ProbeInterval, probeSize: config.ProbeSize,
+		control: make(chan controlWrite, config.ControlCapacity), pong: make(chan controlWrite, 1),
+		reportInterval: config.ReportInterval,
+		pingInterval:   config.PingInterval, pingTimeout: config.PingTimeout, writeTimeout: config.WriteTimeout,
 		progress: deliveryProgress{notify: make(chan struct{}, 1)}, pingChanged: make(chan struct{}, 1),
 	}, nil
 }
@@ -218,7 +206,7 @@ func (l *Lane) Run(ctx context.Context) error {
 	parent := ctx
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	errorsChannel := make(chan error, 5)
+	errorsChannel := make(chan error, 4)
 	var workers sync.WaitGroup
 	start := func(run func() error) {
 		workers.Go(func() {
@@ -229,7 +217,6 @@ func (l *Lane) Run(ctx context.Context) error {
 	start(func() error { return l.read(ctx) })
 	start(func() error { return l.report(ctx) })
 	start(func() error { return l.ping(ctx) })
-	start(func() error { return l.probe(ctx) })
 	err := <-errorsChannel
 	if IsProtocolViolation(err) {
 		l.reportProtocolViolation(parent, err)
@@ -308,6 +295,7 @@ func (l *Lane) ping(ctx context.Context) error {
 		if currentDataWrites := l.dataWrites.Load(); currentDataWrites != observedDataWrites {
 			observedDataWrites = currentDataWrites
 			dataActive = true
+			l.activeData.Store(true)
 			interval = l.pingInterval
 			activePingAt := now.Add(l.pingInterval)
 			if activePingAt.Before(nextPingAt) {
@@ -334,6 +322,7 @@ func (l *Lane) ping(ctx context.Context) error {
 		request := controlWrite{
 			build: func(sendMicros uint64) (protocol.Frame, error) {
 				l.recordPingSend(id, sendMicros)
+				l.exposedPingID.Store(id)
 				return protocol.MarshalTimingPing(protocol.TimingPing{ID: id, SendMicros: sendMicros})
 			},
 			sent: func() { l.recordPingWritten(id, time.Now()) },
@@ -341,6 +330,7 @@ func (l *Lane) ping(ctx context.Context) error {
 		if dataActive {
 			interval = l.pingInterval
 			dataActive = false
+			l.activeData.Store(false)
 		} else {
 			interval = nextIdleInterval(interval, maximumInterval)
 		}
@@ -349,6 +339,7 @@ func (l *Lane) ping(ctx context.Context) error {
 		case l.control <- request:
 		default:
 			l.cancelPing(id)
+			identifier--
 			interval = l.pingInterval
 		}
 		nextPingAt = now.Add(interval)
@@ -449,36 +440,6 @@ func (l *Lane) signalPingChanged() {
 	}
 }
 
-// probe periodically queues bounded opaque traffic for idle carrier and feedback-path validation.
-func (l *Lane) probe(ctx context.Context) error {
-	timer := time.NewTimer(l.probeInterval + lanePhase(l.laneID, l.generation, l.probeInterval/4))
-	defer timer.Stop()
-	interval := l.probeInterval
-	maximumInterval := max(l.probeInterval, maximumIdleProbeInterval)
-	observedDataWrites := l.dataWrites.Load()
-	frame := protocol.Frame{Type: protocol.FrameProbe, Payload: make([]byte, l.probeSize)}
-	for {
-		select {
-		case <-timer.C:
-			if !l.probeNeeded(&observedDataWrites) {
-				interval = l.probeInterval
-				timer.Reset(l.probeInterval)
-				continue
-			}
-			request := controlWrite{build: func(uint64) (protocol.Frame, error) { return frame, nil }}
-			select {
-			case l.control <- request:
-				interval = nextIdleInterval(interval, maximumInterval)
-			default:
-				interval = l.probeInterval
-			}
-			timer.Reset(interval)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
 // nextIdleInterval doubles current without exceeding maximum.
 func nextIdleInterval(current, maximum time.Duration) time.Duration {
 	if current >= maximum/2 {
@@ -487,24 +448,18 @@ func nextIdleInterval(current, maximum time.Duration) time.Duration {
 	return current * 2
 }
 
-// probeNeeded reports whether one complete probe interval passed without a successful data write.
-func (l *Lane) probeNeeded(observed *uint64) bool {
-	current := l.dataWrites.Load()
-	if current == *observed {
-		return true
-	}
-	*observed = current
-	return false
-}
-
 // lanePhase returns a stable sub-interval offset that spreads simultaneous lane startup work.
 func lanePhase(laneID protocol.LaneID, generation uint64, spread time.Duration) time.Duration {
 	if spread <= 0 {
 		return 0
 	}
-	hash := generation
-	for _, value := range laneID {
-		hash = hash*1099511628211 ^ uint64(value)
+	hash := uint64(14695981039346656037)
+	for _, value := range [2]uint64{uint64(laneID), generation} {
+		for range 8 {
+			hash ^= value & 0xff
+			hash *= 1099511628211
+			value >>= 8
+		}
 	}
 	return time.Duration(hash % uint64(spread))
 }
@@ -531,32 +486,47 @@ func (l *Lane) write(ctx context.Context) error {
 				controlFrames = 0
 			}
 		}
-		select {
-		case request := <-l.control:
-			count, err := l.writeControlBatch(carrierContext, request, maximumConsecutiveControlFrames-controlFrames)
-			if err != nil {
-				return err
-			}
-			controlFrames += count
-		default:
+		request, ready := l.nextControl(controlFrames == 0)
+		if !ready {
 			select {
-			case request := <-l.control:
-				count, err := l.writeControlBatch(carrierContext, request, maximumConsecutiveControlFrames-controlFrames)
-				if err != nil {
-					return err
-				}
-				controlFrames += count
+			case request = <-l.pong:
+			case request = <-l.control:
 			case <-l.store.Ready():
 				if err := l.writeReadyData(carrierContext); err != nil {
 					return err
 				}
 				controlFrames = 0
+				continue
 			case <-l.store.Done():
 				return ErrLaneAbandoned
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
+		count, err := l.writeControlBatch(carrierContext, request, maximumConsecutiveControlFrames-controlFrames)
+		if err != nil {
+			return err
+		}
+		controlFrames += count
+	}
+}
+
+// nextControl prefers a timing response at a burst's start and ordinary controls within the remaining budget.
+func (l *Lane) nextControl(preferPong bool) (controlWrite, bool) {
+	first, second := l.control, l.pong
+	if preferPong {
+		first, second = second, first
+	}
+	select {
+	case request := <-first:
+		return request, true
+	default:
+	}
+	select {
+	case request := <-second:
+		return request, true
+	default:
+		return controlWrite{}, false
 	}
 }
 
@@ -611,9 +581,9 @@ collect:
 		if count == limit {
 			break
 		}
-		select {
-		case request = <-l.control:
-		default:
+		var ready bool
+		request, ready = l.nextControl(false)
+		if !ready {
 			break collect
 		}
 	}
@@ -630,19 +600,6 @@ collect:
 
 // writeFrames writes one control batch within the carrier stall budget.
 func (l *Lane) writeFrames(ctx context.Context, frames []protocol.Frame) error {
-	var probes uint64
-	for _, frame := range frames {
-		if frame.Type == protocol.FrameProbe {
-			probes++
-		}
-	}
-	if probes != 0 {
-		if probes > ^uint64(0)-l.probeWrites.Load() {
-			return ErrCounterExhausted
-		}
-		// Publish before writing because peer feedback can return on another lane before this call completes.
-		l.probeWrites.Add(probes)
-	}
 	return carrier.WriteFramesWithin(ctx, l.carrier, frames, l.writeTimeout)
 }
 
@@ -652,7 +609,9 @@ func (l *Lane) writeDataFrames(ctx context.Context, data []protocol.Data) error 
 		return err
 	}
 	l.dataWrites.Add(1)
-	l.signalPingChanged()
+	if !l.activeData.Swap(true) {
+		l.signalPingChanged()
+	}
 	return nil
 }
 
@@ -670,10 +629,9 @@ func (l *Lane) SendControl(frame protocol.Frame, onSent func()) bool {
 	}
 }
 
-// ValidateProbeProgress reports whether cumulative feedback matches probes exposed to this generation's carrier writer.
-func (l *Lane) ValidateProbeProgress(packets, bytes uint64) bool {
-	frameBytes := uint64(protocol.FrameSize(l.probeSize))
-	return packets <= l.probeWrites.Load() && packets <= ^uint64(0)/frameBytes && bytes == packets*frameBytes
+// ValidatePingProgress bounds parsing feedback by timing requests exposed to this generation's carrier writer.
+func (l *Lane) ValidatePingProgress(identifier uint64) bool {
+	return identifier <= l.exposedPingID.Load()
 }
 
 // read parses incoming frames and delivers accepted data to the UDP endpoint.
@@ -780,7 +738,7 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 		}
 		if ClockMappingUsable(mapping) {
 			l.receiver.UpdateClock(mapping.Inverse())
-			l.observer.ObserveTiming(l.laneID, l.generation, sample)
+			l.observeTiming(sample)
 		}
 		return nil
 	case protocol.FrameClockSync:
@@ -792,12 +750,6 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 		}
 		*clockSyncPending = false
 		return nil
-	case protocol.FrameProbe:
-		probe, err := protocol.ParseProbe(frame)
-		if err != nil {
-			return err
-		}
-		return l.progress.addProbe(protocol.FrameSize(len(probe.Payload)))
 	case protocol.FrameDeliveryReport:
 		report, err := protocol.ParseDeliveryReport(frame)
 		if err != nil {
@@ -858,26 +810,30 @@ func (l *Lane) readClockSync(frame protocol.Frame) error {
 		return ErrStaleClockSample
 	}
 	l.receiver.UpdateClock(mapping)
-	l.observer.ObserveTiming(l.laneID, l.generation, sample)
+	l.observeTiming(sample)
 	return nil
 }
 
-// readPing queues a timing response without introducing another carrier writer.
+// readPing reserves one timing response independently of ordinary control queue pressure.
 func (l *Lane) readPing(frame protocol.Frame) error {
 	ping, err := protocol.ParseTimingPing(frame)
 	if err != nil {
 		return err
 	}
 	receiveMicros := l.clock.NowMicros()
+	if len(l.pong) != 0 {
+		return protocol.ErrInvalidControlFrame
+	}
+	if err := l.progress.addPing(ping.ID); err != nil {
+		return err
+	}
 	request := controlWrite{build: func(sendMicros uint64) (protocol.Frame, error) {
 		return protocol.MarshalTimingPong(protocol.TimingPong{
 			ID: ping.ID, PingSendMicros: ping.SendMicros, ReceiveMicros: receiveMicros, SendMicros: sendMicros,
 		})
 	}}
-	select {
-	case l.control <- request:
-	default:
-	}
+	// The sole reader owns admission, and the writer can only free this reserved slot.
+	l.pong <- request
 	return nil
 }
 
@@ -898,7 +854,7 @@ func (l *Lane) report(ctx context.Context) error {
 			return ctx.Err()
 		}
 		now := time.Now()
-		delay, changed := l.progress.reportDelay(now, l.reportInterval)
+		delay, changed := l.progress.reportDelay(now, l.effectiveReportInterval())
 		if !changed {
 			timer.Stop()
 			ready = nil
@@ -924,22 +880,20 @@ func (p *deliveryProgress) reportDelay(now time.Time, interval time.Duration) (t
 	if p.pendingRevision != 0 {
 		return max(0, 4*interval-now.Sub(p.pendingAt)), true
 	}
-	if p.thresholdReachedLocked() {
+	if p.eager || p.reportedDataPackets == 0 || p.thresholdReachedLocked() {
 		return 0, true
 	}
-	return interval, true
+	return max(0, interval-now.Sub(p.firstChangedAt)), true
 }
 
 // queueDeliveryReport claims and queues the newest cumulative delivery progress.
 func (l *Lane) queueDeliveryReport() {
-	report, revision, changed := l.progress.claim(
-		l.laneID, l.generation, time.Now(), 4*l.reportInterval,
-	)
+	snapshot, changed := l.progress.claim(l.laneID, l.generation, time.Now(), 4*l.effectiveReportInterval())
 	if !changed {
 		return
 	}
-	complete := func(sent bool) { l.progress.complete(report, revision, sent) }
-	if !l.observer.RouteDeliveryReport(report, complete) {
+	complete := func(sent bool) { l.progress.complete(snapshot, sent) }
+	if !l.observer.RouteDeliveryReport(snapshot.report, snapshot.parsedAt, complete) {
 		complete(false)
 	}
 }
@@ -951,6 +905,7 @@ func (p *deliveryProgress) addData(packets, bytes uint64) error {
 	if bytes > ^uint64(0)-p.dataBytes || packets > ^uint64(0)-p.dataPackets || p.revision == ^uint64(0) {
 		return ErrCounterExhausted
 	}
+	p.noteParseLocked()
 	p.dataBytes += bytes
 	p.dataPackets += packets
 	p.revision++
@@ -958,46 +913,53 @@ func (p *deliveryProgress) addData(packets, bytes uint64) error {
 	return nil
 }
 
-// addProbe records one parsed probe frame.
-func (p *deliveryProgress) addProbe(bytes int) error {
+// addPing records a strictly increasing parsed timing request and requests immediate feedback.
+func (p *deliveryProgress) addPing(identifier uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if uint64(bytes) > ^uint64(0)-p.probeBytes || p.probePackets == ^uint64(0) || p.revision == ^uint64(0) {
+	if identifier <= p.pingID {
+		return protocol.ErrInvalidControlFrame
+	}
+	if p.revision == ^uint64(0) {
 		return ErrCounterExhausted
 	}
-	p.probeBytes += uint64(bytes)
-	p.probePackets++
+	p.noteParseLocked()
+	p.pingID = identifier
+	p.eager = true
 	p.revision++
-	p.notifyProgressLocked()
+	if p.pendingRevision == 0 {
+		p.signal()
+	}
 	return nil
 }
 
 // claim returns changed cumulative progress and marks it pending for bounded duplicate suppression.
 func (p *deliveryProgress) claim(laneID protocol.LaneID, generation uint64, now time.Time,
-	retryAfter time.Duration) (protocol.DeliveryReport, uint64, bool) {
+	retryAfter time.Duration) (reportSnapshot, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.revision == p.reported || p.pendingRevision != 0 && now.Sub(p.pendingAt) < retryAfter {
-		return protocol.DeliveryReport{}, 0, false
+		return reportSnapshot{}, false
 	}
-	report := protocol.DeliveryReport{
-		LaneID: laneID, Generation: generation, DataBytes: p.dataBytes, DataPackets: p.dataPackets,
-		ProbeBytes: p.probeBytes, ProbePackets: p.probePackets,
+	snapshot := reportSnapshot{
+		report:   protocol.DeliveryReport{LaneID: laneID, Generation: generation, DataPackets: p.dataPackets, PingID: p.pingID},
+		revision: p.revision, dataBytes: p.dataBytes, parsedAt: p.parsedAt,
 	}
 	p.pendingRevision = p.revision
 	p.pendingAt = now
-	return report, p.revision, true
+	p.eager = false
+	return snapshot, true
 }
 
 // complete records whether one claimed report completed a carrier write.
-func (p *deliveryProgress) complete(report protocol.DeliveryReport, revision uint64, sent bool) {
+func (p *deliveryProgress) complete(snapshot reportSnapshot, sent bool) {
 	p.mu.Lock()
-	if sent && revision > p.reported {
-		p.reported = revision
-		p.reportedDataBytes = report.DataBytes
-		p.reportedDataPackets = report.DataPackets
+	if sent && snapshot.revision > p.reported {
+		p.reported = snapshot.revision
+		p.reportedDataBytes = snapshot.dataBytes
+		p.reportedDataPackets = snapshot.report.DataPackets
 	}
-	if sent && p.pendingRevision == revision {
+	if sent && p.pendingRevision == snapshot.revision {
 		p.pendingRevision = 0
 		p.pendingAt = time.Time{}
 	}
@@ -1023,5 +985,62 @@ func (p *deliveryProgress) signal() {
 	select {
 	case p.notify <- struct{}{}:
 	default:
+	}
+}
+
+// reportSnapshot preserves exact progress ownership across delayed and duplicated report writes.
+type reportSnapshot struct {
+	report    protocol.DeliveryReport
+	revision  uint64
+	dataBytes uint64
+	parsedAt  time.Time
+}
+
+// noteParseLocked records the latest progress time and the start of a changed-progress burst.
+func (p *deliveryProgress) noteParseLocked() {
+	now := time.Now()
+	if p.revision == p.reported {
+		p.firstChangedAt = now
+		p.eager = p.parsedAt.IsZero() || now.Sub(p.parsedAt) >= defaultReportInterval
+	}
+	p.parsedAt = now
+}
+
+// observeTiming applies lane timing and shortens feedback delay on low-latency paths.
+func (l *Lane) observeTiming(sample clockmap.Sample) {
+	roundTrip := sample.LocalReceiveMicros - sample.LocalSendMicros
+	processing := sample.RemoteSendMicros - sample.RemoteReceiveMicros
+	if processing < roundTrip {
+		roundTrip -= processing
+	} else {
+		roundTrip = 1
+	}
+	l.reportRTTMicros.Store(roundTrip)
+	l.progress.signal()
+	l.observer.ObserveTiming(l.laneID, l.generation, sample)
+}
+
+// effectiveReportInterval bounds feedback delay by both the configured maximum and measured RTT.
+func (l *Lane) effectiveReportInterval() time.Duration {
+	if rtt := l.reportRTTMicros.Load(); rtt != 0 {
+		return min(l.reportInterval, max(time.Millisecond, time.Duration(rtt/4)*time.Microsecond))
+	}
+	return l.reportInterval
+}
+
+// SendDeliveryReport samples report waiting time immediately before the carrier writer builds its frame.
+func (l *Lane) SendDeliveryReport(report protocol.DeliveryReport, parsedAt time.Time, onSent func()) bool {
+	request := controlWrite{
+		build: func(uint64) (protocol.Frame, error) {
+			report.DelayMicros = uint64(max(0, time.Since(parsedAt)/time.Microsecond))
+			return protocol.MarshalDeliveryReport(report)
+		},
+		sent: onSent,
+	}
+	select {
+	case l.control <- request:
+		return true
+	default:
+		return false
 	}
 }

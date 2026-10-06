@@ -137,7 +137,7 @@ func TestReceiverWriteBatchInvalidatedDeadlineReleasesBuffers(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Another lane can update the clock mapping between validation and acquisition of the UDP write slot.
-			receiver.UpdateClock(clockmap.Mapping{OffsetMicros: 1})
+			receiver.UpdateClock(clockmap.Mapping{OffsetMicros: 1000})
 			if err := receiver.writeBatch(t.Context(), data); !errors.Is(err, ErrInvalidPacketDeadline) {
 				t.Fatalf("invalidated deadline = %v, want deadline rejection", err)
 			}
@@ -326,7 +326,7 @@ type timingReportObserver struct {
 	accept  atomic.Bool
 }
 
-func (o *timingReportObserver) RouteDeliveryReport(_ protocol.DeliveryReport, complete func(bool)) bool {
+func (o *timingReportObserver) RouteDeliveryReport(_ protocol.DeliveryReport, _ time.Time, complete func(bool)) bool {
 	o.reports.Add(1)
 	accepted := o.accept.Load()
 	if accepted {
@@ -349,7 +349,7 @@ func testLaneReportIdleAndRetry(t *testing.T) {
 		if observer.reports.Load() != 0 {
 			t.Fatal("idle lane generated a report")
 		}
-		if err := lane.progress.addProbe(1203); err != nil {
+		if err := lane.progress.addPing(1); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()
@@ -397,14 +397,14 @@ func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		dataPackets int
-		probe       bool
+		ping        bool
 		clockSync   bool
 		invalidTail bool
 		err         error
 	}{
 		{name: "Scalar", dataPackets: 1, err: io.ErrUnexpectedEOF},
 		{name: "MaximumBatch", dataPackets: datagram.MaximumBatchSize, err: io.ErrUnexpectedEOF},
-		{name: "InterleavedProbe", dataPackets: 15, probe: true, err: io.ErrUnexpectedEOF},
+		{name: "InterleavedPing", dataPackets: 15, ping: true, err: io.ErrUnexpectedEOF},
 		{name: "InitialClockSync", dataPackets: 15, clockSync: true, err: io.ErrUnexpectedEOF},
 		{name: "InvalidControlTail", dataPackets: 15, invalidTail: true, err: protocol.ErrInvalidControlFrame},
 	} {
@@ -444,12 +444,12 @@ func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 					t.Fatal(err)
 				}
 				dataBytes += uint64(len(encoded))
-				if test.probe && index == 6 {
-					probe, err := protocol.MarshalProbe(protocol.Probe{Payload: make([]byte, 32)})
+				if test.ping && index == 6 {
+					ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 1000})
 					if err != nil {
 						t.Fatal(err)
 					}
-					connection.frames = append(connection.frames, probe)
+					connection.frames = append(connection.frames, ping)
 				}
 			}
 			if test.invalidTail {
@@ -462,8 +462,8 @@ func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 				len(endpoint.writes) != test.dataPackets {
 				t.Fatal("trailing carrier or control error discarded a complete valid prefix")
 			}
-			if test.probe && (lane.progress.probePackets != 1 || lane.progress.probeBytes != 34) {
-				t.Fatal("interleaved probe was omitted or counted as data")
+			if test.ping && (lane.progress.pingID != 1) {
+				t.Fatal("interleaved report was omitted or counted as data")
 			}
 			if test.clockSync && (!confirmed || observer.samples != 1) {
 				t.Fatal("initial clock synchronization did not confirm and observe the generation")

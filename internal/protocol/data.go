@@ -3,13 +3,16 @@ package protocol
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"slices"
 	"time"
 )
 
 const (
-	// maximumDataHeaderSize bounds the two unsigned 64-bit metadata fields.
-	maximumDataHeaderSize = 2 * binary.MaxVarintLen64
+	// maximumDataHeaderSize bounds the packet ID and the representable millisecond deadline.
+	maximumDataHeaderSize = binary.MaxVarintLen64 + 8
+	// DeadlineResolutionMicros is the wire deadline precision. Encoding rounds up by at most one unit minus one.
+	DeadlineResolutionMicros = uint64(1000)
 	// MaxPacketSize is the largest UDP datagram carried by WireHop.
 	MaxPacketSize = 65_535
 	// MaxPacketLifetimeMicros is the absolute wire-protocol packet lifetime limit.
@@ -23,7 +26,8 @@ var (
 
 // Data is one WireGuard datagram and its cross-lane delivery metadata.
 type Data struct {
-	PacketID       uint64
+	PacketID uint64
+	// DeadlineMicros uses the runtime clock precision and rounds up to milliseconds on the wire.
 	DeadlineMicros uint64
 	Payload        []byte
 }
@@ -72,7 +76,8 @@ func AppendDataFrame(destination []byte, data Data) ([]byte, error) {
 
 // validateData verifies all data-frame metadata and packet bounds.
 func validateData(data Data) error {
-	if data.PacketID == 0 || data.DeadlineMicros == 0 || len(data.Payload) > MaxPacketSize {
+	if data.PacketID == 0 || data.DeadlineMicros == 0 ||
+		data.DeadlineMicros > math.MaxUint64-math.MaxUint64%DeadlineResolutionMicros || len(data.Payload) > MaxPacketSize {
 		return ErrInvalidDataFrame
 	}
 	return nil
@@ -80,15 +85,15 @@ func validateData(data Data) error {
 
 // encodeDataPayload writes data into a validated payload-sized destination.
 func encodeDataPayload(payload []byte, data Data) {
-	metadataSize := uvarintSize(data.PacketID) + uvarintSize(data.DeadlineMicros)
+	metadataSize := uvarintSize(data.PacketID) + uvarintSize(deadlineMillis(data.DeadlineMicros))
 	copy(payload[metadataSize:], data.Payload)
 	offset := binary.PutUvarint(payload, data.PacketID)
-	binary.PutUvarint(payload[offset:], data.DeadlineMicros)
+	binary.PutUvarint(payload[offset:], deadlineMillis(data.DeadlineMicros))
 }
 
 // dataPayloadSize returns the exact content length of validated data.
 func dataPayloadSize(data Data) int {
-	return uvarintSize(data.PacketID) + uvarintSize(data.DeadlineMicros) + len(data.Payload)
+	return uvarintSize(data.PacketID) + uvarintSize(deadlineMillis(data.DeadlineMicros)) + len(data.Payload)
 }
 
 // ParseData parses and validates one generic data frame.
@@ -101,9 +106,18 @@ func ParseData(frame Frame) (Data, error) {
 	if err != nil {
 		return Data{}, ErrInvalidDataFrame
 	}
+	if data.DeadlineMicros > math.MaxUint64/DeadlineResolutionMicros {
+		return Data{}, ErrInvalidDataFrame
+	}
+	data.DeadlineMicros *= DeadlineResolutionMicros
 	data.Payload = payload
 	if err := validateData(data); err != nil {
 		return Data{}, err
 	}
 	return data, nil
+}
+
+// deadlineMillis rounds a validated runtime deadline up without unsigned overflow.
+func deadlineMillis(micros uint64) uint64 {
+	return (micros-1)/DeadlineResolutionMicros + 1
 }

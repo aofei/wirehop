@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"math"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/clockmap"
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
@@ -46,13 +48,14 @@ const (
 
 // LaneRegistration makes one lane generation eligible for packet scheduling.
 type LaneRegistration struct {
-	LaneID                protocol.LaneID
-	Generation            uint64
-	PathGroupID           protocol.PathGroupID
-	Store                 *TransmissionStore
-	Abandon               context.CancelFunc
-	SendControl           func(protocol.Frame, func()) bool
-	ValidateProbeProgress func(uint64, uint64) bool
+	LaneID               protocol.LaneID
+	Generation           uint64
+	PathGroupID          protocol.PathGroupID
+	Store                *TransmissionStore
+	Abandon              context.CancelFunc
+	SendControl          func(protocol.Frame, func()) bool
+	ValidatePingProgress func(uint64) bool
+	SendDeliveryReport   func(protocol.DeliveryReport, time.Time, func()) bool
 	// InitialTiming seeds RTT from usable admission timing known before registration.
 	InitialTiming *clockmap.Sample
 }
@@ -62,7 +65,7 @@ type LaneObserver interface {
 	ObserveDeliveryReport(context.Context, protocol.LaneGeneration, protocol.DeliveryReport, uint64) error
 	ObserveTiming(protocol.LaneID, uint64, clockmap.Sample)
 	ObserveLaneAbandon(context.Context, protocol.LaneGeneration) error
-	RouteDeliveryReport(protocol.DeliveryReport, func(bool)) bool
+	RouteDeliveryReport(protocol.DeliveryReport, time.Time, func(bool)) bool
 }
 
 // schedulerEventKind identifies one serialized scheduler state transition.
@@ -92,6 +95,7 @@ type schedulerEvent struct {
 	laneID         protocol.LaneID
 	generation     uint64
 	report         protocol.DeliveryReport
+	parsedAt       time.Time
 	timing         clockmap.Sample
 	receiveMicros  uint64
 	reportComplete func(bool)
@@ -106,10 +110,9 @@ type scheduledLane struct {
 	minimumRTTMicros    uint64
 	feedbackDelayMicros uint64
 	deliveryRate        uint64
-	lastDataBytes       uint64
 	lastDataPackets     uint64
-	lastProbeBytes      uint64
-	lastProbePackets    uint64
+	lastPingID          uint64
+	rateObserved        bool
 	lastProgressAt      time.Time
 	rttObserved         bool
 	degraded            bool
@@ -134,21 +137,14 @@ func scoredLaneBetter(left, right scoredLane) bool {
 	if right.lane == nil || left.score != right.score {
 		return right.lane == nil || left.score < right.score
 	}
-	leftID := left.lane.registration.LaneID
-	rightID := right.lane.registration.LaneID
-	for index := range leftID {
-		if leftID[index] != rightID[index] {
-			return leftID[index] < rightID[index]
-		}
-	}
-	return false
+	return left.lane.registration.LaneID < right.lane.registration.LaneID
 }
 
 // Scheduler assigns session packets to dynamically registered lanes.
 type Scheduler struct {
 	ingress      *packetqueue.Queue[Packet]
 	events       chan schedulerEvent
-	controlOrder []*scheduledLane
+	controlOrder []scoredLane
 	packetID     uint64
 }
 
@@ -164,7 +160,7 @@ func NewScheduler(ingress *packetqueue.Queue[Packet]) (*Scheduler, error) {
 func (s *Scheduler) Register(ctx context.Context, registration LaneRegistration) error {
 	if registration.LaneID.IsZero() || registration.Generation == 0 || registration.PathGroupID.IsZero() ||
 		registration.Store == nil || registration.Abandon == nil || registration.SendControl == nil ||
-		registration.ValidateProbeProgress == nil {
+		registration.ValidatePingProgress == nil || registration.SendDeliveryReport == nil {
 		return ErrInvalidRegistration
 	}
 	result := make(chan error, 1)
@@ -270,9 +266,9 @@ func (s *Scheduler) CloseSession(ctx context.Context, reason protocol.CloseReaso
 }
 
 // RouteDeliveryReport queues cumulative feedback and its carrier-write completion callback.
-func (s *Scheduler) RouteDeliveryReport(report protocol.DeliveryReport, complete func(bool)) bool {
+func (s *Scheduler) RouteDeliveryReport(report protocol.DeliveryReport, parsedAt time.Time, complete func(bool)) bool {
 	select {
-	case s.events <- schedulerEvent{kind: schedulerRouteReport, report: report, reportComplete: complete}:
+	case s.events <- schedulerEvent{kind: schedulerRouteReport, report: report, parsedAt: parsedAt, reportComplete: complete}:
 		return true
 	default:
 		return false
@@ -473,7 +469,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			delete(lanes, event.laneID)
 			s.migrateTransmissions(lanes, lane)
 			if *preferred == event.laneID {
-				*preferred = protocol.LaneID{}
+				*preferred = protocol.LaneID(0)
 			}
 		}
 		event.result <- nil
@@ -489,9 +485,9 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			return
 		}
 		if progressed {
-			lane.feedbackDelayMicros = 0
+			lane.feedbackDelayMicros = event.report.DelayMicros
 			if source := lanes[event.laneID]; source != nil && source.registration.Generation == event.generation {
-				lane.feedbackDelayMicros = source.minimumRTTMicros / 2
+				lane.feedbackDelayMicros = saturatingAdd(lane.feedbackDelayMicros, source.minimumRTTMicros/2)
 			}
 		}
 		event.result <- nil
@@ -501,7 +497,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			lane.applyTiming(event.timing)
 		}
 	case schedulerRouteReport:
-		s.routeReport(lanes, event.report, event.reportComplete)
+		s.routeReport(lanes, event.report, event.parsedAt, event.reportComplete)
 	case schedulerPeerAbandon:
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation && !lane.abandoning {
@@ -510,7 +506,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		}
 		event.result <- nil
 	case schedulerCloseSession:
-		if !s.routeControl(lanes, event.frame, protocol.LaneID{}, func() { event.result <- nil }) {
+		if !s.routeControl(lanes, event.frame, protocol.LaneID(0), func() { event.result <- nil }) {
 			event.result <- ErrNoActiveLane
 		}
 	}
@@ -518,26 +514,23 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 
 // routeReport duplicates feedback over its own connected lane and one best alternate lane.
 func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report protocol.DeliveryReport,
-	complete func(bool)) {
-	frame, err := protocol.MarshalDeliveryReport(report)
-	if err != nil {
-		complete(false)
-		return
-	}
+	parsedAt time.Time, complete func(bool)) {
 	var completeOnce sync.Once
 	completed := func(sent bool) { completeOnce.Do(func() { complete(sent) }) }
 	onSent := func() { completed(true) }
 	accepted := false
 	candidates := s.orderedControlLanes(lanes)
-	for _, candidate := range candidates {
+	for _, scored := range candidates {
+		candidate := scored.lane
 		if candidate.registration.LaneID == report.LaneID {
-			accepted = candidate.registration.SendControl(frame, onSent)
+			accepted = candidate.registration.SendDeliveryReport(report, parsedAt, onSent)
 			break
 		}
 	}
-	for _, candidate := range candidates {
+	for _, scored := range candidates {
+		candidate := scored.lane
 		if candidate.registration.LaneID != report.LaneID &&
-			candidate.registration.SendControl(frame, onSent) {
+			candidate.registration.SendDeliveryReport(report, parsedAt, onSent) {
 			accepted = true
 			break
 		}
@@ -549,25 +542,25 @@ func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report
 
 // orderedControlLanes returns every non-abandoning lane in deterministic predicted-delivery order.
 // The result remains valid until this method is called again.
-func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane) []*scheduledLane {
+func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane) []scoredLane {
 	clear(s.controlOrder)
-	ordered := s.controlOrder[:0]
+	scores := s.controlOrder[:0]
 	for _, lane := range lanes {
 		if !lane.abandoning {
-			ordered = append(ordered, lane)
+			scores = append(scores, scoredLane{lane, lane.score(0)})
 		}
 	}
-	for index := 1; index < len(ordered); index++ {
-		lane := ordered[index]
+	for index := 1; index < len(scores); index++ {
+		candidate := scores[index]
 		position := index
-		for position > 0 && laneBetterForFrame(lane, ordered[position-1], 0) {
-			ordered[position] = ordered[position-1]
+		for position > 0 && scoredLaneBetter(candidate, scores[position-1]) {
+			scores[position] = scores[position-1]
 			position--
 		}
-		ordered[position] = lane
+		scores[position] = candidate
 	}
-	s.controlOrder = ordered
-	return ordered
+	s.controlOrder = scores
+	return scores
 }
 
 // schedule assigns one PacketID to one or two eligible lanes.
@@ -629,9 +622,12 @@ func selectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferred protoc
 		return selectControlCandidates(lanes, frameBytes, maximumScore)
 	}
 	var preferredCandidate scoredLane
+	var preferredQueuedBytes uint64
 	if lane := lanes[preferred]; lane != nil && !lane.degraded && !lane.abandoning &&
 		(frameBytes == 0 || lane.canAccept(frameBytes)) {
-		preferredCandidate = scoredLane{lane: lane, score: lane.score(frameBytes)}
+		queuedBytes, retainedBytes := lane.registration.Store.deliveryBacklog()
+		preferredQueuedBytes = queuedBytes
+		preferredCandidate = scoredLane{lane: lane, score: lane.scoreBacklog(frameBytes, queuedBytes, retainedBytes)}
 	}
 	result := laneCandidates{}
 	var first scoredLane
@@ -664,9 +660,12 @@ func selectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferred protoc
 	} else {
 		preferredLimit = math.MaxUint64
 	}
-	if preferredCandidate.lane != nil && preferredBetter < 2 && preferredCandidate.score < maximumScore &&
-		preferredCandidate.score <= preferredLimit {
-		first = preferredCandidate
+	if preferredCandidate.lane != nil && preferredCandidate.score < maximumScore {
+		stable := frameBytes > 0 && preferredQueuedBytes == 0 &&
+			preferredCandidate.lane.registration.PathGroupID == first.lane.registration.PathGroupID
+		if stable || preferredBetter < 2 && preferredCandidate.score <= preferredLimit {
+			first = preferredCandidate
+		}
 	}
 	result.lanes[0] = first.lane
 	result.count = 1
@@ -740,27 +739,30 @@ func laneEligible(lanes map[protocol.LaneID]*scheduledLane, lane *scheduledLane,
 
 // canAccept reports whether current retained work can accept one more frame.
 func (l *scheduledLane) canAccept(frameBytes uint64) bool {
-	return l.registration.Store.canAccept(frameBytes)
+	if !l.registration.Store.canAccept(frameBytes) {
+		return false
+	}
+	if !l.rateObserved {
+		return true
+	}
+	_, bytes := l.registration.Store.backlog()
+	window := l.deliveryWindowBytes()
+	return frameBytes <= window && bytes <= window-frameBytes
 }
 
 // laneBetterForFrame orders candidates by predicted frame delivery and then stable lane identity.
 func laneBetterForFrame(left, right *scheduledLane, frameBytes uint64) bool {
-	leftScore := left.score(frameBytes)
-	rightScore := right.score(frameBytes)
-	if leftScore != rightScore {
-		return leftScore < rightScore
-	}
-	for index := range left.registration.LaneID {
-		if left.registration.LaneID[index] != right.registration.LaneID[index] {
-			return left.registration.LaneID[index] < right.registration.LaneID[index]
-		}
-	}
-	return false
+	return scoredLaneBetter(scoredLane{left, left.score(frameBytes)}, scoredLane{right, right.score(frameBytes)})
 }
 
 // score returns predicted delivery delay in microseconds.
 func (l *scheduledLane) score(frameBytes uint64) uint64 {
 	queuedBytes, backlogBytes := l.registration.Store.deliveryBacklog()
+	return l.scoreBacklog(frameBytes, queuedBytes, backlogBytes)
+}
+
+// scoreBacklog predicts delivery from one consistent queued and retained byte snapshot.
+func (l *scheduledLane) scoreBacklog(frameBytes, queuedBytes, backlogBytes uint64) uint64 {
 	if l.deliveryRate == 0 || backlogBytes > math.MaxUint64-frameBytes ||
 		backlogBytes+frameBytes > math.MaxUint64/1_000_000 {
 		return math.MaxUint64
@@ -772,7 +774,7 @@ func (l *scheduledLane) score(frameBytes uint64) uint64 {
 		return math.MaxUint64
 	}
 	// Unsent data still needs serialization and propagation. Already committed data can have reached the peer
-	// while its report returns over another lane. Discount only that carrier's minimum observed return delay.
+	// while its report returns over another lane. Discount the reported construction wait and the carrier's minimum observed return delay.
 	if retainedMicros <= l.feedbackDelayMicros {
 		return base + queuedMicros
 	}
@@ -810,7 +812,7 @@ func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64,
 	}
 	transmission := retainedTransmission{
 		data: data, kind: item.Value.Kind, priority: item.Priority, deadline: item.Deadline,
-		budget: budget, packet: packet,
+		budget: budget, packet: packet.datagram,
 	}
 	if l.registration.Store.pushAt(transmission, now) == nil {
 		return true
@@ -828,43 +830,32 @@ func (l *scheduledLane) enqueueTransmission(transmission retainedTransmission) b
 // applyReport releases the reported carrier prefix and returns whether validated progress advanced.
 func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicros uint64,
 	receiveTime time.Time) (bool, error) {
-	if !l.registration.ValidateProbeProgress(report.ProbePackets, report.ProbeBytes) {
+	if !l.registration.ValidatePingProgress(report.PingID) {
 		return false, ErrInvalidDeliveryReport
 	}
-	dataDirection, err := cumulativeDirection(
-		report.DataPackets, report.DataBytes, l.lastDataPackets, l.lastDataBytes,
-	)
-	if err != nil {
-		return false, err
-	}
-	probeDirection, err := cumulativeDirection(
-		report.ProbePackets, report.ProbeBytes, l.lastProbePackets, l.lastProbeBytes,
-	)
-	if err != nil {
-		return false, err
-	}
-	if dataDirection < 0 || probeDirection < 0 {
-		if dataDirection > 0 || probeDirection > 0 {
+	dataDirection := cmp.Compare(report.DataPackets, l.lastDataPackets)
+	pingDirection := cmp.Compare(report.PingID, l.lastPingID)
+	if dataDirection < 0 || pingDirection < 0 {
+		if dataDirection > 0 || pingDirection > 0 {
 			return false, ErrInvalidDeliveryReport
 		}
 		return false, nil
 	}
-	if dataDirection == 0 && probeDirection == 0 {
+	if dataDirection == 0 && pingDirection == 0 {
 		return false, nil
 	}
-	deliveryConstrained := l.registration.Store.deliveryConstrained()
-	sample, stale, err := l.registration.Store.acknowledge(report.DataPackets, report.DataBytes, receiveMicros)
-	if err != nil {
+	windowBytes := uint64(l.registration.Store.limits.Bytes)
+	if l.rateObserved {
+		windowBytes = l.deliveryWindowBytes()
+	}
+	deliveryConstrained := l.registration.Store.deliveryConstrained(windowBytes)
+	sample, stale, err := l.registration.Store.acknowledge(report.DataPackets, receiveMicros)
+	if err != nil || stale {
 		return false, err
 	}
-	if stale {
-		return false, nil
-	}
 	l.updateDeliveryRate(sample, deliveryConstrained)
-	l.lastDataBytes = report.DataBytes
 	l.lastDataPackets = report.DataPackets
-	l.lastProbeBytes = report.ProbeBytes
-	l.lastProbePackets = report.ProbePackets
+	l.lastPingID = report.PingID
 	l.lastProgressAt = receiveTime
 	l.degraded = false
 	return true, nil
@@ -876,9 +867,15 @@ func (l *scheduledLane) updateDeliveryRate(sample deliverySample, deliveryConstr
 		return
 	}
 	rate := sample.bytes * 1_000_000 / sample.intervalMicros
-	if rate > l.deliveryRate || rate > 0 && deliveryConstrained {
-		l.deliveryRate = weightedAverage7(l.deliveryRate, rate)
+	if rate == 0 || rate <= l.deliveryRate && !deliveryConstrained {
+		return
 	}
+	if !l.rateObserved {
+		l.deliveryRate = rate
+		l.rateObserved = true
+		return
+	}
+	l.deliveryRate = weightedAverage7(l.deliveryRate, rate)
 }
 
 // applyTiming updates a bounded RTT exponential moving average.
@@ -992,7 +989,8 @@ func (s *Scheduler) announceAbandonment(lanes map[protocol.LaneID]*scheduledLane
 // routeControl queues one fixed control frame on the best connected lane outside exclude.
 func (s *Scheduler) routeControl(lanes map[protocol.LaneID]*scheduledLane, frame protocol.Frame,
 	exclude protocol.LaneID, onSent func()) bool {
-	for _, candidate := range s.orderedControlLanes(lanes) {
+	for _, scored := range s.orderedControlLanes(lanes) {
+		candidate := scored.lane
 		if candidate.registration.LaneID == exclude {
 			continue
 		}
@@ -1021,11 +1019,11 @@ func (s *Scheduler) migrateTransmissions(lanes map[protocol.LaneID]*scheduledLan
 		frameBytes := uint64(transmission.size)
 		remaining := transmission.deadline.Sub(now)
 		deadlineMicros := uint64(remaining / time.Microsecond)
-		candidates := selectCandidates(lanes, protocol.LaneID{}, false, frameBytes, deadlineMicros)
+		candidates := selectCandidates(lanes, protocol.LaneID(0), false, frameBytes, deadlineMicros)
 		for _, candidate := range candidates.lanes[:candidates.count] {
 			if candidate.enqueueTransmission(*transmission) {
 				transmission.budget = nil
-				transmission.packet = Packet{}
+				transmission.packet = datagram.Packet{}
 				break
 			}
 		}
@@ -1038,4 +1036,28 @@ func releaseTransmissions(transmissions []retainedTransmission) {
 	for index := range transmissions {
 		transmissions[index].release()
 	}
+}
+
+// saturatingAdd combines time estimates without wrapping an untrusted wire value.
+func saturatingAdd(left, right uint64) uint64 {
+	if right > math.MaxUint64-left {
+		return math.MaxUint64
+	}
+	return left + right
+}
+
+// deliveryWindowBytes bounds reported in-flight work by two estimated feedback cycles and one ready write batch.
+func (l *scheduledLane) deliveryWindowBytes() uint64 {
+	maximum := uint64(l.registration.Store.limits.Bytes)
+	cycle := max(l.rttMicros, saturatingAdd(l.rttMicros/2, l.feedbackDelayMicros))
+	cycle = saturatingAdd(cycle, uint64(defaultReportInterval/time.Microsecond))
+	if cycle > math.MaxUint64/2 {
+		return maximum
+	}
+	interval := cycle * 2
+	if l.deliveryRate > math.MaxUint64/interval {
+		return maximum
+	}
+	bytes := l.deliveryRate * interval / 1_000_000
+	return min(maximum, max(uint64(reportByteThreshold), saturatingAdd(bytes, targetDataBatchBytes)))
 }

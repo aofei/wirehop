@@ -179,8 +179,8 @@ does not determine the WireGuard MTU.
 ### Carrier overhead
 
 Each WireGuard datagram receives a one-byte frame type and shortest-form unsigned LEB128 integers for its content
-length, packet ID, and absolute deadline. WireHop framing overhead varies from 4 to 24 bytes. For example, a 1452-byte
-WireGuard datagram with a five-byte packet ID and six-byte deadline adds 14 bytes. TCP/IP, TLS records, and WebSocket
+length, packet ID, and absolute deadline. WireHop framing overhead varies from 4 to 22 bytes. For example, a 1452-byte
+WireGuard datagram with a five-byte packet ID and five-byte deadline adds 13 bytes. TCP/IP, TLS records, and WebSocket
 frames add carrier overhead. Coalescing amortizes TLS and WebSocket overhead across already-ready frames without waiting
 for more traffic. Control coalescing is bounded by frame count and ends at timing and lifecycle frames.
 
@@ -190,8 +190,8 @@ segmentation and reassembly. Broken TCP PMTU discovery can stall the carrier and
 Application writes and TCP segmentation do not preserve WireHop frame boundaries. Smaller packets can change loss
 recovery and latency, but tuning requires workload measurements rather than assuming one frame per TCP segment.
 
-WireHop probes validate the carrier and feedback path. They terminate at WireHop and cannot establish the server-to-peer
-UDP path MTU. Reverse-proxy message limits and idle timeouts must also suit the carrier.
+WireHop timing requests validate the carrier and feedback path. They terminate at WireHop and cannot establish the
+server-to-peer UDP path MTU. Reverse-proxy message limits and idle timeouts must also suit the carrier.
 
 The `forward` command uses direct UDP and adds no WireHop framing or packet-length overhead. Reserved translation does
 not change the WireGuard datagram length.

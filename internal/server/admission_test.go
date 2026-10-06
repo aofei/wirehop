@@ -53,8 +53,8 @@ func TestServerCandidateRetention(t *testing.T) {
 							<-finished
 						}()
 						hello := protocol.ClientHello{
-							Mode: protocol.HelloCreate, Target: endpoint, LaneID: protocol.LaneID{1}, Generation: 1,
-							PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+							Mode: protocol.HelloCreate, Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
+							PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 						}
 						if err := protocol.SignClientHello(&hello, []byte("test-token")); err != nil {
 							t.Fatal(err)
@@ -73,8 +73,8 @@ func TestServerCandidateRetention(t *testing.T) {
 						defer httpServer.Close()
 						defer cancel()
 						headers, err := wsheader.Headers(wsheader.Create{
-							Token: "test-token", Target: endpoint, LaneID: protocol.LaneID{1}, Generation: 1,
-							PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+							Token: "test-token", Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
+							PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 						})
 						if err != nil {
 							t.Fatal(err)
@@ -185,8 +185,8 @@ func TestServerPreparationCancellation(t *testing.T) {
 					instance.serveConnection(parent, connection, func() { t.Error("unexpected admission") })
 				}()
 				hello := protocol.ClientHello{
-					Mode: protocol.HelloCreate, Target: endpoint, LaneID: protocol.LaneID{1}, Generation: 1,
-					PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+					Mode: protocol.HelloCreate, Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
+					PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 				}
 				if err := protocol.SignClientHello(&hello, []byte("test-token")); err != nil {
 					t.Fatal(err)
@@ -216,8 +216,8 @@ func TestServerPreparationCancellation(t *testing.T) {
 					t.Fatal(err)
 				}
 				request.Header, err = wsheader.Headers(wsheader.Create{
-					Token: "test-token", Target: endpoint, LaneID: protocol.LaneID{1}, Generation: 1,
-					PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+					Token: "test-token", Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
+					PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -289,8 +289,8 @@ func TestCreationDeadlineRequiresAuthorization(t *testing.T) {
 					started := time.Now()
 					if transport == "Raw" {
 						hello := protocol.ClientHello{
-							Mode: protocol.HelloCreate, Target: target.MustParse(test.target), LaneID: protocol.LaneID{1},
-							Generation: 1, PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+							Mode: protocol.HelloCreate, Target: target.MustParse(test.target), LaneID: protocol.LaneID(1),
+							Generation: 1, PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 						}
 						if err := protocol.SignClientHello(&hello, []byte(test.token)); err != nil {
 							t.Fatal(err)
@@ -303,8 +303,8 @@ func TestCreationDeadlineRequiresAuthorization(t *testing.T) {
 						deadline = connection.deadline
 					} else {
 						headers, err := wsheader.Headers(wsheader.Create{
-							Token: test.token, Target: target.MustParse(test.target), LaneID: protocol.LaneID{1},
-							Generation: 1, PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+							Token: test.token, Target: target.MustParse(test.target), LaneID: protocol.LaneID(1),
+							Generation: 1, PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 						})
 						if err != nil {
 							t.Fatal(err)

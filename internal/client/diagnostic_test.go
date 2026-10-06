@@ -77,7 +77,7 @@ func TestClientCreateCandidateRedactsHTTPResponse(t *testing.T) {
 				},
 				lanes: []clientLane{{
 					spec:   testLaneSpec(t, "ws"+strings.TrimPrefix(server.URL, "http")),
-					laneID: protocol.LaneID{1}, pathGroupID: protocol.PathGroupID{1},
+					laneID: protocol.LaneID(1), pathGroupID: protocol.PathGroupID(1),
 					authenticationClock: newAuthenticationClock(time.Now),
 				}},
 			}

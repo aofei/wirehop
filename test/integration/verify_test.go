@@ -13,14 +13,25 @@ func TestVerifyCarrier(t *testing.T) {
 		scenario string
 		active   int
 		passive  int
+		sockets  string
 		wantErr  bool
 	}{
 		{name: "DiscardedServerChildSockets", scenario: "tcp-blackhole", active: 3, passive: 5},
 		{name: "CarrierReconnect", scenario: "tcp-loss", active: 4, passive: 4, wantErr: true},
 		{name: "UDPControlConnection", scenario: "tcp-udp", active: 2, passive: 2},
+		{name: "AsymmetricStallInitialLanes", scenario: "tcp-asymmetric-stall",
+			sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n"},
+		{name: "AsymmetricStallMissingLane", scenario: "tcp-asymmetric-stall",
+			sockets: "0 0 local:1 remote:51822\n", wantErr: true},
+		{name: "AsymmetricStallMissingSnapshot", scenario: "tcp-asymmetric-stall", wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			directory := t.TempDir()
+			if tt.sockets != "" {
+				if err := os.WriteFile(filepath.Join(directory, "client-tcp-sockets.txt"), []byte(tt.sockets), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := os.WriteFile(filepath.Join(directory, "client-after.txt"),
 				fmt.Appendf(nil, "TcpActiveOpens %d 0.0\n", tt.active), 0600); err != nil {
 				t.Fatal(err)
@@ -43,6 +54,8 @@ func TestVerifyParallelCarriers(t *testing.T) {
 		wantErr                 bool
 	}{
 		{name: "Repeated", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
+		{name: "Asymmetric", scenario: "tcp-asymmetric", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},
+		{name: "AsymmetricMissingLane", scenario: "tcp-asymmetric", sockets: "0 0 local:1 remote:51822\n", opened: 2, wantErr: true},
 		{name: "Mixed", scenario: "tcp-mixed", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},
 		{name: "MissingLane", scenario: "tcp-mixed", sockets: "0 0 local:1 remote:51822\n", opened: 2, wantErr: true},
 		{name: "Reconnected", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 3, wantErr: true},

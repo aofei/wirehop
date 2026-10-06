@@ -12,8 +12,6 @@ import (
 func TestControlFrameWireLayout(t *testing.T) {
 	const (
 		id1     = "01000000000000000000000000000000"
-		id3     = "03000000000000000000000000000000"
-		zeroID  = "00000000000000000000000000000000"
 		secret2 = "0200000000000000000000000000000000000000000000000000000000000000"
 	)
 	for _, tt := range []struct {
@@ -27,28 +25,27 @@ func TestControlFrameWireLayout(t *testing.T) {
 		{name: "ClockSync", value: ClockSync{
 			ClientSendMicros: 127, ServerReceiveMicros: 128, ServerSendMicros: 16383, ClientReceiveMicros: 16384,
 		}, encoded: "04087f8001ff7f808001"},
-		{name: "Probe", value: Probe{Payload: []byte{1, 0x23, 0x45}}, encoded: "0503012345"},
 		{name: "DeliveryReport", value: DeliveryReport{
-			LaneID: testLaneID(1), Generation: 128, DataBytes: 16384, DataPackets: 127,
-			ProbeBytes: 16383, ProbePackets: 1,
-		}, encoded: "0619" + id1 + "80018080017fff7f01"},
+			LaneID: testLaneID(1), Generation: 128, DataPackets: 127,
+			PingID: 1, DelayMicros: 16383,
+		}, encoded: "05070180017f01ff7f"},
 		{name: "SessionCreated", value: SessionCreated{
 			SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: testPathGroupID(3),
 			ReceiveMicros: 128, SendMicros: 16384,
-		}, encoded: "0745" + id1 + secret2 + id3 + "8001808001"},
+		}, encoded: "0636" + id1 + secret2 + "038001808001"},
 		{name: "LaneAccepted", value: LaneAccepted{
 			SessionID: testSessionID(1), PathGroupID: testPathGroupID(3), ReceiveMicros: 128, SendMicros: 16384,
-		}, encoded: "0825" + id1 + id3 + "8001808001"},
-		{name: "SessionClose", value: CloseClientShutdown, encoded: "090101"},
+		}, encoded: "0716" + id1 + "038001808001"},
+		{name: "SessionClose", value: CloseClientShutdown, encoded: "080101"},
 		{name: "LaneAbandon", value: LaneGeneration{LaneID: testLaneID(1), Generation: 128},
-			encoded: "0a12" + id1 + "8001"},
+			encoded: "0903018001"},
 		{name: "LaneError", value: ErrorFrame{
 			Code: ErrorProtocolViolation, Class: ErrorLaneRejected, Scope: ErrorScopeLane,
 			LaneID: testLaneID(1), Generation: 128, Diagnostic: "ok",
-		}, encoded: "0b170a0201" + id1 + "80016f6b"},
+		}, encoded: "0a080a02010180016f6b"},
 		{name: "SessionError", value: ErrorFrame{
 			Code: ErrorAuthentication, Class: ErrorSessionRejected, Scope: ErrorScopeSession, Diagnostic: "bad",
-		}, encoded: "0b17030402" + zeroID + "00626164"},
+		}, encoded: "0a080304020000626164"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			want, err := hex.DecodeString(tt.encoded)
@@ -72,9 +69,6 @@ func TestControlFrameWireLayout(t *testing.T) {
 			case ClockSync:
 				encoded, err = MarshalClockSync(value)
 				parsed, parseErr = ParseClockSync(frames[0])
-			case Probe:
-				encoded, err = MarshalProbe(value)
-				parsed, parseErr = ParseProbe(frames[0])
 			case DeliveryReport:
 				encoded, err = MarshalDeliveryReport(value)
 				parsed, parseErr = ParseDeliveryReport(frames[0])
@@ -139,35 +133,16 @@ func TestTimingFrames(t *testing.T) {
 	}
 }
 
-func TestProbeAndDeliveryReport(t *testing.T) {
-	probe := Probe{Payload: []byte{1, 2, 3}}
-	probeFrame, err := MarshalProbe(probe)
+func TestDeliveryReport(t *testing.T) {
+	report := DeliveryReport{LaneID: 1, Generation: 2, DataPackets: 5, PingID: 7, DelayMicros: 25}
+	frame, err := MarshalDeliveryReport(report)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := ParseProbe(probeFrame); err != nil || !reflect.DeepEqual(got, probe) {
-		t.Fatalf("ParseProbe() = %#v, %v", got, err)
+	if len(frame.Payload) != 5 {
+		t.Fatalf("delivery report payload length = %d, want 5", len(frame.Payload))
 	}
-	encodedProbe, err := MarshalFrame(probeFrame)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(encodedProbe) != FrameSize(len(probe.Payload)) {
-		t.Fatalf("encoded probe length = %d, want %d", len(encodedProbe), FrameSize(len(probe.Payload)))
-	}
-
-	report := DeliveryReport{
-		LaneID: testLaneID(1), Generation: 2, DataBytes: 4, DataPackets: 5, ProbeBytes: 6,
-		ProbePackets: 7,
-	}
-	reportFrame, err := MarshalDeliveryReport(report)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reportFrame.Payload) != 21 {
-		t.Fatalf("delivery report payload length = %d, want 21", len(reportFrame.Payload))
-	}
-	if got, err := ParseDeliveryReport(reportFrame); err != nil || got != report {
+	if got, err := ParseDeliveryReport(frame); err != nil || got != report {
 		t.Fatalf("ParseDeliveryReport() = %#v, %v", got, err)
 	}
 }
@@ -242,9 +217,6 @@ func TestControlFrameErrors(t *testing.T) {
 	if _, err := MarshalTimingPong(TimingPong{ID: 1, ReceiveMicros: 2, SendMicros: 1}); err == nil {
 		t.Fatal("MarshalTimingPong() succeeded with reversed timestamps")
 	}
-	if _, err := MarshalProbe(Probe{Payload: make([]byte, MaxProbePayloadSize+1)}); err == nil {
-		t.Fatal("MarshalProbe() succeeded with oversized payload")
-	}
 	if _, err := MarshalDeliveryReport(DeliveryReport{}); err == nil {
 		t.Fatal("MarshalDeliveryReport() succeeded without lane generation")
 	}
@@ -293,7 +265,7 @@ func TestControlFrameErrors(t *testing.T) {
 	if _, err := ParseErrorFrame(clockSkewFrame); !errors.Is(err, ErrInvalidControlFrame) {
 		t.Fatalf("ParseErrorFrame() error = %v for admission-only clock skew", err)
 	}
-	frame.Payload[20] = '\n'
+	frame.Payload[5] = '\n'
 	if _, err := ParseErrorFrame(frame); !errors.Is(err, ErrInvalidControlFrame) {
 		t.Fatalf("ParseErrorFrame() error = %v for control-byte diagnostic", err)
 	}
@@ -311,7 +283,6 @@ func FuzzParseControlFrame(f *testing.F) {
 	add(MarshalClockSync(ClockSync{
 		ClientSendMicros: 1, ServerReceiveMicros: 2, ServerSendMicros: 3, ClientReceiveMicros: 4,
 	}))
-	add(MarshalProbe(Probe{Payload: []byte{1, 2, 3}}))
 	add(MarshalDeliveryReport(DeliveryReport{LaneID: testLaneID(1), Generation: 1}))
 	add(MarshalSessionCreated(SessionCreated{
 		SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: testPathGroupID(3),
@@ -348,12 +319,6 @@ func FuzzParseControlFrame(f *testing.F) {
 			if value, err = ParseClockSync(frame); err == nil {
 				valid = true
 				encoded, err = MarshalClockSync(value)
-			}
-		case FrameProbe:
-			var value Probe
-			if value, err = ParseProbe(frame); err == nil {
-				valid = true
-				encoded, err = MarshalProbe(value)
 			}
 		case FrameDeliveryReport:
 			var value DeliveryReport
@@ -418,21 +383,21 @@ func TestControlIntegerBoundaries(t *testing.T) {
 		},
 			parse: func(f Frame) error { _, err := ParseClockSync(f); return err }, size: 40},
 		{name: "DeliveryReport", marshal: func() (Frame, error) {
-			return MarshalDeliveryReport(DeliveryReport{LaneID: testLaneID(1), Generation: maximum, DataBytes: maximum, DataPackets: maximum, ProbeBytes: maximum, ProbePackets: maximum})
+			return MarshalDeliveryReport(DeliveryReport{LaneID: LaneID(maximum), Generation: maximum, DataPackets: maximum, PingID: maximum, DelayMicros: maximum})
 		},
-			parse: func(f Frame) error { _, err := ParseDeliveryReport(f); return err }, size: 66, prefix: 16},
+			parse: func(f Frame) error { _, err := ParseDeliveryReport(f); return err }, size: 50},
 		{name: "SessionCreated", marshal: func() (Frame, error) {
-			return MarshalSessionCreated(SessionCreated{SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: testPathGroupID(3), ReceiveMicros: maximum, SendMicros: maximum})
+			return MarshalSessionCreated(SessionCreated{SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: PathGroupID(maximum), ReceiveMicros: maximum, SendMicros: maximum})
 		},
-			parse: func(f Frame) error { _, err := ParseSessionCreated(f); return err }, size: 84, prefix: 64},
+			parse: func(f Frame) error { _, err := ParseSessionCreated(f); return err }, size: 78, prefix: 48},
 		{name: "LaneAccepted", marshal: func() (Frame, error) {
-			return MarshalLaneAccepted(LaneAccepted{SessionID: testSessionID(1), PathGroupID: testPathGroupID(2), ReceiveMicros: maximum, SendMicros: maximum})
+			return MarshalLaneAccepted(LaneAccepted{SessionID: testSessionID(1), PathGroupID: PathGroupID(maximum), ReceiveMicros: maximum, SendMicros: maximum})
 		},
-			parse: func(f Frame) error { _, err := ParseLaneAccepted(f); return err }, size: 52, prefix: 32},
+			parse: func(f Frame) error { _, err := ParseLaneAccepted(f); return err }, size: 46, prefix: 16},
 		{name: "LaneAbandon", marshal: func() (Frame, error) {
-			return MarshalLaneAbandon(LaneGeneration{LaneID: testLaneID(1), Generation: maximum})
+			return MarshalLaneAbandon(LaneGeneration{LaneID: LaneID(maximum), Generation: maximum})
 		},
-			parse: func(f Frame) error { _, err := ParseLaneAbandon(f); return err }, size: 26, prefix: 16},
+			parse: func(f Frame) error { _, err := ParseLaneAbandon(f); return err }, size: 20},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			frame, err := tt.marshal()
@@ -462,42 +427,19 @@ func TestControlIntegerBoundaries(t *testing.T) {
 	}
 }
 
-func TestProbePayloadBoundaries(t *testing.T) {
-	for _, size := range []int{0, 127, 128, MaxProbePayloadSize} {
-		source := bytes.Repeat([]byte{42}, size)
-		frame, err := MarshalProbe(Probe{Payload: source})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if size > 0 {
-			source[0] = 9
-		}
-		parsed, err := ParseProbe(frame)
-		if err != nil || len(parsed.Payload) != size || size > 0 && parsed.Payload[0] != 42 {
-			t.Fatalf("probe ownership or size changed: %v", err)
-		}
-		if size > 0 && &parsed.Payload[0] != &frame.Payload[0] {
-			t.Fatal("probe parser copied its borrowed payload")
-		}
-	}
-	if _, err := ParseProbe(Frame{Type: FrameProbe, Payload: make([]byte, MaxProbePayloadSize+1)}); !errors.Is(err, ErrProbeTooLarge) {
-		t.Fatalf("oversized probe error = %v", err)
-	}
-}
-
 func TestErrorFrameCanonicalFields(t *testing.T) {
 	frame, err := MarshalErrorFrame(ErrorFrame{Code: ErrorProtocolViolation, Class: ErrorLaneRejected, Scope: ErrorScopeLane,
 		LaneID: testLaneID(1), Generation: math.MaxUint64, Diagnostic: string(bytes.Repeat([]byte{'a'}, MaxDiagnosticSize))})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(frame.Payload) != 541 {
+	if len(frame.Payload) != 526 {
 		t.Fatalf("maximum error size = %d", len(frame.Payload))
 	}
 	if _, err := ParseErrorFrame(frame); err != nil {
 		t.Fatal(err)
 	}
-	for cut := 0; cut < 29; cut++ {
+	for cut := 0; cut < 14; cut++ {
 		if _, err := ParseErrorFrame(Frame{Type: FrameError, Payload: frame.Payload[:cut]}); err == nil {
 			t.Fatalf("accepted truncated error prefix at %d", cut)
 		}
@@ -505,7 +447,7 @@ func TestErrorFrameCanonicalFields(t *testing.T) {
 	for _, payload := range [][]byte{
 		append([]byte{0x8b, 0}, frame.Payload[1:]...),
 		append([]byte{0x80, 0x80, 4}, frame.Payload[1:]...),
-		append(bytes.Clone(frame.Payload[:19]), append([]byte{0x81, 0}, frame.Payload[29:]...)...),
+		append(bytes.Clone(frame.Payload[:4]), append([]byte{0x81, 0}, frame.Payload[14:]...)...),
 		append(bytes.Clone(frame.Payload), 'a'),
 	} {
 		if _, err := ParseErrorFrame(Frame{Type: FrameError, Payload: payload}); err == nil {

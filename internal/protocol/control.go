@@ -1,19 +1,13 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 )
 
-// MaxProbePayloadSize bounds opaque probe traffic in one frame.
-const MaxProbePayloadSize = 1200
-
 var (
 	// ErrInvalidControlFrame indicates malformed control-frame fields or length.
 	ErrInvalidControlFrame = errors.New("invalid control frame")
-	// ErrProbeTooLarge indicates probe padding above its absolute protocol limit.
-	ErrProbeTooLarge = errors.New("probe too large")
 )
 
 // TimingPing requests one lane-local timing observation.
@@ -113,38 +107,14 @@ func ParseClockSync(frame Frame) (ClockSync, error) {
 	return sync, nil
 }
 
-// Probe carries bounded opaque bytes for lane delivery measurement.
-type Probe struct {
-	Payload []byte
-}
-
-// MarshalProbe returns a bounded probe frame.
-func MarshalProbe(probe Probe) (Frame, error) {
-	if len(probe.Payload) > MaxProbePayloadSize {
-		return Frame{}, ErrProbeTooLarge
-	}
-	return Frame{Type: FrameProbe, Payload: bytes.Clone(probe.Payload)}, nil
-}
-
-// ParseProbe parses a bounded probe frame.
-func ParseProbe(frame Frame) (Probe, error) {
-	if frame.Type != FrameProbe {
-		return Probe{}, ErrInvalidControlFrame
-	}
-	if len(frame.Payload) > MaxProbePayloadSize {
-		return Probe{}, ErrProbeTooLarge
-	}
-	return Probe{Payload: frame.Payload}, nil
-}
-
 // DeliveryReport reports cumulative parsing progress for one lane generation and direction.
 type DeliveryReport struct {
-	LaneID       LaneID
-	Generation   uint64
-	DataBytes    uint64
-	DataPackets  uint64
-	ProbeBytes   uint64
-	ProbePackets uint64
+	LaneID      LaneID
+	Generation  uint64
+	DataPackets uint64
+	PingID      uint64
+	// DelayMicros is the time from the newest reported parse progress to report construction by the carrier writer.
+	DelayMicros uint64
 }
 
 // MarshalDeliveryReport returns a cumulative delivery report frame.
@@ -152,23 +122,18 @@ func MarshalDeliveryReport(report DeliveryReport) (Frame, error) {
 	if report.LaneID.IsZero() || report.Generation == 0 {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := integerPayload(16, report.Generation, report.DataBytes, report.DataPackets, report.ProbeBytes, report.ProbePackets)
-	copy(payload[:LaneIDSize], report.LaneID[:])
+	payload := integerPayload(0, uint64(report.LaneID), report.Generation, report.DataPackets, report.PingID, report.DelayMicros)
 	return Frame{Type: FrameDeliveryReport, Payload: payload}, nil
 }
 
 // ParseDeliveryReport parses a cumulative delivery report frame.
 func ParseDeliveryReport(frame Frame) (DeliveryReport, error) {
-	if frame.Type != FrameDeliveryReport || len(frame.Payload) < 16 {
+	if frame.Type != FrameDeliveryReport {
 		return DeliveryReport{}, ErrInvalidControlFrame
 	}
 	var report DeliveryReport
-	copy(report.LaneID[:], frame.Payload[:LaneIDSize])
-	remaining, err := parseIntegers(frame.Payload[16:], &report.Generation, &report.DataBytes, &report.DataPackets, &report.ProbeBytes, &report.ProbePackets)
-	if err != nil || len(remaining) != 0 {
-		return DeliveryReport{}, ErrInvalidControlFrame
-	}
-	if report.LaneID.IsZero() || report.Generation == 0 {
+	remaining, err := parseIntegers(frame.Payload, (*uint64)(&report.LaneID), &report.Generation, &report.DataPackets, &report.PingID, &report.DelayMicros)
+	if err != nil || len(remaining) != 0 || report.LaneID.IsZero() || report.Generation == 0 {
 		return DeliveryReport{}, ErrInvalidControlFrame
 	}
 	return report, nil
@@ -189,23 +154,21 @@ func MarshalSessionCreated(created SessionCreated) (Frame, error) {
 		created.ReceiveMicros > created.SendMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := integerPayload(64, created.ReceiveMicros, created.SendMicros)
+	payload := integerPayload(48, uint64(created.PathGroupID), created.ReceiveMicros, created.SendMicros)
 	copy(payload[:16], created.SessionID[:])
 	copy(payload[16:48], created.SessionSecret[:])
-	copy(payload[48:64], created.PathGroupID[:])
 	return Frame{Type: FrameSessionCreated, Payload: payload}, nil
 }
 
 // ParseSessionCreated parses a session-created control frame.
 func ParseSessionCreated(frame Frame) (SessionCreated, error) {
-	if frame.Type != FrameSessionCreated || len(frame.Payload) < 64 {
+	if frame.Type != FrameSessionCreated || len(frame.Payload) < 48 {
 		return SessionCreated{}, ErrInvalidControlFrame
 	}
 	var created SessionCreated
 	copy(created.SessionID[:], frame.Payload[:16])
 	copy(created.SessionSecret[:], frame.Payload[16:48])
-	copy(created.PathGroupID[:], frame.Payload[48:64])
-	remaining, err := parseIntegers(frame.Payload[64:], &created.ReceiveMicros, &created.SendMicros)
+	remaining, err := parseIntegers(frame.Payload[48:], (*uint64)(&created.PathGroupID), &created.ReceiveMicros, &created.SendMicros)
 	if err != nil || len(remaining) != 0 {
 		return SessionCreated{}, ErrInvalidControlFrame
 	}
@@ -229,21 +192,19 @@ func MarshalLaneAccepted(accepted LaneAccepted) (Frame, error) {
 	if accepted.SessionID.IsZero() || accepted.PathGroupID.IsZero() || accepted.ReceiveMicros > accepted.SendMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := integerPayload(32, accepted.ReceiveMicros, accepted.SendMicros)
+	payload := integerPayload(16, uint64(accepted.PathGroupID), accepted.ReceiveMicros, accepted.SendMicros)
 	copy(payload[:16], accepted.SessionID[:])
-	copy(payload[16:32], accepted.PathGroupID[:])
 	return Frame{Type: FrameLaneAccepted, Payload: payload}, nil
 }
 
 // ParseLaneAccepted parses a lane-accepted control frame.
 func ParseLaneAccepted(frame Frame) (LaneAccepted, error) {
-	if frame.Type != FrameLaneAccepted || len(frame.Payload) < 32 {
+	if frame.Type != FrameLaneAccepted || len(frame.Payload) < 16 {
 		return LaneAccepted{}, ErrInvalidControlFrame
 	}
 	var accepted LaneAccepted
 	copy(accepted.SessionID[:], frame.Payload[:16])
-	copy(accepted.PathGroupID[:], frame.Payload[16:32])
-	remaining, err := parseIntegers(frame.Payload[32:], &accepted.ReceiveMicros, &accepted.SendMicros)
+	remaining, err := parseIntegers(frame.Payload[16:], (*uint64)(&accepted.PathGroupID), &accepted.ReceiveMicros, &accepted.SendMicros)
 	if err != nil || len(remaining) != 0 {
 		return LaneAccepted{}, ErrInvalidControlFrame
 	}
@@ -297,19 +258,17 @@ func MarshalLaneAbandon(lane LaneGeneration) (Frame, error) {
 	if lane.LaneID.IsZero() || lane.Generation == 0 {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := integerPayload(16, lane.Generation)
-	copy(payload[:LaneIDSize], lane.LaneID[:])
+	payload := integerPayload(0, uint64(lane.LaneID), lane.Generation)
 	return Frame{Type: FrameLaneAbandon, Payload: payload}, nil
 }
 
 // ParseLaneAbandon parses a generation-specific lane-abandon frame.
 func ParseLaneAbandon(frame Frame) (LaneGeneration, error) {
-	if frame.Type != FrameLaneAbandon || len(frame.Payload) < 16 {
+	if frame.Type != FrameLaneAbandon {
 		return LaneGeneration{}, ErrInvalidControlFrame
 	}
 	var lane LaneGeneration
-	copy(lane.LaneID[:], frame.Payload[:LaneIDSize])
-	remaining, err := parseIntegers(frame.Payload[16:], &lane.Generation)
+	remaining, err := parseIntegers(frame.Payload, (*uint64)(&lane.LaneID), &lane.Generation)
 	if err != nil || len(remaining) != 0 {
 		return LaneGeneration{}, ErrInvalidControlFrame
 	}
@@ -341,11 +300,11 @@ func MarshalErrorFrame(value ErrorFrame) (Frame, error) {
 	if value.Scope == ErrorScopeSession && (!value.LaneID.IsZero() || value.Generation != 0) {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	size := uvarintSize(uint64(value.Code)) + 2 + LaneIDSize + uvarintSize(value.Generation) + len(value.Diagnostic)
+	size := uvarintSize(uint64(value.Code)) + 2 + uvarintSize(uint64(value.LaneID)) + uvarintSize(value.Generation) + len(value.Diagnostic)
 	payload := make([]byte, 0, size)
 	payload = binary.AppendUvarint(payload, uint64(value.Code))
 	payload = append(payload, byte(value.Class), byte(value.Scope))
-	payload = append(payload, value.LaneID[:]...)
+	payload = binary.AppendUvarint(payload, uint64(value.LaneID))
 	payload = binary.AppendUvarint(payload, value.Generation)
 	payload = append(payload, value.Diagnostic...)
 	return Frame{Type: FrameError, Payload: payload}, nil
@@ -357,13 +316,12 @@ func ParseErrorFrame(frame Frame) (ErrorFrame, error) {
 		return ErrorFrame{}, ErrInvalidControlFrame
 	}
 	code, width, err := parseUvarint(frame.Payload)
-	if err != nil || code > uint64(ErrorClockSkew) || len(frame.Payload)-width < 2+LaneIDSize {
+	if err != nil || code > uint64(ErrorClockSkew) || len(frame.Payload)-width < 2 {
 		return ErrorFrame{}, ErrInvalidControlFrame
 	}
 	payload := frame.Payload[width:]
 	value := ErrorFrame{Code: ErrorCode(code), Class: ErrorClass(payload[0]), Scope: ErrorScope(payload[1])}
-	copy(value.LaneID[:], payload[2:2+LaneIDSize])
-	diagnostic, err := parseIntegers(payload[2+LaneIDSize:], &value.Generation)
+	diagnostic, err := parseIntegers(payload[2:], (*uint64)(&value.LaneID), &value.Generation)
 	if err != nil || len(diagnostic) > MaxDiagnosticSize {
 		return ErrorFrame{}, ErrInvalidControlFrame
 	}

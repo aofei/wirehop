@@ -132,7 +132,7 @@ func BenchmarkSchedulerMaintenance(b *testing.B) {
 					if err != nil || count != 1 {
 						b.Fatalf("takeBatch() = %d, %v, want one sent packet", count, err)
 					}
-					laneID := protocol.LaneID{1}
+					laneID := protocol.LaneID(1)
 					lane := &scheduledLane{
 						registration: LaneRegistration{LaneID: laneID, Store: store},
 						deliveryRate: 10_000_000, lastProgressAt: now,

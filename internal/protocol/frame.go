@@ -43,8 +43,6 @@ const (
 	FramePong
 	// FrameClockSync updates the shared session clock mapping.
 	FrameClockSync
-	// FrameProbe measures lane delivery behavior without reaching the UDP target.
-	FrameProbe
 	// FrameDeliveryReport reports cumulative peer parsing progress.
 	FrameDeliveryReport
 	// FrameSessionCreated accepts a newly created session.

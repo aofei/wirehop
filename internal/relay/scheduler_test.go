@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"math"
+	"net"
+	"net/netip"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/aofei/wirehop/internal/clockmap"
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -30,7 +33,7 @@ func TestSelectCandidates(t *testing.T) {
 	if transport.count != 1 || transport.lanes[0] != sameGroup {
 		t.Fatalf("transport candidates = %v, want preferred lane", transport)
 	}
-	control := selectCandidates(lanes, protocol.LaneID{}, true, 1500, math.MaxUint64)
+	control := selectCandidates(lanes, protocol.LaneID(0), true, 1500, math.MaxUint64)
 	if control.count != 2 || control.lanes[0] != first || control.lanes[1] != otherGroup {
 		t.Fatalf("control candidates = %v, want fastest lane and a distinct path group", control)
 	}
@@ -43,10 +46,10 @@ func TestSelectCandidatesUsesSerializationAndCapacity(t *testing.T) {
 		slow.registration.LaneID: slow,
 		fast.registration.LaneID: fast,
 	}
-	if got := selectCandidates(lanes, protocol.LaneID{}, false, 0, math.MaxUint64); got.lanes[0] != slow {
+	if got := selectCandidates(lanes, protocol.LaneID(0), false, 0, math.MaxUint64); got.lanes[0] != slow {
 		t.Fatal("zero-byte scheduling ignored the lower RTT lane")
 	}
-	if got := selectCandidates(lanes, protocol.LaneID{}, false, 1500, math.MaxUint64); got.lanes[0] != fast {
+	if got := selectCandidates(lanes, protocol.LaneID(0), false, 1500, math.MaxUint64); got.lanes[0] != fast {
 		t.Fatal("large-frame scheduling ignored serialization delay")
 	}
 
@@ -119,7 +122,7 @@ func TestSelectCandidatesAppliesDeadlineBeforePreference(t *testing.T) {
 	if got.count != 1 || got.lanes[0] != fast {
 		t.Fatalf("candidates = %v, want timely fastest lane", got)
 	}
-	late := selectCandidates(lanes, protocol.LaneID{}, false, 0, 400)
+	late := selectCandidates(lanes, protocol.LaneID(0), false, 0, 400)
 	if late.count != 0 || !late.available {
 		t.Fatalf("late candidates = %v, want available but predicted-late lanes", late)
 	}
@@ -176,7 +179,7 @@ func TestSelectCandidatesMatchesReference(t *testing.T) {
 	}
 	for iteration := range 5000 {
 		for _, lane := range lanes {
-			lane.registration.PathGroupID = protocol.PathGroupID{byte(next()%20 + 1)}
+			lane.registration.PathGroupID = protocol.PathGroupID(byte(next()%20 + 1))
 			lane.rttMicros = next() % 20_000
 			lane.deliveryRate = next() % 20_000_001
 			lane.degraded = next()%11 == 0
@@ -193,7 +196,7 @@ func TestSelectCandidatesMatchesReference(t *testing.T) {
 		}
 		var preferred protocol.LaneID
 		if value := next() % (laneCount + 1); value != 0 {
-			preferred = protocol.LaneID{byte(value)}
+			preferred = protocol.LaneID(byte(value))
 		}
 		frameBytes := next() % 3001
 		maximumScore := next() % 30_001
@@ -227,7 +230,7 @@ func TestSelectCandidatesExhaustiveGroupScores(t *testing.T) {
 		for _, lane := range members {
 			choice := remaining % 8
 			remaining /= 8
-			lane.registration.PathGroupID = protocol.PathGroupID{byte(choice/4 + 1)}
+			lane.registration.PathGroupID = protocol.PathGroupID(byte(choice/4 + 1))
 			lane.rttMicros = [4]uint64{0, 4000, 4002, 0}[choice%4]
 			lane.deliveryRate = 1_000_000
 			if choice%4 == 3 {
@@ -235,7 +238,7 @@ func TestSelectCandidatesExhaustiveGroupScores(t *testing.T) {
 			}
 		}
 		for _, cutoff := range [...]uint64{0, 2000, 2001, math.MaxUint64} {
-			for _, preferred := range [...]protocol.LaneID{{}, {1}, {2}, {3}, {4}} {
+			for _, preferred := range [...]protocol.LaneID{0, 1, 2, 3, 4} {
 				got := selectCandidates(lanes, preferred, false, 0, cutoff)
 				want := referenceSelectCandidates(lanes, preferred, false, 0, cutoff)
 				if got != want {
@@ -243,8 +246,8 @@ func TestSelectCandidatesExhaustiveGroupScores(t *testing.T) {
 						state, cutoff, preferred, got, want)
 				}
 			}
-			got := selectCandidates(lanes, protocol.LaneID{}, true, 0, cutoff)
-			want := referenceSelectCandidates(lanes, protocol.LaneID{}, true, 0, cutoff)
+			got := selectCandidates(lanes, protocol.LaneID(0), true, 0, cutoff)
+			want := referenceSelectCandidates(lanes, protocol.LaneID(0), true, 0, cutoff)
 			if got != want {
 				t.Fatalf("state %d, cutoff %d: control candidates = %v, want %v", state, cutoff, got, want)
 			}
@@ -353,10 +356,13 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 		} else {
 			preferredLimit = math.MaxUint64
 		}
-		if preferredLane := lanes[preferred]; preferredLane != nil &&
-			!preferredLane.degraded && !preferredLane.abandoning && laneEligible(lanes, preferredLane, frameBytes) &&
-			preferredLane.score(frameBytes) < maximumScore && preferredLane.score(frameBytes) <= preferredLimit {
-			first = preferredLane
+		if preferredLane := lanes[preferred]; preferredLane != nil && !preferredLane.degraded && !preferredLane.abandoning &&
+			(frameBytes == 0 || preferredLane.canAccept(frameBytes)) && preferredLane.score(frameBytes) < maximumScore {
+			queued, _ := preferredLane.registration.Store.deliveryBacklog()
+			if frameBytes > 0 && queued == 0 && preferredLane.registration.PathGroupID == first.registration.PathGroupID ||
+				laneEligible(lanes, preferredLane, frameBytes) && preferredLane.score(frameBytes) <= preferredLimit {
+				first = preferredLane
+			}
 		}
 		result.lanes[0] = first
 		result.count = 1
@@ -540,7 +546,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		}
 		if err := scheduler.ObserveDeliveryReport(ctx, source, protocol.DeliveryReport{
 			LaneID: registration.LaneID, Generation: registration.Generation,
-			DataPackets: 1, DataBytes: uint64(existing.size),
+			DataPackets: 1,
 		}, 1000); err != nil {
 			t.Fatal(err)
 		}
@@ -551,7 +557,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		}
 		if err := scheduler.ObserveDeliveryReport(ctx, source, protocol.DeliveryReport{
 			LaneID: registration.LaneID, Generation: registration.Generation,
-			DataPackets: 2, DataBytes: uint64(existing.size + dataFrameSize(control)),
+			DataPackets: 2,
 		}, 2000); err != nil {
 			t.Fatal(err)
 		}
@@ -681,13 +687,11 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	store := schedulerStore(t, packetqueue.Limits{Packets: 4, Bytes: 4096})
 	registration := schedulerRegistration(1, 1, store)
 	source := protocol.LaneGeneration{LaneID: registration.LaneID, Generation: registration.Generation}
-	registration.ValidateProbeProgress = func(packets, bytes uint64) bool {
-		return packets <= 1 && bytes == packets*uint64(protocol.FrameSize(0))
-	}
+	registration.ValidatePingProgress = func(identifier uint64) bool { return identifier <= 1 }
 	invalidRegistration := registration
-	invalidRegistration.ValidateProbeProgress = nil
+	invalidRegistration.ValidatePingProgress = nil
 	if err := scheduler.Register(ctx, invalidRegistration); !errors.Is(err, ErrInvalidRegistration) {
-		t.Fatalf("registration without probe validation error = %v, want %v", err, ErrInvalidRegistration)
+		t.Fatalf("registration without ping validation error = %v, want %v", err, ErrInvalidRegistration)
 	}
 	if err := scheduler.Register(ctx, registration); err != nil {
 		t.Fatal(err)
@@ -708,10 +712,8 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
 	releaseBatchOwnership(ownership[:count])
-	firstSize := uint64(first.size)
 	report := protocol.DeliveryReport{
 		LaneID: registration.LaneID, Generation: registration.Generation, DataPackets: 1,
-		DataBytes: firstSize,
 	}
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 1000); err != nil {
 		t.Fatal(err)
@@ -720,8 +722,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatalf("backlog packets = %d, want 1", packets)
 	}
 
-	report.DataPackets = 2
-	report.DataBytes++
+	report.DataPackets = 3
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 2000); !errors.Is(err, ErrInvalidDeliveryReport) {
 		t.Fatalf("invalid report error = %v, want %v", err, ErrInvalidDeliveryReport)
 	}
@@ -729,7 +730,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatalf("invalid report changed backlog to %d packets", packets)
 	}
 
-	report.DataBytes = uint64(first.size + second.size)
+	report.DataPackets = 2
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 3000); err != nil {
 		t.Fatal(err)
 	}
@@ -737,19 +738,13 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatalf("released backlog = %d packets, %d bytes", packets, bytes)
 	}
 
-	report.ProbePackets = 1
-	report.ProbeBytes = uint64(protocol.FrameSize(0) - 1)
-	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 4000); !errors.Is(err, ErrInvalidDeliveryReport) {
-		t.Fatalf("invalid probe byte report error = %v, want %v", err, ErrInvalidDeliveryReport)
-	}
-	report.ProbeBytes++
+	report.PingID = 1
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 5000); err != nil {
 		t.Fatal(err)
 	}
-	report.ProbePackets = 2
-	report.ProbeBytes *= 2
+	report.PingID = 2
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 6000); !errors.Is(err, ErrInvalidDeliveryReport) {
-		t.Fatalf("unwritten probe report error = %v, want %v", err, ErrInvalidDeliveryReport)
+		t.Fatalf("unexposed ping report error = %v", err)
 	}
 
 	cancel()
@@ -800,10 +795,10 @@ func TestSchedulerDeliveryReportUsesFeedbackCarrierDelay(t *testing.T) {
 			}
 			takeOneTransmission(t, store)
 			report := protocol.DeliveryReport{
-				LaneID: target.registration.LaneID, Generation: 1, DataPackets: 1, DataBytes: uint64(transmission.size),
+				LaneID: target.registration.LaneID, Generation: 1, DataPackets: 1,
 			}
 			if test.invalidReport {
-				report.DataBytes++
+				report.DataPackets++
 			}
 			if test.changedTarget {
 				report.Generation++
@@ -852,15 +847,15 @@ func TestSchedulerObserveTiming(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				scheduler := &Scheduler{events: make(chan schedulerEvent, 1)}
 				want := schedulerEvent{
-					kind: schedulerTiming, laneID: protocol.LaneID{1}, generation: 7,
+					kind: schedulerTiming, laneID: protocol.LaneID(1), generation: 7,
 					timing: clockmap.Sample{LocalReceiveMicros: 4000},
 				}
 				if test.full {
-					want.laneID = protocol.LaneID{2}
+					want.laneID = protocol.LaneID(2)
 					want.timing.LocalReceiveMicros = 9000
 					scheduler.events <- want
 				}
-				scheduler.ObserveTiming(protocol.LaneID{1}, 7, clockmap.Sample{LocalReceiveMicros: 4000})
+				scheduler.ObserveTiming(protocol.LaneID(1), 7, clockmap.Sample{LocalReceiveMicros: 4000})
 				event := <-scheduler.events
 				if event.kind != want.kind || event.laneID != want.laneID || event.generation != want.generation ||
 					event.timing != want.timing || len(scheduler.events) != 0 {
@@ -958,17 +953,17 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		stale     bool
-		probe     bool
+		ping      bool
 		slowFirst bool
 	}{
 		{name: "DuplicateData"},
 		{name: "StaleData", stale: true},
-		{name: "DuplicateProbe", probe: true},
-		{name: "StaleProbe", probe: true, stale: true},
+		{name: "DuplicatePing", ping: true},
+		{name: "StalePing", ping: true, stale: true},
 		{name: "SlowFirstDuplicateData", slowFirst: true},
 		{name: "SlowFirstStaleData", slowFirst: true, stale: true},
-		{name: "SlowFirstDuplicateProbe", slowFirst: true, probe: true},
-		{name: "SlowFirstStaleProbe", slowFirst: true, probe: true, stale: true},
+		{name: "SlowFirstDuplicatePing", slowFirst: true, ping: true},
+		{name: "SlowFirstStalePing", slowFirst: true, ping: true, stale: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			target := schedulerLane(t, 1, 1, 20_000, 1_000_000)
@@ -998,15 +993,13 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 			event := schedulerEvent{
 				kind: schedulerReport, laneID: fast.registration.LaneID, generation: 1,
 				report: protocol.DeliveryReport{
-					LaneID: target.registration.LaneID, Generation: 1, DataPackets: 2, DataBytes: bytes,
+					LaneID: target.registration.LaneID, Generation: 1, DataPackets: 2,
 				},
 				receiveMicros: 2000, result: result,
 			}
-			if test.probe {
+			if test.ping {
 				event.report.DataPackets = 0
-				event.report.DataBytes = 0
-				event.report.ProbePackets = 1
-				event.report.ProbeBytes = 1203
+				event.report.PingID = 1
 			}
 			if test.slowFirst {
 				event.laneID = slow.registration.LaneID
@@ -1026,9 +1019,7 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 			event.receiveMicros = 9000
 			if test.stale {
 				event.report.DataPackets = 0
-				event.report.DataBytes = 0
-				event.report.ProbePackets = 0
-				event.report.ProbeBytes = 0
+				event.report.PingID = 0
 			}
 			scheduler.applyEvent(lanes, &preferred, event, time.Unix(9, 0))
 			if err := <-result; err != nil {
@@ -1048,26 +1039,26 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 
 func TestScheduledLaneApplyReport(t *testing.T) {
 	for _, test := range []struct {
-		name         string
-		dataPackets  uint64
-		probePackets uint64
-		invalidBytes bool
-		closedStore  bool
-		progressed   bool
-		err          error
+		name           string
+		dataPackets    uint64
+		pingID         uint64
+		invalidPackets bool
+		closedStore    bool
+		progressed     bool
+		err            error
 	}{
 		{name: "StaleBoth"},
-		{name: "StaleData", probePackets: 1},
-		{name: "StaleProbe", dataPackets: 1},
-		{name: "Duplicate", dataPackets: 1, probePackets: 1},
-		{name: "AdvanceData", dataPackets: 2, probePackets: 1, progressed: true},
-		{name: "AdvanceProbe", dataPackets: 1, probePackets: 2, progressed: true},
-		{name: "AdvanceBoth", dataPackets: 2, probePackets: 2, progressed: true},
-		{name: "AdvanceDataStaleProbe", dataPackets: 2, err: ErrInvalidDeliveryReport},
-		{name: "StaleDataAdvanceProbe", probePackets: 2, err: ErrInvalidDeliveryReport},
-		{name: "InvalidPrefixBytes", dataPackets: 2, probePackets: 1, invalidBytes: true,
+		{name: "StaleData", pingID: 1},
+		{name: "StalePing", dataPackets: 1},
+		{name: "Duplicate", dataPackets: 1, pingID: 1},
+		{name: "AdvanceData", dataPackets: 2, pingID: 1, progressed: true},
+		{name: "AdvancePing", dataPackets: 1, pingID: 2, progressed: true},
+		{name: "AdvanceBoth", dataPackets: 2, pingID: 2, progressed: true},
+		{name: "AdvanceDataStalePing", dataPackets: 2, err: ErrInvalidDeliveryReport},
+		{name: "StaleDataAdvancePing", pingID: 2, err: ErrInvalidDeliveryReport},
+		{name: "InvalidPrefixCount", dataPackets: 2, pingID: 1, invalidPackets: true,
 			err: ErrInvalidDeliveryReport},
-		{name: "ClosedStore", dataPackets: 2, probePackets: 2, closedStore: true},
+		{name: "ClosedStore", dataPackets: 2, pingID: 2, closedStore: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			lane := schedulerLane(t, 1, 1, 20_000, 1_000_000)
@@ -1082,7 +1073,7 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 				takeOneTransmission(t, store)
 				prefixBytes[index] = prefixBytes[index-1] + uint64(transmission.size)
 			}
-			report := protocol.DeliveryReport{DataPackets: 1, DataBytes: prefixBytes[1], ProbePackets: 1, ProbeBytes: 1203}
+			report := protocol.DeliveryReport{DataPackets: 1, PingID: 1}
 			if progressed, err := lane.applyReport(report, 2000, time.Unix(2, 0)); err != nil || !progressed {
 				t.Fatalf("initial report = %t, %v", progressed, err)
 			}
@@ -1093,19 +1084,16 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 			before := *lane
 			packets, bytes := store.backlog()
 			report.DataPackets = test.dataPackets
-			report.DataBytes = prefixBytes[test.dataPackets]
-			report.ProbePackets = test.probePackets
-			report.ProbeBytes = test.probePackets * 1203
-			if test.invalidBytes {
-				report.DataBytes++
+			report.PingID = test.pingID
+			if test.invalidPackets {
+				report.DataPackets = 3
 			}
 			progressed, err := lane.applyReport(report, 9000, time.Unix(9, 0))
 			if progressed != test.progressed || !errors.Is(err, test.err) {
 				t.Fatalf("applyReport() = %t, %v, want %t, %v", progressed, err, test.progressed, test.err)
 			}
 			if !progressed {
-				if lane.lastDataPackets != before.lastDataPackets || lane.lastDataBytes != before.lastDataBytes ||
-					lane.lastProbePackets != before.lastProbePackets || lane.lastProbeBytes != before.lastProbeBytes ||
+				if lane.lastDataPackets != before.lastDataPackets || lane.lastPingID != before.lastPingID ||
 					lane.deliveryRate != before.deliveryRate || lane.lastProgressAt != before.lastProgressAt ||
 					lane.degraded != before.degraded {
 					t.Fatal("nonadvancing report changed lane state")
@@ -1114,7 +1102,7 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 					t.Fatal("nonadvancing report released retained data")
 				}
 			} else if lane.lastProgressAt != time.Unix(9, 0) || lane.degraded ||
-				lane.lastDataPackets != report.DataPackets || lane.lastProbePackets != report.ProbePackets {
+				lane.lastDataPackets != report.DataPackets || lane.lastPingID != report.PingID {
 				t.Fatal("advancing report did not update cumulative progress")
 			}
 		})
@@ -1123,41 +1111,25 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 
 func TestScheduledLaneReportIgnoresStaleCounters(t *testing.T) {
 	lane := schedulerLane(t, 1, 1, 1000, 1_000_000)
-	lane.lastDataBytes = 100
 	lane.lastDataPackets = 2
-	lane.lastProbeBytes = 50
-	lane.lastProbePackets = 1
-	report := protocol.DeliveryReport{
-		DataBytes: 99, DataPackets: 1, ProbeBytes: 40,
-	}
-	if _, err := lane.applyReport(report, 2000, time.Unix(2, 0)); err != nil {
+	lane.lastPingID = 1
+	if _, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, 2000, time.Unix(2, 0)); err != nil {
 		t.Fatal(err)
 	}
-	if lane.lastDataBytes != 100 || lane.lastProbeBytes != 50 {
+	if lane.lastDataPackets != 2 || lane.lastPingID != 1 {
 		t.Fatal("stale report changed cumulative state")
 	}
 	lane.registration.Store.deliveredMicros = 1000
-	report = protocol.DeliveryReport{
-		DataBytes: 100, DataPackets: 2, ProbeBytes: 50, ProbePackets: 1,
-	}
-	if _, err := lane.applyReport(report, 9000, time.Unix(9, 0)); err != nil {
+	if _, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 2, PingID: 1}, 9000, time.Unix(9, 0)); err != nil {
 		t.Fatal(err)
 	}
 	if lane.registration.Store.deliveredMicros != 1000 {
-		t.Fatal("duplicate report changed the delivery-rate time baseline")
+		t.Fatal("duplicate report changed the sample baseline")
 	}
-	report.DataBytes = 99
-	report.DataPackets = 1
-	report.ProbeBytes = 100
-	report.ProbePackets = 2
-	if _, err := lane.applyReport(report, 3000, time.Unix(3, 0)); !errors.Is(err, ErrInvalidDeliveryReport) {
-		t.Fatalf("mixed report error = %v, want %v", err, ErrInvalidDeliveryReport)
-	}
-	report = protocol.DeliveryReport{
-		DataBytes: 100, DataPackets: 1, ProbeBytes: 50, ProbePackets: 1,
-	}
-	if _, err := lane.applyReport(report, 4000, time.Unix(4, 0)); !errors.Is(err, ErrInvalidDeliveryReport) {
-		t.Fatalf("partially changed report error = %v, want %v", err, ErrInvalidDeliveryReport)
+	for _, report := range []protocol.DeliveryReport{{DataPackets: 1, PingID: 2}, {DataPackets: 3}} {
+		if _, err := lane.applyReport(report, 3000, time.Unix(3, 0)); !errors.Is(err, ErrInvalidDeliveryReport) {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -1167,13 +1139,11 @@ func TestScheduledLaneDeliveryRateRejectsCompressedFeedback(t *testing.T) {
 	now := time.UnixMicro(1000)
 	store.now = func() time.Time { return now }
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
-	var frameBytes uint64
 	for packetID := uint64(1); packetID <= 2; packetID++ {
 		transmission := schedulerTransmission(packetID, wgpacket.TransportData, now.Add(time.Second))
 		payload := make([]byte, 4096)
 		copy(payload, transmission.data.Payload)
 		transmission.data.Payload = payload
-		frameBytes = uint64(dataFrameSize(transmission.data))
 		if err := store.push(transmission); err != nil {
 			t.Fatal(err)
 		}
@@ -1183,7 +1153,7 @@ func TestScheduledLaneDeliveryRateRejectsCompressedFeedback(t *testing.T) {
 	for packetID := uint64(1); packetID <= 2; packetID++ {
 		report := protocol.DeliveryReport{
 			LaneID: lane.registration.LaneID, Generation: lane.registration.Generation,
-			DataPackets: packetID, DataBytes: packetID * frameBytes,
+			DataPackets: packetID,
 		}
 		if _, err := lane.applyReport(report, uint64(now.UnixMicro()), now); err != nil {
 			t.Fatal(err)
@@ -1206,8 +1176,8 @@ func TestScheduledLaneDeliveryRateRejectsApplicationLimitedDecrease(t *testing.T
 		want                uint64
 	}{
 		{name: "ApplicationLimitedDecrease", dataBytes: 5000, want: 1_000_000},
-		{name: "ConstrainedDecrease", dataBytes: 5000, deliveryConstrained: true, want: 937_500},
-		{name: "ApplicationLimitedIncrease", dataBytes: 20_000, want: 1_125_000},
+		{name: "ConstrainedDecrease", dataBytes: 5000, deliveryConstrained: true, want: 500_000},
+		{name: "ApplicationLimitedIncrease", dataBytes: 20_000, want: 2_000_000},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			lane := &scheduledLane{
@@ -1246,7 +1216,7 @@ func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T
 	releaseBatchOwnership(ownership[:count])
 	report := protocol.DeliveryReport{
 		LaneID: lane.registration.LaneID, Generation: lane.registration.Generation,
-		DataPackets: transmissionCount, DataBytes: dataBytes,
+		DataPackets: transmissionCount,
 	}
 	if _, err := lane.applyReport(report, 11_000, time.Unix(1, 0)); err != nil {
 		t.Fatal(err)
@@ -1456,49 +1426,138 @@ func TestSchedulerMigratesTransportOnce(t *testing.T) {
 	}
 }
 
-func TestSchedulerTransfersAggregateBudgetDuringMigration(t *testing.T) {
-	budget, err := retention.NewBudget(retention.Limits{Packets: 1, Bytes: 4096})
-	if err != nil {
-		t.Fatal(err)
-	}
-	limits := packetqueue.Limits{Packets: 1, Bytes: 4096}
-	now := func() time.Time { return time.Unix(123, 0) }
-	ingress, err := packetqueue.NewWithClock[Packet](limits, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scheduler, err := NewScheduler(ingress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sourceStore, err := NewTransmissionStoreWithBudget(limits, budget, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	destinationStore, err := NewTransmissionStoreWithBudget(limits, budget, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	transmission := schedulerTransmission(1, wgpacket.TransportData, now().Add(time.Second))
-	if err := sourceStore.push(transmission); err != nil {
-		t.Fatal(err)
-	}
-	source := &scheduledLane{registration: schedulerRegistration(1, 1, sourceStore)}
-	destination := &scheduledLane{
-		registration: schedulerRegistration(2, 2, destinationStore), rttMicros: 1000, deliveryRate: 1_000_000,
-	}
-	scheduler.migrateTransmissions(map[protocol.LaneID]*scheduledLane{
-		destination.registration.LaneID: destination,
-	}, source)
-	if packets, _ := destinationStore.backlog(); packets != 1 {
-		t.Fatalf("destination retained packets = %d, want 1", packets)
-	}
-	if got := budget.Usage(); got.Packets != 1 {
-		t.Fatalf("budget usage after migration = %+v", got)
-	}
-	releaseTransmissions(destinationStore.drain())
-	if got := budget.Usage(); got != (retention.Usage{}) {
-		t.Fatalf("budget usage after release = %+v", got)
+func TestSchedulerMigrateTransmissions(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		sourceWrite   bool
+		sourcePending bool
+		overlap       bool
+	}{
+		{name: "Queued"},
+		{name: "Sent", sourceWrite: true},
+		{name: "ActiveWrite", sourceWrite: true, sourcePending: true},
+		{name: "OverlappingWrites", sourceWrite: true, sourcePending: true, overlap: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			budget, err := retention.NewBudget(retention.Limits{Packets: 1, Bytes: 4096})
+			if err != nil {
+				t.Fatal(err)
+			}
+			limits := packetqueue.Limits{Packets: 1, Bytes: 4096}
+			now := func() time.Time { return time.Unix(123, 0) }
+			ingress, err := packetqueue.NewWithClock[Packet](limits, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ingress.Close()
+			scheduler, err := NewScheduler(ingress)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sourceStore, err := NewTransmissionStoreWithBudget(limits, budget, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { releaseTransmissions(sourceStore.drain()) }()
+			destinationStore, err := NewTransmissionStoreWithBudget(limits, budget, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { releaseTransmissions(destinationStore.drain()) }()
+			transmission := schedulerTransmission(1, wgpacket.TransportData, now().Add(time.Second))
+			local, err := datagram.ListenLocal(netip.MustParseAddrPort("127.0.0.1:0"), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer local.Close()
+			peer, err := net.ListenUDP("udp4", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			if _, err := peer.WriteToUDPAddrPort(transmission.data.Payload, local.LocalAddr()); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			packet, err := local.Read(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transmission.packet = packet
+			transmission.data.Payload = packet.Payload
+			wantPayload := string(packet.Payload)
+			if err := sourceStore.push(transmission); err != nil {
+				packet.Release()
+				t.Fatal(err)
+			}
+			var sourceData, destinationData [1]protocol.Data
+			var sourceOwnership, destinationOwnership [1]Packet
+			defer sourceOwnership[0].Release()
+			defer destinationOwnership[0].Release()
+			if test.sourceWrite {
+				if count, err := sourceStore.takeBatch(sourceData[:], sourceOwnership[:], 4096); err != nil || count != 1 {
+					t.Fatalf("source takeBatch() = %d, %v", count, err)
+				}
+				if !test.sourcePending {
+					sourceOwnership[0].Release()
+				}
+			}
+			source := &scheduledLane{registration: schedulerRegistration(1, 1, sourceStore)}
+			destination := &scheduledLane{
+				registration: schedulerRegistration(2, 2, destinationStore), rttMicros: 1000, deliveryRate: 1_000_000,
+			}
+			scheduler.migrateTransmissions(map[protocol.LaneID]*scheduledLane{
+				destination.registration.LaneID: destination,
+			}, source)
+			if packets, bytes := sourceStore.backlog(); packets != 0 || bytes != 0 {
+				t.Fatalf("source backlog = %d packets, %d bytes", packets, bytes)
+			}
+			select {
+			case <-sourceStore.Done():
+			default:
+				t.Fatal("migration did not close the source store")
+			}
+			if packets, bytes := destinationStore.backlog(); packets != 1 || bytes != uint64(transmission.size) {
+				t.Fatalf("destination backlog = %d packets, %d bytes", packets, bytes)
+			}
+			if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: transmission.size}) {
+				t.Fatalf("budget usage after migration = %+v", got)
+			}
+			if test.sourcePending && !test.overlap {
+				if got := string(sourceData[0].Payload); got != wantPayload {
+					t.Fatalf("source write payload = %q, want %q", got, wantPayload)
+				}
+				// Complete the old write before the destination acquires its write reference.
+				sourceOwnership[0].Release()
+			}
+			if count, err := destinationStore.takeBatch(destinationData[:], destinationOwnership[:], 4096); err != nil || count != 1 {
+				t.Fatalf("destination takeBatch() = %d, %v", count, err)
+			}
+			if destinationData[0].PacketID != transmission.data.PacketID ||
+				destinationData[0].DeadlineMicros != transmission.data.DeadlineMicros {
+				t.Fatalf("migrated packet metadata = %+v", destinationData[0])
+			}
+			if _, _, err := destinationStore.acknowledge(1, uint64(now().UnixMicro())); err != nil {
+				t.Fatal(err)
+			}
+			if got := budget.Usage(); got != (retention.Usage{}) {
+				t.Fatalf("budget usage after acknowledgement = %+v", got)
+			}
+			if test.overlap {
+				if got := string(sourceData[0].Payload); got != wantPayload {
+					t.Fatalf("source write payload after acknowledgement = %q, want %q", got, wantPayload)
+				}
+				retained := sourceOwnership[0].Retain()
+				retained.Release()
+				sourceOwnership[0].Release()
+			}
+			if got := string(destinationData[0].Payload); got != wantPayload {
+				t.Fatalf("destination write payload = %q, want %q", got, wantPayload)
+			}
+			retained := destinationOwnership[0].Retain()
+			retained.Release()
+		})
 	}
 }
 
@@ -1565,12 +1624,12 @@ func TestSchedulerRetainsExpiredSentPrefixUntilReport(t *testing.T) {
 			if source.abandoning || source.degraded {
 				t.Fatalf("expired lane: abandoning=%t degraded=%t", source.abandoning, source.degraded)
 			}
-			size, err := protocol.DataFrameSize(packet)
+			_, err := protocol.DataFrameSize(packet)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if _, err := source.applyReport(protocol.DeliveryReport{
-				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1, DataBytes: uint64(size),
+				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1,
 			}, 1_200_000, now.Add(1200*time.Millisecond)); err != nil {
 				t.Fatal(err)
 			}
@@ -1623,8 +1682,8 @@ func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
 			}
 			completed := 0
 			scheduler.routeReport(lanes, protocol.DeliveryReport{
-				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1, DataBytes: uint64(transmission.size),
-			}, func(ok bool) {
+				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1,
+			}, time.Now(), func(ok bool) {
 				if ok {
 					completed++
 				}
@@ -1667,7 +1726,7 @@ func TestSchedulerDoesNotCountIdleTimeAsProgressStall(t *testing.T) {
 			t.Fatal("fresh burst was degraded before one report could return")
 		}
 		if _, err := source.applyReport(protocol.DeliveryReport{
-			LaneID: source.registration.LaneID, Generation: 1, DataPackets: uint64((burst + 1) * 2), DataBytes: bytes,
+			LaneID: source.registration.LaneID, Generation: 1, DataPackets: uint64((burst + 1) * 2),
 		}, uint64(burst+1)*1_000_000, now.Add(100*time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}
@@ -1814,7 +1873,7 @@ func TestSchedulerDuplicatesReportAcrossLanes(t *testing.T) {
 		second.registration.LaneID: second,
 	}, protocol.DeliveryReport{
 		LaneID: first.registration.LaneID, Generation: 1,
-	}, func(sent bool) {
+	}, time.Now(), func(sent bool) {
 		if sent {
 			completed++
 		}
@@ -1833,7 +1892,7 @@ func TestSchedulerRejectsUnroutableReport(t *testing.T) {
 		lane.registration.LaneID: lane,
 	}, protocol.DeliveryReport{
 		LaneID: lane.registration.LaneID, Generation: 1,
-	}, func(sent bool) { completed <- sent })
+	}, time.Now(), func(sent bool) { completed <- sent })
 	if sent := <-completed; sent {
 		t.Fatal("unroutable report completed as sent")
 	}
@@ -1851,10 +1910,11 @@ func TestSchedulerReusesControlLaneOrder(t *testing.T) {
 	if len(ordered) != len(lanes) {
 		t.Fatalf("ordered lanes = %d, want %d", len(ordered), len(lanes))
 	}
-	for index, lane := range ordered {
+	for index, candidate := range ordered {
+		lane := candidate.lane
 		want := byte(len(ordered) - index)
-		if lane.registration.LaneID[0] != want {
-			t.Fatalf("ordered lane %d = %d, want %d", index, lane.registration.LaneID[0], want)
+		if lane.registration.LaneID != protocol.LaneID(want) {
+			t.Fatalf("ordered lane %d = %d, want %d", index, lane.registration.LaneID, want)
 		}
 	}
 
@@ -1903,10 +1963,15 @@ func schedulerLaneWithLimits(t *testing.T, id, group byte, rtt, rate uint64,
 	limits packetqueue.Limits) *scheduledLane {
 	t.Helper()
 	store := schedulerStore(t, limits)
-	return &scheduledLane{
+	lane := &scheduledLane{
 		registration: schedulerRegistration(id, group, store),
 		rttMicros:    rtt, deliveryRate: rate, rttObserved: true,
 	}
+	lane.registration.SendDeliveryReport = func(report protocol.DeliveryReport, _ time.Time, sent func()) bool {
+		frame, err := protocol.MarshalDeliveryReport(report)
+		return err == nil && lane.registration.SendControl(frame, sent)
+	}
+	return lane
 }
 
 func schedulerStore(t *testing.T, limits packetqueue.Limits) *TransmissionStore {
@@ -1920,9 +1985,10 @@ func schedulerStore(t *testing.T, limits packetqueue.Limits) *TransmissionStore 
 
 func schedulerRegistration(id, group byte, store *TransmissionStore) LaneRegistration {
 	return LaneRegistration{
-		LaneID: protocol.LaneID{id}, Generation: 1, PathGroupID: protocol.PathGroupID{group},
+		LaneID: protocol.LaneID(id), Generation: 1, PathGroupID: protocol.PathGroupID(group),
 		Store: store, Abandon: func() {}, SendControl: func(protocol.Frame, func()) bool { return true },
-		ValidateProbeProgress: func(uint64, uint64) bool { return true },
+		ValidatePingProgress: func(uint64) bool { return true },
+		SendDeliveryReport:   func(protocol.DeliveryReport, time.Time, func()) bool { return true },
 	}
 }
 
@@ -1993,18 +2059,18 @@ func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
 		payloadSize int
 		size        int
 	}{
-		{name: "OneByteID", id: 127, deadline: 128, payloadSize: 32, size: 37},
-		{name: "TwoByteID", id: 128, deadline: 128, payloadSize: 32, size: 38},
-		{name: "ThreeByteID", id: 16384, deadline: 128, payloadSize: 32, size: 39},
-		{name: "FullWidthID", id: math.MaxUint64, deadline: 128, payloadSize: 32, size: 46},
-		{name: "OneByteDeadline", id: 1, deadline: 127, payloadSize: 32, size: 36},
-		{name: "TwoByteDeadline", id: 1, deadline: 128, payloadSize: 32, size: 37},
-		{name: "FullWidthDeadline", id: 1, deadline: math.MaxUint64, payloadSize: 32, size: 45},
-		{name: "OneByteLength", id: 1, deadline: 128, payloadSize: 124, size: 129},
-		{name: "TwoByteLength", id: 1, deadline: 128, payloadSize: 125, size: 131},
-		{name: "TwoByteLengthMaximum", id: 1, deadline: 128, payloadSize: 16380, size: 16386},
-		{name: "ThreeByteLength", id: 1, deadline: 128, payloadSize: 16381, size: 16388},
-		{name: "MaximumFrame", id: math.MaxUint64, deadline: math.MaxUint64, payloadSize: 65535, size: 65559},
+		{name: "OneByteID", id: 127, deadline: 128000, payloadSize: 32, size: 37},
+		{name: "TwoByteID", id: 128, deadline: 128000, payloadSize: 32, size: 38},
+		{name: "ThreeByteID", id: 16384, deadline: 128000, payloadSize: 32, size: 39},
+		{name: "FullWidthID", id: math.MaxUint64, deadline: 128000, payloadSize: 32, size: 46},
+		{name: "OneByteDeadline", id: 1, deadline: 127000, payloadSize: 32, size: 36},
+		{name: "TwoByteDeadline", id: 1, deadline: 128000, payloadSize: 32, size: 37},
+		{name: "FullWidthDeadline", id: 1, deadline: math.MaxUint64 - math.MaxUint64%1000, payloadSize: 32, size: 43},
+		{name: "OneByteLength", id: 1, deadline: 128000, payloadSize: 124, size: 129},
+		{name: "TwoByteLength", id: 1, deadline: 128000, payloadSize: 125, size: 131},
+		{name: "TwoByteLengthMaximum", id: 1, deadline: 128000, payloadSize: 16380, size: 16386},
+		{name: "ThreeByteLength", id: 1, deadline: 128000, payloadSize: 16381, size: 16388},
+		{name: "MaximumFrame", id: math.MaxUint64, deadline: math.MaxUint64 - math.MaxUint64%1000, payloadSize: 65535, size: 65557},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, fits := range []bool{true, false} {

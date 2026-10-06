@@ -68,7 +68,7 @@ func main() {
 			}
 			_, err = os.Stat(filepath.Join(directory, marker))
 			if err == nil && (len(flow.Intervals) == 0 || flow.Intervals[len(flow.Intervals)-1].Sum.Bytes == 0) {
-				err = fmt.Errorf("TCP flow did not resume after path recovery")
+				err = fmt.Errorf("TCP flow made no progress in the final interval after path recovery")
 			}
 		}
 		if err == nil {
@@ -97,10 +97,13 @@ func main() {
 
 // verifyCarrier detects unexpected reconnects in scenarios that should retain one admitted carrier.
 func verifyCarrier(directory, scenario string) error {
+	if scenario == "tcp-asymmetric-stall" {
+		return verifyParallelCarrierSockets(filepath.Join(directory, "client-tcp-sockets.txt"), true)
+	}
 	if strings.HasSuffix(scenario, "-stall") || strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam") {
 		return nil
 	}
-	if scenario == "tcp-multipath" || scenario == "tcp-mixed" {
+	if scenario == "tcp-multipath" || scenario == "tcp-mixed" || scenario == "tcp-asymmetric" {
 		return verifyParallelCarriers(directory, scenario)
 	}
 	expected := 3
@@ -142,24 +145,9 @@ func tcpActiveOpens(path string) (int, error) {
 // verifyParallelCarriers requires both configured lanes to remain available without reconnecting during the flow.
 func verifyParallelCarriers(directory, scenario string) error {
 	for _, name := range []string{"client-tcp-sockets.txt", "client-tcp-sockets-after.txt"} {
-		data, err := os.ReadFile(filepath.Join(directory, name))
-		if err != nil {
+		splitPorts := scenario == "tcp-mixed" || scenario == "tcp-asymmetric"
+		if err := verifyParallelCarrierSockets(filepath.Join(directory, name), splitPorts); err != nil {
 			return err
-		}
-		tcp, wss := 0, 0
-		for line := range strings.Lines(string(data)) {
-			fields := strings.Fields(line)
-			if len(fields) < 4 {
-				continue
-			}
-			if strings.HasSuffix(fields[3], ":51822") {
-				tcp++
-			} else if strings.HasSuffix(fields[3], ":51823") {
-				wss++
-			}
-		}
-		if scenario == "tcp-mixed" && (tcp != 1 || wss != 1) || scenario == "tcp-multipath" && tcp != 2 {
-			return fmt.Errorf("%s has %d TCP and %d WSS carriers, expected two configured lanes", name, tcp, wss)
 		}
 	}
 	before, err := tcpActiveOpens(filepath.Join(directory, "client-before.txt"))
@@ -172,6 +160,31 @@ func verifyParallelCarriers(directory, scenario string) error {
 	}
 	if after-before != 2 {
 		return fmt.Errorf("initiated %d TCP connections during the flow, expected only iperf3 control and data", after-before)
+	}
+	return nil
+}
+
+// verifyParallelCarrierSockets requires both configured lanes in one established-socket snapshot.
+func verifyParallelCarrierSockets(path string, splitPorts bool) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	primary, secondary := 0, 0
+	for line := range strings.Lines(string(data)) {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		if strings.HasSuffix(fields[3], ":51822") {
+			primary++
+		} else if strings.HasSuffix(fields[3], ":51823") {
+			secondary++
+		}
+	}
+	if splitPorts && (primary != 1 || secondary != 1) || !splitPorts && primary != 2 {
+		return fmt.Errorf("%s has %d primary and %d secondary carriers, expected two configured lanes",
+			filepath.Base(path), primary, secondary)
 	}
 	return nil
 }

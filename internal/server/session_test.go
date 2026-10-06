@@ -220,8 +220,8 @@ func TestSessionLaneCancellationClosesNormally(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.close()
-	laneID := protocol.LaneID{1}
-	pathGroupID := protocol.PathGroupID{1}
+	laneID := protocol.LaneID(1)
+	pathGroupID := protocol.PathGroupID(1)
 	if err := session.reserveLane(laneID, 1, pathGroupID); err != nil {
 		t.Fatal(err)
 	}
@@ -254,8 +254,8 @@ func TestSessionCloseRacesLaneAttachment(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		laneID := protocol.LaneID{byte(index + 1)}
-		pathGroupID := protocol.PathGroupID{1}
+		laneID := protocol.LaneID(byte(index + 1))
+		pathGroupID := protocol.PathGroupID(1)
 		if err := session.reserveLane(laneID, 1, pathGroupID); err != nil {
 			t.Fatal(err)
 		}
@@ -284,7 +284,7 @@ func TestLaneReservationDefersDetachedExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := session.reserveLane(protocol.LaneID{1}, 1, protocol.PathGroupID{1}); err != nil {
+	if err := session.reserveLane(protocol.LaneID(1), 1, protocol.PathGroupID(1)); err != nil {
 		t.Fatal(err)
 	}
 	if snapshot := instance.Snapshot(); snapshot.Detached != 0 {
@@ -320,7 +320,7 @@ func TestStaleDetachedExpiryCannotCloseReservedSession(t *testing.T) {
 	if stale == nil {
 		t.Fatal("detached expiry was not created")
 	}
-	if err := session.reserveLane(protocol.LaneID{1}, 1, protocol.PathGroupID{1}); err != nil {
+	if err := session.reserveLane(protocol.LaneID(1), 1, protocol.PathGroupID(1)); err != nil {
 		t.Fatal(err)
 	}
 	session.expireDetached(stale)
@@ -436,8 +436,8 @@ func TestWebSocketCreationReplayCapacityIsRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID{1}, Generation: 1,
-		PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{2}, UnixSeconds: now,
+		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+		PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{2}, UnixSeconds: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -474,8 +474,8 @@ func TestWebSocketCreationReplayIsTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID{1}, Generation: 1,
-		PathGroupID: protocol.PathGroupID{1}, Nonce: nonce, UnixSeconds: now,
+		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+		PathGroupID: protocol.PathGroupID(1), Nonce: nonce, UnixSeconds: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -508,8 +508,8 @@ func TestWebSocketClockSkewIsRetryable(t *testing.T) {
 	instance := newSessionTestServer(t, token, target, time.Second)
 	instance.config.WallClock = func() time.Time { return time.Unix(2_000, 0) }
 	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID{1}, Generation: 1,
-		PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{2}, UnixSeconds: 3_000,
+		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+		PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{2}, UnixSeconds: 3_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -556,8 +556,8 @@ func TestWebSocketRejectionSurvivesReverseProxy(t *testing.T) {
 	proxy := httptest.NewServer(httputil.NewSingleHostReverseProxy(upstreamURL))
 	defer proxy.Close()
 	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID{1}, Generation: 1,
-		PathGroupID: protocol.PathGroupID{1}, Nonce: protocol.Nonce{2}, UnixSeconds: 1_000,
+		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+		PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{2}, UnixSeconds: 1_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -600,12 +600,12 @@ func TestWebSocketLaneLimitIsTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.close()
-	if err := session.reserveLane(protocol.LaneID{1}, 1, protocol.PathGroupID{1}); err != nil {
+	if err := session.reserveLane(protocol.LaneID(1), 1, protocol.PathGroupID(1)); err != nil {
 		t.Fatal(err)
 	}
 	join := wsheader.Join{
-		Method: "GET", Path: "/_wirehop", SessionID: session.id, LaneID: protocol.LaneID{2}, Generation: 1,
-		PathGroupID: protocol.PathGroupID{2}, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+		Method: "GET", Path: "/_wirehop", SessionID: session.id, LaneID: protocol.LaneID(2), Generation: 1,
+		PathGroupID: protocol.PathGroupID(2), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 	}
 	if err := wsheader.SignJoin(&join, session.secret); err != nil {
 		t.Fatal(err)
@@ -913,11 +913,11 @@ func TestLanePathGroupIsStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.close()
-	laneID := protocol.LaneID{1}
-	if err := session.reserveLane(laneID, 1, protocol.PathGroupID{1}); err != nil {
+	laneID := protocol.LaneID(1)
+	if err := session.reserveLane(laneID, 1, protocol.PathGroupID(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.reserveLane(laneID, 2, protocol.PathGroupID{2}); err != ErrPathGroupMismatch {
+	if err := session.reserveLane(laneID, 2, protocol.PathGroupID(2)); err != ErrPathGroupMismatch {
 		t.Fatalf("reserveLane() error = %v, want %v", err, ErrPathGroupMismatch)
 	}
 }
@@ -956,8 +956,8 @@ func TestRawClockSkewIsRetryable(t *testing.T) {
 	instance.config.WallClock = func() time.Time { return time.Unix(2_000, 0) }
 	hello := protocol.ClientHello{
 		Mode: protocol.HelloCreate, UnixSeconds: 3_000, MonotonicMicros: 1,
-		Nonce: protocol.Nonce{2}, LaneID: protocol.LaneID{1}, Generation: 1,
-		PathGroupID: protocol.PathGroupID{1}, Target: target,
+		Nonce: protocol.Nonce{2}, LaneID: protocol.LaneID(1), Generation: 1,
+		PathGroupID: protocol.PathGroupID(1), Target: target,
 	}
 	if err := protocol.SignClientHello(&hello, token); err != nil {
 		t.Fatal(err)
@@ -1022,7 +1022,7 @@ func TestRawUnsupportedVersionIsRejected(t *testing.T) {
 	instance := newSessionTestServer(t, token, target, time.Second)
 	hello := protocol.ClientHello{
 		Mode: protocol.HelloCreate, UnixSeconds: time.Now().Unix(), Nonce: protocol.Nonce{1},
-		LaneID: protocol.LaneID{1}, Generation: 1, PathGroupID: protocol.PathGroupID{1}, Target: target,
+		LaneID: protocol.LaneID(1), Generation: 1, PathGroupID: protocol.PathGroupID(1), Target: target,
 	}
 	if err := protocol.SignClientHello(&hello, token); err != nil {
 		t.Fatal(err)
@@ -1038,7 +1038,7 @@ func TestRawUnsupportedVersionIsRejected(t *testing.T) {
 	go func() {
 		result <- instance.serveConnection(context.Background(), serverConnection, func() {})
 	}()
-	prefixSize := len(encoded) - len(hello.Target.String()) - len(hello.AuthTag)
+	prefixSize := 8
 	if _, err := clientConnection.Write(encoded[:prefixSize]); err != nil {
 		t.Fatal(err)
 	}
@@ -1078,7 +1078,7 @@ func TestShouldReportLaneError(t *testing.T) {
 			name: "ActiveRemoteProtocolViolation",
 			err: &activeLaneError{cause: &relay.RemoteError{Value: protocol.ErrorFrame{
 				Code: protocol.ErrorProtocolViolation, Class: protocol.ErrorLaneRejected,
-				Scope: protocol.ErrorScopeLane, LaneID: protocol.LaneID{1}, Generation: 1,
+				Scope: protocol.ErrorScopeLane, LaneID: protocol.LaneID(1), Generation: 1,
 				Diagnostic: "private diagnostic",
 			}}},
 			want: true,
@@ -1102,7 +1102,7 @@ func TestServerLogLaneErrorRedactsRemoteDiagnostic(t *testing.T) {
 	instance.logLaneError("stream lane ended", "192.0.2.1:1234", &activeLaneError{
 		cause: &relay.RemoteError{Value: protocol.ErrorFrame{
 			Code: protocol.ErrorProtocolViolation, Class: protocol.ErrorLaneRejected,
-			Scope: protocol.ErrorScopeLane, LaneID: protocol.LaneID{1}, Generation: 1,
+			Scope: protocol.ErrorScopeLane, LaneID: protocol.LaneID(1), Generation: 1,
 			Diagnostic: "private diagnostic",
 		}},
 	})
