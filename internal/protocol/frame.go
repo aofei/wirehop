@@ -118,7 +118,7 @@ func ReadFrame(reader io.Reader) (Frame, error) {
 	return frameReader.Read(reader)
 }
 
-// Read reads one frame whose payload remains valid until the next Read, ReadBuffered, or Reset call.
+// Read reads one frame whose payload remains valid until the next Read or Reset call.
 func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
 	r.Reset()
 	if _, err := io.ReadFull(reader, r.header[:1]); err != nil {
@@ -163,31 +163,31 @@ func (r *FrameReader) readContent(reader io.Reader, typeID FrameType, length int
 	return Frame{Type: typeID, Payload: r.content}, nil
 }
 
-// ReadBuffered reads one complete frame only when it is already buffered. Its payload remains valid until the next
-// Read, ReadBuffered, or Reset call.
-func (r *FrameReader) ReadBuffered(reader *bufio.Reader) (Frame, bool, error) {
-	r.Reset()
-	if reader.Buffered() < 2 {
+// ReadBufferedFrame borrows one complete frame from reader without reading or refilling it. Returned payloads remain
+// valid until an operation refills or resets reader. Further ReadBufferedFrame calls preserve previous payloads.
+func ReadBufferedFrame(reader *bufio.Reader) (Frame, bool, error) {
+	buffered := reader.Buffered()
+	if buffered < 2 {
 		return Frame{}, false, nil
 	}
-	header, err := reader.Peek(min(reader.Buffered(), maximumFrameHeaderSize))
+	encoded, err := reader.Peek(buffered)
 	if err != nil {
 		return Frame{}, false, err
 	}
-	contentLength, headerSize, err := frameHeader(header)
+	contentLength, headerSize, err := frameHeader(encoded)
 	if err != nil {
 		if err == ErrTrailingFrameData {
 			return Frame{}, false, nil
 		}
 		return Frame{}, false, err
 	}
-	if reader.Buffered() < headerSize+contentLength {
+	encodedLength := headerSize + contentLength
+	if buffered < encodedLength {
 		return Frame{}, false, nil
 	}
-	typeID := FrameType(header[0])
-	reader.Discard(headerSize)
-	frame, err := r.readContent(reader, typeID, contentLength)
-	return frame, true, err
+	frame := Frame{Type: FrameType(encoded[0]), Payload: encoded[headerSize:encodedLength]}
+	reader.Discard(encodedLength)
+	return frame, true, nil
 }
 
 // Reset invalidates the previous payload and releases exceptional historical capacity while preserving ordinary buffers.

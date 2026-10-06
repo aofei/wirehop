@@ -142,11 +142,10 @@ func TestSelectCandidatesKeepsCommittedSamePath(t *testing.T) {
 	for id := uint64(1); id <= 16; id++ {
 		transmission := schedulerTransmission(id, wgpacket.TransportData, time.Now().Add(time.Second))
 		payload := make([]byte, 1400)
-		copy(payload, transmission.data.Payload)
+		copy(payload, transmission.packet.Payload)
 		transmission.packet.Release()
 		transmission.packet = datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}
-		transmission.data.Payload = transmission.packet.Payload
-		transmission.size = dataFrameSize(transmission.data)
+		transmission.size = dataFrameSize(transmission.data())
 		if err := store.push(transmission); err != nil {
 			t.Fatal(err)
 		}
@@ -234,7 +233,7 @@ func TestRetainedTransmissionLayout(t *testing.T) {
 		migrated bool
 		size     int
 		budget   *retention.Budget
-		packet   Packet
+		packet   datagram.Packet
 		delivery deliverySnapshot
 	}
 	t.Logf("retained transmission metadata: %d bytes, original %d bytes", unsafe.Sizeof(retainedTransmission{}), unsafe.Sizeof(originalTransmission{}))
@@ -249,8 +248,8 @@ func TestScheduledLaneRatePressureUsesEstimatedWindow(t *testing.T) {
 	for id := uint64(1); id <= 200; id++ {
 		transmission := schedulerTransmission(id, wgpacket.TransportData, store.now().Add(time.Second))
 		payload := make([]byte, 4096)
-		copy(payload, transmission.data.Payload)
-		transmission.data.Payload = payload
+		copy(payload, transmission.packet.Payload)
+		transmission.packet.Payload = payload
 		if err := store.push(transmission); err != nil {
 			t.Fatal(err)
 		}

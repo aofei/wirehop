@@ -44,8 +44,8 @@ func BenchmarkSelectCandidates(b *testing.B) {
 		for packetIndex := range index {
 			transmission := schedulerTransmission(uint64(packetIndex+1), wgpacket.TransportData, deadline)
 			payload := make([]byte, 1452)
-			copy(payload, transmission.data.Payload)
-			transmission.data.Payload = payload
+			copy(payload, transmission.packet.Payload)
+			transmission.packet.Payload = payload
 			if err := store.push(transmission); err != nil {
 				b.Fatal(err)
 			}
@@ -104,10 +104,10 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 	var ownership [1]Packet
 	var packets uint64
 	b.ReportAllocs()
-	b.SetBytes(int64(len(transmission.data.Payload)))
+	b.SetBytes(int64(len(transmission.packet.Payload)))
 	for b.Loop() {
 		packets++
-		transmission.data.PacketID = packets
+		transmission.packetID = packets
 		if err := store.push(transmission); err != nil {
 			b.Fatal(err)
 		}
@@ -135,7 +135,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 	packetID := uint64(0)
 	for range backlogPackets {
 		packetID++
-		transmission.data.PacketID = packetID
+		transmission.packetID = packetID
 		if err := store.push(transmission); err != nil {
 			b.Fatal(err)
 		}
@@ -143,7 +143,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 	var batch [maximumDataBatchFrames]protocol.Data
 	var ownership [maximumDataBatchFrames]Packet
 	b.ReportAllocs()
-	b.SetBytes(int64(len(transmission.data.Payload) * len(batch)))
+	b.SetBytes(int64(len(transmission.packet.Payload) * len(batch)))
 	for b.Loop() {
 		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes)
 		if err != nil || count != len(batch) {
@@ -155,7 +155,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 		}
 		for range count {
 			packetID++
-			transmission.data.PacketID = packetID
+			transmission.packetID = packetID
 			if err := store.push(transmission); err != nil {
 				b.Fatal(err)
 			}

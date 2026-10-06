@@ -28,9 +28,9 @@ var (
 )
 
 const (
-	// defaultInitialRTTMicros is the conservative RTT before timing samples arrive.
+	// defaultInitialRTTMicros is the RTT estimate before timing samples arrive.
 	defaultInitialRTTMicros = 100_000
-	// defaultInitialRateBytesPerSecond is the conservative delivery rate before reports arrive.
+	// defaultInitialRateBytesPerSecond is the delivery-rate estimate before reports arrive.
 	defaultInitialRateBytesPerSecond = 1_000_000
 	// preferredLaneHysteresisMicros prevents sparse traffic from oscillating between similar lanes.
 	preferredLaneHysteresisMicros = 2_000
@@ -715,28 +715,6 @@ func selectControlCandidates(lanes map[protocol.LaneID]*scheduledLane,
 	return result
 }
 
-// laneEligible reports whether lane is one of the two best group members for the current frame size.
-func laneEligible(lanes map[protocol.LaneID]*scheduledLane, lane *scheduledLane, frameBytes uint64) bool {
-	if frameBytes > 0 && !lane.canAccept(frameBytes) {
-		return false
-	}
-	better := 0
-	for _, candidate := range lanes {
-		if candidate == lane || candidate.degraded || candidate.abandoning ||
-			candidate.registration.PathGroupID != lane.registration.PathGroupID ||
-			frameBytes > 0 && !candidate.canAccept(frameBytes) {
-			continue
-		}
-		if laneBetterForFrame(candidate, lane, frameBytes) {
-			better++
-			if better == 2 {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 // canAccept reports whether current retained work can accept one more frame.
 func (l *scheduledLane) canAccept(frameBytes uint64) bool {
 	if !l.registration.Store.canAccept(frameBytes) {
@@ -748,11 +726,6 @@ func (l *scheduledLane) canAccept(frameBytes uint64) bool {
 	_, bytes := l.registration.Store.backlog()
 	window := l.deliveryWindowBytes()
 	return frameBytes <= window && bytes <= window-frameBytes
-}
-
-// laneBetterForFrame orders candidates by predicted frame delivery and then stable lane identity.
-func laneBetterForFrame(left, right *scheduledLane, frameBytes uint64) bool {
-	return scoredLaneBetter(scoredLane{left, left.score(frameBytes)}, scoredLane{right, right.score(frameBytes)})
 }
 
 // score returns predicted delivery delay in microseconds.
@@ -797,6 +770,8 @@ func (l *scheduledLane) retentionDelay(bytes uint64) uint64 {
 // enqueue retains one newly identified packet after successful store admission.
 func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64, now time.Time) bool {
 	packet := item.Value.Retain()
+	packet.datagram.Kind = packet.Kind
+	packet.datagram.Payload = packet.Payload
 	data := protocol.Data{
 		PacketID: packetID, DeadlineMicros: packet.DeadlineMicros, Payload: packet.Payload,
 	}
@@ -811,7 +786,7 @@ func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64,
 		return false
 	}
 	transmission := retainedTransmission{
-		data: data, kind: item.Value.Kind, priority: item.Priority, deadline: item.Deadline,
+		packetID: packetID, wireDeadline: packet.DeadlineMicros, deadline: item.Deadline,
 		budget: budget, packet: packet.datagram,
 	}
 	if l.registration.Store.pushAt(transmission, now) == nil {
@@ -912,8 +887,8 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 		if lane.abandoning {
 			continue
 		}
-		unreportedSince := lane.registration.Store.expireQueued(now)
-		if !laneProgressStalled(lane, now, unreportedSince) {
+		unreportedSince, firstBytes := lane.registration.Store.expireQueued(now)
+		if !laneProgressStalled(lane, now, unreportedSince, firstBytes) {
 			lane.degraded = false
 			continue
 		}
@@ -922,14 +897,19 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 			lane.degraded = false
 			continue
 		}
-		remaining := assessment.deadline.Sub(now)
-		// Retained sent bytes include packets already delivered while their parsing report is in flight. Their
-		// age alone cannot justify withholding fresh packets with later deadlines from a progressing connection.
-		lane.degraded = assessment.atRisk && laneProgressStalled(lane, now, assessment.unreportedSince)
-		// Packet expiry does not imply carrier failure. A parsing report can still be returning after successful
-		// delivery. Keep that connection available for feedback and let its ping and write budgets detect failure.
-		if remaining > 0 && lane.degraded &&
-			hasTimelyAlternative(lanes, lane, assessment.frameBytes, remaining) {
+		// Stalled progress makes the previous capacity prediction optimistic. A healthy alternative that can
+		// deliver useful work within another progress guard justifies recovery before the salvage window closes.
+		remaining := assessment.usefulDeadline.Sub(now)
+		recoveryMicros := progressGuardMicros(lane, firstBytes)
+		progressSince := lane.lastProgressAt
+		if unreportedSince.After(progressSince) {
+			progressSince = unreportedSince
+		}
+		recoveryMicros = max(recoveryMicros, uint64(now.Sub(progressSince)/time.Microsecond))
+		alternative := remaining > 0 && hasTimelyAlternative(lanes, lane, now, assessment.usefulBytes,
+			min(uint64(remaining/time.Microsecond), recoveryMicros))
+		lane.degraded = assessment.atRisk || alternative
+		if alternative {
 			lane.abandoning = true
 			s.announceAbandonment(lanes, lane)
 			lane.registration.Abandon()
@@ -938,7 +918,7 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 }
 
 // laneProgressStalled reports whether outstanding work has waited beyond a path-aware progress guard.
-func laneProgressStalled(lane *scheduledLane, now, unreportedSince time.Time) bool {
+func laneProgressStalled(lane *scheduledLane, now, unreportedSince time.Time, firstBytes uint64) bool {
 	if lane.lastProgressAt.IsZero() || unreportedSince.IsZero() {
 		return false
 	}
@@ -946,15 +926,7 @@ func laneProgressStalled(lane *scheduledLane, now, unreportedSince time.Time) bo
 	if unreportedSince.After(progressSince) {
 		progressSince = unreportedSince
 	}
-	marginMicros := uint64(progressStallReportMargin / time.Microsecond)
-	if lane.rttMicros > (math.MaxUint64-marginMicros)/2 {
-		return false
-	}
-	thresholdMicros := lane.rttMicros*2 + marginMicros
-	minimumMicros := uint64(minimumProgressStall / time.Microsecond)
-	if thresholdMicros < minimumMicros {
-		thresholdMicros = minimumMicros
-	}
+	thresholdMicros := progressGuardMicros(lane, firstBytes)
 	if thresholdMicros > uint64(math.MaxInt64/time.Microsecond) {
 		return false
 	}
@@ -962,17 +934,48 @@ func laneProgressStalled(lane *scheduledLane, now, unreportedSince time.Time) bo
 	return now.Sub(progressSince) >= threshold
 }
 
-// hasTimelyAlternative reports whether another eligible generation can carry equivalent work before the first deadline.
-func hasTimelyAlternative(lanes map[protocol.LaneID]*scheduledLane, current *scheduledLane,
-	frameBytes uint64, remaining time.Duration) bool {
-	remainingMicros := uint64(remaining / time.Microsecond)
+// progressGuardMicros allows two feedback cycles and serialization of the first unreported frame. The byte term keeps
+// a healthy low-rate carrier from looking stalled before it can deliver even one frame.
+func progressGuardMicros(lane *scheduledLane, firstBytes uint64) uint64 {
+	if lane.rttMicros > math.MaxUint64/2 || lane.deliveryRate == 0 || firstBytes > math.MaxUint64/1_000_000 {
+		return math.MaxUint64
+	}
+	cycle := max(lane.rttMicros, saturatingAdd(lane.rttMicros/2, lane.feedbackDelayMicros))
+	if cycle > math.MaxUint64/2 {
+		return math.MaxUint64
+	}
+	guard := saturatingAdd(cycle*2, uint64(progressStallReportMargin/time.Microsecond))
+	guard = saturatingAdd(guard, firstBytes*1_000_000/lane.deliveryRate)
+	return max(uint64(minimumProgressStall/time.Microsecond), guard)
+}
+
+// hasTimelyAlternative reports whether another healthy generation can carry equivalent work before the recovery cutoff.
+// At least one rate must be measured before initial estimates can justify abandonment. Stalled group members cannot
+// disqualify a usable lower-ranked lane.
+func hasTimelyAlternative(lanes map[protocol.LaneID]*scheduledLane, current *scheduledLane, now time.Time,
+	frameBytes, remainingMicros uint64) bool {
 	for _, candidate := range lanes {
-		if candidate != current && !candidate.degraded && !candidate.abandoning &&
-			laneEligible(lanes, candidate, frameBytes) && candidate.score(frameBytes) < remainingMicros {
+		if candidate == current || !current.rateObserved && !candidate.rateObserved {
+			continue
+		}
+		if _, eligible := recoveryCandidate(candidate, now, frameBytes, remainingMicros); eligible {
 			return true
 		}
 	}
 	return false
+}
+
+// recoveryCandidate scores a live recovery lane after reclaiming queued expiry and checking current parsing progress.
+func recoveryCandidate(lane *scheduledLane, now time.Time, frameBytes, remainingMicros uint64) (scoredLane, bool) {
+	if lane.degraded || lane.abandoning {
+		return scoredLane{}, false
+	}
+	since, firstBytes := lane.registration.Store.expireQueued(now)
+	if laneProgressStalled(lane, now, since, firstBytes) || !lane.canAccept(frameBytes) {
+		return scoredLane{}, false
+	}
+	candidate := scoredLane{lane: lane, score: lane.score(frameBytes)}
+	return candidate, candidate.score < remainingMicros
 }
 
 // announceAbandonment asks the peer to close the same generation over another connected lane.
@@ -1010,7 +1013,7 @@ func (s *Scheduler) migrateTransmissions(lanes map[protocol.LaneID]*scheduledLan
 	})
 	for index := range retained {
 		transmission := &retained[index]
-		if transmission.kind != wgpacket.TransportData || transmission.migrated ||
+		if transmission.packet.Kind != wgpacket.TransportData || transmission.migrated ||
 			!now.Before(transmission.deadline) {
 			transmission.release()
 			continue
@@ -1019,13 +1022,16 @@ func (s *Scheduler) migrateTransmissions(lanes map[protocol.LaneID]*scheduledLan
 		frameBytes := uint64(transmission.size)
 		remaining := transmission.deadline.Sub(now)
 		deadlineMicros := uint64(remaining / time.Microsecond)
-		candidates := selectCandidates(lanes, protocol.LaneID(0), false, frameBytes, deadlineMicros)
-		for _, candidate := range candidates.lanes[:candidates.count] {
-			if candidate.enqueueTransmission(*transmission) {
-				transmission.budget = nil
-				transmission.packet = datagram.Packet{}
-				break
+		var best scoredLane
+		for _, lane := range lanes {
+			candidate, eligible := recoveryCandidate(lane, now, frameBytes, deadlineMicros)
+			if eligible && scoredLaneBetter(candidate, best) {
+				best = candidate
 			}
+		}
+		if best.lane != nil && best.lane.enqueueTransmission(*transmission) {
+			transmission.budget = nil
+			transmission.packet = datagram.Packet{}
 		}
 		transmission.release()
 	}

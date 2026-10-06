@@ -70,7 +70,7 @@ fi
 case "$scenario" in
   tcp-latency) tc qdisc replace dev eth0 root netem delay 600ms ;;
   tcp-loss) tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 0.5% ;;
-  tcp-asymmetric|tcp-asymmetric-stall)
+  tcp-asymmetric|tcp-asymmetric-stall*)
     tc qdisc replace dev eth0 root handle 1: prio bands 3
     tc qdisc add dev eth0 parent 1:1 handle 10: netem delay 5ms rate 100mbit limit 1000
     tc qdisc add dev eth0 parent 1:2 handle 20: netem delay 150ms rate 20mbit limit 1000
@@ -83,6 +83,21 @@ case "$scenario" in
     rate=${scenario##*slow}
     tc qdisc replace dev eth0 root handle 1: tbf rate "${rate}kbit" burst 4096 latency 1s
     tc qdisc replace dev eth0 parent 1:1 handle 10: netem delay 100ms 20ms loss 0.2% limit 8
+    ;;
+esac
+
+case "$scenario" in
+  tcp-multipath-capacity-change*)
+    (
+      while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
+      sleep 5
+      tc qdisc replace dev eth0 root handle 1: tbf rate 32kbit burst 4096 latency 1s
+      tc qdisc replace dev eth0 parent 1:1 handle 10: netem delay 100ms 20ms loss 0.2% limit 8
+      date +%s > "/results/$role-rate-dropped.txt"
+      sleep 7
+      tc qdisc del dev eth0 root
+      date +%s > "/results/$role-rate-restored.txt"
+    ) &
     ;;
 esac
 
@@ -108,7 +123,7 @@ if [ "$role" = server ]; then
     set -- "$@" --allow-insecure --listen wss://:51823
   fi
   case "$scenario" in
-    tcp-asymmetric|tcp-asymmetric-stall) set -- "$@" --listen tcp://:51823 ;;
+    tcp-asymmetric|tcp-asymmetric-stall*) set -- "$@" --listen tcp://:51823 ;;
   esac
   touch /results/ready
   exec /wirehop server --listen "$scheme://:51822" --allow-target "$target" "$@"
@@ -143,11 +158,13 @@ case "$scheme" in
       tls|wss) set -- --tls-server-name wirehop.test ;;
       *) set -- --allow-insecure ;;
     esac
-    if [ "$scenario" = tcp-multipath ]; then
-      set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51822"
-    fi
     case "$scenario" in
-      tcp-asymmetric|tcp-asymmetric-stall) set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51823" ;;
+      tcp-multipath|tcp-multipath-slow32|tcp-multipath-slow64|tcp-multipath-slow128|tcp-multipath-capacity-change*)
+        set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51822"
+        ;;
+    esac
+    case "$scenario" in
+      tcp-asymmetric|tcp-asymmetric-stall*) set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51823" ;;
     esac
     if [ "$scenario" = tcp-fwmark ]; then set -- "$@" --fwmark 51820; fi
     if [ "$scenario" = tcp-mixed ]; then
@@ -164,7 +181,7 @@ if [ "$scenario" = tcp-idle ]; then
   sleep 35
 fi
 case "$scenario" in
-  tcp-asymmetric-stall)
+  tcp-asymmetric-stall*)
     (
       sleep 5
       tc qdisc replace dev eth0 parent 1:1 handle 10: netem loss 100%
@@ -212,9 +229,10 @@ case "$scenario" in
     ;;
 esac
 set --
-if [ "$scenario" = tcp-bidir ]; then
-  set -- --bidir
-fi
+case "$scenario" in
+  *-bidir) set -- --bidir ;;
+  *-reverse) set -- -R ;;
+esac
 case "$scenario" in
   *-udp) set -- -u -b 20M -l 1200 ;;
 esac

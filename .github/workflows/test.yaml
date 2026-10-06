@@ -31,6 +31,8 @@ jobs:
           go test ./internal/wgpacket -run '^$' -fuzz '^FuzzClassify$' -fuzztime 1000000x
           go test ./internal/wgpacket -run '^$' -fuzz '^FuzzReservedText$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseFrames$' -fuzztime 1000000x
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzReadBufferedFrame$' -fuzztime 1000000x
+          go test ./internal/carrier -run '^$' -fuzz '^FuzzCarrierReadFrames$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseUvarint$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseData$' -fuzztime 1000000x
           go test ./internal/protocol -run '^$' -fuzz '^FuzzParseClientHello$' -fuzztime 1000000x
@@ -88,7 +90,9 @@ jobs:
           sh test/integration/run.sh "$RUNNER_TEMP/wirehop" "$RUNNER_TEMP/kernel-results" \
             native forward tcp-latency tcp-loss tcp-stall wss forward-prohibit tcp-blackhole tcp-udp \
             tcp-ipv6 tcp-fwmark forward-fwmark tcp-mixed \
-            tcp-slow32 wss-slow32 tcp-outage wss-roam
+            tcp-asymmetric-stall tcp-asymmetric-stall-reverse tcp-asymmetric-stall-bidir \
+            tcp-slow32 tcp-multipath-slow32 tcp-multipath-capacity-change tcp-multipath-capacity-change-bidir \
+            wss-slow32 tcp-outage wss-roam
       - name: Preserve kernel WireGuard results
         if: always()
         uses: actions/upload-artifact@v7

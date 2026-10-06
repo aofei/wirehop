@@ -29,15 +29,19 @@ const maximumRetainedDequeCapacity = 2 * reportPacketThreshold
 
 // retainedTransmission is one assigned packet retained until parsing is reported or its generation is drained.
 type retainedTransmission struct {
-	data     protocol.Data
-	kind     wgpacket.Kind
-	priority packetqueue.Priority
-	deadline time.Time
-	migrated bool
-	size     int
-	budget   *retention.Budget
-	packet   datagram.Packet
-	delivery deliverySnapshot
+	packetID     uint64
+	wireDeadline uint64
+	deadline     time.Time
+	migrated     bool
+	size         int
+	budget       *retention.Budget
+	packet       datagram.Packet
+	delivery     deliverySnapshot
+}
+
+// data builds the wire view from the transmission's single payload owner.
+func (t *retainedTransmission) data() protocol.Data {
+	return protocol.Data{PacketID: t.packetID, DeadlineMicros: t.wireDeadline, Payload: t.packet.Payload}
 }
 
 // deliverySnapshot anchors one transmission to the preceding delivery curve and send interval.
@@ -56,11 +60,10 @@ type deliverySample struct {
 
 // deadlineAssessment summarizes retained deadline state in carrier order.
 type deadlineAssessment struct {
-	deadline        time.Time
-	unreportedSince time.Time
-	frameBytes      uint64
-	retained        bool
-	atRisk          bool
+	usefulDeadline time.Time
+	usefulBytes    uint64
+	retained       bool
+	atRisk         bool
 }
 
 // release returns a drained transmission's packet and aggregate retention ownership.
@@ -75,7 +78,6 @@ func (t *retainedTransmission) release() {
 // releasePacket relinquishes a transmission's retained packet ownership.
 func (t *retainedTransmission) releasePacket() {
 	t.packet.Release()
-	t.data.Payload = nil
 }
 
 // transmissionDeque is a compacting first-in, first-out transmission sequence.
@@ -218,22 +220,6 @@ func (d *transmissionDeque) appendTo(destination []retainedTransmission) []retai
 	return append(destination, d.items[d.head:]...)
 }
 
-// prefixSize returns the encoded size of the requested FIFO prefix.
-func (d *transmissionDeque) prefixSize(count uint64) (uint64, bool) {
-	if count > uint64(d.len()) {
-		return 0, false
-	}
-	var size uint64
-	for index := d.head; index < d.head+int(count); index++ {
-		transmissionSize := uint64(d.items[index].size)
-		if transmissionSize > math.MaxUint64-size {
-			return 0, false
-		}
-		size += transmissionSize
-	}
-	return size, true
-}
-
 // TransmissionStore owns queued and sent-unreported work for one lane generation.
 type TransmissionStore struct {
 	mu              sync.Mutex
@@ -300,12 +286,10 @@ func (s *TransmissionStore) push(transmission retainedTransmission) error {
 
 // pushAt retains one transmission when all limits and invariants permit it at now.
 func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.Time) error {
-	size, err := protocol.DataFrameSize(transmission.data)
-	if err != nil || !transmission.kind.Accepted() ||
-		wgpacket.Classify(transmission.data.Payload) != transmission.kind ||
-		!transmission.priority.Valid() ||
-		(transmission.priority == packetqueue.PriorityControl) != transmission.kind.Control() ||
-		transmission.deadline.IsZero() || transmission.migrated && transmission.kind != wgpacket.TransportData {
+	size, err := protocol.DataFrameSize(transmission.data())
+	if err != nil || !transmission.packet.Kind.Accepted() ||
+		wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind ||
+		transmission.deadline.IsZero() || transmission.migrated && transmission.packet.Kind != wgpacket.TransportData {
 		return ErrInvalidTransmission
 	}
 	transmission.size = size
@@ -340,7 +324,7 @@ func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.T
 		}
 		transmission.budget = s.budget
 	}
-	if transmission.priority == packetqueue.PriorityControl {
+	if transmission.packet.Kind.Control() {
 		s.control.push(transmission)
 	} else {
 		s.normal.push(transmission)
@@ -392,8 +376,8 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 		s.sent.items = append(s.sent.items, transmission)
 		s.sentPackets++
 		s.sentBytes += uint64(transmission.size)
-		destination[count] = transmission.data
-		ownership[count] = newPacket(transmission.packet.Retain(), transmission.data.DeadlineMicros)
+		destination[count] = transmission.data()
+		ownership[count] = newPacket(transmission.packet.Retain(), transmission.wireDeadline)
 		count++
 		bytes += transmission.size
 	}
@@ -441,22 +425,20 @@ func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (delivery
 	if deltaPackets > uint64(s.sent.len()) || packets > s.sentPackets {
 		return deliverySample{}, false, ErrInvalidDeliveryReport
 	}
-	releasedBytes, ok := s.sent.prefixSize(deltaPackets)
-	if !ok {
-		return deliverySample{}, false, ErrInvalidDeliveryReport
-	}
-	bytes := s.reportedBytes + releasedBytes
 	acknowledged := s.sent.items[s.sent.head : s.sent.head+int(deltaPackets)]
 	delivery := acknowledged[len(acknowledged)-1].delivery
+	var releasedBytes uint64
+	for index := range acknowledged {
+		releasedBytes += uint64(acknowledged[index].size)
+		acknowledged[index].releasePacket()
+	}
+	bytes := s.reportedBytes + releasedBytes
 	var sample deliverySample
 	if receiveMicros > s.deliveredMicros && receiveMicros >= delivery.sentMicros && delivery.sentMicros >= delivery.firstSentMicros {
 		sample = deliverySample{
 			bytes:          bytes - delivery.deliveredBytes,
 			intervalMicros: max(receiveMicros-delivery.deliveredMicros, delivery.sentMicros-delivery.firstSentMicros),
 		}
-	}
-	for index := range acknowledged {
-		acknowledged[index].releasePacket()
 	}
 	s.sent.discardPrefix(len(acknowledged))
 	if s.sent.len() == 0 {
@@ -508,11 +490,15 @@ func (s *TransmissionStore) atRisk(now time.Time, delay func(uint64) uint64) boo
 }
 
 // expireQueued reclaims overdue unsent work and returns the start of outstanding carrier progress.
-func (s *TransmissionStore) expireQueued(now time.Time) time.Time {
+func (s *TransmissionStore) expireQueued(now time.Time) (time.Time, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.removeExpiredQueuedLocked(now)
-	return s.unreportedSince
+	first, ok := s.sent.peek()
+	if !ok {
+		return time.Time{}, 0
+	}
+	return s.unreportedSince, uint64(first.size)
 }
 
 // assessDeadlines reclaims queued expiry and evaluates retained work in one locked traversal.
@@ -523,19 +509,15 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 		return deadlineAssessment{}
 	}
 	s.removeExpiredQueuedLocked(now)
-	assessment := deadlineAssessment{unreportedSince: s.unreportedSince}
+	assessment := deadlineAssessment{retained: s.packets > 0}
 	prefixBytes := uint64(0)
 	visit := func(transmission retainedTransmission) bool {
-		if !assessment.retained || transmission.deadline.Before(assessment.deadline) {
-			assessment.deadline = transmission.deadline
-			assessment.frameBytes = uint64(transmission.size)
-			assessment.retained = true
+		if now.Before(transmission.deadline) &&
+			(assessment.usefulDeadline.IsZero() || transmission.deadline.Before(assessment.usefulDeadline)) {
+			assessment.usefulDeadline = transmission.deadline
+			assessment.usefulBytes = uint64(transmission.size)
 		}
 		if assessment.atRisk {
-			return true
-		}
-		if uint64(transmission.size) > math.MaxUint64-prefixBytes {
-			assessment.atRisk = true
 			return true
 		}
 		prefixBytes += uint64(transmission.size)

@@ -83,9 +83,9 @@ func TestSelectCandidatesSeparatesQueuedAndUnreportedData(t *testing.T) {
 			for packetID := uint64(1); packetID <= 40; packetID++ {
 				transmission := schedulerTransmission(packetID, wgpacket.TransportData, deadline)
 				payload := make([]byte, 1400)
-				copy(payload, transmission.data.Payload)
-				transmission.data.Payload = payload
-				transmission.size = dataFrameSize(transmission.data)
+				copy(payload, transmission.packet.Payload)
+				transmission.packet.Payload = payload
+				transmission.size = dataFrameSize(transmission.data())
 				if err := store.push(transmission); err != nil {
 					t.Fatal(err)
 				}
@@ -335,14 +335,14 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 	result := laneCandidates{}
 	var first *scheduledLane
 	for _, lane := range lanes {
-		if lane.degraded || lane.abandoning || !laneEligible(lanes, lane, frameBytes) {
+		if lane.degraded || lane.abandoning || !referenceLaneEligible(lanes, lane, frameBytes) {
 			continue
 		}
 		result.available = true
 		if lane.score(frameBytes) >= maximumScore {
 			continue
 		}
-		if first == nil || laneBetterForFrame(lane, first, frameBytes) {
+		if first == nil || referenceLaneBetterForFrame(lane, first, frameBytes) {
 			first = lane
 		}
 	}
@@ -360,7 +360,7 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 			(frameBytes == 0 || preferredLane.canAccept(frameBytes)) && preferredLane.score(frameBytes) < maximumScore {
 			queued, _ := preferredLane.registration.Store.deliveryBacklog()
 			if frameBytes > 0 && queued == 0 && preferredLane.registration.PathGroupID == first.registration.PathGroupID ||
-				laneEligible(lanes, preferredLane, frameBytes) && preferredLane.score(frameBytes) <= preferredLimit {
+				referenceLaneEligible(lanes, preferredLane, frameBytes) && preferredLane.score(frameBytes) <= preferredLimit {
 				first = preferredLane
 			}
 		}
@@ -370,7 +370,7 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 	}
 	var second *scheduledLane
 	for _, lane := range lanes {
-		if lane == first || lane.degraded || lane.abandoning || !laneEligible(lanes, lane, frameBytes) ||
+		if lane == first || lane.degraded || lane.abandoning || !referenceLaneEligible(lanes, lane, frameBytes) ||
 			lane.score(frameBytes) >= maximumScore {
 			continue
 		}
@@ -381,7 +381,7 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 		}
 		secondDistinct := second.registration.PathGroupID != first.registration.PathGroupID
 		if candidateDistinct && !secondDistinct ||
-			candidateDistinct == secondDistinct && laneBetterForFrame(lane, second, frameBytes) {
+			candidateDistinct == secondDistinct && referenceLaneBetterForFrame(lane, second, frameBytes) {
 			second = lane
 		}
 	}
@@ -393,6 +393,33 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 	result.lanes = [2]*scheduledLane{first, second}
 	result.count = 2
 	return result
+}
+
+func referenceLaneBetterForFrame(left, right *scheduledLane, frameBytes uint64) bool {
+	leftScore, rightScore := left.score(frameBytes), right.score(frameBytes)
+	return leftScore < rightScore || leftScore == rightScore &&
+		left.registration.LaneID < right.registration.LaneID
+}
+
+func referenceLaneEligible(lanes map[protocol.LaneID]*scheduledLane, lane *scheduledLane, frameBytes uint64) bool {
+	if frameBytes > 0 && !lane.canAccept(frameBytes) {
+		return false
+	}
+	better := 0
+	for _, candidate := range lanes {
+		if candidate == lane || candidate.degraded || candidate.abandoning ||
+			candidate.registration.PathGroupID != lane.registration.PathGroupID ||
+			frameBytes > 0 && !candidate.canAccept(frameBytes) {
+			continue
+		}
+		if referenceLaneBetterForFrame(candidate, lane, frameBytes) {
+			better++
+			if better == 2 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func TestSchedulerSpillsSustainedTrafficAcrossLanes(t *testing.T) {
@@ -1142,8 +1169,8 @@ func TestScheduledLaneDeliveryRateRejectsCompressedFeedback(t *testing.T) {
 	for packetID := uint64(1); packetID <= 2; packetID++ {
 		transmission := schedulerTransmission(packetID, wgpacket.TransportData, now.Add(time.Second))
 		payload := make([]byte, 4096)
-		copy(payload, transmission.data.Payload)
-		transmission.data.Payload = payload
+		copy(payload, transmission.packet.Payload)
+		transmission.packet.Payload = payload
 		if err := store.push(transmission); err != nil {
 			t.Fatal(err)
 		}
@@ -1475,7 +1502,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer peer.Close()
-			if _, err := peer.WriteToUDPAddrPort(transmission.data.Payload, local.LocalAddr()); err != nil {
+			if _, err := peer.WriteToUDPAddrPort(transmission.packet.Payload, local.LocalAddr()); err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -1485,7 +1512,6 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				t.Fatal(err)
 			}
 			transmission.packet = packet
-			transmission.data.Payload = packet.Payload
 			wantPayload := string(packet.Payload)
 			if err := sourceStore.push(transmission); err != nil {
 				packet.Release()
@@ -1534,8 +1560,8 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 			if count, err := destinationStore.takeBatch(destinationData[:], destinationOwnership[:], 4096); err != nil || count != 1 {
 				t.Fatalf("destination takeBatch() = %d, %v", count, err)
 			}
-			if destinationData[0].PacketID != transmission.data.PacketID ||
-				destinationData[0].DeadlineMicros != transmission.data.DeadlineMicros {
+			if destinationData[0].PacketID != transmission.packetID ||
+				destinationData[0].DeadlineMicros != transmission.wireDeadline {
 				t.Fatalf("migrated packet metadata = %+v", destinationData[0])
 			}
 			if _, _, err := destinationStore.acknowledge(1, uint64(now().UnixMicro())); err != nil {
@@ -1754,7 +1780,8 @@ func TestSchedulerRequiresProgressStallForEarlyAbandonment(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			abandonments := 0
-			source := schedulerLane(t, 1, 1, 80_000, 1)
+			source := schedulerLane(t, 1, 1, 80_000, 1_000_000)
+			source.rateObserved = true
 			source.registration.Store.now = func() time.Time { return now.Add(-minimumProgressStall) }
 			source.lastProgressAt = tt.lastProgressAt
 			source.registration.Abandon = func() { abandonments++ }
@@ -1797,8 +1824,8 @@ func TestLaneProgressStalled(t *testing.T) {
 		{name: "Overflow", rttMicros: math.MaxUint64, lastProgressAt: now.Add(-time.Hour)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			lane := &scheduledLane{rttMicros: tt.rttMicros, lastProgressAt: tt.lastProgressAt}
-			if got := laneProgressStalled(lane, now, now.Add(-time.Hour)); got != tt.want {
+			lane := &scheduledLane{rttMicros: tt.rttMicros, deliveryRate: 1_000_000, lastProgressAt: tt.lastProgressAt}
+			if got := laneProgressStalled(lane, now, now.Add(-time.Hour), 0); got != tt.want {
 				t.Fatalf("laneProgressStalled() = %t, want %t", got, tt.want)
 			}
 		})
@@ -1995,8 +2022,9 @@ func schedulerRegistration(id, group byte, store *TransmissionStore) LaneRegistr
 func schedulerTransmission(packetID uint64, kind wgpacket.Kind, deadline time.Time) retainedTransmission {
 	data := protocol.Data{PacketID: packetID, DeadlineMicros: packetID + 1000, Payload: relayWireGuardPacket(kind)}
 	return retainedTransmission{
-		data: data, kind: kind, priority: packetPriority(kind.Control()), deadline: deadline,
-		size: dataFrameSize(data),
+		packetID: packetID, wireDeadline: data.DeadlineMicros, deadline: deadline,
+		packet: datagram.Packet{Kind: kind, Payload: data.Payload},
+		size:   dataFrameSize(data),
 	}
 }
 

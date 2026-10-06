@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/carrier"
-	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
@@ -58,13 +57,8 @@ func TestLaneWriteControlBatch(t *testing.T) {
 						t.Fatal("SendControl() rejected a bounded test write")
 					}
 				}
-				transmission := retainedTransmission{
-					data: protocol.Data{
-						PacketID: 1, DeadlineMicros: 1_000_000,
-						Payload: relayWireGuardPacket(wgpacket.TransportData),
-					},
-					kind: wgpacket.TransportData, priority: packetqueue.PriorityNormal, deadline: time.Now().Add(time.Second),
-				}
+				transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
+				transmission.wireDeadline = 1_000_000
 				if err := lane.store.push(transmission); err != nil {
 					t.Fatal(err)
 				}

@@ -16,6 +16,8 @@ never decrypts or authenticates WireGuard cryptographic content and preserves co
 
 See the [design document](docs/design.md) for the scheduling model, wire protocol, and recovery rules.
 
+The [performance review](docs/performance.md) records the V1 optimizations, measurement method, and validation results.
+
 ## Carrier schemes
 
 | Scheme | Carrier | Intended use |

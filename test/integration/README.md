@@ -19,7 +19,7 @@ sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-results
 Use `GOARCH=amd64` for an x86-64 engine. Each run requires a fresh results directory. To reuse an equivalent tool image,
 set `WIREHOP_TEST_IMAGE`. It must provide `sh`, `ip`, `wg`, `tc`, `nstat`, `iperf3`, `openssl`, and `timeout`.
 
-The default matrix contains 54 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
+The default matrix contains 62 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
 1.2-second RTT, 0.5% loss with delay and jitter, four-second and twelve-second one-way outages, client address
 replacement, 32, 64, and 128 kbit/s carrier links, bidirectional TCP, an idle interval followed by a new burst, and
 140-second TCP flows spanning an actual kernel WireGuard rekey. Each scenario uses fresh endpoints. Ordinary cases run
@@ -28,9 +28,25 @@ after recovery. Address replacement changes the container's carrier-facing addre
 TCP connection. The rate-limited cases add 100 ms one-way delay, 20 ms jitter, and 0.2% loss with an eight-packet netem
 queue. They test continued connectivity at low capacity, not comparative mobile throughput or battery consumption. The
 `tcp-asymmetric` case uses distinct TCP path groups with 5 ms one-way delay at 100 Mbit/s and 150 ms one-way delay at 20
-Mbit/s. `tcp-asymmetric-stall` additionally interrupts only the faster path for four seconds. These cases check
-completed delivery and recovery with unequal paths. They do not guarantee uninterrupted inner TCP progress during a
-carrier stall.
+Mbit/s. `tcp-asymmetric-stall` additionally interrupts only the faster path for four seconds. Its `-reverse` and
+`-bidir` variants exercise the opposite direction and simultaneous bidirectional traffic. Each exercised direction must
+recover at least 25 percent of its measured pre-fault throughput during the final five seconds. These cases check
+completed delivery and substantial recovery with unequal paths. They do not guarantee uninterrupted inner TCP progress
+during a carrier stall.
+
+The `tcp-multipath-slow32`, `tcp-multipath-slow64`, and `tcp-multipath-slow128` cases keep two TCP lanes behind the same
+32, 64, or 128 kbit/s endpoint-egress bottleneck. Both carriers must remain connected before and after the transfer,
+without additional carrier connection attempts during the flow. These cases check that provisional capacity estimates do
+not cause healthy low-rate generations to be repeatedly abandoned.
+
+The `tcp-multipath-capacity-change` case starts both same-group lanes at unrestricted capacity, limits both endpoint
+links to 32 kbit/s five seconds into the flow, and restores capacity seven seconds later. Both endpoints must record
+successful rate changes, both lanes must be connected before and after the flow, and final-window throughput must
+recover at least 25 percent of its own pre-fault throughput. Reconnection is permitted during this injected fault
+because previously measured capacity and accumulated TCP backlog can make the old generation unusable. Healthy low-rate
+startup cases retain their stricter no-reconnection check. The capacity-change case's `-reverse` and `-bidir` variants
+apply the same fault to opposite-direction and simultaneous bidirectional traffic. Each exercised direction must meet
+the recovery threshold using its own pre-fault rate.
 
 Select a subset by passing case names:
 
@@ -84,5 +100,6 @@ docker run --rm --network none --read-only --cap-add NET_ADMIN \
 ```
 
 The route test is skipped during ordinary `go test` runs. CI runs the socket recovery tests in isolation and selects
-seventeen representative kernel flow cases, including low-rate TCP/WSS, a twelve-second interruption, and address
-replacement. The complete matrix remains available through `run.sh` without case arguments.
+twenty-three representative kernel flow cases, including directional multipath recovery, low-rate TCP/WSS and multipath,
+shared-capacity changes with simultaneous bidirectional traffic, a twelve-second interruption, and address replacement.
+The complete matrix remains available through `run.sh` without case arguments.

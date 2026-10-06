@@ -13,12 +13,8 @@ import (
 // flowResult contains the iperf3 fields needed to distinguish completed transfers from nominal test completion.
 type flowResult struct {
 	Error     string
-	Intervals []struct {
-		Sum struct {
-			Bytes uint64
-		}
-	}
-	End struct {
+	Intervals []flowIntervalResult
+	End       struct {
 		Received struct {
 			Bytes         uint64
 			BitsPerSecond float64 `json:"bits_per_second"`
@@ -31,6 +27,19 @@ type flowResult struct {
 			Bytes uint64
 		} `json:"sum_received_bidir_reverse"`
 	}
+}
+
+// flowIntervalResult contains the directions reported for one measurement period.
+type flowIntervalResult struct {
+	Sum     flowInterval
+	Reverse flowInterval `json:"sum_bidir_reverse"`
+}
+
+// flowInterval describes one direction's completed iperf3 reporting interval.
+type flowInterval struct {
+	Bytes uint64
+	Start float64
+	End   float64
 }
 
 // main validates every requested scenario and exits unsuccessfully if any transfer failed or made no progress.
@@ -50,7 +59,7 @@ func main() {
 		if err == nil && (flow.Error != "" || flow.End.Received.Bytes == 0) {
 			err = fmt.Errorf("transfer did not complete with data: %s", flow.Error)
 		}
-		if err == nil && scenario == "tcp-bidir" && flow.End.ReverseReceived.Bytes == 0 {
+		if err == nil && strings.HasSuffix(scenario, "-bidir") && flow.End.ReverseReceived.Bytes == 0 {
 			err = fmt.Errorf("reverse TCP flow made no progress")
 		}
 		if err == nil && strings.HasSuffix(scenario, "-rekey") {
@@ -61,7 +70,8 @@ func main() {
 			err = fmt.Errorf("UDP delivery lost more than five percent of the controlled offered load")
 		}
 		if err == nil && (strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") ||
-			strings.HasSuffix(scenario, "-stall") || strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam")) {
+			strings.HasPrefix(scenario, "tcp-asymmetric-stall") || strings.HasSuffix(scenario, "-stall") ||
+			strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam")) {
 			marker := "path-recovered.txt"
 			if strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") {
 				marker = "route-recovered.txt"
@@ -70,6 +80,18 @@ func main() {
 			if err == nil && (len(flow.Intervals) == 0 || flow.Intervals[len(flow.Intervals)-1].Sum.Bytes == 0) {
 				err = fmt.Errorf("TCP flow made no progress in the final interval after path recovery")
 			}
+		}
+		capacityChange := strings.HasPrefix(scenario, "tcp-multipath-capacity-change")
+		if err == nil && capacityChange {
+			for _, name := range []string{"client-rate-dropped.txt", "client-rate-restored.txt",
+				"server-rate-dropped.txt", "server-rate-restored.txt"} {
+				if _, err = os.Stat(filepath.Join(directory, name)); err != nil {
+					break
+				}
+			}
+		}
+		if err == nil && (strings.HasPrefix(scenario, "tcp-asymmetric-stall") || capacityChange) {
+			err = verifyThroughputRecovery(flow, strings.HasSuffix(scenario, "-bidir"))
 		}
 		if err == nil {
 			err = verifyCarrier(directory, scenario)
@@ -95,15 +117,56 @@ func main() {
 	}
 }
 
+// verifyThroughputRecovery requires substantial throughput in each exercised direction during the final five seconds
+// of a twenty-second flow, relative to its own throughput before fault injection at five seconds.
+func verifyThroughputRecovery(flow flowResult, bidirectional bool) error {
+	directions := 1
+	if bidirectional {
+		directions = 2
+	}
+	for direction := range directions {
+		var baselineBytes, recoveredBytes uint64
+		var baselineSeconds, recoveredSeconds float64
+		for _, interval := range flow.Intervals {
+			sample := interval.Sum
+			if direction == 1 {
+				sample = interval.Reverse
+			}
+			duration := sample.End - sample.Start
+			if duration <= 0 {
+				continue
+			}
+			if sample.End <= 4.5 {
+				baselineBytes += sample.Bytes
+				baselineSeconds += duration
+			}
+			if sample.Start >= 14.5 {
+				recoveredBytes += sample.Bytes
+				recoveredSeconds += duration
+			}
+		}
+		if baselineSeconds < 2 || recoveredSeconds < 4 || baselineBytes == 0 {
+			return fmt.Errorf("direction %d lacks complete pre-fault or post-fault throughput intervals", direction)
+		}
+		baseline := float64(baselineBytes) / baselineSeconds
+		recovered := float64(recoveredBytes) / recoveredSeconds
+		if recovered < baseline/4 {
+			return fmt.Errorf("direction %d recovered %.1f percent of pre-fault throughput, require at least 25 percent",
+				direction, recovered/baseline*100)
+		}
+	}
+	return nil
+}
+
 // verifyCarrier detects unexpected reconnects in scenarios that should retain one admitted carrier.
 func verifyCarrier(directory, scenario string) error {
-	if scenario == "tcp-asymmetric-stall" {
+	if strings.HasPrefix(scenario, "tcp-asymmetric-stall") {
 		return verifyParallelCarrierSockets(filepath.Join(directory, "client-tcp-sockets.txt"), true)
 	}
 	if strings.HasSuffix(scenario, "-stall") || strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam") {
 		return nil
 	}
-	if scenario == "tcp-multipath" || scenario == "tcp-mixed" || scenario == "tcp-asymmetric" {
+	if strings.HasPrefix(scenario, "tcp-multipath") || scenario == "tcp-mixed" || scenario == "tcp-asymmetric" {
 		return verifyParallelCarriers(directory, scenario)
 	}
 	expected := 3
@@ -142,13 +205,17 @@ func tcpActiveOpens(path string) (int, error) {
 	return 0, fmt.Errorf("missing TCP active-open counter")
 }
 
-// verifyParallelCarriers requires both configured lanes to remain available without reconnecting during the flow.
+// verifyParallelCarriers requires both configured lanes before and after a flow. Only capacity-change faults permit
+// reconnection during these parallel-lane checks.
 func verifyParallelCarriers(directory, scenario string) error {
 	for _, name := range []string{"client-tcp-sockets.txt", "client-tcp-sockets-after.txt"} {
 		splitPorts := scenario == "tcp-mixed" || scenario == "tcp-asymmetric"
 		if err := verifyParallelCarrierSockets(filepath.Join(directory, name), splitPorts); err != nil {
 			return err
 		}
+	}
+	if strings.HasPrefix(scenario, "tcp-multipath-capacity-change") {
+		return nil
 	}
 	before, err := tcpActiveOpens(filepath.Join(directory, "client-before.txt"))
 	if err != nil {

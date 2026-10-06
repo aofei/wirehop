@@ -7,6 +7,43 @@ import (
 	"testing"
 )
 
+func TestVerifyThroughputRecovery(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		intervals     int
+		recovered     uint64
+		reverse       uint64
+		bidirectional bool
+		wantErr       bool
+	}{
+		{name: "Restored", intervals: 20, recovered: 100},
+		{name: "Boundary", intervals: 20, recovered: 25},
+		{name: "NominalFinalProgress", intervals: 20, recovered: 1, wantErr: true},
+		{name: "BelowThreshold", intervals: 20, recovered: 24, wantErr: true},
+		{name: "Truncated", intervals: 17, recovered: 100, wantErr: true},
+		{name: "BothDirections", intervals: 20, recovered: 100, reverse: 100, bidirectional: true},
+		{name: "ReverseStalled", intervals: 20, recovered: 100, reverse: 1, bidirectional: true, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var flow flowResult
+			for index := range tt.intervals {
+				interval := flowIntervalResult{
+					Sum:     flowInterval{Start: float64(index), End: float64(index + 1), Bytes: 100},
+					Reverse: flowInterval{Start: float64(index), End: float64(index + 1), Bytes: 100},
+				}
+				if index >= 15 {
+					interval.Sum.Bytes = tt.recovered
+					interval.Reverse.Bytes = tt.reverse
+				}
+				flow.Intervals = append(flow.Intervals, interval)
+			}
+			if err := verifyThroughputRecovery(flow, tt.bidirectional); (err != nil) != tt.wantErr {
+				t.Fatalf("recovery validation = %v, want error %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestVerifyCarrier(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -54,6 +91,17 @@ func TestVerifyParallelCarriers(t *testing.T) {
 		wantErr                 bool
 	}{
 		{name: "Repeated", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
+		{name: "LowRate32", scenario: "tcp-multipath-slow32", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
+		{name: "LowRate64", scenario: "tcp-multipath-slow64", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
+		{name: "LowRate128", scenario: "tcp-multipath-slow128", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
+		{name: "LowRateReconnected", scenario: "tcp-multipath-slow32", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 3, wantErr: true},
+		{name: "LowRateMissingLane", scenario: "tcp-multipath-slow64", sockets: "0 0 local:1 remote:51822\n", opened: 2, wantErr: true},
+		{name: "CapacityChange", scenario: "tcp-multipath-capacity-change", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 3},
+		{name: "CapacityChangeMissingLane", scenario: "tcp-multipath-capacity-change", sockets: "0 0 local:1 remote:51822\n", opened: 3, wantErr: true},
+		{name: "CapacityChangeReverse", scenario: "tcp-multipath-capacity-change-reverse", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 3},
+		{name: "CapacityChangeReverseMissingLane", scenario: "tcp-multipath-capacity-change-reverse", sockets: "0 0 local:1 remote:51822\n", opened: 3, wantErr: true},
+		{name: "CapacityChangeBidirectional", scenario: "tcp-multipath-capacity-change-bidir", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 4},
+		{name: "CapacityChangeBidirectionalMissingLane", scenario: "tcp-multipath-capacity-change-bidir", sockets: "0 0 local:1 remote:51822\n", opened: 4, wantErr: true},
 		{name: "Asymmetric", scenario: "tcp-asymmetric", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},
 		{name: "AsymmetricMissingLane", scenario: "tcp-asymmetric", sockets: "0 0 local:1 remote:51822\n", opened: 2, wantErr: true},
 		{name: "Mixed", scenario: "tcp-mixed", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},

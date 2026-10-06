@@ -192,7 +192,7 @@ func TestFrameReaderReleasesLargeBuffer(t *testing.T) {
 	}
 }
 
-func TestFrameReaderReadBuffered(t *testing.T) {
+func TestReadBufferedFrame(t *testing.T) {
 	encoded, err := MarshalFrame(Frame{Type: FramePing, Payload: []byte{1, 2, 3}})
 	if err != nil {
 		t.Fatal(err)
@@ -212,14 +212,13 @@ func TestFrameReaderReadBuffered(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := bufio.NewReaderSize(bytes.NewReader(tt.encoded), len(encoded))
 			reader.Peek(tt.buffered)
-			var frameReader FrameReader
-			frame, available, err := frameReader.ReadBuffered(reader)
+			frame, available, err := ReadBufferedFrame(reader)
 			if !errors.Is(err, tt.wantErr) || available != tt.available {
-				t.Fatalf("ReadBuffered() = %#v, %t, %v, want availability %t and error %v", frame, available,
+				t.Fatalf("ReadBufferedFrame() = %#v, %t, %v, want availability %t and error %v", frame, available,
 					err, tt.available, tt.wantErr)
 			}
 			if available && (frame.Type != FramePing || !bytes.Equal(frame.Payload, []byte{1, 2, 3})) {
-				t.Fatalf("ReadBuffered() frame = %#v", frame)
+				t.Fatalf("ReadBufferedFrame() frame = %#v", frame)
 			}
 		})
 	}
@@ -421,7 +420,7 @@ func TestFrameReaderLengthBoundaries(t *testing.T) {
 	}
 }
 
-func TestFrameReaderReadBufferedPartialHeader(t *testing.T) {
+func TestReadBufferedFramePartialHeader(t *testing.T) {
 	encoded, err := MarshalFrame(Frame{Type: FrameData, Payload: make([]byte, 128)})
 	if err != nil {
 		t.Fatal(err)
@@ -429,8 +428,7 @@ func TestFrameReaderReadBufferedPartialHeader(t *testing.T) {
 	for cut := 0; cut <= len(encoded); cut++ {
 		reader := bufio.NewReaderSize(bytes.NewReader(encoded[:cut]), len(encoded))
 		reader.Peek(cut)
-		var decoder FrameReader
-		frame, ready, err := decoder.ReadBuffered(reader)
+		frame, ready, err := ReadBufferedFrame(reader)
 		if err != nil || ready != (cut == len(encoded)) {
 			t.Fatalf("cut %d: ready %t, error %v", cut, ready, err)
 		}
@@ -440,6 +438,41 @@ func TestFrameReaderReadBufferedPartialHeader(t *testing.T) {
 		if ready && len(frame.Payload) != 128 {
 			t.Fatal("complete payload changed")
 		}
+	}
+}
+
+func TestReadBufferedFramePreservesBorrowedPrefix(t *testing.T) {
+	want := []Frame{
+		{Type: FrameData, Payload: bytes.Repeat([]byte{0xa5}, 1452)},
+		{Type: FramePing, Payload: bytes.Repeat([]byte{0x5a}, 16)},
+	}
+	var encoded []byte
+	for _, frame := range want {
+		var err error
+		encoded, err = AppendFrame(encoded, frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded = append(encoded, byte(FrameData), 128)
+	reader := bufio.NewReaderSize(bytes.NewReader(encoded), len(encoded))
+	buffered, err := reader.Peek(len(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ready, err := ReadBufferedFrame(reader)
+	if err != nil || !ready || &first.Payload[0] != &buffered[3] {
+		t.Fatalf("first frame did not borrow buffered content: %t, %v", ready, err)
+	}
+	second, ready, err := ReadBufferedFrame(reader)
+	if err != nil || !ready {
+		t.Fatalf("second frame: %t, %v", ready, err)
+	}
+	if _, ready, err := ReadBufferedFrame(reader); err != nil || ready || reader.Buffered() != 2 {
+		t.Fatalf("partial tail: %t, %v, %d bytes", ready, err, reader.Buffered())
+	}
+	if !reflect.DeepEqual([]Frame{first, second}, want) {
+		t.Fatal("later buffered operations invalidated the borrowed prefix")
 	}
 }
 
@@ -467,8 +500,8 @@ func TestFrameCanonicalLength(t *testing.T) {
 			}
 			reader := bufio.NewReader(bytes.NewReader(tt.header))
 			reader.Peek(len(tt.header))
-			if _, _, err := decoder.ReadBuffered(reader); !errors.Is(err, tt.want) {
-				t.Fatalf("ReadBuffered() = %v", err)
+			if _, _, err := ReadBufferedFrame(reader); !errors.Is(err, tt.want) {
+				t.Fatalf("ReadBufferedFrame() = %v", err)
 			}
 		})
 	}

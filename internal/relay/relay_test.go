@@ -120,6 +120,38 @@ type recordingBatchEndpoint struct {
 	dropFirst bool
 }
 
+type partialWriteEndpoint struct {
+	*testEndpoint
+	failureAt    int
+	failure      error
+	afterFailure func()
+	calls        int
+}
+
+func (e *partialWriteEndpoint) Write(ctx context.Context, payload []byte, deadline time.Time) error {
+	e.calls++
+	if e.calls == e.failureAt {
+		if e.afterFailure != nil {
+			e.afterFailure()
+		}
+		return e.failure
+	}
+	return e.testEndpoint.Write(ctx, payload, deadline)
+}
+
+type partialBatchWriteEndpoint struct {
+	*partialWriteEndpoint
+}
+
+func (e *partialBatchWriteEndpoint) WriteBatch(ctx context.Context, payloads [][]byte, deadline time.Time) (int, error) {
+	for index, payload := range payloads {
+		if err := e.Write(ctx, payload, deadline); err != nil {
+			return index, err
+		}
+	}
+	return len(payloads), nil
+}
+
 func (e *recordingBatchEndpoint) WriteBatch(ctx context.Context, payloads [][]byte, deadline time.Time) (int, error) {
 	e.mu.Lock()
 	e.calls = append(e.calls, len(payloads))
@@ -671,10 +703,10 @@ func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
 			payloadSizes := [...]int{32, 123, 124, 16_379, 16_380, protocol.MaxPacketSize}
 			for index := range frames {
 				transmission := schedulerTransmission(test.firstID+uint64(index), wgpacket.TransportData, now.Add(time.Second))
-				transmission.data.DeadlineMicros = 1_000_000
-				transmission.data.Payload = make([]byte, payloadSizes[index%len(payloadSizes)])
-				transmission.data.Payload[0] = 4
-				transmission.data.Payload[4] = byte(index)
+				transmission.wireDeadline = 1_000_000
+				transmission.packet.Payload = make([]byte, payloadSizes[index%len(payloadSizes)])
+				transmission.packet.Payload[0] = 4
+				transmission.packet.Payload[4] = byte(index)
 				if err := store.push(transmission); err != nil {
 					t.Fatal(err)
 				}
@@ -714,6 +746,113 @@ func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
 				}
 				offset = end
 				now = now.Add(time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
+	for _, batched := range []bool{false, true} {
+		name := "Scalar"
+		if batched {
+			name = "Vector"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, test := range []struct {
+				name      string
+				failureAt int
+				failure   error
+				cancel    bool
+				expire    bool
+				wantError error
+				first     []byte
+				retry     []byte
+			}{
+				{name: "DropFirst", failureAt: 1, failure: datagram.ErrDatagramDropped,
+					first: []byte{2, 3, 4, 5}, retry: []byte{1}},
+				{name: "DropMiddle", failureAt: 3, failure: datagram.ErrDatagramDropped,
+					first: []byte{1, 2, 4, 5}, retry: []byte{3}},
+				{name: "DropLast", failureAt: 5, failure: datagram.ErrDatagramDropped,
+					first: []byte{1, 2, 3, 4}, retry: []byte{5}},
+				{name: "MissingLocalPeer", failureAt: 3, failure: datagram.ErrNoLocalPeer,
+					first: []byte{1, 2}, retry: []byte{3, 4, 5}},
+				{name: "EndpointFailure", failureAt: 3, failure: net.ErrClosed, wantError: ErrEndpointFailure,
+					first: []byte{1, 2}, retry: []byte{3, 4, 5}},
+				{name: "CanceledAfterPrefix", failureAt: 3, failure: context.Canceled, cancel: true,
+					wantError: ErrEndpointFailure, first: []byte{1, 2}, retry: []byte{3, 4, 5}},
+				{name: "ExpiryAfterDrop", failureAt: 3, failure: datagram.ErrDatagramDropped, expire: true,
+					first: []byte{1, 2, 5}, retry: []byte{3}},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					endpoint := &partialWriteEndpoint{
+						testEndpoint: newTestEndpoint(), failureAt: test.failureAt, failure: test.failure,
+					}
+					lane := newTestLane(t, newTestCarrier(), endpoint.testEndpoint)
+					lane.receiver.endpoint = endpoint
+					if batched {
+						lane.receiver.endpoint = &partialBatchWriteEndpoint{partialWriteEndpoint: endpoint}
+					}
+					clock := lane.receiver.clock.(*testClock)
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					if test.cancel {
+						endpoint.afterFailure = cancel
+					}
+					if test.expire {
+						endpoint.afterFailure = func() { clock.now = 200_000 }
+					}
+					var frames [5]protocol.Frame
+					var encodedBytes uint64
+					for index := range frames {
+						packet := protocol.Data{
+							PacketID: uint64(index + 1), DeadlineMicros: 1_000_000,
+							Payload: relayWireGuardPacket(wgpacket.TransportData),
+						}
+						packet.Payload[4] = byte(index + 1)
+						if test.expire && index == 3 {
+							packet.DeadlineMicros = 200_000
+						}
+						frame, err := protocol.MarshalData(packet)
+						if err != nil {
+							t.Fatal(err)
+						}
+						frames[index] = frame
+						encodedBytes += uint64(protocol.FrameSize(len(frame.Payload)))
+					}
+					if err := lane.readDataBatch(ctx, frames[:]); !errors.Is(err, test.wantError) ||
+						test.wantError != nil && !errors.Is(err, test.failure) {
+						t.Fatalf("partial delivery error = %v, want %v and %v", err, test.wantError, test.failure)
+					}
+					if lane.progress.dataPackets != uint64(len(frames)) || lane.progress.dataBytes != encodedBytes {
+						t.Fatal("partial UDP delivery changed the cumulative parsed prefix")
+					}
+					if len(endpoint.writes) != len(test.first) {
+						t.Fatalf("first delivery wrote %d packets, want %d", len(endpoint.writes), len(test.first))
+					}
+					for _, marker := range test.first {
+						if payload := <-endpoint.writes; payload[4] != marker {
+							t.Fatalf("first delivery marker = %d, want %d", payload[4], marker)
+						}
+					}
+					if err := lane.readDataBatch(t.Context(), frames[:]); err != nil {
+						t.Fatal(err)
+					}
+					if len(endpoint.writes) != len(test.retry) {
+						t.Fatalf("retry wrote %d packets, want %d", len(endpoint.writes), len(test.retry))
+					}
+					for _, marker := range test.retry {
+						if payload := <-endpoint.writes; payload[4] != marker {
+							t.Fatalf("retry delivery marker = %d, want %d", payload[4], marker)
+						}
+					}
+					if err := lane.readDataBatch(t.Context(), frames[:]); err != nil {
+						t.Fatal(err)
+					}
+					if len(endpoint.writes) != 0 || lane.progress.dataPackets != 3*uint64(len(frames)) ||
+						lane.progress.dataBytes != 3*encodedBytes {
+						t.Fatal("repeated carrier parsing changed exactly-once UDP delivery")
+					}
+				})
 			}
 		})
 	}
@@ -1821,13 +1960,8 @@ func TestLaneWriterBoundsInternalControlBurst(t *testing.T) {
 			t.Fatal("SendControl() rejected a bounded test write")
 		}
 	}
-	transmission := retainedTransmission{
-		data: protocol.Data{
-			PacketID: 1, DeadlineMicros: 1_000_000,
-			Payload: relayWireGuardPacket(wgpacket.TransportData),
-		},
-		kind: wgpacket.TransportData, priority: packetqueue.PriorityNormal, deadline: time.Now().Add(time.Second),
-	}
+	transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
+	transmission.wireDeadline = 1_000_000
 	if err := lane.store.push(transmission); err != nil {
 		t.Fatal(err)
 	}
@@ -1933,7 +2067,7 @@ func TestLaneDataWriteFailureRetainsSentPrefix(t *testing.T) {
 		t.Fatalf("retained backlog = %d packets and %d bytes", packets, bytes)
 	}
 	drained := lane.store.drain()
-	if len(drained) != 1 || drained[0].data.PacketID != transmission.data.PacketID {
+	if len(drained) != 1 || drained[0].packetID != transmission.packetID {
 		t.Fatalf("drained transmissions = %+v", drained)
 	}
 }

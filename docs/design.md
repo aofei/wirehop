@@ -146,7 +146,7 @@ stateDiagram-v2
   Connecting --> Active: generation admitted
   Connecting --> Reconnecting: retryable setup failure
   Reconnecting --> Active: generation admitted
-  Active --> Degraded: deadline risk and progress stall
+  Active --> Degraded: progress stall and deadline risk or useful alternative
   Degraded --> Active: progress resumes or risk clears
   Active --> Abandoning
   Degraded --> Abandoning
@@ -907,26 +907,38 @@ explicit units in formulas.
 TCP cannot remove one stale application frame after its bytes have entered the stream. When a lost TCP segment blocks
 the stream, the only way to discard all bytes trapped behind that loss is to close the carrier connection.
 
-WireHop marks a lane `degraded` and stops assigning new packets only when retained work is at deadline risk and
-cumulative parsing progress has stalled for at least the greater of 250 milliseconds or two estimated round trips plus
-two delivery report intervals. Sent-but-unreported packets may already be at their destination, so their age alone must
-not suppress fresh traffic with later deadlines. A valid advancing report immediately restores scheduling. Risk is
-recomputed during periodic scans and queued expiry. Prediction follows the sent FIFO, queued WireGuard control packets,
-and queued WireGuard transport packets in transmission-store order. Bytes ordered after a frame cannot make that earlier
-frame appear late.
+WireHop first requires cumulative parsing progress to stall for a path-aware guard. The guard is the greater of 250
+milliseconds or two estimated feedback cycles plus two delivery report intervals and serialization of the first
+unreported frame. A feedback cycle is the greater of the lane RTT or half its RTT plus the observed report return delay.
+Including serialization protects healthy low-rate carriers. Sent-but-unreported packets may already be at their
+destination, so their age alone cannot establish a stall. A valid advancing report immediately restores scheduling.
+
+Once progress stalls, a lane becomes `degraded` when retained work is at deadline risk or a useful recovery alternative
+exists. Prediction follows the sent FIFO, queued WireGuard control packets, and queued WireGuard transport packets in
+transmission-store order. Bytes ordered after a frame cannot make that earlier frame appear late. Risk is recomputed
+during periodic scans and queued expiry.
 
 The progress guard starts no earlier than the first outstanding carrier write. Fully reporting that sent prefix resets
 the outstanding interval. Time spent idle or holding only queued work cannot make the next fresh burst appear stalled.
 
-WireHop abandons a generation only when retained work is at deadline risk, parsing progress has stalled according to the
-guard above, and an eligible alternative can still carry equivalent work before the earliest retained deadline. That
-deadline must remain in the future. The alternative's prediction uses a frame of the same encoded size as the
-earliest-deadline retained frame. These conditions prevent ordinary sustained congestion from churning healthy carrier
-generations. Abandonment permits future traffic and eligible migrations to continue immediately, but does not make an
-otherwise unduplicated control frame migratable. Without all three conditions, WireHop keeps the generation subject to
-its independent ping and carrier write budgets. Neither queued expiry nor sent-but-unreported expiry alone forces
-generation abandonment. Packet lifetimes allow ordinary TCP retransmission and remain independent of carrier failure
-detection.
+WireHop abandons a stalled generation when an eligible alternative predicts delivery before both the earliest future
+retained deadline and a recovery estimate. The recovery estimate is the greater of the source's progress guard and its
+observed time without progress. The alternative must not itself have stalled outstanding progress. Its prediction uses a
+frame of the same encoded size as the earliest future-deadline retained frame. Recovery checks every healthy lane with
+capacity. Stalled higher-ranked members cannot exclude a healthy third or fourth lane in the same path group. Expired
+sent entries retain their accounting and no longer block recovery of later useful entries.
+
+At least the source or alternative must have a measured delivery rate before this prediction can justify abandonment.
+Two initial rate estimates do not establish that either path can deliver faster. This avoids reconnect churn when
+several newly admitted lanes share a low-rate bottleneck. Capacity observation does not gate initial forwarding or
+generation removal after an actual carrier failure.
+
+This decision does not depend on the stalled lane's previous capacity estimate predicting imminent expiry. Otherwise,
+deadline risk and a slower alternative's salvage window may never overlap. Abandonment permits future traffic and
+eligible migrations to continue immediately, but does not make an otherwise unduplicated control frame migratable.
+Without a useful alternative, the generation remains subject to its independent ping and carrier write budgets. Neither
+queued expiry nor sent-but-unreported expiry alone forces generation abandonment. Packet lifetimes allow ordinary TCP
+retransmission and remain independent of carrier failure detection.
 
 The abandonment sequence is:
 
@@ -948,6 +960,11 @@ Each transport packet can migrate at most once. Migration is opportunistic and d
 delivery, wait for an acknowledgment, retry repeatedly, or retain expired data. Delayed delivery reports can cause a
 packet already parsed by the peer to be migrated conservatively, so direction-local packet deduplication remains
 mandatory.
+
+Generation removal and replacement check current parsing progress as well as cached degradation state when selecting a
+migration destination. They reclaim queued expiry before checking destination capacity and exclude independently stalled
+outstanding work. A removal processed before the next maintenance tick cannot spend a packet's single migration attempt
+on a generation already stalled beyond its progress guard.
 
 ## Reordering policy
 
@@ -1370,12 +1387,14 @@ it. Size classes retain buffers up to 32 KiB, and larger payload allocations are
 
 Linux receive staging uses a process-wide pool of 15-datagram vectors. Its capacity is chosen from `GOMAXPROCS` at
 initialization, with a minimum of two vectors and a maximum of 16. At the maximum, payload storage occupies 15 MiB plus
-vector metadata. A reader that cannot borrow a vector continues with scalar reads. Carrier frame and encoding buffers
-reuse capacities up to 32 KiB. Larger encoding buffers are discarded after writing. A nonempty carrier read that passes
-its initial cancellation check discards oversized content buffers from every frame reader, including readers unused by a
-smaller batch. WebSocket decoding uses a fixed 32 KiB buffered reader and retains only individual frame contents, never
-a complete message buffer. These scratch buffers, size-class overhead, and kernel socket buffers are separate from the
-retained relay-work budget.
+vector metadata. A reader that cannot borrow a vector continues with scalar reads. TCP and TLS carriers borrow complete
+frames from a fixed 32 KiB buffered reader and use one reusable owned frame buffer for fragmented or larger frames.
+WebSocket carriers own the first frame and copy already-buffered batch tails into one contiguous allocation bounded by
+32 KiB. Only the first frame can refill the read buffer. Payloads remain valid until the next carrier read, and UDP
+submission consumes them synchronously. A nonempty read that passes its initial cancellation check discards exceptional
+owned first-frame capacity above 32 KiB. Larger encoding buffers are discarded after writing. WebSocket decoding remains
+incremental within a message without retaining a complete message allocation. These scratch buffers, size-class
+overhead, and kernel socket buffers are separate from the retained relay-work budget.
 
 ### WebSocket transport
 

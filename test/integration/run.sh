@@ -11,10 +11,11 @@ results=$(cd "$2" && pwd)
 scripts=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 shift 2
 if [ "$#" -eq 0 ]; then
-  set -- native forward tcp tls ws wss tcp-multipath tcp-asymmetric tcp-asymmetric-stall tcp-latency tcp-loss tcp-stall tcp-bidir tcp-idle \
+  set -- native forward tcp tls ws wss tcp-multipath tcp-asymmetric tcp-asymmetric-stall tcp-asymmetric-stall-reverse tcp-asymmetric-stall-bidir tcp-latency tcp-loss tcp-stall tcp-bidir tcp-idle \
     tcp-rekey forward-rekey forward-prohibit forward-blackhole tcp-prohibit tcp-blackhole \
     native-udp forward-udp tcp-udp wss-udp tcp-ipv6 wss-ipv6 forward-ipv6 tcp-inner-ipv6 tcp-fwmark forward-fwmark tcp-mixed \
-    tcp-slow32 tcp-slow64 tcp-slow128 tcp-outage tcp-roam \
+    tcp-slow32 tcp-slow64 tcp-slow128 tcp-multipath-slow32 tcp-multipath-slow64 tcp-multipath-slow128 \
+    tcp-multipath-capacity-change tcp-multipath-capacity-change-reverse tcp-multipath-capacity-change-bidir tcp-outage tcp-roam \
     tls-slow32 tls-slow64 tls-slow128 tls-outage tls-roam \
     ws-slow32 ws-slow64 ws-slow128 ws-outage ws-roam \
     wss-slow32 wss-slow64 wss-slow128 wss-outage wss-roam tls-stall ws-stall wss-stall
@@ -44,10 +45,11 @@ else
 fi
 for scenario in "$@"; do
   case "$scenario" in
-    native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-asymmetric|tcp-asymmetric-stall|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
+    native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-asymmetric|tcp-asymmetric-stall|tcp-asymmetric-stall-reverse|tcp-asymmetric-stall-bidir|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
     forward-prohibit|forward-blackhole|tcp-prohibit|tcp-blackhole|native-udp|forward-udp|tcp-udp|wss-udp|\
     tcp-ipv6|wss-ipv6|forward-ipv6|tcp-inner-ipv6|tcp-fwmark|forward-fwmark|tcp-mixed|\
-    tcp-slow32|tcp-slow64|tcp-slow128|tcp-outage|tcp-roam|\
+    tcp-slow32|tcp-slow64|tcp-slow128|tcp-multipath-slow32|tcp-multipath-slow64|tcp-multipath-slow128|\
+    tcp-multipath-capacity-change|tcp-multipath-capacity-change-reverse|tcp-multipath-capacity-change-bidir|tcp-outage|tcp-roam|\
     tls-slow32|tls-slow64|tls-slow128|tls-outage|tls-roam|\
     ws-slow32|ws-slow64|ws-slow128|ws-outage|ws-roam|\
     wss-slow32|wss-slow64|wss-slow128|wss-outage|wss-roam|tls-stall|ws-stall|wss-stall) ;;

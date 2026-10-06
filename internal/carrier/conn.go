@@ -92,13 +92,13 @@ func WriteDataBatchWithin(ctx context.Context, connection Conn, data []protocol.
 
 // StreamConn carries WireHop frames over one ordered byte stream.
 type StreamConn struct {
-	conn         net.Conn
-	reader       *bufio.Reader
-	frameReaders [maximumStreamReadBatchFrames]protocol.FrameReader
-	writeBuffer  []byte
-	writeMu      sync.Mutex
-	closeOnce    sync.Once
-	closeErr     error
+	conn        net.Conn
+	reader      *bufio.Reader
+	frameReader protocol.FrameReader
+	writeBuffer []byte
+	writeMu     sync.Mutex
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 // TCPOptionsListener applies WireHop TCP options before returning accepted sockets.
@@ -142,7 +142,8 @@ type WebSocketConn struct {
 	messageOpen       bool
 	messageHasFrames  bool
 	message           webSocketMessageReader
-	frameReaders      [maximumStreamReadBatchFrames]protocol.FrameReader
+	frameReader       protocol.FrameReader
+	readBuffer        []byte
 	writeBuffer       []byte
 	writeMu           sync.Mutex
 	closeOnce         sync.Once
@@ -194,9 +195,7 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	for index := range c.frameReaders {
-		c.frameReaders[index].Reset()
-	}
+	c.readBuffer = c.readBuffer[:0]
 	if ctx.Done() != nil {
 		stop := context.AfterFunc(ctx, func() { c.Close() })
 		defer stop()
@@ -210,7 +209,7 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 				return 0, err
 			}
 		}
-		frame, err := c.frameReaders[0].Read(c.messageReader)
+		frame, err := c.frameReader.Read(c.messageReader)
 		if err == io.EOF && c.message.ended {
 			c.messageOpen = false
 			c.messageReader.Reset(nil)
@@ -229,14 +228,21 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 		c.messageHasFrames = true
 		frames[0] = frame
 		count := 1
-		for count < min(len(frames), len(c.frameReaders)) {
-			frame, available, err := c.frameReaders[count].ReadBuffered(c.messageReader)
+		for count < min(len(frames), maximumStreamReadBatchFrames) {
+			frame, available, err := protocol.ReadBufferedFrame(c.messageReader)
 			if err != nil {
 				return count, c.readFrameError(err)
 			}
 			if !available {
 				break
 			}
+			// Reserve the buffered prefix so every tail uses the same bounded allocation.
+			if count == 1 && cap(c.readBuffer) < len(frame.Payload)+c.messageReader.Buffered() {
+				c.readBuffer = make([]byte, 0, len(frame.Payload)+c.messageReader.Buffered())
+			}
+			offset := len(c.readBuffer)
+			c.readBuffer = append(c.readBuffer, frame.Payload...)
+			frame.Payload = c.readBuffer[offset:]
 			frames[count] = frame
 			count++
 		}
@@ -422,21 +428,19 @@ func (c *StreamConn) ReadFrames(ctx context.Context, frames []protocol.Frame) (i
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	for index := range c.frameReaders {
-		c.frameReaders[index].Reset()
-	}
+	c.frameReader.Reset()
 	if err := c.conn.SetReadDeadline(contextDeadline(ctx)); err != nil {
 		return 0, fmt.Errorf("set carrier read deadline: %w", err)
 	}
-	frame, err := c.frameReaders[0].Read(c.reader)
+	frame, err := readCarrierFrame(c.reader, &c.frameReader)
 	if err != nil {
 		return 0, fmt.Errorf("read carrier frame: %w", err)
 	}
 	frames[0] = frame
 	count := 1
-	limit := min(len(frames), len(c.frameReaders))
+	limit := min(len(frames), maximumStreamReadBatchFrames)
 	for count < limit {
-		frame, available, err := c.frameReaders[count].ReadBuffered(c.reader)
+		frame, available, err := protocol.ReadBufferedFrame(c.reader)
 		if err != nil {
 			return count, fmt.Errorf("read buffered carrier frame: %w", err)
 		}
@@ -447,6 +451,19 @@ func (c *StreamConn) ReadFrames(ctx context.Context, frames []protocol.Frame) (i
 		count++
 	}
 	return count, nil
+}
+
+// readCarrierFrame fills an empty buffer once, then borrows a complete frame or owns an incremental fallback. Callers
+// may borrow more buffered frames after this call, but must not refill the reader until their next read operation.
+func readCarrierFrame(reader *bufio.Reader, fallback *protocol.FrameReader) (protocol.Frame, error) {
+	if _, err := reader.Peek(1); err != nil {
+		return protocol.Frame{}, err
+	}
+	frame, available, err := protocol.ReadBufferedFrame(reader)
+	if available || err != nil {
+		return frame, err
+	}
+	return fallback.Read(reader)
 }
 
 // WriteFrames writes one nonempty frame batch without interleaving another writer.
