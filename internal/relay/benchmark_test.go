@@ -52,7 +52,7 @@ func BenchmarkSelectCandidates(b *testing.B) {
 		}
 		if committed := index / 2; committed > 0 {
 			var batch [16]protocol.Data
-			var ownership [16]Packet
+			var ownership [16]datagram.Packet
 			count, err := store.takeBatch(batch[:committed], ownership[:], committed*1500)
 			releaseBatchOwnership(ownership[:count])
 			if err != nil || count != committed {
@@ -69,14 +69,14 @@ func BenchmarkSelectCandidates(b *testing.B) {
 	b.Run("Transport", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			selected := selectCandidates(lanes, protocol.LaneID(2), false, 1500, math.MaxUint64)
+			selected := selectCandidates(lanes, protocol.LaneID(2), 1500, math.MaxUint64)
 			benchmarkCandidateSink = selected.lanes[0].score(1500)
 		}
 	})
 	b.Run("Control", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			selected := selectCandidates(lanes, protocol.LaneID(0), true, 1500, math.MaxUint64)
+			selected := selectControlCandidates(lanes, 1500, math.MaxUint64)
 			benchmarkCandidateSink = selected.lanes[selected.count-1].score(1500)
 		}
 	})
@@ -101,7 +101,7 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 	}
 	transmission := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))
 	var batch [1]protocol.Data
-	var ownership [1]Packet
+	var ownership [1]datagram.Packet
 	var packets uint64
 	b.ReportAllocs()
 	b.SetBytes(int64(len(transmission.packet.Payload)))
@@ -141,7 +141,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 		}
 	}
 	var batch [maximumDataBatchFrames]protocol.Data
-	var ownership [maximumDataBatchFrames]Packet
+	var ownership [maximumDataBatchFrames]datagram.Packet
 	b.ReportAllocs()
 	b.SetBytes(int64(len(transmission.packet.Payload) * len(batch)))
 	for b.Loop() {

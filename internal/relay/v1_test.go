@@ -151,23 +151,23 @@ func TestSelectCandidatesKeepsCommittedSamePath(t *testing.T) {
 		}
 		takeOneTransmission(t, store)
 	}
-	if got := selectCandidates(lanes, 1, false, 1500, math.MaxUint64); got.lanes[0] != first {
+	if got := selectCandidates(lanes, 1, 1500, math.MaxUint64); got.lanes[0] != first {
 		t.Fatal("unreported committed work caused same-path striping")
 	}
 	if err := store.push(schedulerTransmission(17, wgpacket.TransportData, time.Now().Add(time.Second))); err != nil {
 		t.Fatal(err)
 	}
-	if got := selectCandidates(lanes, 1, false, 1500, math.MaxUint64); got.lanes[0] != second {
+	if got := selectCandidates(lanes, 1, 1500, math.MaxUint64); got.lanes[0] != second {
 		t.Fatal("real write backlog did not permit same-path spillover")
 	}
 	first.degraded = true
-	if got := selectCandidates(lanes, 1, false, 1500, math.MaxUint64); got.lanes[0] != second {
+	if got := selectCandidates(lanes, 1, 1500, math.MaxUint64); got.lanes[0] != second {
 		t.Fatal("degraded preferred lane blocked failover")
 	}
 	first.degraded = false
 	takeOneTransmission(t, store)
 	second.registration.PathGroupID = 2
-	if got := selectCandidates(lanes, 1, false, 1500, math.MaxUint64); got.lanes[0] != second {
+	if got := selectCandidates(lanes, 1, 1500, math.MaxUint64); got.lanes[0] != second {
 		t.Fatal("distinct path selection was suppressed")
 	}
 }
@@ -175,7 +175,7 @@ func TestSelectCandidatesKeepsCommittedSamePath(t *testing.T) {
 func TestScheduledLaneDeliveryWindow(t *testing.T) {
 	lane := schedulerLaneWithLimits(t, 1, 1, 200_000, 1_000_000, packetqueue.Limits{Packets: 65_536, Bytes: 32 << 20})
 	lane.rateObserved = true
-	if got := lane.deliveryWindowBytes(); got != 515_536 {
+	if got := lane.deliveryWindowBytes(); got != 904_096 {
 		t.Fatalf("initial window = %d", got)
 	}
 	lane.deliveryRate = 120_000_000
@@ -189,17 +189,18 @@ func TestScheduledLaneDeliveryWindow(t *testing.T) {
 	lane.feedbackDelayMicros = 0
 	lane.rttMicros = 1
 	lane.deliveryRate = 1
-	if got := lane.deliveryWindowBytes(); got != reportByteThreshold {
+	if got := lane.deliveryWindowBytes(); got != minimumDeliveryWindow {
 		t.Fatalf("small-packet floor = %d", got)
 	}
 	store := lane.registration.Store
-	store.backlogBytes.Store(reportByteThreshold - 100)
+	store.backlogBytes.Store(minimumDeliveryWindow - 100)
 	if !lane.canAccept(100) || lane.canAccept(101) {
 		t.Fatal("estimated window admitted an oversized next frame")
 	}
 	lane.rateObserved = false
-	if !lane.canAccept(101) {
-		t.Fatal("unobserved startup capacity was restricted")
+	store.backlogBytes.Store(initialDeliveryWindow - 100)
+	if !lane.canAccept(100) || lane.canAccept(101) {
+		t.Fatal("startup window is not bounded")
 	}
 }
 
@@ -237,6 +238,14 @@ func TestRetainedTransmissionLayout(t *testing.T) {
 		delivery deliverySnapshot
 	}
 	t.Logf("retained transmission metadata: %d bytes, original %d bytes", unsafe.Sizeof(retainedTransmission{}), unsafe.Sizeof(originalTransmission{}))
+	type previousPacket struct {
+		Kind           wgpacket.Kind
+		Payload        []byte
+		DeadlineMicros uint64
+		datagram       datagram.Packet
+	}
+	t.Logf("ingress packet metadata: %d bytes, previous %d bytes", unsafe.Sizeof(Packet{}), unsafe.Sizeof(previousPacket{}))
+	t.Logf("writer ownership: %d bytes, previous %d bytes", unsafe.Sizeof(datagram.Packet{}), unsafe.Sizeof(previousPacket{}))
 }
 
 func TestScheduledLaneRatePressureUsesEstimatedWindow(t *testing.T) {
@@ -245,7 +254,7 @@ func TestScheduledLaneRatePressureUsesEstimatedWindow(t *testing.T) {
 	store := lane.registration.Store
 	store.now = func() time.Time { return time.UnixMicro(1) }
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
-	for id := uint64(1); id <= 200; id++ {
+	for id := uint64(1); id <= 300; id++ {
 		transmission := schedulerTransmission(id, wgpacket.TransportData, store.now().Add(time.Second))
 		payload := make([]byte, 4096)
 		copy(payload, transmission.packet.Payload)

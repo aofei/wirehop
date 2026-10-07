@@ -6,6 +6,8 @@ umask 022
 role=$1
 scenario=$2
 scheme=${scenario%%-*}
+carrier_port=51822
+if [ "${WIREHOP_TEST_PATH:-Both}" = High ]; then carrier_port=51823; fi
 export WIREHOP_TOKEN=isolated-kernel-tcp-test-fixture
 export SSL_CERT_FILE=/results/ca.pem
 ip link add wgtest type wireguard
@@ -71,13 +73,15 @@ case "$scenario" in
   tcp-latency) tc qdisc replace dev eth0 root netem delay 600ms ;;
   tcp-loss) tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 0.5% ;;
   tcp-asymmetric|tcp-asymmetric-stall*)
-    tc qdisc replace dev eth0 root handle 1: prio bands 3
-    tc qdisc add dev eth0 parent 1:1 handle 10: netem delay 5ms rate 100mbit limit 1000
-    tc qdisc add dev eth0 parent 1:2 handle 20: netem delay 150ms rate 20mbit limit 1000
-    for field in sport dport; do
-      tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51822 0xffff flowid 1:1
-      tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51823 0xffff flowid 1:2
-    done
+    if [ "${WIREHOP_TEST_ROUTED:-false}" != true ]; then
+      tc qdisc replace dev eth0 root handle 1: prio bands 3
+      tc qdisc add dev eth0 parent 1:1 handle 10: netem delay 5ms rate 100mbit limit 1000
+      tc qdisc add dev eth0 parent 1:2 handle 20: netem delay 150ms rate 20mbit limit 1000
+      for field in sport dport; do
+        tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51822 0xffff flowid 1:1
+        tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51823 0xffff flowid 1:2
+      done
+    fi
     ;;
   *-slow32|*-slow64|*-slow128)
     rate=${scenario##*slow}
@@ -123,7 +127,9 @@ if [ "$role" = server ]; then
     set -- "$@" --allow-insecure --listen wss://:51823
   fi
   case "$scenario" in
-    tcp-asymmetric|tcp-asymmetric-stall*) set -- "$@" --listen tcp://:51823 ;;
+    tcp-asymmetric|tcp-asymmetric-stall*|tcp-multipath-distinct-slow*)
+      set -- "$@" --listen tcp://:51823
+      ;;
   esac
   touch /results/ready
   exec /wirehop server --listen "$scheme://:51822" --allow-target "$target" "$@"
@@ -164,14 +170,18 @@ case "$scheme" in
         ;;
     esac
     case "$scenario" in
-      tcp-asymmetric|tcp-asymmetric-stall*) set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51823" ;;
+      tcp-asymmetric|tcp-asymmetric-stall*|tcp-multipath-distinct-slow*)
+        if [ "${WIREHOP_TEST_PATH:-Both}" = Both ]; then
+          set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51823"
+        fi
+        ;;
     esac
     if [ "$scenario" = tcp-fwmark ]; then set -- "$@" --fwmark 51820; fi
     if [ "$scenario" = tcp-mixed ]; then
       set -- "$@" --tls-server-name wirehop.test --lane "wss://$WIREHOP_TEST_SERVER:51823"
     fi
     /wirehop client --listen "$local_endpoint" --target "$target" \
-      --lane "$scheme://$WIREHOP_TEST_SERVER:51822" "$@" > /results/client.log 2>&1 &
+      --lane "$scheme://$WIREHOP_TEST_SERVER:$carrier_port" "$@" > /results/client.log 2>&1 &
     wg set wgtest peer "$peer" endpoint "$local_endpoint"
     ;;
 esac

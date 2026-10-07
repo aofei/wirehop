@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
@@ -127,7 +128,7 @@ func TestLaneDeliveryThresholdReleasesHighBandwidthWindow(t *testing.T) {
 		payload[4] = byte(index)
 		err := firstIngress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 1_000_000,
+				DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload},
 			},
 			Size: len(payload), Deadline: deadline,
 		})

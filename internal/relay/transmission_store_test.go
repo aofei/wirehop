@@ -93,7 +93,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 		t.Fatal(err)
 	}
 	var batch [1]protocol.Data
-	var ownership [1]Packet
+	var ownership [1]datagram.Packet
 	count, err := store.takeBatch(batch[:], ownership[:], 4096)
 	if err != nil || count != 1 {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
@@ -106,8 +106,8 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 	} else {
 		releaseTransmissions(store.drain())
 	}
-	if err := ownership[0].Validate(); err != nil {
-		t.Fatalf("write ownership after release is invalid: %v", err)
+	if wgpacket.Classify(ownership[0].Payload) != ownership[0].Kind {
+		t.Fatal("writer ownership changed its packet classification")
 	}
 	if got := string(batch[0].Payload); got != wantPayload {
 		t.Fatalf("payload after release = %q, want %q", got, wantPayload)
@@ -139,7 +139,7 @@ func TestTransmissionStoreAggregateBudget(t *testing.T) {
 		t.Fatalf("push() error = %v, want %v", err, packetqueue.ErrFull)
 	}
 	var batch [1]protocol.Data
-	var ownership [1]Packet
+	var ownership [1]datagram.Packet
 	count, err := first.takeBatch(batch[:], ownership[:], 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -207,7 +207,7 @@ func TestTransmissionStoreCarrierOrderAndAcknowledgement(t *testing.T) {
 	}
 
 	var batch [3]protocol.Data
-	var ownership [3]Packet
+	var ownership [3]datagram.Packet
 	count, err := store.takeBatch(batch[:], ownership[:], 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -368,7 +368,7 @@ func TestTransmissionStoreTakeBatchSkipsExpiredWork(t *testing.T) {
 	}
 	now = now.Add(2 * time.Millisecond)
 	var batch [4]protocol.Data
-	var ownership [4]Packet
+	var ownership [4]datagram.Packet
 	count, err := store.takeBatch(batch[:], ownership[:], 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -500,7 +500,7 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 			store.reportedBytes = store.sentBytes
 			initialPackets, initialBytes := store.sentPackets, store.sentBytes
 			var batch [3]protocol.Data
-			var ownership [3]Packet
+			var ownership [3]datagram.Packet
 			count, err := store.takeBatch(batch[:], ownership[:], 32*1024)
 			defer releaseBatchOwnership(ownership[:count])
 			if count != test.wantCount || count == 0 && !errors.Is(err, ErrCounterExhausted) || count > 0 && err != nil {
@@ -515,7 +515,7 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 				}
 			}
 			var next [1]protocol.Data
-			var nextOwnership [1]Packet
+			var nextOwnership [1]datagram.Packet
 			for attempt := range 2 {
 				if taken, err := store.takeBatch(next[:], nextOwnership[:], 32*1024); taken != 0 || !errors.Is(err, ErrCounterExhausted) {
 					t.Fatalf("exhausted takeBatch() = %d, %v, want an unchanged queued suffix", taken, err)
@@ -548,8 +548,8 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 				}
 			}
 			for index := range ownership[:count] {
-				if err := ownership[index].Validate(); err != nil || batch[index].Payload[4] != byte(index+1) {
-					t.Fatalf("writer ownership %d changed during acknowledgement and drain: %v", index, err)
+				if wgpacket.Classify(ownership[index].Payload) != ownership[index].Kind || batch[index].Payload[4] != byte(index+1) {
+					t.Fatalf("writer ownership %d changed during acknowledgement and drain", index)
 				}
 			}
 		})
@@ -730,27 +730,50 @@ func TestTransmissionDequeFeedbackWindowReusesStorage(t *testing.T) {
 }
 
 func TestTransmissionStoreStateMachine(t *testing.T) {
-	t.Run("Local", func(t *testing.T) {
-		testTransmissionStoreStateMachine(t, nil)
-	})
-	t.Run("Aggregate", func(t *testing.T) {
-		budget, err := retention.NewBudget(retention.Limits{Packets: 32, Bytes: 4096})
-		if err != nil {
-			t.Fatal(err)
-		}
-		testTransmissionStoreStateMachine(t, budget)
-	})
+	for _, tt := range []struct {
+		name              string
+		bytes             int
+		aggregate, probes bool
+	}{
+		{name: "Local", bytes: 4096},
+		{name: "Aggregate", bytes: 4096, aggregate: true},
+		{name: "LocalWithProbes", bytes: 16 * 1024, probes: true},
+		{name: "AggregateWithProbes", bytes: 16 * 1024, aggregate: true, probes: true},
+		{name: "LocalSingleProbeCapacity", bytes: 4101, probes: true},
+		{name: "AggregateSingleProbeCapacity", bytes: 4101, aggregate: true, probes: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			limits := packetqueue.Limits{Packets: 32, Bytes: tt.bytes}
+			var budget *retention.Budget
+			if tt.aggregate {
+				var err error
+				budget, err = retention.NewBudget(retention.Limits{Packets: limits.Packets, Bytes: limits.Bytes})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			testTransmissionStoreStateMachine(t, limits, budget, tt.probes)
+		})
+	}
 }
 
-func testTransmissionStoreStateMachine(t *testing.T, budget *retention.Budget) {
+func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, budget *retention.Budget, probes bool) {
 	t.Helper()
 	now := time.Unix(0, 0)
-	store, err := newTransmissionStoreWithBudget(
-		packetqueue.Limits{Packets: 32, Bytes: 4096}, func() time.Time { return now }, budget,
-	)
+	store, err := newTransmissionStoreWithBudget(limits, func() time.Time { return now }, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	padding := make([]byte, protocol.ProbePayloadSize)
+	padding[0] = 4
+	type writtenFrame struct {
+		transportBytes uint64
+		probe          bool
+	}
+	var unreported []writtenFrame
+	var reported, transportProof uint64
+	var acceptedProbes, sentProbes, reportedProbes int
 	seed := uint64(0x4d595df4d0f33173)
 	next := func() uint64 {
 		seed ^= seed << 13
@@ -768,43 +791,71 @@ func testTransmissionStoreStateMachine(t *testing.T, budget *retention.Budget) {
 				kind = wgpacket.HandshakeInitiation
 			}
 			deadline := now.Add(time.Duration(next()%20+1) * time.Millisecond)
-			err := store.push(schedulerTransmission(packetID, kind, deadline))
+			transmission := schedulerTransmission(packetID, kind, deadline)
+			if probes && next()%3 == 0 {
+				transmission = retainedTransmission{deadline: deadline, packet: datagram.Packet{Payload: padding}}
+			}
+			err := store.push(transmission)
 			if err != nil && !errors.Is(err, packetqueue.ErrFull) {
 				t.Fatalf("push() error = %v", err)
 			}
+			if err == nil && transmission.packetID == 0 {
+				acceptedProbes++
+			}
 		case 2:
 			var batch [8]protocol.Data
-			var ownership [8]Packet
+			var ownership [8]datagram.Packet
 			count, err := store.takeBatch(batch[:], ownership[:], int(next()%1024+1))
-			releaseBatchOwnership(ownership[:count])
 			if err != nil && !errors.Is(err, packetqueue.ErrEmpty) {
 				t.Fatalf("takeBatch() error = %v", err)
 			}
-		case 3:
-			count := uint64(0)
-			if store.sent.len() > 0 {
-				count = next() % (uint64(store.sent.len()) + 1)
+			for _, frame := range batch[:count] {
+				written := writtenFrame{probe: frame.PacketID == 0}
+				if written.probe {
+					sentProbes++
+				} else if frame.Payload[0] == 4 {
+					written.transportBytes = uint64(len(frame.Payload))
+				}
+				unreported = append(unreported, written)
 			}
+			releaseBatchOwnership(ownership[:count])
+		case 3:
+			count := int(next() % uint64(len(unreported)+1))
 			if _, stale, err := store.acknowledge(
-				store.reportedPackets+count, uint64(store.now().UnixMicro())); err != nil || stale {
+				reported+uint64(count), uint64(store.now().UnixMicro())); err != nil || stale {
 				t.Fatalf("acknowledge() = stale %t, error %v", stale, err)
 			}
+			for _, written := range unreported[:count] {
+				transportProof = min(minimumRateSampleBytes, transportProof+written.transportBytes)
+				if written.probe {
+					reportedProbes++
+				}
+			}
+			unreported = unreported[count:]
+			reported += uint64(count)
 		case 4:
 			now = now.Add(time.Duration(next()%5+1) * time.Millisecond)
 			store.assessDeadlines(now, func(uint64) uint64 { return 0 })
 		case 5:
-			if store.reportedPackets > 0 {
+			if reported > 0 {
 				if _, stale, err := store.acknowledge(0, uint64(store.now().UnixMicro())); err != nil || !stale {
 					t.Fatalf("stale acknowledge() = stale %t, error %v", stale, err)
 				}
 			}
 		case 6:
 			if _, _, err := store.acknowledge(
-				store.sentPackets+1, uint64(store.now().UnixMicro())); !errors.Is(err, ErrInvalidDeliveryReport) {
+				reported+uint64(len(unreported))+1, uint64(store.now().UnixMicro())); !errors.Is(err, ErrInvalidDeliveryReport) {
 				t.Fatalf("partial acknowledge() error = %v, want %v", err, ErrInvalidDeliveryReport)
 			}
 		}
 		assertTransmissionStoreInvariants(t, store)
+		if store.transportReported.Load() != transportProof || store.reportedPackets != reported ||
+			store.sentPackets != reported+uint64(len(unreported)) {
+			t.Fatal("cumulative feedback or recovery proof differs from the observed writer prefix")
+		}
+	}
+	if probes && (acceptedProbes == 0 || sentProbes == 0 || reportedProbes == 0) {
+		t.Fatal("mixed state-machine run did not admit, write, and acknowledge capacity probes")
 	}
 
 	if packets, _ := store.backlog(); packets == 0 {
@@ -824,8 +875,8 @@ func testTransmissionStoreStateMachine(t *testing.T, budget *retention.Budget) {
 	if store.sent.len() != 0 || store.control.len() != 0 || store.normal.len() != 0 {
 		t.Fatal("drain retained deque entries")
 	}
+	releaseTransmissions(drained)
 	if budget != nil {
-		releaseTransmissions(drained)
 		if got := budget.Usage(); got != (retention.Usage{}) {
 			t.Fatalf("budget usage after drain release = %+v", got)
 		}
@@ -857,10 +908,15 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 	}
 	validate := func(transmission retainedTransmission, sent bool) bool {
 		size, err := protocol.DataFrameSize(transmission.data())
-		if err != nil || size != transmission.size || !transmission.packet.Kind.Accepted() ||
-			wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind ||
-			transmission.budget != store.budget {
+		if err != nil || size != transmission.size || transmission.budget != store.budget {
 			t.Fatalf("invalid retained transmission: %+v", transmission)
+		}
+		if transmission.packetID == 0 {
+			if transmission.packet.Kind != wgpacket.NonWireGuard {
+				t.Fatal("capacity probe retained a real packet classification")
+			}
+		} else if !transmission.packet.Kind.Accepted() || wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind {
+			t.Fatal("retained packet classification differs from its payload")
 		}
 		bytes += transmission.size
 		if sent {
@@ -903,7 +959,7 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 	}
 }
 
-func releaseBatchOwnership(packets []Packet) {
+func releaseBatchOwnership(packets []datagram.Packet) {
 	for index := range packets {
 		packets[index].Release()
 	}

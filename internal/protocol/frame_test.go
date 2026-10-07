@@ -368,6 +368,11 @@ func FuzzParseData(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(seed.Payload)
+	probe, err := MarshalData(Data{Payload: make([]byte, ProbePayloadSize)})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(probe.Payload)
 	f.Add([]byte(nil))
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		data, err := ParseData(Frame{Type: FrameData, Payload: payload})

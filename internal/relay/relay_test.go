@@ -361,7 +361,7 @@ func TestDeadlinePolicy(t *testing.T) {
 
 func TestPacketValidation(t *testing.T) {
 	valid := Packet{
-		Kind: wgpacket.TransportData, Payload: relayWireGuardPacket(wgpacket.TransportData), DeadlineMicros: 1,
+		DeadlineMicros: 1, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: relayWireGuardPacket(wgpacket.TransportData)},
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatal(err)
@@ -752,12 +752,17 @@ func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
 }
 
 func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
-	for _, batched := range []bool{false, true} {
-		name := "Scalar"
-		if batched {
-			name = "Vector"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, mode := range []struct {
+		name    string
+		batched bool
+		probes  bool
+	}{
+		{name: "Scalar"},
+		{name: "Vector", batched: true},
+		{name: "ScalarWithProbes", probes: true},
+		{name: "VectorWithProbes", batched: true, probes: true},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
 			for _, test := range []struct {
 				name      string
 				failureAt int
@@ -789,7 +794,7 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 					}
 					lane := newTestLane(t, newTestCarrier(), endpoint.testEndpoint)
 					lane.receiver.endpoint = endpoint
-					if batched {
+					if mode.batched {
 						lane.receiver.endpoint = &partialBatchWriteEndpoint{partialWriteEndpoint: endpoint}
 					}
 					clock := lane.receiver.clock.(*testClock)
@@ -801,9 +806,9 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 					if test.expire {
 						endpoint.afterFailure = func() { clock.now = 200_000 }
 					}
-					var frames [5]protocol.Frame
+					var frames []protocol.Frame
 					var encodedBytes uint64
-					for index := range frames {
+					for index := range 5 {
 						packet := protocol.Data{
 							PacketID: uint64(index + 1), DeadlineMicros: 1_000_000,
 							Payload: relayWireGuardPacket(wgpacket.TransportData),
@@ -816,7 +821,15 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						frames[index] = frame
+						if mode.probes {
+							padding, err := protocol.MarshalData(protocol.Data{Payload: probePadding[:]})
+							if err != nil {
+								t.Fatal(err)
+							}
+							frames = append(frames, padding)
+							encodedBytes += uint64(protocol.FrameSize(len(padding.Payload)))
+						}
+						frames = append(frames, frame)
 						encodedBytes += uint64(protocol.FrameSize(len(frame.Payload)))
 					}
 					if err := lane.readDataBatch(ctx, frames[:]); !errors.Is(err, test.wantError) ||
@@ -1196,7 +1209,7 @@ func TestIngressDeadlineFollowsProtocolClock(t *testing.T) {
 	}
 	clock.now += 2_000_000
 	var item packetqueue.Item[Packet]
-	if err := queue.TryPop(&item); !errors.Is(err, packetqueue.ErrEmpty) {
+	if err := queue.TryPop(&item, queue.Now()); !errors.Is(err, packetqueue.ErrEmpty) {
 		item.Release()
 		t.Fatalf("TryPop() = %v, want expiry after the protocol clock advances", err)
 	}
@@ -1641,35 +1654,50 @@ func TestLaneAbandonUsesAbortiveClose(t *testing.T) {
 }
 
 func TestLaneRequiresInitialClockSync(t *testing.T) {
-	carrier := newTestCarrier()
-	endpoint := newTestEndpoint()
-	store, err := NewTransmissionStore(packetqueue.Limits{Packets: 8, Bytes: 8192})
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock := &testClock{now: 1000}
-	receiver, err := NewReceiver(ReceiverConfig{Endpoint: endpoint, Clock: clock, DeduplicationSize: 64})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
-		Generation: 1, ClockSyncTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := make(chan error, 1)
-	go func() { result <- lane.Run(context.Background()) }()
-	frame, err := protocol.MarshalData(protocol.Data{
-		PacketID: 1, DeadlineMicros: 1900, Payload: relayWireGuardPacket(wgpacket.TransportData),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	carrier.reads <- frame
-	if err := <-result; !errors.Is(err, ErrClockSyncRequired) {
-		t.Fatalf("Run() error = %v, want %v", err, ErrClockSyncRequired)
+	for _, tt := range []struct {
+		name string
+		data protocol.Data
+	}{
+		{name: "Datagram", data: protocol.Data{PacketID: 1, DeadlineMicros: 1900,
+			Payload: relayWireGuardPacket(wgpacket.TransportData)}},
+		{name: "CapacityProbe", data: protocol.Data{Payload: probePadding[:]}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			carrier := newTestCarrier()
+			endpoint := newTestEndpoint()
+			store, err := NewTransmissionStore(packetqueue.Limits{Packets: 8, Bytes: 8192})
+			if err != nil {
+				t.Fatal(err)
+			}
+			clock := &testClock{now: 1000}
+			receiver, err := NewReceiver(ReceiverConfig{Endpoint: endpoint, Clock: clock, DeduplicationSize: 64})
+			if err != nil {
+				t.Fatal(err)
+			}
+			synced := false
+			lane, err := newObservedLane(LaneConfig{
+				Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
+				Generation: 1, ClockSyncTimeout: time.Second, ClockSynced: func() { synced = true },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- lane.Run(ctx) }()
+			frame, err := protocol.MarshalData(tt.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			carrier.reads <- frame
+			if err := <-result; !errors.Is(err, ErrClockSyncRequired) {
+				t.Fatalf("Run() error = %v, want %v", err, ErrClockSyncRequired)
+			}
+			if synced || lane.progress.dataPackets != 0 || lane.progress.dataBytes != 0 || len(endpoint.writes) != 0 {
+				t.Fatal("pre-sync data changed admission, parsing progress, or UDP delivery")
+			}
+		})
 	}
 }
 

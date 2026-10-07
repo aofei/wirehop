@@ -33,22 +33,22 @@ func testQueueNextDeadlineNonFIFOExpiry(t *testing.T) {
 		}
 	}
 	var item Item[int]
-	if err := queue.TryPop(&item); err != nil || item.Value != 1 {
+	if err := queue.TryPop(&item, queue.Now()); err != nil || item.Value != 1 {
 		t.Fatalf("priority pop = %+v, %v", item, err)
 	}
-	if deadline := queue.NextDeadline(); deadline.After(now.Add(2*time.Second)) || deadline.Before(first) {
+	if deadline := queue.NextDeadline(queue.Now()); deadline.After(now.Add(2*time.Second)) || deadline.Before(first) {
 		t.Fatalf("conservative wake-up after priority pop = %v", deadline)
 	}
 	now = now.Add(2 * time.Second)
-	if deadline := queue.NextDeadline(); !deadline.Equal(last) || queue.Len() != 1 {
+	if deadline := queue.NextDeadline(queue.Now()); !deadline.Equal(last) || queue.Len() != 1 {
 		t.Fatalf("non-FIFO expiry retained deadline %v and %d packets", deadline, queue.Len())
 	}
-	if err := queue.TryPop(&item); err != nil || item.Value != 2 || !queue.NextDeadline().IsZero() {
+	if err := queue.TryPop(&item, queue.Now()); err != nil || item.Value != 2 || !queue.NextDeadline(queue.Now()).IsZero() {
 		t.Fatalf("last pop retained expiry state: item %+v, error %v", item, err)
 	}
 	queue.Close()
 	queue.Expire()
-	if !queue.NextDeadline().IsZero() {
+	if !queue.NextDeadline(queue.Now()).IsZero() {
 		t.Fatal("closed queue retained expiry state")
 	}
 }
@@ -76,7 +76,7 @@ func testQueueNextDeadlineFailedControlPreemption(t *testing.T) {
 	if err := queue.Push(Item[int]{Value: 2, Size: 2, Priority: PriorityControl, Deadline: deadline}); !errors.Is(err, ErrFull) {
 		t.Fatalf("control admission = %v, want aggregate capacity rejection", err)
 	}
-	if queue.Len() != 0 || !queue.NextDeadline().IsZero() {
+	if queue.Len() != 0 || !queue.NextDeadline(queue.Now()).IsZero() {
 		t.Fatal("empty preempted queue retained an expiry deadline")
 	}
 	if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: 1}) {
@@ -109,14 +109,14 @@ func testQueueNextDeadlinePriorityBounds(t *testing.T) {
 	}
 	assertDeadline := func(lifetime time.Duration) {
 		t.Helper()
-		if deadline := queue.NextDeadline(); !deadline.Equal(start.Add(lifetime)) {
+		if deadline := queue.NextDeadline(queue.Now()); !deadline.Equal(start.Add(lifetime)) {
 			t.Fatalf("next deadline = %v, want %v", deadline, start.Add(lifetime))
 		}
 	}
 	pop := func(index int) {
 		t.Helper()
 		var item Item[ownedQueueValue]
-		if err := queue.TryPop(&item); err != nil {
+		if err := queue.TryPop(&item, queue.Now()); err != nil {
 			t.Fatal(err)
 		}
 		if item.Value.releases != &releases[index] {
@@ -152,7 +152,7 @@ func testQueueNextDeadlinePriorityBounds(t *testing.T) {
 	}
 	now = start.Add(4 * time.Second)
 	queue.Expire()
-	if !queue.NextDeadline().IsZero() || releases != ([6]int{1, 1, 1, 1, 1, 1}) ||
+	if !queue.NextDeadline(queue.Now()).IsZero() || releases != ([6]int{1, 1, 1, 1, 1, 1}) ||
 		budget.Usage() != (retention.Usage{}) {
 		t.Fatalf("final releases = %v, retained usage = %+v", releases, budget.Usage())
 	}

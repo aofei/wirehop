@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -59,6 +60,123 @@ func TestSchedulerRecoversStallBeforeSalvageWindowCloses(t *testing.T) {
 	}
 }
 
+func TestSchedulerRecoveryRequiresMigratableTransport(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		kind     wgpacket.Kind
+		migrated bool
+	}{
+		{name: "HandshakeInitiation", kind: wgpacket.HandshakeInitiation},
+		{name: "HandshakeResponse", kind: wgpacket.HandshakeResponse},
+		{name: "CookieReply", kind: wgpacket.CookieReply},
+		{name: "AlreadyMigrated", kind: wgpacket.TransportData, migrated: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			source := schedulerLane(t, 1, 1, 10_000, 12_500_000)
+			alternate := schedulerLane(t, 2, 2, 10_000, 12_500_000)
+			source.lastProgressAt = now
+			source.registration.Store.now = func() time.Time { return now }
+			source.registration.Abandon = func() { t.Fatal("unmigratable work abandoned a generation") }
+			for _, lane := range []*scheduledLane{source, alternate} {
+				t.Cleanup(func() { releaseTransmissions(lane.registration.Store.drain()) })
+			}
+			transmission := schedulerTransmission(1, tt.kind, now.Add(time.Second))
+			transmission.migrated = tt.migrated
+			if err := source.registration.Store.push(transmission); err != nil {
+				t.Fatal(err)
+			}
+			takeOneTransmission(t, source.registration.Store)
+			var scheduler Scheduler
+			lanes := map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}
+			scheduler.checkAbandonment(lanes, now.Add(500*time.Millisecond))
+			if source.abandoning || source.degraded {
+				t.Fatal("fresh unmigratable work justified predictive recovery")
+			}
+			scheduler.checkAbandonment(lanes, now.Add(2*time.Second))
+			if source.abandoning || !source.degraded {
+				t.Fatal("expired unmigratable work did not preserve degradation without abandonment")
+			}
+		})
+	}
+}
+
+func TestSchedulerProbeCapacityDivertsBeforeProvenRecovery(t *testing.T) {
+	now := time.Unix(100, 0)
+	source := schedulerLane(t, 1, 1, 10_000, 12_500_000)
+	alternate := schedulerLane(t, 2, 2, 10_000, 12_500_000)
+	alternate.registration.Store.transportReported.Store(0)
+	abandonments := 0
+	source.registration.Abandon = func() { abandonments++ }
+	source.lastProgressAt = now
+	for _, lane := range []*scheduledLane{source, alternate} {
+		lane.registration.Store.now = func() time.Time { return now }
+		t.Cleanup(func() { releaseTransmissions(lane.registration.Store.drain()) })
+	}
+	if err := source.registration.Store.push(schedulerTransmission(1, wgpacket.TransportData, now.Add(5*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	takeOneTransmission(t, source.registration.Store)
+	lanes := map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}
+	var scheduler Scheduler
+	now = now.Add(250 * time.Millisecond)
+	scheduler.checkAbandonment(lanes, now)
+	if !source.degraded || source.abandoning || abandonments != 0 {
+		t.Fatal("padding-only capacity did not divert new traffic without abandoning the source")
+	}
+	transmission := schedulerTransmission(2, wgpacket.TransportData, now.Add(time.Second))
+	transmission.packet.Payload = make([]byte, minimumRateSampleBytes)
+	transmission.packet.Payload[0] = 4
+	if err := alternate.registration.Store.push(transmission); err != nil {
+		t.Fatal(err)
+	}
+	takeOneTransmission(t, alternate.registration.Store)
+	now = now.Add(10 * time.Millisecond)
+	if _, err := alternate.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.checkAbandonment(lanes, now)
+	if !source.abandoning || abandonments != 1 {
+		t.Fatal("validated real transport progress did not permit recovery")
+	}
+}
+
+func TestTransmissionStoreRecoveryProofExcludesPaddingAndControls(t *testing.T) {
+	now := time.Unix(100, 0)
+	store := schedulerStore(t, packetqueue.Limits{Packets: 8, Bytes: 64 * 1024})
+	store.now = func() time.Time { return now }
+	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	for index, tt := range []struct {
+		kind wgpacket.Kind
+		size int
+		want uint64
+	}{
+		{kind: wgpacket.NonWireGuard, size: protocol.ProbePayloadSize},
+		{kind: wgpacket.HandshakeResponse, size: 92},
+		{kind: wgpacket.TransportData, size: 2048, want: 2048},
+		{kind: wgpacket.TransportData, size: 2048, want: minimumRateSampleBytes},
+		{kind: wgpacket.TransportData, size: 32, want: minimumRateSampleBytes},
+	} {
+		transmission := retainedTransmission{deadline: now.Add(time.Second), packet: datagram.Packet{Payload: probePadding[:]}}
+		if tt.kind != wgpacket.NonWireGuard {
+			transmission = schedulerTransmission(uint64(index), tt.kind, now.Add(time.Second))
+			transmission.packet.Payload = make([]byte, tt.size)
+			copy(transmission.packet.Payload, relayWireGuardPacket(tt.kind))
+		}
+		if err := store.push(transmission); err != nil {
+			t.Fatal(err)
+		}
+		takeOneTransmission(t, store)
+		now = now.Add(time.Millisecond)
+		if _, _, err := store.acknowledge(uint64(index+1), uint64(now.UnixMicro())); err != nil {
+			t.Fatal(err)
+		}
+		if got := store.transportReported.Load(); got != tt.want {
+			t.Fatalf("recovery proof after kind %d = %d bytes, want %d", tt.kind, got, tt.want)
+		}
+	}
+}
+
 func TestProgressGuardIncludesSerializationAndFeedback(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -69,7 +187,7 @@ func TestProgressGuardIncludesSerializationAndFeedback(t *testing.T) {
 		want     uint64
 	}{
 		{name: "Fast", rtt: 10_000, rate: 12_500_000, bytes: 1452, want: 250_000},
-		{name: "Slow", rtt: 200_000, rate: 4_000, bytes: 1500, want: 825_000},
+		{name: "Slow", rtt: 200_000, rate: 4_000, bytes: 1500, want: 4_521_000},
 		{name: "AlternateFeedback", rtt: 10_000, rate: 1_000_000, feedback: 300_000, bytes: 1500, want: 661_500},
 		{name: "UnknownRate", want: math.MaxUint64},
 		{name: "OverflowRTT", rtt: math.MaxUint64, rate: 1, want: math.MaxUint64},
@@ -94,8 +212,8 @@ func TestSchedulerRecoveryRequiresObservedCapacity(t *testing.T) {
 	}{
 		{name: "BothInitialEstimates"},
 		{name: "InitialEstimatesWithExpiredPrefix", expiredPrefix: true},
-		{name: "ObservedSource", sourceObserved: true, wantAbandon: true},
-		{name: "ObservedAlternative", alternateObserved: true, wantAbandon: true},
+		{name: "ObservedSource", sourceObserved: true},
+		{name: "ObservedAlternative", alternateObserved: true},
 		{name: "BothObserved", sourceObserved: true, alternateObserved: true, wantAbandon: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -255,7 +373,7 @@ func TestSchedulerRecoversThroughHealthyLastLaneInGroup(t *testing.T) {
 			}
 			store := lanes[protocol.LaneID(tt.count)].registration.Store
 			var data [6]protocol.Data
-			var ownership [6]Packet
+			var ownership [6]datagram.Packet
 			count, err := store.takeBatch(data[:], ownership[:], protocol.MaxEncodedFrameSize)
 			if err != nil {
 				t.Fatal(err)
@@ -290,7 +408,8 @@ func TestSchedulerRecoveryUsesObservedStallWithoutPrematurelyClosingSlowLinks(t 
 		wantAbandon  bool
 	}{
 		{name: "SlowSerializationPending", sourceRate: 4_000, alternateRTT: 10_000, checkAt: 400 * time.Millisecond},
-		{name: "SlowSerializationElapsed", sourceRate: 4_000, alternateRTT: 10_000, checkAt: 500 * time.Millisecond, wantAbandon: true},
+		{name: "SlowFlightPending", sourceRate: 4_000, alternateRTT: 10_000, checkAt: 4500 * time.Millisecond},
+		{name: "SlowSerializationElapsed", sourceRate: 4_000, alternateRTT: 10_000, checkAt: 4600 * time.Millisecond, wantAbandon: true},
 		{name: "SlowAlternativePending", sourceRate: 12_500_000, alternateRTT: 1_000_000, checkAt: 250 * time.Millisecond},
 		{name: "SlowAlternativeElapsed", sourceRate: 12_500_000, alternateRTT: 1_000_000, checkAt: 550 * time.Millisecond, wantAbandon: true},
 	} {
@@ -334,7 +453,8 @@ func TestSchedulerMigrateTransmissionsChecksCurrentProgress(t *testing.T) {
 		{name: "AtProgressGuard", rate: 12_500_000, checkAt: 250 * time.Millisecond},
 		{name: "RecentPartialReport", rate: 12_500_000, checkAt: 500 * time.Millisecond, recentReport: true, wantMigration: true},
 		{name: "SlowSerializationPending", rate: 4_000, checkAt: 400 * time.Millisecond, wantMigration: true},
-		{name: "SlowSerializationElapsed", rate: 4_000, checkAt: 500 * time.Millisecond},
+		{name: "SlowFlightPending", rate: 4_000, checkAt: 4500 * time.Millisecond, wantMigration: true},
+		{name: "SlowSerializationElapsed", rate: 4_000, checkAt: 4600 * time.Millisecond},
 		{name: "ExpiredQueuedCapacity", rate: 12_500_000, checkAt: 500 * time.Millisecond, expiredQueued: true, wantMigration: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

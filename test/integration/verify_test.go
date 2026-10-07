@@ -86,14 +86,19 @@ func TestVerifyCarrier(t *testing.T) {
 
 func TestVerifyParallelCarriers(t *testing.T) {
 	for _, tt := range []struct {
-		name, scenario, sockets string
-		opened                  int
-		wantErr                 bool
+		name, scenario, sockets, afterSockets string
+		opened                                int
+		wantErr                               bool
 	}{
 		{name: "Repeated", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
 		{name: "LowRate32", scenario: "tcp-multipath-slow32", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
 		{name: "LowRate64", scenario: "tcp-multipath-slow64", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
 		{name: "LowRate128", scenario: "tcp-multipath-slow128", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2},
+		{name: "DistinctLowRate32", scenario: "tcp-multipath-distinct-slow32", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},
+		{name: "DistinctLowRate64", scenario: "tcp-multipath-distinct-slow64", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},
+		{name: "DistinctLowRate128", scenario: "tcp-multipath-distinct-slow128", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},
+		{name: "DistinctLowRateMissingLane", scenario: "tcp-multipath-distinct-slow32", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 2, wantErr: true},
+		{name: "DistinctLowRateReconnected", scenario: "tcp-multipath-distinct-slow64", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 3, wantErr: true},
 		{name: "LowRateReconnected", scenario: "tcp-multipath-slow32", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 3, wantErr: true},
 		{name: "LowRateMissingLane", scenario: "tcp-multipath-slow64", sockets: "0 0 local:1 remote:51822\n", opened: 2, wantErr: true},
 		{name: "CapacityChange", scenario: "tcp-multipath-capacity-change", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 3},
@@ -106,13 +111,21 @@ func TestVerifyParallelCarriers(t *testing.T) {
 		{name: "AsymmetricMissingLane", scenario: "tcp-asymmetric", sockets: "0 0 local:1 remote:51822\n", opened: 2, wantErr: true},
 		{name: "Mixed", scenario: "tcp-mixed", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51823\n", opened: 2},
 		{name: "MissingLane", scenario: "tcp-mixed", sockets: "0 0 local:1 remote:51822\n", opened: 2, wantErr: true},
+		{name: "UnexpectedSecondaryLane", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n0 0 local:3 remote:51823\n", opened: 2, wantErr: true},
 		{name: "Reconnected", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", opened: 3, wantErr: true},
+		{name: "ReplacedPreopenedCarrier", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", afterSockets: "0 0 local:3 remote:51822\n0 0 local:2 remote:51822\n", opened: 2, wantErr: true},
+		{name: "ReorderedSnapshot", scenario: "tcp-multipath", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", afterSockets: "0 20 local:2 remote:51822\n0 30 local:1 remote:51822\n", opened: 2},
+		{name: "FaultReplacesCarrier", scenario: "tcp-multipath-capacity-change", sockets: "0 0 local:1 remote:51822\n0 0 local:2 remote:51822\n", afterSockets: "0 0 local:3 remote:51822\n0 0 local:2 remote:51822\n", opened: 3},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			directory := t.TempDir()
+			afterSockets := tt.afterSockets
+			if afterSockets == "" {
+				afterSockets = tt.sockets
+			}
 			for name, contents := range map[string]string{
 				"client-tcp-sockets.txt":       tt.sockets,
-				"client-tcp-sockets-after.txt": tt.sockets,
+				"client-tcp-sockets-after.txt": afterSockets,
 				"client-before.txt":            "TcpActiveOpens 3 0.0\n",
 				"client-after.txt":             fmt.Sprintf("TcpActiveOpens %d 0.0\n", 3+tt.opened),
 			} {

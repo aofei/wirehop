@@ -16,8 +16,6 @@ never decrypts or authenticates WireGuard cryptographic content and preserves co
 
 See the [design document](docs/design.md) for the scheduling model, wire protocol, and recovery rules.
 
-The [performance review](docs/performance.md) records the V1 optimizations, measurement method, and validation results.
-
 ## Carrier schemes
 
 | Scheme | Carrier | Intended use |
@@ -262,16 +260,16 @@ wirehop client \
 
 Each flag occurrence is one stable lane identity and one TCP connection. Repeating the same canonical URL and `resolve`
 value creates multiple connections in the same path group. A different URL or fixed resolution creates a different path
-group. WireHop prefers a stable low-delay lane for sparse transport traffic, spills load when predicted queueing makes
-another lane faster, and sends at most two copies of a WireGuard control packet. The second copy prefers another path
-group.
+group. WireHop keeps a stable transport primary, discovers distinct-path capacity with bounded padding, and promotes a
+measurably faster path. A full primary waits for feedback rather than striping unique packets across unequal delays.
+WireGuard controls still use at most two copies, preferring different groups.
 
 Start with one lane and measure each candidate separately. Two repeated declarations can isolate a single carrier stream
 stall, but additional connections do not establish additional physical bandwidth. Paths with different delays can
 reorder packets and reduce inner TCP goodput below the best single-lane result. WireHop forwards received datagrams
-without waiting for packet ID order, and a higher-capacity lane can remain underused when the offered traffic keeps the
-preferred lane's queue short. Compare sustained goodput and latency in both directions, with both single and concurrent
-inner flows, before retaining extra lanes.
+without waiting for packet ID order. Capacity discovery adds bounded carrier traffic and does not guarantee aggregation
+or the lowest interactive latency. Compare sustained goodput and latency in both directions, with both single and
+concurrent inner flows, before retaining extra lanes.
 
 The client races carrier preparation and session admission across configured lanes, selects the first successful
 candidate, and cancels the others. Only the selected session carries WireGuard packets. The remaining lanes reconnect

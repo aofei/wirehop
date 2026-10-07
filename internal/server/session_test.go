@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/datagram"
+
 	"github.com/aofei/wirehop/internal/auth"
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/client"
@@ -387,7 +389,7 @@ func TestSessionCloseReleasesRetainedCapacity(t *testing.T) {
 	payload := make([]byte, 32)
 	payload[0] = 4
 	if err := session.ingressQueue.Push(packetqueue.Item[relay.Packet]{
-		Value: relay.Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 1000},
+		Value: relay.Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}, DeadlineMicros: 1000},
 		Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 	}); err != nil {
 		t.Fatal(err)

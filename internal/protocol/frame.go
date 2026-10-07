@@ -35,7 +35,7 @@ var (
 type FrameType uint8
 
 const (
-	// FrameData carries one WireGuard UDP datagram.
+	// FrameData carries one WireGuard UDP datagram or fixed capacity padding.
 	FrameData FrameType = iota + 1
 	// FramePing requests a lane timing response.
 	FramePing

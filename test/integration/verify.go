@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -161,7 +162,8 @@ func verifyThroughputRecovery(flow flowResult, bidirectional bool) error {
 // verifyCarrier detects unexpected reconnects in scenarios that should retain one admitted carrier.
 func verifyCarrier(directory, scenario string) error {
 	if strings.HasPrefix(scenario, "tcp-asymmetric-stall") {
-		return verifyParallelCarrierSockets(filepath.Join(directory, "client-tcp-sockets.txt"), true)
+		_, err := parallelCarrierSockets(filepath.Join(directory, "client-tcp-sockets.txt"), true)
+		return err
 	}
 	if strings.HasSuffix(scenario, "-stall") || strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam") {
 		return nil
@@ -208,14 +210,21 @@ func tcpActiveOpens(path string) (int, error) {
 // verifyParallelCarriers requires both configured lanes before and after a flow. Only capacity-change faults permit
 // reconnection during these parallel-lane checks.
 func verifyParallelCarriers(directory, scenario string) error {
-	for _, name := range []string{"client-tcp-sockets.txt", "client-tcp-sockets-after.txt"} {
-		splitPorts := scenario == "tcp-mixed" || scenario == "tcp-asymmetric"
-		if err := verifyParallelCarrierSockets(filepath.Join(directory, name), splitPorts); err != nil {
+	var sockets [2][]string
+	for index, name := range []string{"client-tcp-sockets.txt", "client-tcp-sockets-after.txt"} {
+		splitPorts := scenario == "tcp-mixed" || scenario == "tcp-asymmetric" ||
+			strings.HasPrefix(scenario, "tcp-multipath-distinct-")
+		var err error
+		sockets[index], err = parallelCarrierSockets(filepath.Join(directory, name), splitPorts)
+		if err != nil {
 			return err
 		}
 	}
 	if strings.HasPrefix(scenario, "tcp-multipath-capacity-change") {
 		return nil
+	}
+	if !slices.Equal(sockets[0], sockets[1]) {
+		return fmt.Errorf("carrier socket identities changed during the flow")
 	}
 	before, err := tcpActiveOpens(filepath.Join(directory, "client-before.txt"))
 	if err != nil {
@@ -231,13 +240,14 @@ func verifyParallelCarriers(directory, scenario string) error {
 	return nil
 }
 
-// verifyParallelCarrierSockets requires both configured lanes in one established-socket snapshot.
-func verifyParallelCarrierSockets(path string, splitPorts bool) error {
+// parallelCarrierSockets returns sorted endpoint pairs after validating both configured lanes in one snapshot.
+func parallelCarrierSockets(path string, splitPorts bool) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	primary, secondary := 0, 0
+	var sockets []string
 	for line := range strings.Lines(string(data)) {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
@@ -247,13 +257,17 @@ func verifyParallelCarrierSockets(path string, splitPorts bool) error {
 			primary++
 		} else if strings.HasSuffix(fields[3], ":51823") {
 			secondary++
+		} else {
+			continue
 		}
+		sockets = append(sockets, fields[2]+" "+fields[3])
 	}
-	if splitPorts && (primary != 1 || secondary != 1) || !splitPorts && primary != 2 {
-		return fmt.Errorf("%s has %d primary and %d secondary carriers, expected two configured lanes",
+	if splitPorts && (primary != 1 || secondary != 1) || !splitPorts && (primary != 2 || secondary != 0) {
+		return nil, fmt.Errorf("%s has %d primary and %d secondary carriers, expected two configured lanes",
 			filepath.Base(path), primary, secondary)
 	}
-	return nil
+	slices.Sort(sockets)
+	return sockets, nil
 }
 
 // verifyRouteExclusion confirms that the configured mark bypasses an otherwise capturing WireGuard route.

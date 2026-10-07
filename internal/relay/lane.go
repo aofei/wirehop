@@ -128,7 +128,7 @@ type Lane struct {
 	reportRTTMicros   atomic.Uint64
 	controlBatch      [maximumConsecutiveControlFrames]protocol.Frame
 	dataBatch         [maximumDataBatchFrames]protocol.Data
-	dataOwnership     [maximumDataBatchFrames]Packet
+	dataOwnership     [maximumDataBatchFrames]datagram.Packet
 	progress          deliveryProgress
 	pingMu            sync.Mutex
 	pendingPingID     uint64
@@ -544,7 +544,8 @@ func (l *Lane) writeReadyData(ctx context.Context) error {
 
 // writeDataBatch coalesces only data already available without introducing a batching delay.
 func (l *Lane) writeDataBatch(ctx context.Context) error {
-	count, err := l.store.takeBatch(l.dataBatch[:], l.dataOwnership[:], targetDataBatchBytes)
+	target := max(uint64(1024), l.store.writeBudget.Load())
+	count, err := l.store.takeBatch(l.dataBatch[:], l.dataOwnership[:], int(target))
 	if err != nil {
 		return err
 	}
@@ -692,26 +693,33 @@ func (l *Lane) readDataBatch(ctx context.Context, frames []protocol.Frame) error
 	var data [datagram.MaximumBatchSize]protocol.Data
 	var deadlines [datagram.MaximumBatchSize]uint64
 	var frameBytes uint64
-	for index, frame := range frames {
+	count := 0
+	for _, frame := range frames {
 		packet, err := protocol.ParseData(frame)
 		if err != nil {
 			return err
 		}
+		frameBytes += uint64(protocol.FrameSize(len(frame.Payload)))
+		if packet.PacketID == 0 {
+			continue
+		}
 		if !wgpacket.Classify(packet.Payload).Accepted() {
 			return ErrInvalidWireGuardPacket
 		}
-		data[index] = packet
-		deadlines[index] = packet.DeadlineMicros
-		frameBytes += uint64(protocol.FrameSize(len(frame.Payload)))
+		data[count] = packet
+		deadlines[count] = packet.DeadlineMicros
+		count++
 	}
-	if err := l.receiver.ValidateDeadlines(deadlines[:len(frames)]); err != nil {
-		return err
+	if count > 0 {
+		if err := l.receiver.ValidateDeadlines(deadlines[:count]); err != nil {
+			return err
+		}
 	}
 	if err := l.progress.addData(uint64(len(frames)), frameBytes); err != nil {
 		return err
 	}
 	l.recordReceive()
-	return l.receiver.deliverBatch(ctx, data[:len(frames)])
+	return l.receiver.deliverBatch(ctx, data[:count])
 }
 
 // readControl processes one non-data frame and updates clock-sync admission state.

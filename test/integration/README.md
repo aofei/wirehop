@@ -19,7 +19,7 @@ sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-results
 Use `GOARCH=amd64` for an x86-64 engine. Each run requires a fresh results directory. To reuse an equivalent tool image,
 set `WIREHOP_TEST_IMAGE`. It must provide `sh`, `ip`, `wg`, `tc`, `nstat`, `iperf3`, `openssl`, and `timeout`.
 
-The default matrix contains 62 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
+The default matrix contains 65 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
 1.2-second RTT, 0.5% loss with delay and jitter, four-second and twelve-second one-way outages, client address
 replacement, 32, 64, and 128 kbit/s carrier links, bidirectional TCP, an idle interval followed by a new burst, and
 140-second TCP flows spanning an actual kernel WireGuard rekey. Each scenario uses fresh endpoints. Ordinary cases run
@@ -38,6 +38,11 @@ The `tcp-multipath-slow32`, `tcp-multipath-slow64`, and `tcp-multipath-slow128` 
 32, 64, or 128 kbit/s endpoint-egress bottleneck. Both carriers must remain connected before and after the transfer,
 without additional carrier connection attempts during the flow. These cases check that provisional capacity estimates do
 not cause healthy low-rate generations to be repeatedly abandoned.
+
+The `tcp-multipath-distinct-slow32`, `tcp-multipath-distinct-slow64`, and `tcp-multipath-distinct-slow128` cases use
+distinct TCP destination ports behind those same shared low-rate bottlenecks. This enables capacity discovery and checks
+that its padding neither prevents completed useful transfers nor causes extra carrier connections. Both distinct
+carriers must remain connected before and after each flow.
 
 The `tcp-multipath-capacity-change` case starts both same-group lanes at unrestricted capacity, limits both endpoint
 links to 32 kbit/s five seconds into the flow, and restores capacity seven seconds later. Both endpoints must record
@@ -70,21 +75,21 @@ The verifier rejects incomplete transfers and zero-byte results. Ordinary single
 active-open count to detect unexpected reconnect attempts. Server passive-open counts can include discarded child
 sockets during concurrent handshake processing and are retained only as supporting evidence. Outage and address-change
 cases permit reconnection. Healthy parallel-lane cases permit concurrent admission attempts but require both configured
-carriers before and after the flow, with no additional carrier connection attempts during the flow. The asymmetric stall
-case requires both carriers before fault injection and permits recovery through a new connection. Rekey cases require a
-later kernel handshake while the same iperf3 TCP flow remains active. Results preserve iperf3 JSON, kernel counters,
-socket receive limits, handshake timestamps, software versions, and WireHop diagnostics. Compare goodput,
-retransmissions, and `UdpRcvbufErrors` across repeated runs on the same engine. Kernel counters are namespace totals, so
-`TcpOutRsts` alone cannot identify an outer carrier reset. The tests use MTU 1420 and fixed public test keys exclusively
-inside the isolated network.
+carrier endpoint pairs to remain identical before and after the flow, with no additional carrier connection attempts
+during the flow. The asymmetric stall case requires both carriers before fault injection and permits recovery through a
+new connection. Rekey cases require a later kernel handshake while the same iperf3 TCP flow remains active. Results
+preserve iperf3 JSON, kernel counters, socket receive limits, handshake timestamps, software versions, and WireHop
+diagnostics. Compare goodput, retransmissions, and `UdpRcvbufErrors` across repeated runs on the same engine. Kernel
+counters are namespace totals, so `TcpOutRsts` alone cannot identify an outer carrier reset. The tests use MTU 1420 and
+fixed public test keys exclusively inside the isolated network.
 
 These cases establish connectivity and recovery under the specified faults. Their endpoint-egress netem settings and
 short flows do not establish comparative WAN throughput or multipath capacity aggregation. For performance comparisons,
-apply impairments on an intermediate router or receiver ingress, verify that traffic traverses the configured queues,
-and run each candidate separately before testing the combined lanes. Keep workloads sequential on the same engine and
-record per-path traffic, retransmissions, and latency along with goodput. See the
-[netem limitations](https://man7.org/linux/man-pages/man8/tc-netem.8.html#LIMITATIONS) for the effect of TCP Small
-Queues on sender-side emulation.
+use [the routed performance harness](../performance/README.md), or apply impairments on an intermediate router or
+receiver ingress and verify traffic through the configured queues. Run each candidate separately before testing the
+combined lanes. Keep workloads sequential on the same engine and record per-path traffic, retransmissions, and latency
+along with goodput. See the [netem limitations](https://man7.org/linux/man-pages/man8/tc-netem.8.html#LIMITATIONS) for
+the effect of TCP Small Queues on sender-side emulation.
 
 An additional opt-in Go test exercises actual Linux `prohibit`, `blackhole`, and `unreachable` routes against both UDP
 endpoint implementations. It verifies delivery through the same endpoint before and after every fault. Batch tests
@@ -100,6 +105,6 @@ docker run --rm --network none --read-only --cap-add NET_ADMIN \
 ```
 
 The route test is skipped during ordinary `go test` runs. CI runs the socket recovery tests in isolation and selects
-twenty-three representative kernel flow cases, including directional multipath recovery, low-rate TCP/WSS and multipath,
+twenty-four representative kernel flow cases, including directional multipath recovery, low-rate TCP/WSS and multipath,
 shared-capacity changes with simultaneous bidirectional traffic, a twelve-second interruption, and address replacement.
 The complete matrix remains available through `run.sh` without case arguments.

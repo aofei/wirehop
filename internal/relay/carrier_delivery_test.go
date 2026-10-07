@@ -38,9 +38,9 @@ func TestLaneReadPreservesPayloadDuringCarrierTeardown(t *testing.T) {
 	for _, scheme := range []string{"TCP", "TLS", "WS", "WSS"} {
 		t.Run(scheme, func(t *testing.T) {
 			for _, tt := range []struct {
-				name  string
-				size  int
-				abort bool
+				name          string
+				size          int
+				abort, probes bool
 			}{
 				{name: "Ordinary", size: 1452},
 				{name: "BufferBoundary", size: 32 * 1024},
@@ -48,12 +48,20 @@ func TestLaneReadPreservesPayloadDuringCarrierTeardown(t *testing.T) {
 				{name: "AbortOrdinary", size: 1452, abort: true},
 				{name: "AbortBufferBoundary", size: 32 * 1024, abort: true},
 				{name: "AbortMaximumPacket", size: protocol.MaxPacketSize, abort: true},
+				{name: "ProbeOrdinary", size: 1452, probes: true},
+				{name: "ProbeBufferBoundary", size: 32 * 1024, probes: true},
+				{name: "ProbeMaximumPacket", size: protocol.MaxPacketSize, probes: true},
+				{name: "ProbeAbortOrdinary", size: 1452, abort: true, probes: true},
+				{name: "ProbeAbortBufferBoundary", size: 32 * 1024, abort: true, probes: true},
+				{name: "ProbeAbortMaximumPacket", size: protocol.MaxPacketSize, abort: true, probes: true},
 			} {
 				t.Run(tt.name, func(t *testing.T) {
 					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 					defer cancel()
 					var encoded []byte
 					var expected [][]byte
+					prefixBytes := []uint64{0}
+					prefixDatagrams := []int{0}
 					for index := range 3 {
 						size := 32
 						if index == 0 {
@@ -63,12 +71,23 @@ func TestLaneReadPreservesPayloadDuringCarrierTeardown(t *testing.T) {
 						copy(payload, []byte{4, 0, 0, 0})
 						expected = append(expected, payload)
 						var err error
+						if tt.probes {
+							padding := bytes.Repeat([]byte{4}, protocol.ProbePayloadSize)
+							encoded, err = protocol.AppendDataFrame(encoded, protocol.Data{Payload: padding})
+							if err != nil {
+								t.Fatal(err)
+							}
+							prefixBytes = append(prefixBytes, uint64(len(encoded)))
+							prefixDatagrams = append(prefixDatagrams, index)
+						}
 						encoded, err = protocol.AppendDataFrame(encoded, protocol.Data{
 							PacketID: 1_000_000_000 + uint64(index), DeadlineMicros: 1_000_000, Payload: payload,
 						})
 						if err != nil {
 							t.Fatal(err)
 						}
+						prefixBytes = append(prefixBytes, uint64(len(encoded)))
+						prefixDatagrams = append(prefixDatagrams, index+1)
 					}
 					encoded = append(encoded, 0, 0)
 					connection := deliveryTestCarrier(t, ctx, scheme, encoded)
@@ -111,7 +130,9 @@ func TestLaneReadPreservesPayloadDuringCarrierTeardown(t *testing.T) {
 						t.Fatal("lane read remained blocked after carrier teardown")
 					}
 					count := len(endpoint.writes)
-					if count == 0 || count > len(expected) || lane.progress.dataPackets != uint64(count) {
+					parsed := lane.progress.dataPackets
+					if count == 0 || count > len(expected) || parsed >= uint64(len(prefixDatagrams)) ||
+						prefixDatagrams[parsed] != count || prefixBytes[parsed] != lane.progress.dataBytes {
 						t.Fatalf("delivered %d packets with %d parsing acknowledgements", count, lane.progress.dataPackets)
 					}
 					for index := range count {

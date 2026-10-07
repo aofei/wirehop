@@ -53,7 +53,7 @@ func TestQueue(t *testing.T) {
 		t.Fatalf("empty queue accounting = %d packets, %d bytes", queue.Len(), queue.Bytes())
 	}
 	var empty Item[string]
-	if err := queue.TryPop(&empty); !errors.Is(err, ErrEmpty) {
+	if err := queue.TryPop(&empty, queue.Now()); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("TryPop() error = %v, want %v", err, ErrEmpty)
 	}
 }
@@ -82,7 +82,7 @@ func TestQueueAggregateBudget(t *testing.T) {
 		t.Fatalf("budget usage = %+v", got)
 	}
 	var item Item[int]
-	err = first.TryPop(&item)
+	err = first.TryPop(&item, first.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestQueueTransfersAggregateRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	var item Item[int]
-	err = first.TryPop(&item)
+	err = first.TryPop(&item, first.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,18 +184,18 @@ func TestTryPopPriority(t *testing.T) {
 	}
 	now = now.Add(2 * time.Millisecond)
 	var item Item[string]
-	err = queue.TryPopPriority(PriorityControl, &item)
+	err = queue.TryPopPriority(PriorityControl, &item, queue.Now())
 	if err != nil || item.Value != "control" {
 		t.Fatalf("TryPopPriority(Control) = %q, %v", item.Value, err)
 	}
-	if err := queue.TryPopPriority(PriorityControl, &item); !errors.Is(err, ErrEmpty) {
+	if err := queue.TryPopPriority(PriorityControl, &item, queue.Now()); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("empty control dequeue error = %v, want %v", err, ErrEmpty)
 	}
-	err = queue.TryPopPriority(PriorityNormal, &item)
+	err = queue.TryPopPriority(PriorityNormal, &item, queue.Now())
 	if err != nil || item.Value != "normal" {
 		t.Fatalf("TryPopPriority(Normal) = %q, %v", item.Value, err)
 	}
-	if err := queue.TryPopPriority(Priority(2), &item); !errors.Is(err, ErrInvalidItem) {
+	if err := queue.TryPopPriority(Priority(2), &item, queue.Now()); !errors.Is(err, ErrInvalidItem) {
 		t.Fatalf("invalid priority error = %v, want %v", err, ErrInvalidItem)
 	}
 }
@@ -250,7 +250,7 @@ func TestQueuePushBatch(t *testing.T) {
 		}
 		for _, want := range []int{1, 2} {
 			var item Item[int]
-			err := queue.TryPop(&item)
+			err := queue.TryPop(&item, queue.Now())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -275,7 +275,7 @@ func TestQueuePushBatch(t *testing.T) {
 			t.Fatalf("PushBatch() = %d, %v, want 1, %v", written, err, ErrInvalidItem)
 		}
 		var item Item[int]
-		err = queue.TryPop(&item)
+		err = queue.TryPop(&item, queue.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -377,7 +377,7 @@ func TestControlAdmissionEvictsNormalForAggregateCapacity(t *testing.T) {
 	}
 	for _, want := range []string{"control", "normal-3"} {
 		var item Item[string]
-		err := queue.TryPop(&item)
+		err := queue.TryPop(&item, queue.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -415,7 +415,7 @@ func TestQueueClose(t *testing.T) {
 		t.Fatalf("closed queue accounting = %d packets, %d bytes", queue.Len(), queue.Bytes())
 	}
 	var item Item[int]
-	if err := queue.TryPop(&item); !errors.Is(err, ErrClosed) {
+	if err := queue.TryPop(&item, queue.Now()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("TryPop() error = %v, want %v", err, ErrClosed)
 	}
 
@@ -435,7 +435,7 @@ func TestQueueClose(t *testing.T) {
 	if err := queue.Push(Item[int]{Size: 1, Priority: PriorityNormal, Deadline: time.Now().Add(time.Second)}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Push() error = %v", err)
 	}
-	if err := queue.TryPop(&item); !errors.Is(err, ErrClosed) {
+	if err := queue.TryPop(&item, queue.Now()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("TryPop() error = %v, want %v", err, ErrClosed)
 	}
 }
@@ -466,7 +466,7 @@ func TestQueueReleasesOwnedValues(t *testing.T) {
 		t.Fatalf("releases after preemption = %d, want 1", releases)
 	}
 	var item Item[ownedQueueValue]
-	err = queue.TryPop(&item)
+	err = queue.TryPop(&item, queue.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestQueueReclaimsUnorderedDeadlines(t *testing.T) {
 	now = start.Add(2 * time.Second)
 	push(4, start.Add(5*time.Second))
 	var item Item[ownedQueueValue]
-	if err := queue.TryPop(&item); err != nil {
+	if err := queue.TryPop(&item, queue.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if item.Value.releases != &releases[0] {
@@ -536,7 +536,7 @@ func TestQueueReclaimsUnorderedDeadlines(t *testing.T) {
 		t.Fatalf("retained usage = %+v", got)
 	}
 	for _, index := range []int{3, 4, 6} {
-		if err := queue.TryPop(&item); err != nil {
+		if err := queue.TryPop(&item, queue.Now()); err != nil {
 			t.Fatal(err)
 		}
 		if item.Value.releases != &releases[index] {
@@ -678,7 +678,7 @@ func TestQueueRetentionStateMachine(t *testing.T) {
 			}
 		case 1:
 			var item Item[int]
-			err := queue.TryPop(&item)
+			err := queue.TryPop(&item, queue.Now())
 			if err == nil {
 				held = append(held, item)
 			} else if !errors.Is(err, ErrEmpty) {
@@ -687,7 +687,7 @@ func TestQueueRetentionStateMachine(t *testing.T) {
 		case 2:
 			priority := Priority(next() % 2)
 			var item Item[int]
-			err := queue.TryPopPriority(priority, &item)
+			err := queue.TryPopPriority(priority, &item, queue.Now())
 			if err == nil {
 				held = append(held, item)
 			} else if !errors.Is(err, ErrEmpty) {

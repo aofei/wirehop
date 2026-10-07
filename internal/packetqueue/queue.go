@@ -393,16 +393,16 @@ func (q *Queue[T]) removeExpiredLocked(now time.Time) {
 	q.releaseLocked(removedPackets, removedBytes)
 }
 
-// NextDeadline returns a conservative wake-up deadline for queued expiry, or zero when the queue is empty. A consumed
-// item's deadline can remain until a due expiry scan recomputes its priority deque's bound.
-func (q *Queue[T]) NextDeadline() time.Time {
+// NextDeadline uses a fresh reading of [Queue.Now] to return a conservative queued-expiry deadline, or zero when empty.
+// A consumed item's deadline can remain until a due expiry scan recomputes its priority deque's bound.
+func (q *Queue[T]) NextDeadline(now time.Time) time.Time {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	deadline := q.nextDeadlineLocked()
 	if deadline.IsZero() {
 		return deadline
 	}
-	if now := q.now(); !now.Before(deadline) {
+	if !now.Before(deadline) {
 		q.removeExpiredLocked(now)
 		return q.nextDeadlineLocked()
 	}
@@ -470,8 +470,8 @@ func (q *Queue[T]) Pop(ctx context.Context) (Item[T], error) {
 	}
 }
 
-// TryPop transfers ownership of the next unexpired item into an unowned destination without blocking.
-func (q *Queue[T]) TryPop(destination *Item[T]) error {
+// TryPop uses a fresh reading of [Queue.Now] to transfer the next unexpired item without blocking.
+func (q *Queue[T]) TryPop(destination *Item[T], now time.Time) error {
 	*destination = Item[T]{}
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -481,7 +481,6 @@ func (q *Queue[T]) TryPop(destination *Item[T]) error {
 	if !q.popLocked(destination) {
 		return ErrEmpty
 	}
-	now := q.now()
 	for {
 		if now.Before(destination.Deadline) {
 			return nil
@@ -494,8 +493,8 @@ func (q *Queue[T]) TryPop(destination *Item[T]) error {
 }
 
 // TryPopPriority transfers the next unexpired item at priority into an unowned destination without considering other
-// priorities.
-func (q *Queue[T]) TryPopPriority(priority Priority, destination *Item[T]) error {
+// priorities. The caller supplies a fresh reading of [Queue.Now].
+func (q *Queue[T]) TryPopPriority(priority Priority, destination *Item[T], now time.Time) error {
 	*destination = Item[T]{}
 	if !priority.Valid() {
 		return ErrInvalidItem
@@ -508,7 +507,6 @@ func (q *Queue[T]) TryPopPriority(priority Priority, destination *Item[T]) error
 	if !q.popPriorityLocked(priority, destination) {
 		return ErrEmpty
 	}
-	now := q.now()
 	for {
 		if now.Before(destination.Deadline) {
 			return nil

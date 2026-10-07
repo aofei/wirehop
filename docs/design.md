@@ -12,7 +12,7 @@ WireHop combines WireGuard-aware packet handling with independently measured car
 
 - WebSocket or TLS TCP reachability when native UDP is unavailable or performs poorly
 - Concurrent lanes across different addresses, IP families, or carrier types
-- Independent connections to one carrier endpoint when a single TCP stream is insufficient
+- Independent connections to one carrier endpoint for measured selection and recovery
 - Continued forwarding and bounded recovery when one lane stalls or fails
 
 ## Design boundary
@@ -532,119 +532,82 @@ different fixed values require separate client sessions or direct forwarder proc
 
 ## Multipath scheduling
 
-The scheduler chooses a lane for each WireGuard packet. Path groups organize the candidates for each scheduling
-decision, while packet placement uses per-lane delivery predictions.
+The scheduler keeps one transport primary per session direction. It discovers capacity with bounded padding instead of
+relying on inner traffic to saturate every path. A healthy full primary waits for feedback rather than spilling unique
+transport packets onto another path with a different arrival time. Handshake and cookie packets retain their separate
+policy of at most two copies, preferring distinct path groups.
 
-The scheduling goal is to maximize useful goodput within packet deadlines while minimizing delivery time and unnecessary
-reordering. Maximum raw carrier throughput is not a reason to stripe packets when one lane can deliver them earlier.
+Each usable lane direction maintains its smoothed RTT, minimum RTT, delivery rate, feedback return delay, and queued and
+retained encoded bytes. Observations and preferred-lane state are direction-local. The shared session clock mapping does
+not merge their capacity estimates.
 
-Each usable lane direction maintains these scheduling estimates:
-
-- Smoothed round trip time and the generation's minimum observed round trip time
-- Estimated delivery rate
-- Unsent and total retained encoded bytes
-- Return-delay estimate from the carrier that most recently advanced validated cumulative delivery feedback
-
-The session clock mapping is shared by all lanes in that session. RTT, delivery rate, and retained backlog remain
-lane-local and direction-local. Preferred-lane state is also direction-local, so observations in one direction do not
-stand in for capacity in the reverse direction. A new lane refines path timing without creating a separate clock domain.
-
-The scheduler does not use unconditional round robin because that can create excessive reordering and continue sending
-packets into stalled lanes.
-
-For packet `p` and candidate lane `i`, the baseline prediction is:
+For a frame of size `F`, the deadline prediction is:
 
 ```text
-queued_time_i = (unsent_bytes_i + frame_size(p)) / estimated_delivery_rate_i
-retained_time_i = (retained_bytes_i + frame_size(p)) / estimated_delivery_rate_i
-feedback_delay_i = report_delay + feedback_carrier_minimum_rtt / 2
-
-predicted_arrival_i =
-  now + max(
-    smoothed_rtt_i / 2 + queued_time_i,
-    max(0, retained_time_i - feedback_delay_i)
-  )
+queued_time = (unsent_bytes + F) / delivery_rate
+retained_time = (retained_bytes + F) / delivery_rate
+feedback_delay = report_delay + feedback_carrier_minimum_rtt / 2
+predicted_delay = max(smoothed_rtt / 2 + queued_time, max(0, retained_time - feedback_delay))
 ```
 
-The scheduler assigns the packet to the eligible lane with the earliest predicted arrival that can meet the packet
-deadline. Successful admission transfers the complete frame into that generation's bounded transmission store. Retained
-bytes remain budgeted until validated delivery feedback releases them. Unsent bytes require both serialization and
-propagation. Sent-but-unreported bytes can include packets already parsed while their reports return, so treating every
-retained byte as additional unsent work can overstate delay and cause unnecessary lane changes.
+An initial or failed primary is selected by RTT and stable lane identity, including temporarily full paths. A measured
+alternative can replace a healthy primary when its delivery rate exceeds the primary estimate by more than 25 percent
+and it can meet the current packet deadline. A change from an existing primary holds that choice for at least two
+seconds and four estimated RTTs, capped at eight seconds. The first assignment does not delay a proven capacity
+improvement. This hold does not suppress failure recovery. A primary that cannot meet the deadline permits a timely
+alternative. If no eligible lane can meet the deadline, the packet is dropped. A full primary retains the pending
+ingress item until feedback, expiry, or a lifecycle transition permits another decision. WireGuard controls can still
+preempt that pending transport item. An initial empty 32-byte WireGuard keepalive uses predicted delivery without fixing
+the bulk-data primary or restarting idle capacity discovery.
 
-The feedback event records its incoming carrier identity and generation separately from the data generation named in the
-report. The return-delay correction combines the reported construction delay with that carrier's minimum observed RTT,
-keeping transient network congestion out of the deducted propagation estimate. If the incoming generation is no longer
-registered or has no RTT observation, the propagation correction is zero. The reported construction delay remains
-available. Valid cumulative progress still releases its reported data in either case. Duplicate and wholly stale reports
-preserve the correction, delivery-rate estimate, and progress timestamp. New generations start with no feedback-delay
-history and initialize their minimum RTT from usable admission timing when available.
+Each committed transmission records its send time, send-interval anchor, and the preceding cumulative delivered byte
+count and time. Valid feedback samples the bytes since that anchor over the longer corresponding send and feedback
+interval. New flights exclude idle time. Samples need at least 4 KiB and an interval no shorter than one millisecond.
+The data lane's Ping RTT does not bound a sample because feedback can return over another carrier. The interval includes
+the newly acknowledged transmission's actual feedback latency and is bounded by its corresponding send interval. The
+estimate uses the maximum of the last five valid samples to permit immediate startup growth while aging out old peaks.
+An increase replaces the estimate immediately. A decrease uses a seven-to-one moving average and requires queued work or
+at least half the hard packet limit or estimated byte window to be occupied before acknowledgment. The first valid
+sample replaces the provisional 1 MB/s estimate, including when it is lower. Duplicate, stale, and invalid reports do
+not alter the sampling anchors. Earlier receive timestamps release valid prefixes without moving the time anchor
+backwards.
 
-Deadline-risk assessment uses the complete retained prefix without deducting feedback delay. Packet expiry, cumulative
-report validation, aggregate retention accounting, and generation abandonment continue to govern retained ownership.
+A session with at least two healthy distinct path groups starts bounded discovery after carrier admission, before real
+transport placement. An active discovery period completes even if its path becomes primary, so selection cannot freeze
+an early capacity estimate. Later periods start only on alternatives. Discovery uses the reserved zero-ID Data form
+described below, so padding cannot reach UDP or alter relay deduplication. It shares the ordinary writer, transmission
+store, process retention budget, cumulative feedback, and rate estimator. No separate probe worker, acknowledgment, or
+packet ID sequence is needed.
 
-Timing requests validate idle carriers and their cross-lane report paths without padding traffic. Each committed data
-transmission records its send time, send-interval anchor, and preceding cumulative delivery count and time. Valid
-feedback samples the bytes delivered since the last acknowledged transmission's recorded delivery count. The sampling
-interval is the longer of the corresponding send and feedback intervals. Feedback arriving in a burst therefore cannot
-inflate capacity merely by shortening the interval between reports. Starting a new flight with no unreported data resets
-both time anchors, excluding idle time. Migrated packets receive fresh metadata when committed to a new generation.
+Each discovery period lasts four seconds or eight estimated RTTs, capped at eight seconds, and admits at most 2 MiB of
+encoded padding per lane direction. Unknown capacity retains at most one unreported 4101-byte sample frame within the 16
+KiB startup window. A measured path with less than half a probe frame per unloaded feedback cycle also keeps at most one
+unreported probe. The normal byte window still leaves useful-traffic headroom. Other measured paths use eight feedback
+cycles plus one real-data sampling allowance while no real packet is pending. Useful traffic is scheduled before
+padding. A pending packet restores the normal window and reserves its maximum encoded size and one packet slot before
+probe admission. A round-robin lane cursor prevents one training path from monopolizing discovery work. Another period
+is eligible 30 seconds after the preceding period ends, and only while real transport traffic has been scheduled within
+the last second. Single-path and same-group configurations send no padding. Padding deadlines do not themselves justify
+generation abandonment. Padding bytes still count in the carrier prefix preceding any useful datagram. Stalled
+probe-only progress can temporarily degrade a lane so it cannot block initial traffic on a healthy alternative. It does
+not abandon the generation, and validated progress restores eligibility.
 
-Delivery rate changes only for samples covering at least 4 KiB of real data over a positive interval. Duplicate, stale,
-and invalid reports do not change the sampling anchors. Valid cumulative progress with an earlier receive timestamp
-still releases its exact retained prefix, without producing a rate sample or moving the delivery-time anchor backwards.
-A sample above the current estimate can increase it immediately. A lower sample decreases the estimate only when its
-completing report arrives while unsent work exists or at least half of the lane's hard packet limit or current estimated
-byte window is occupied. Pressure is sampled before that report releases acknowledged data. A lower application-limited
-offered rate therefore cannot be mistaken for a reduction in path capacity, while sustained sender pressure can still
-detect a real capacity drop.
+The feedback event identifies its incoming carrier separately from the generation whose progress it reports. Return
+correction combines report-construction delay with the incoming carrier's minimum observed half RTT. Duplicate and
+wholly stale reports preserve that correction. Deadline-risk assessment always includes the full retained prefix.
+Existing progress guards, generation removal, one-time transport migration, and exact aggregate ownership still govern
+failure recovery. Padding never migrates.
 
-The half-RTT term approximates one-way delay, and application-limited traffic can preserve an outdated capacity estimate
-after a path slows. Directional asymmetry and stale estimates can therefore cause suboptimal packet placement even while
-all lanes remain healthy.
+Timing requests remain small liveness and clock-mapping messages. They do not estimate capacity. First timing requests
+are phase-spread across the first quarter of the active interval, and idle timing backs off to 15 seconds. Admission's
+four timestamps initialize RTT without an extra exchange. The first usable timing sample replaces 100 ms directly, and
+later RTT samples use a seven-to-one moving average.
 
-Each lane sends its first timing request within a stable phase spread over the first quarter of the active ping
-interval. Timing requests back off exponentially while no real data is written and return to the active interval when
-traffic resumes. The client initializes RTT from the admission's four timestamps when registering the generation. The
-server submits the same sample after validating its initial ClockSync frame. This subtracts server processing time and
-requires no additional exchange. Runtime timing observations, including the server's admission sample, are nonblocking
-and may be skipped when the scheduler event queue is full. A generation without applied timing starts at 100 ms, and its
-first valid RTT sample replaces that estimate directly. The first accepted capacity sample also replaces its startup
-estimate directly. Later RTT samples and accepted delivery-rate samples use a seven-to-one previous-to-new weighted
-average.
-
-Each session direction maintains one preferred lane. A healthy preferred lane in the best candidate's path group is kept
-while it has no unsent write backlog, has capacity, and can meet the deadline. Already committed but unreported work
-alone does not force same-path striping. Otherwise, the scheduler keeps that lane when it is healthy, can meet the
-current packet's deadline, and another lane's predicted advantage is no larger than the fixed 2 ms switching margin:
-
-```text
-switch_gain = preferred_predicted_arrival - best_predicted_arrival
-
-switch only when switch_gain > 2 ms
-```
-
-Equal predictions use a stable lane identifier as the tie-break. They never use randomness. This stickiness prevents
-measurement noise from causing repeated lane changes. Candidate selection uses one pass over usable lanes while
-preserving path-group ranking, preferred-lane hysteresis, and distinct-group control duplication.
-
-Under sparse transport-data traffic, the preferred lane may carry every packet because its retained backlog remains
-empty. This is expected and avoids needless reordering. Under sustained load, actual write backlog or a full estimated
-feedback window permits another eligible lane to predict an earlier arrival beyond the switching margin. Traffic then
-spills across lanes according to their observed RTT, real-data delivery rate, and outstanding work.
-
-This spillover does not guarantee capacity aggregation. Inner TCP congestion control can keep offered traffic below the
-level that would consistently favor a higher-delay lane, even when that lane has substantially more available bandwidth.
-Occasional lane changes can still introduce reordering and reduce inner TCP goodput. Since timing requests do not
-measure capacity, an underused lane may also retain its conservative startup delivery-rate estimate. Evaluate each lane
-alone as well as the combined configuration with the actual workload.
-
-WireHop cannot determine whether encrypted transport data contains bulk, interactive, or control traffic. Scheduling
-therefore uses observable packet timing, size, deadlines, and lane behavior rather than inferred inner payload
-semantics.
-
-Handshake and cookie packets use the duplication policy below. Transport data is not proactively duplicated during
-normal operation.
+This policy favors stable bulk throughput after capacity discovery. It does not guarantee capacity aggregation, optimal
+interactive latency, or fairness between independent kernel TCP connections. A capacity change can temporarily stale an
+estimate, and a primary change can still reorder in-flight packets. Different path groups can share a physical
+bottleneck. Measure each path separately and the combination using the actual workload in both directions. WireHop
+cannot infer inner flow semantics from encrypted WireGuard transport packets.
 
 ## Lane count policy
 
@@ -652,8 +615,8 @@ More lanes are not always better.
 
 Benefits of more lanes:
 
-- Avoid single stream head-of-line blocking
-- Avoid single connection rate limits
+- Continue around a stalled stream
+- Select a path with a higher measured delivery rate
 - Use multiple carrier paths
 - Use IPv4 and IPv6 when they behave differently
 - Improve failover speed
@@ -667,15 +630,10 @@ Costs of more lanes:
 - More bufferbloat risk
 - More proxy and NAT state
 
-For each packet, at most the two best healthy lanes with enough transmission-store capacity in one path group are
-eligible for WireGuard packet scheduling. The eligible pair can change as predictions, retained capacity, and health
-change. Other connected lanes remain liveness-monitored and may carry session control or delivery feedback. Lanes from
-different path groups compete using the same per-lane predictions.
-
-A healthy preferred lane without unsent backlog can remain selected even outside that pair. Otherwise, the pair is
-selected independently for each packet. Across successive decisions, more than two members can receive transport data
-and retain unreported work at the same time. The candidate limit does not cap a group's active TCP congestion windows or
-aggregate in-flight data at two connections.
+Transport uses one primary at a time. Initial selection uses RTT and stable lane identity. Deadline fallback retains
+deterministic delivery prediction and same-group preference. Measured capacity promotion can select any healthy timely
+lane. Other connected lanes remain available for controls, feedback, bounded capacity discovery, and failure recovery.
+Recovery considers every eligible lane rather than limiting the alternatives to the ordinary selection rank.
 
 Two configured lanes in one path group isolate TCP sequence spaces and permit progress around one stalled stream. They
 do not prove that the underlying path has additional bandwidth. Large numbers of parallel TCP connections are not a
@@ -743,6 +701,10 @@ transmission stores, so opening more sessions or lanes cannot multiply retained 
 charged at its payload size in ingress and at its complete encoded Data-frame size after lane assignment. Moving a
 packet between those states transfers and resizes the same reservation without an unaccounted gap.
 
+Scheduler maintenance retries a held ingress packet when another session releases shared retention through feedback,
+queued expiry, or generation drain. This does not require new ingress or local lane progress. A lane whose hard byte
+limit cannot fit a capacity probe can still forward ordinary frames that fit.
+
 Each packet carries an absolute deadline in the sender's process-relative monotonic clock. Runtime calculations use
 microseconds. The wire deadline rounds up to milliseconds, extending it by at most 999 microseconds. The sender computes
 it once at UDP ingress from the packet-class lifetime, rounded up to whole microseconds. Queueing and scheduling use the
@@ -773,12 +735,12 @@ Sustainable throughput is bounded by that packet and byte window divided by the 
 256 Data frames or 256 KiB, with an adaptive interval bounded by 25 milliseconds. Report workers use one-shot timers
 only while progress or a retry remains pending.
 
-The default hard limits are 65,536 packets and 32 MiB per lane direction. After the first accepted capacity sample, an
-estimated byte window bounds retention to two feedback cycles plus a 64 KiB write batch. A feedback cycle is the larger
-of the lane RTT and half that RTT plus the latest report return-delay estimate, with 25 milliseconds of reporting
-headroom. The estimated window has a 256 KiB floor and never exceeds the configured hard byte limit. Before capacity is
-observed, the configured hard limits permit startup sampling. The packet ceiling protects small-packet workloads, and
-the shared process budget bounds total retained memory. Deployments still need to measure their intended workload.
+The default hard limits are 65,536 packets and 32 MiB per lane direction. Startup retention is additionally bounded to
+16 KiB. Once capacity is observed, the byte window covers four feedback cycles plus 4 KiB, with a 4 KiB floor and the
+configured hard byte limit as its ceiling. A cycle is the larger of minimum RTT and half minimum RTT plus feedback
+return delay, with 25 milliseconds of reporting headroom. Minimum RTT prevents queue growth from increasing its own
+allowance. An empty store can admit one larger datagram when the hard limits permit it. The packet ceiling protects
+small-packet workloads, and the shared process budget also charges every padding transmission.
 
 An emptied transmission deque retains at most 512 metadata slots. This accommodates one 256-packet report batch plus
 in-flight progress without repeated allocation and copying under steady traffic. Larger historical capacities still
@@ -908,10 +870,11 @@ TCP cannot remove one stale application frame after its bytes have entered the s
 the stream, the only way to discard all bytes trapped behind that loss is to close the carrier connection.
 
 WireHop first requires cumulative parsing progress to stall for a path-aware guard. The guard is the greater of 250
-milliseconds or two estimated feedback cycles plus two delivery report intervals and serialization of the first
-unreported frame. A feedback cycle is the greater of the lane RTT or half its RTT plus the observed report return delay.
-Including serialization protects healthy low-rate carriers. Sent-but-unreported packets may already be at their
-destination, so their age alone cannot establish a stall. A valid advancing report immediately restores scheduling.
+milliseconds or the longer of two estimated feedback cycles and serialization of a 16 KiB startup flight, plus two
+delivery report intervals and serialization of the first unreported frame. A feedback cycle is the greater of the lane
+RTT or half its RTT plus the observed report return delay. Including the flight time protects healthy low-rate carriers
+even when their first unreported frame is small. Sent-but-unreported packets may already be at their destination, so
+their age alone cannot establish a stall. A valid advancing report immediately restores scheduling.
 
 Once progress stalls, a lane becomes `degraded` when retained work is at deadline risk or a useful recovery alternative
 exists. Prediction follows the sent FIFO, queued WireGuard control packets, and queued WireGuard transport packets in
@@ -922,16 +885,18 @@ The progress guard starts no earlier than the first outstanding carrier write. F
 the outstanding interval. Time spent idle or holding only queued work cannot make the next fresh burst appear stalled.
 
 WireHop abandons a stalled generation when an eligible alternative predicts delivery before both the earliest future
-retained deadline and a recovery estimate. The recovery estimate is the greater of the source's progress guard and its
-observed time without progress. The alternative must not itself have stalled outstanding progress. Its prediction uses a
-frame of the same encoded size as the earliest future-deadline retained frame. Recovery checks every healthy lane with
-capacity. Stalled higher-ranked members cannot exclude a healthy third or fourth lane in the same path group. Expired
-sent entries retain their accounting and no longer block recovery of later useful entries.
+unmigrated transport deadline and a recovery estimate. The recovery estimate is the greater of the source's progress
+guard and its observed time without progress. The alternative must not itself have stalled outstanding progress. Its
+prediction uses a frame of the same encoded size as the earliest future-deadline unmigrated transport frame. Recovery
+checks every healthy lane with capacity. Stalled higher-ranked members cannot exclude a healthy third or fourth lane in
+the same path group. Expired sent entries retain their accounting and no longer block recovery of later useful entries.
 
-At least the source or alternative must have a measured delivery rate before this prediction can justify abandonment.
-Two initial rate estimates do not establish that either path can deliver faster. This avoids reconnect churn when
-several newly admitted lanes share a low-rate bottleneck. Capacity observation does not gate initial forwarding or
-generation removal after an actual carrier failure.
+Both the source and alternative must have measured delivery rates before this prediction can justify abandonment. A
+provisional rate does not establish that either path can deliver faster. A padding-only estimate can divert new work but
+cannot justify closing the old generation. Before proactive abandonment, an eligible alternative must cumulatively
+confirm at least 4 KiB of actual transport payload. Controls and padding do not count. This bounded counter saturates at
+4 KiB and introduces no wire field. This avoids reconnect churn when several newly admitted lanes share a low-rate
+bottleneck. Capacity observation does not gate initial forwarding or generation removal after an actual carrier failure.
 
 This decision does not depend on the stalled lane's previous capacity estimate predicting imminent expiry. Otherwise,
 deadline risk and a slower alternative's salvage window may never overlap. Abandonment permits future traffic and
@@ -1354,7 +1319,8 @@ Fast-path behavior:
 - Schedule each WireGuard datagram independently
 - Allow one socket write or WebSocket message to contain several already-scheduled complete WireHop frames
 - Coalesce only frames already available to the writer, with no batching timer
-- Bound one data batch to 16 frames and a target of 64 KiB before the final admitted frame
+- Bound one data batch to 16 frames and 25 milliseconds of estimated capacity, clamped to 1 to 64 KiB before the final
+  admitted frame. Startup uses the 1 KiB target, and a single larger frame remains indivisible
 - Keep application queues and unconfirmed retention bounded independently from kernel socket buffers
 - Use an abortive TCP close for an abandoned generation so unacknowledged stale bytes are discarded
 - Bound each WebSocket binary message to two maximum encoded frames, or 131,114 bytes, on receipt
@@ -1648,9 +1614,12 @@ while session scope requires both fields to be zero. After lane admission, a lan
 carrying lane and its current generation. The `clock_skew` code is valid only in an admission rejection and is invalid
 in an in-session Error frame.
 
-The Data parser requires two complete canonical integers. Packet IDs and absolute deadlines must be nonzero. In-session
-validation additionally requires a recognized WireGuard packet, whose shortest valid form is a 32-byte transport-data
-packet.
+The Data codec requires two complete canonical integers. Ordinary datagrams require nonzero packet IDs and absolute
+deadlines. The relay additionally requires a recognized WireGuard packet of at least 32 bytes. ID zero is reserved for a
+capacity probe. It requires a zero deadline and exactly 4096 padding bytes. Padding contents are opaque and discarded.
+This form occupies 4101 encoded bytes, counts in cumulative Data-frame feedback and byte thresholds, and never enters
+UDP, deduplication, or transport migration. Every other zero-ID form is a protocol violation. Protocol version remains
+1.
 
 The WireHop protocol accepts at most 65,535 bytes of UDP payload for one datagram. UDP ingress reserves one additional
 receive-buffer byte and drops any larger datagram, so an unsupported IPv6 UDP jumbogram cannot be truncated into an
@@ -1731,8 +1700,8 @@ system suspend. WireHop does not provide a native Android or iOS lifecycle integ
 Each direction reports the lane identifier, connection generation, cumulative number of parsed Data frames, latest
 parsed Ping ID, and report-construction delay. Counts start at zero for each generation and never wrap. A parsed Ping
 requests immediate feedback, including over an alternate lane, so the same small timing request tests both carrier
-liveness and the cross-lane feedback path. No padding frame or independent probe worker is needed. Ping traffic does not
-estimate capacity.
+liveness and the cross-lane feedback path. Capacity padding uses the same Data counter and retained FIFO. Ping traffic
+does not estimate capacity.
 
 The receiver still accumulates exact encoded Data bytes internally for its 256 KiB trigger. It reports after 256 newly
 parsed Data frames or 256 KiB. The first change after idle is eager. Sustained smaller changes wait at most the shorter
@@ -1742,9 +1711,10 @@ completes. The delay field measures time from the newest parse in that snapshot 
 lane's writer. It includes report timer and control queue delay, but excludes the following carrier write and network
 propagation.
 
-A consecutive received Data batch is fully validated before its packet and encoded-byte totals enter the progress
-accumulator under one lock. Feedback can observe the previous prefix or the complete validated batch. Counter overflow
-rejects the complete batch without changing progress or submitting packets to UDP. This adds no batch collection wait.
+A consecutive received Data batch, including any capacity probes, is fully validated before its packet and encoded-byte
+totals enter the progress accumulator under one lock. Feedback can observe the previous prefix or the complete validated
+batch. Counter overflow rejects the complete batch without changing progress or submitting packets to UDP. This adds no
+batch collection wait.
 
 A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
 risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Reports

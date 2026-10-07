@@ -238,11 +238,14 @@ type TransmissionStore struct {
 	reportedBytes   uint64
 	firstSentMicros uint64
 	deliveredMicros uint64
-	backlogPackets  atomic.Int64
-	backlogBytes    atomic.Uint64
-	notify          chan struct{}
-	done            chan struct{}
-	closed          bool
+	// transportReported saturates at minimumRateSampleBytes and excludes capacity padding.
+	transportReported atomic.Uint64
+	writeBudget       atomic.Uint64
+	backlogPackets    atomic.Int64
+	backlogBytes      atomic.Uint64
+	notify            chan struct{}
+	done              chan struct{}
+	closed            bool
 }
 
 // NewTransmissionStore returns an empty bounded store using the process wall clock for deadline decisions.
@@ -287,9 +290,14 @@ func (s *TransmissionStore) push(transmission retainedTransmission) error {
 // pushAt retains one transmission when all limits and invariants permit it at now.
 func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.Time) error {
 	size, err := protocol.DataFrameSize(transmission.data())
-	if err != nil || !transmission.packet.Kind.Accepted() ||
-		wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind ||
-		transmission.deadline.IsZero() || transmission.migrated && transmission.packet.Kind != wgpacket.TransportData {
+	if err != nil || transmission.deadline.IsZero() || transmission.migrated && transmission.packet.Kind != wgpacket.TransportData {
+		return ErrInvalidTransmission
+	}
+	if transmission.packetID == 0 {
+		if transmission.packet.Kind != wgpacket.NonWireGuard {
+			return ErrInvalidTransmission
+		}
+	} else if !transmission.packet.Kind.Accepted() || wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind {
 		return ErrInvalidTransmission
 	}
 	transmission.size = size
@@ -335,7 +343,7 @@ func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.T
 }
 
 // takeBatch moves an available write-order batch into the sent prefix and retains its packet buffers for the caller.
-func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []Packet, targetBytes int) (int, error) {
+func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []datagram.Packet, targetBytes int) (int, error) {
 	if len(destination) == 0 || len(ownership) < len(destination) || targetBytes <= 0 {
 		return 0, ErrInvalidTransmissionStore
 	}
@@ -377,7 +385,7 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []P
 		s.sentPackets++
 		s.sentBytes += uint64(transmission.size)
 		destination[count] = transmission.data()
-		ownership[count] = newPacket(transmission.packet.Retain(), transmission.wireDeadline)
+		ownership[count] = transmission.packet.Retain()
 		count++
 		bytes += transmission.size
 	}
@@ -428,9 +436,17 @@ func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (delivery
 	acknowledged := s.sent.items[s.sent.head : s.sent.head+int(deltaPackets)]
 	delivery := acknowledged[len(acknowledged)-1].delivery
 	var releasedBytes uint64
+	var transportBytes uint64
+	needTransportProof := s.transportReported.Load() < minimumRateSampleBytes
 	for index := range acknowledged {
 		releasedBytes += uint64(acknowledged[index].size)
+		if needTransportProof && acknowledged[index].packet.Kind == wgpacket.TransportData {
+			transportBytes += uint64(len(acknowledged[index].packet.Payload))
+		}
 		acknowledged[index].releasePacket()
+	}
+	if needTransportProof {
+		s.transportReported.Store(min(minimumRateSampleBytes, s.transportReported.Load()+transportBytes))
 	}
 	bytes := s.reportedBytes + releasedBytes
 	var sample deliverySample
@@ -475,6 +491,22 @@ func (s *TransmissionStore) deliveryConstrained(windowBytes uint64) bool {
 	return queued || s.packets >= halfPackets || uint64(s.bytes) >= halfBytes
 }
 
+// hasProbe reports whether the queued or sent prefix already contains capacity padding.
+func (s *TransmissionStore) hasProbe() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	found := false
+	visit := func(transmission retainedTransmission) bool {
+		found = transmission.packetID == 0
+		return !found
+	}
+	s.sent.each(visit)
+	if !found {
+		s.normal.each(visit)
+	}
+	return found
+}
+
 // canAccept reports whether current retained work leaves capacity for one encoded frame.
 func (s *TransmissionStore) canAccept(frameBytes uint64) bool {
 	packets, bytes := s.backlog()
@@ -509,10 +541,15 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 		return deadlineAssessment{}
 	}
 	s.removeExpiredQueuedLocked(now)
-	assessment := deadlineAssessment{retained: s.packets > 0}
+	var assessment deadlineAssessment
 	prefixBytes := uint64(0)
 	visit := func(transmission retainedTransmission) bool {
-		if now.Before(transmission.deadline) &&
+		prefixBytes += uint64(transmission.size)
+		if transmission.packetID == 0 {
+			return true
+		}
+		assessment.retained = true
+		if transmission.packet.Kind == wgpacket.TransportData && !transmission.migrated && now.Before(transmission.deadline) &&
 			(assessment.usefulDeadline.IsZero() || transmission.deadline.Before(assessment.usefulDeadline)) {
 			assessment.usefulDeadline = transmission.deadline
 			assessment.usefulBytes = uint64(transmission.size)
@@ -520,7 +557,6 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 		if assessment.atRisk {
 			return true
 		}
-		prefixBytes += uint64(transmission.size)
 		remaining := transmission.deadline.Sub(now)
 		if remaining <= 0 || delay(prefixBytes) >= uint64(remaining/time.Microsecond) {
 			assessment.atRisk = true

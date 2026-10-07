@@ -49,28 +49,24 @@ func (p DeadlinePolicy) Lifetime(kind wgpacket.Kind) time.Duration {
 
 // Packet is one ingress-owned WireGuard packet awaiting session scheduling.
 type Packet struct {
-	Kind           wgpacket.Kind
-	Payload        []byte
+	datagram.Packet
 	DeadlineMicros uint64
-	datagram       datagram.Packet
 }
 
 // newPacket transfers ownership of packet into relay scheduling metadata.
 func newPacket(packet datagram.Packet, deadlineMicros uint64) Packet {
-	return Packet{
-		Kind: packet.Kind, Payload: packet.Payload, DeadlineMicros: deadlineMicros, datagram: packet,
-	}
+	return Packet{Packet: packet, DeadlineMicros: deadlineMicros}
 }
 
 // Retain returns another ownership reference to p.
 func (p Packet) Retain() Packet {
-	p.datagram = p.datagram.Retain()
+	p.Packet = p.Packet.Retain()
 	return p
 }
 
 // Release relinquishes p's owned datagram reference and clears p.
 func (p *Packet) Release() {
-	p.datagram.Release()
+	p.Packet.Release()
 	*p = Packet{}
 }
 

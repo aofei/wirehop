@@ -15,6 +15,7 @@ if [ "$#" -eq 0 ]; then
     tcp-rekey forward-rekey forward-prohibit forward-blackhole tcp-prohibit tcp-blackhole \
     native-udp forward-udp tcp-udp wss-udp tcp-ipv6 wss-ipv6 forward-ipv6 tcp-inner-ipv6 tcp-fwmark forward-fwmark tcp-mixed \
     tcp-slow32 tcp-slow64 tcp-slow128 tcp-multipath-slow32 tcp-multipath-slow64 tcp-multipath-slow128 \
+    tcp-multipath-distinct-slow32 tcp-multipath-distinct-slow64 tcp-multipath-distinct-slow128 \
     tcp-multipath-capacity-change tcp-multipath-capacity-change-reverse tcp-multipath-capacity-change-bidir tcp-outage tcp-roam \
     tls-slow32 tls-slow64 tls-slow128 tls-outage tls-roam \
     ws-slow32 ws-slow64 ws-slow128 ws-outage ws-roam \
@@ -49,6 +50,7 @@ for scenario in "$@"; do
     forward-prohibit|forward-blackhole|tcp-prohibit|tcp-blackhole|native-udp|forward-udp|tcp-udp|wss-udp|\
     tcp-ipv6|wss-ipv6|forward-ipv6|tcp-inner-ipv6|tcp-fwmark|forward-fwmark|tcp-mixed|\
     tcp-slow32|tcp-slow64|tcp-slow128|tcp-multipath-slow32|tcp-multipath-slow64|tcp-multipath-slow128|\
+    tcp-multipath-distinct-slow32|tcp-multipath-distinct-slow64|tcp-multipath-distinct-slow128|\
     tcp-multipath-capacity-change|tcp-multipath-capacity-change-reverse|tcp-multipath-capacity-change-bidir|tcp-outage|tcp-roam|\
     tls-slow32|tls-slow64|tls-slow128|tls-outage|tls-roam|\
     ws-slow32|ws-slow64|ws-slow128|ws-outage|ws-roam|\

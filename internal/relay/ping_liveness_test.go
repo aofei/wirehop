@@ -12,11 +12,7 @@ import (
 )
 
 func TestLaneDelayedPongWithReceiveProgress(t *testing.T) {
-	for _, frameType := range []protocol.FrameType{protocol.FrameData, protocol.FramePing} {
-		name := "Data"
-		if frameType == protocol.FramePing {
-			name = "Ping"
-		}
+	for _, name := range []string{"Data", "Ping", "Probe"} {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				carrier := newTestCarrier()
@@ -41,13 +37,16 @@ func TestLaneDelayedPongWithReceiveProgress(t *testing.T) {
 					synctest.Sleep(time.Second)
 					var frame protocol.Frame
 					var err error
-					if frameType == protocol.FrameData {
+					switch name {
+					case "Data":
 						frame, err = protocol.MarshalData(protocol.Data{
 							PacketID: uint64(index + 1), DeadlineMicros: 1000000,
 							Payload: relayWireGuardPacket(wgpacket.TransportData),
 						})
-					} else {
+					case "Ping":
 						frame, err = protocol.MarshalTimingPing(protocol.TimingPing{ID: uint64(index + 1), SendMicros: 1000})
+					case "Probe":
+						frame, err = protocol.MarshalData(protocol.Data{Payload: probePadding[:]})
 					}
 					if err != nil {
 						t.Fatal(err)

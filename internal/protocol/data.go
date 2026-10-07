@@ -15,6 +15,8 @@ const (
 	DeadlineResolutionMicros = uint64(1000)
 	// MaxPacketSize is the largest UDP datagram carried by WireHop.
 	MaxPacketSize = 65_535
+	// ProbePayloadSize is the fixed padding size used by capacity probes.
+	ProbePayloadSize = 4096
 	// MaxPacketLifetimeMicros is the absolute wire-protocol packet lifetime limit.
 	MaxPacketLifetimeMicros = uint64(5 * time.Minute / time.Microsecond)
 )
@@ -24,7 +26,7 @@ var (
 	ErrInvalidDataFrame = errors.New("invalid data frame")
 )
 
-// Data is one WireGuard datagram and its cross-lane delivery metadata.
+// Data is one WireGuard datagram and its cross-lane delivery metadata, or a capacity probe with a zero ID and deadline.
 type Data struct {
 	PacketID uint64
 	// DeadlineMicros uses the runtime clock precision and rounds up to milliseconds on the wire.
@@ -76,7 +78,13 @@ func AppendDataFrame(destination []byte, data Data) ([]byte, error) {
 
 // validateData verifies all data-frame metadata and packet bounds.
 func validateData(data Data) error {
-	if data.PacketID == 0 || data.DeadlineMicros == 0 ||
+	if data.PacketID == 0 {
+		if data.DeadlineMicros != 0 || len(data.Payload) != ProbePayloadSize {
+			return ErrInvalidDataFrame
+		}
+		return nil
+	}
+	if data.DeadlineMicros == 0 ||
 		data.DeadlineMicros > math.MaxUint64-math.MaxUint64%DeadlineResolutionMicros || len(data.Payload) > MaxPacketSize {
 		return ErrInvalidDataFrame
 	}
@@ -119,5 +127,5 @@ func ParseData(frame Frame) (Data, error) {
 
 // deadlineMillis rounds a validated runtime deadline up without unsigned overflow.
 func deadlineMillis(micros uint64) uint64 {
-	return (micros-1)/DeadlineResolutionMicros + 1
+	return micros/DeadlineResolutionMicros + min(micros%DeadlineResolutionMicros, 1)
 }

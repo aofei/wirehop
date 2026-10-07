@@ -112,7 +112,13 @@ type scheduledLane struct {
 	deliveryRate        uint64
 	lastDataPackets     uint64
 	lastPingID          uint64
+	rateHistory         [5]uint64
+	rateHistoryCount    int
+	rateHistoryNext     int
 	rateObserved        bool
+	probeUntil          time.Time
+	nextProbeAt         time.Time
+	probeBytes          uint64
 	lastProgressAt      time.Time
 	rttObserved         bool
 	degraded            bool
@@ -142,10 +148,13 @@ func scoredLaneBetter(left, right scoredLane) bool {
 
 // Scheduler assigns session packets to dynamically registered lanes.
 type Scheduler struct {
-	ingress      *packetqueue.Queue[Packet]
-	events       chan schedulerEvent
-	controlOrder []scoredLane
-	packetID     uint64
+	ingress            *packetqueue.Queue[Packet]
+	events             chan schedulerEvent
+	controlOrder       []scoredLane
+	packetID           uint64
+	transportHoldUntil time.Time
+	lastTransportAt    time.Time
+	lastProbeLane      protocol.LaneID
 }
 
 // NewScheduler validates resources and returns an empty multipath scheduler.
@@ -325,6 +334,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		}
 	}()
 	for {
+		now := s.ingress.Now()
 		progressed := false
 		if !hasPending {
 			if hasPreempted {
@@ -334,7 +344,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 				hasPreempted = false
 				progressed = true
 			} else if len(lanes) > 0 {
-				err := s.ingress.TryPop(&pending)
+				err := s.ingress.TryPop(&pending, now)
 				switch {
 				case err == nil:
 					hasPending = true
@@ -348,7 +358,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 			}
 		}
 		if hasPending && pending.Priority == packetqueue.PriorityNormal {
-			err := s.ingress.TryPopPriority(packetqueue.PriorityControl, &controlCandidate)
+			err := s.ingress.TryPopPriority(packetqueue.PriorityControl, &controlCandidate, now)
 			switch {
 			case err == nil:
 				preempted = pending
@@ -365,7 +375,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		}
 		if hasPending {
 			if len(lanes) > 0 {
-				scheduled, err := s.schedule(lanes, &preferred, &pending)
+				scheduled, err := s.schedule(lanes, &preferred, &pending, now)
 				if err != nil {
 					return err
 				}
@@ -374,13 +384,18 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 					hasPending = false
 					progressed = true
 				}
-			} else if !s.ingress.Now().Before(pending.Deadline) {
+			} else if !now.Before(pending.Deadline) {
 				pending.Release()
 				pending = packetqueue.Item[Packet]{}
 				hasPending = false
 				progressed = true
 			}
 		}
+		reserveBytes := uint64(0)
+		if hasPending {
+			reserveBytes = uint64(len(pending.Value.Payload) + protocol.MaxEncodedFrameSize - protocol.MaxPacketSize)
+		}
+		progressed = s.fillTransportProbe(lanes, preferred, now, reserveBytes) || progressed
 		needsCheck := hasPending || hasPreempted
 		if !needsCheck {
 			for _, lane := range lanes {
@@ -400,13 +415,13 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 				check = nil
 			}
 		}
-		if next := s.ingress.NextDeadline(); !next.Equal(expiryAt) {
+		if next := s.ingress.NextDeadline(now); !next.Equal(expiryAt) {
 			expiryAt = next
 			if next.IsZero() {
 				expiry.Stop()
 				expiryReady = nil
 			} else {
-				expiry.Reset(max(0, next.Sub(s.ingress.Now())))
+				expiry.Reset(max(0, next.Sub(now)))
 				expiryReady = expiry.C
 			}
 		}
@@ -459,6 +474,9 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		}
 		lanes[event.registration.LaneID] = replacement
 		if current != nil {
+			if *preferred == event.registration.LaneID {
+				*preferred = 0
+			}
 			current.registration.Abandon()
 			s.migrateTransmissions(lanes, current)
 		}
@@ -565,12 +583,11 @@ func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane
 
 // schedule assigns one PacketID to one or two eligible lanes.
 func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred *protocol.LaneID,
-	item *packetqueue.Item[Packet]) (bool, error) {
+	item *packetqueue.Item[Packet], now time.Time) (bool, error) {
 	if err := item.Value.Validate(); err != nil {
 		item.Release()
 		return true, nil
 	}
-	now := s.ingress.Now()
 	remaining := item.Deadline.Sub(now)
 	if remaining <= 0 {
 		item.Release()
@@ -589,7 +606,16 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 		return true, nil
 	}
 	frameBytes := uint64(size)
-	candidates := selectCandidates(lanes, *preferred, item.Value.Kind.Control(), frameBytes, deadlineMicros)
+	control := item.Value.Kind.Control()
+	initialKeepalive := !control && preferred.IsZero() && len(item.Value.Payload) == wgpacket.TransportKeepaliveLength
+	var candidates laneCandidates
+	if control {
+		candidates = selectControlCandidates(lanes, frameBytes, deadlineMicros)
+	} else if initialKeepalive {
+		candidates = selectCandidates(lanes, 0, frameBytes, deadlineMicros)
+	} else {
+		candidates = s.selectTransportCandidates(lanes, *preferred, frameBytes, deadlineMicros, now)
+	}
 	if candidates.count == 0 {
 		if candidates.available {
 			item.Release()
@@ -599,13 +625,13 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 	scheduled := false
 	for _, lane := range candidates.lanes[:candidates.count] {
 		if lane.enqueue(item, packetID, now) {
-			scheduled = true
-			if !item.Value.Kind.Control() {
-				s.packetID = packetID
+			if !control && !initialKeepalive {
+				s.recordTransportAssignment(lanes, *preferred, lane, now)
 				*preferred = lane.registration.LaneID
-				item.Release()
-				return true, nil
 			}
+			scheduled = true
+		} else if !control {
+			return false, nil
 		}
 	}
 	if scheduled {
@@ -615,12 +641,9 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 	return scheduled, nil
 }
 
-// selectCandidates returns lanes ordered for one transport packet or duplicated control packet.
+// selectCandidates returns lanes ordered by predicted transport delivery.
 func selectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferred protocol.LaneID,
-	control bool, frameBytes, maximumScore uint64) laneCandidates {
-	if control {
-		return selectControlCandidates(lanes, frameBytes, maximumScore)
-	}
+	frameBytes, maximumScore uint64) laneCandidates {
 	var preferredCandidate scoredLane
 	var preferredQueuedBytes uint64
 	if lane := lanes[preferred]; lane != nil && !lane.degraded && !lane.abandoning &&
@@ -720,12 +743,10 @@ func (l *scheduledLane) canAccept(frameBytes uint64) bool {
 	if !l.registration.Store.canAccept(frameBytes) {
 		return false
 	}
-	if !l.rateObserved {
-		return true
-	}
+
 	_, bytes := l.registration.Store.backlog()
 	window := l.deliveryWindowBytes()
-	return frameBytes <= window && bytes <= window-frameBytes
+	return bytes == 0 || frameBytes <= window && bytes <= window-frameBytes
 }
 
 // score returns predicted delivery delay in microseconds.
@@ -770,8 +791,6 @@ func (l *scheduledLane) retentionDelay(bytes uint64) uint64 {
 // enqueue retains one newly identified packet after successful store admission.
 func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64, now time.Time) bool {
 	packet := item.Value.Retain()
-	packet.datagram.Kind = packet.Kind
-	packet.datagram.Payload = packet.Payload
 	data := protocol.Data{
 		PacketID: packetID, DeadlineMicros: packet.DeadlineMicros, Payload: packet.Payload,
 	}
@@ -787,7 +806,7 @@ func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64,
 	}
 	transmission := retainedTransmission{
 		packetID: packetID, wireDeadline: packet.DeadlineMicros, deadline: item.Deadline,
-		budget: budget, packet: packet.datagram,
+		budget: budget, packet: packet.Packet,
 	}
 	if l.registration.Store.pushAt(transmission, now) == nil {
 		return true
@@ -819,16 +838,22 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	if dataDirection == 0 && pingDirection == 0 {
 		return false, nil
 	}
-	windowBytes := uint64(l.registration.Store.limits.Bytes)
-	if l.rateObserved {
-		windowBytes = l.deliveryWindowBytes()
-	}
+	windowBytes := l.deliveryWindowBytes()
 	deliveryConstrained := l.registration.Store.deliveryConstrained(windowBytes)
 	sample, stale, err := l.registration.Store.acknowledge(report.DataPackets, receiveMicros)
 	if err != nil || stale {
 		return false, err
 	}
 	l.updateDeliveryRate(sample, deliveryConstrained)
+	quantum := uint64(1024)
+	if l.rateObserved {
+		quantum = targetDataBatchBytes
+		interval := uint64(defaultReportInterval / time.Microsecond)
+		if l.deliveryRate <= math.MaxUint64/interval {
+			quantum = max(uint64(1024), min(quantum, l.deliveryRate*interval/1_000_000))
+		}
+	}
+	l.registration.Store.writeBudget.Store(quantum)
 	l.lastDataPackets = report.DataPackets
 	l.lastPingID = report.PingID
 	l.lastProgressAt = receiveTime
@@ -836,13 +861,24 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	return true, nil
 }
 
-// updateDeliveryRate uses a send-bounded sample without reducing capacity from an application-limited sample.
+// updateDeliveryRate uses a send-bounded sample without reducing capacity from an application-limited sample. Reports
+// can return over another carrier, so the data lane's Ping RTT cannot bound their sampling interval.
 func (l *scheduledLane) updateDeliveryRate(sample deliverySample, deliveryConstrained bool) {
-	if sample.bytes < minimumRateSampleBytes || sample.intervalMicros == 0 || sample.bytes > math.MaxUint64/1_000_000 {
+	if sample.bytes < minimumRateSampleBytes || sample.intervalMicros < uint64(time.Millisecond/time.Microsecond) ||
+		sample.bytes > math.MaxUint64/1_000_000 {
 		return
 	}
 	rate := sample.bytes * 1_000_000 / sample.intervalMicros
-	if rate == 0 || rate <= l.deliveryRate && !deliveryConstrained {
+	if rate == 0 {
+		return
+	}
+	l.rateHistory[l.rateHistoryNext] = rate
+	l.rateHistoryNext = (l.rateHistoryNext + 1) % len(l.rateHistory)
+	l.rateHistoryCount = min(l.rateHistoryCount+1, len(l.rateHistory))
+	for _, previous := range l.rateHistory[:l.rateHistoryCount] {
+		rate = max(rate, previous)
+	}
+	if l.rateObserved && rate <= l.deliveryRate && !deliveryConstrained {
 		return
 	}
 	if !l.rateObserved {
@@ -850,7 +886,11 @@ func (l *scheduledLane) updateDeliveryRate(sample deliverySample, deliveryConstr
 		l.rateObserved = true
 		return
 	}
-	l.deliveryRate = weightedAverage7(l.deliveryRate, rate)
+	if rate > l.deliveryRate {
+		l.deliveryRate = rate
+	} else {
+		l.deliveryRate = weightedAverage7(l.deliveryRate, rate)
+	}
 }
 
 // applyTiming updates a bounded RTT exponential moving average.
@@ -894,7 +934,7 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 		}
 		assessment := lane.registration.Store.assessDeadlines(now, lane.retentionDelay)
 		if !assessment.retained {
-			lane.degraded = false
+			lane.degraded = true
 			continue
 		}
 		// Stalled progress makes the previous capacity prediction optimistic. A healthy alternative that can
@@ -906,10 +946,13 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 			progressSince = unreportedSince
 		}
 		recoveryMicros = max(recoveryMicros, uint64(now.Sub(progressSince)/time.Microsecond))
-		alternative := remaining > 0 && hasTimelyAlternative(lanes, lane, now, assessment.usefulBytes,
-			min(uint64(remaining/time.Microsecond), recoveryMicros))
+		var alternative, proven bool
+		if remaining > 0 {
+			alternative, proven = hasTimelyAlternative(lanes, lane, now, assessment.usefulBytes,
+				min(uint64(remaining/time.Microsecond), recoveryMicros))
+		}
 		lane.degraded = assessment.atRisk || alternative
-		if alternative {
+		if proven {
 			lane.abandoning = true
 			s.announceAbandonment(lanes, lane)
 			lane.registration.Abandon()
@@ -934,8 +977,8 @@ func laneProgressStalled(lane *scheduledLane, now, unreportedSince time.Time, fi
 	return now.Sub(progressSince) >= threshold
 }
 
-// progressGuardMicros allows two feedback cycles and serialization of the first unreported frame. The byte term keeps
-// a healthy low-rate carrier from looking stalled before it can deliver even one frame.
+// progressGuardMicros allows the longer of two feedback cycles or a startup flight, plus the first frame's serialization.
+// The flight allowance keeps low-rate carriers from looking stalled between small-frame reports.
 func progressGuardMicros(lane *scheduledLane, firstBytes uint64) uint64 {
 	if lane.rttMicros > math.MaxUint64/2 || lane.deliveryRate == 0 || firstBytes > math.MaxUint64/1_000_000 {
 		return math.MaxUint64
@@ -944,25 +987,29 @@ func progressGuardMicros(lane *scheduledLane, firstBytes uint64) uint64 {
 	if cycle > math.MaxUint64/2 {
 		return math.MaxUint64
 	}
-	guard := saturatingAdd(cycle*2, uint64(progressStallReportMargin/time.Microsecond))
+	guard := max(cycle*2, initialDeliveryWindow*1_000_000/lane.deliveryRate)
+	guard = saturatingAdd(guard, uint64(progressStallReportMargin/time.Microsecond))
 	guard = saturatingAdd(guard, firstBytes*1_000_000/lane.deliveryRate)
 	return max(uint64(minimumProgressStall/time.Microsecond), guard)
 }
 
-// hasTimelyAlternative reports whether another healthy generation can carry equivalent work before the recovery cutoff.
-// At least one rate must be measured before initial estimates can justify abandonment. Stalled group members cannot
+// hasTimelyAlternative reports timely alternatives and whether one has delivered enough real transport to prove recovery.
+// Both rates must be measured before a capacity comparison can justify abandonment. Stalled group members cannot
 // disqualify a usable lower-ranked lane.
 func hasTimelyAlternative(lanes map[protocol.LaneID]*scheduledLane, current *scheduledLane, now time.Time,
-	frameBytes, remainingMicros uint64) bool {
+	frameBytes, remainingMicros uint64) (available, proven bool) {
 	for _, candidate := range lanes {
-		if candidate == current || !current.rateObserved && !candidate.rateObserved {
+		if candidate == current || !current.rateObserved || !candidate.rateObserved {
 			continue
 		}
 		if _, eligible := recoveryCandidate(candidate, now, frameBytes, remainingMicros); eligible {
-			return true
+			available = true
+			if candidate.registration.Store.transportReported.Load() >= minimumRateSampleBytes {
+				return true, true
+			}
 		}
 	}
-	return false
+	return available, false
 }
 
 // recoveryCandidate scores a live recovery lane after reclaiming queued expiry and checking current parsing progress.
@@ -1050,20 +1097,4 @@ func saturatingAdd(left, right uint64) uint64 {
 		return math.MaxUint64
 	}
 	return left + right
-}
-
-// deliveryWindowBytes bounds reported in-flight work by two estimated feedback cycles and one ready write batch.
-func (l *scheduledLane) deliveryWindowBytes() uint64 {
-	maximum := uint64(l.registration.Store.limits.Bytes)
-	cycle := max(l.rttMicros, saturatingAdd(l.rttMicros/2, l.feedbackDelayMicros))
-	cycle = saturatingAdd(cycle, uint64(defaultReportInterval/time.Microsecond))
-	if cycle > math.MaxUint64/2 {
-		return maximum
-	}
-	interval := cycle * 2
-	if l.deliveryRate > math.MaxUint64/interval {
-		return maximum
-	}
-	bytes := l.deliveryRate * interval / 1_000_000
-	return min(maximum, max(uint64(reportByteThreshold), saturatingAdd(bytes, targetDataBatchBytes)))
 }

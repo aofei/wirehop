@@ -69,7 +69,7 @@ func TestInspect(t *testing.T) {
 		{name: "Initiation", typeID: 1, length: handshakeInitiationLength, sender: 11},
 		{name: "Response", typeID: 2, length: handshakeResponseLength, sender: 12, receiver: 11},
 		{name: "Cookie", typeID: 3, length: cookieReplyLength, receiver: 11},
-		{name: "Transport", typeID: 4, length: transportDataMinimumLength, receiver: 12},
+		{name: "Transport", typeID: 4, length: TransportKeepaliveLength, receiver: 12},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			packet := make([]byte, tt.length)
@@ -120,7 +120,7 @@ func FuzzClassify(f *testing.F) {
 		{1, 0, 0, 0},
 		append([]byte{1, 1, 2, 3}, make([]byte, handshakeInitiationLength-4)...),
 		make([]byte, handshakeInitiationLength),
-		make([]byte, transportDataMinimumLength),
+		make([]byte, TransportKeepaliveLength),
 	} {
 		f.Add(packet)
 	}

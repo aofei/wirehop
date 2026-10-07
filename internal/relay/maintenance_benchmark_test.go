@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
@@ -39,7 +40,7 @@ func BenchmarkSaturatedIngress(b *testing.B) {
 			payload := make([]byte, 1452)
 			payload[0] = 4
 			item := packetqueue.Item[Packet]{
-				Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 1_000_000},
+				Value: Packet{DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 				Size:  1452, Deadline: now.Add(time.Second),
 			}
 			for range packets {
@@ -70,7 +71,7 @@ func BenchmarkIngressExpiryReclaim(b *testing.B) {
 	payload := make([]byte, 1452)
 	payload[0] = 4
 	live := packetqueue.Item[Packet]{
-		Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 1_000_000},
+		Value: Packet{DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 		Size:  1452, Deadline: now.Add(time.Hour),
 	}
 	for range packets - 1 {
@@ -90,7 +91,7 @@ func BenchmarkIngressExpiryReclaim(b *testing.B) {
 		if err := queue.Push(live); err != nil {
 			b.Fatal(err)
 		}
-		if err := queue.TryPop(&popped); err != nil {
+		if err := queue.TryPop(&popped, queue.Now()); err != nil {
 			b.Fatal(err)
 		}
 		popped.Release()
@@ -126,7 +127,7 @@ func BenchmarkSchedulerMaintenance(b *testing.B) {
 						}
 					}
 					var data [1]protocol.Data
-					var ownership [1]Packet
+					var ownership [1]datagram.Packet
 					count, err := store.takeBatch(data[:], ownership[:], 4096)
 					releaseBatchOwnership(ownership[:count])
 					if err != nil || count != 1 {

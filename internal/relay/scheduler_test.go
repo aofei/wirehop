@@ -29,11 +29,11 @@ func TestSelectCandidates(t *testing.T) {
 		otherGroup.registration.LaneID: otherGroup,
 	}
 
-	transport := selectCandidates(lanes, sameGroup.registration.LaneID, false, 1500, math.MaxUint64)
+	transport := selectCandidates(lanes, sameGroup.registration.LaneID, 1500, math.MaxUint64)
 	if transport.count != 1 || transport.lanes[0] != sameGroup {
 		t.Fatalf("transport candidates = %v, want preferred lane", transport)
 	}
-	control := selectCandidates(lanes, protocol.LaneID(0), true, 1500, math.MaxUint64)
+	control := selectControlCandidates(lanes, 1500, math.MaxUint64)
 	if control.count != 2 || control.lanes[0] != first || control.lanes[1] != otherGroup {
 		t.Fatalf("control candidates = %v, want fastest lane and a distinct path group", control)
 	}
@@ -46,10 +46,10 @@ func TestSelectCandidatesUsesSerializationAndCapacity(t *testing.T) {
 		slow.registration.LaneID: slow,
 		fast.registration.LaneID: fast,
 	}
-	if got := selectCandidates(lanes, protocol.LaneID(0), false, 0, math.MaxUint64); got.lanes[0] != slow {
+	if got := selectCandidates(lanes, protocol.LaneID(0), 0, math.MaxUint64); got.lanes[0] != slow {
 		t.Fatal("zero-byte scheduling ignored the lower RTT lane")
 	}
-	if got := selectCandidates(lanes, protocol.LaneID(0), false, 1500, math.MaxUint64); got.lanes[0] != fast {
+	if got := selectCandidates(lanes, protocol.LaneID(0), 1500, math.MaxUint64); got.lanes[0] != fast {
 		t.Fatal("large-frame scheduling ignored serialization delay")
 	}
 
@@ -103,7 +103,7 @@ func TestSelectCandidatesSeparatesQueuedAndUnreportedData(t *testing.T) {
 			if test.sent {
 				want = lowDelay
 			}
-			got := selectCandidates(lanes, lowDelay.registration.LaneID, false, 1500, math.MaxUint64)
+			got := selectCandidates(lanes, lowDelay.registration.LaneID, 1500, math.MaxUint64)
 			if got.count != 1 || got.lanes[0] != want {
 				t.Fatalf("candidates = %v, want lane %v", got, want.registration.LaneID)
 			}
@@ -118,11 +118,11 @@ func TestSelectCandidatesAppliesDeadlineBeforePreference(t *testing.T) {
 		fast.registration.LaneID:      fast,
 		preferred.registration.LaneID: preferred,
 	}
-	got := selectCandidates(lanes, preferred.registration.LaneID, false, 0, 1_000)
+	got := selectCandidates(lanes, preferred.registration.LaneID, 0, 1_000)
 	if got.count != 1 || got.lanes[0] != fast {
 		t.Fatalf("candidates = %v, want timely fastest lane", got)
 	}
-	late := selectCandidates(lanes, protocol.LaneID(0), false, 0, 400)
+	late := selectCandidates(lanes, protocol.LaneID(0), 0, 400)
 	if late.count != 0 || !late.available {
 		t.Fatalf("late candidates = %v, want available but predicted-late lanes", late)
 	}
@@ -154,7 +154,10 @@ func TestSelectCandidatesGroupRankAndCutoff(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			for range 100 {
-				got := selectCandidates(lanes, test.preferred, test.control, 0, test.cutoff)
+				got := selectCandidates(lanes, test.preferred, 0, test.cutoff)
+				if test.control {
+					got = selectControlCandidates(lanes, 0, test.cutoff)
+				}
 				if !got.available || got.count != test.count || got.lanes != test.want {
 					t.Fatalf("candidates = %+v, want count %d and lanes %v", got, test.count, test.want)
 				}
@@ -204,7 +207,10 @@ func TestSelectCandidatesMatchesReference(t *testing.T) {
 			maximumScore = math.MaxUint64
 		}
 		for _, control := range []bool{false, true} {
-			got := selectCandidates(lanes, preferred, control, frameBytes, maximumScore)
+			got := selectCandidates(lanes, preferred, frameBytes, maximumScore)
+			if control {
+				got = selectControlCandidates(lanes, frameBytes, maximumScore)
+			}
 			want := referenceSelectCandidates(lanes, preferred, control, frameBytes, maximumScore)
 			if got != want {
 				t.Fatalf("iteration %d selectCandidates() = %v, want %v", iteration, got, want)
@@ -239,14 +245,14 @@ func TestSelectCandidatesExhaustiveGroupScores(t *testing.T) {
 		}
 		for _, cutoff := range [...]uint64{0, 2000, 2001, math.MaxUint64} {
 			for _, preferred := range [...]protocol.LaneID{0, 1, 2, 3, 4} {
-				got := selectCandidates(lanes, preferred, false, 0, cutoff)
+				got := selectCandidates(lanes, preferred, 0, cutoff)
 				want := referenceSelectCandidates(lanes, preferred, false, 0, cutoff)
 				if got != want {
 					t.Fatalf("state %d, cutoff %d, preferred %v: candidates = %v, want %v",
 						state, cutoff, preferred, got, want)
 				}
 			}
-			got := selectCandidates(lanes, protocol.LaneID(0), true, 0, cutoff)
+			got := selectControlCandidates(lanes, 0, cutoff)
 			want := referenceSelectCandidates(lanes, protocol.LaneID(0), true, 0, cutoff)
 			if got != want {
 				t.Fatalf("state %d, cutoff %d: control candidates = %v, want %v", state, cutoff, got, want)
@@ -271,14 +277,14 @@ func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	if err := ingress.Push(packetqueue.Item[Packet]{
 		Value: Packet{
-			Kind: wgpacket.HandshakeInitiation, Payload: payload, DeadlineMicros: 1_000_000,
+			DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.HandshakeInitiation, Payload: payload},
 		},
 		Size: len(payload), Priority: packetqueue.PriorityControl, Deadline: deadline,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	var item packetqueue.Item[Packet]
-	err = ingress.TryPop(&item)
+	err = ingress.TryPop(&item, ingress.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +316,7 @@ func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	var preferred protocol.LaneID
-	scheduled, err := scheduler.schedule(lanes, &preferred, &item)
+	scheduled, err := scheduler.schedule(lanes, &preferred, &item, scheduler.ingress.Now())
 	if err != nil || !scheduled {
 		t.Fatalf("schedule() = %t, %v", scheduled, err)
 	}
@@ -422,39 +428,37 @@ func referenceLaneEligible(lanes map[protocol.LaneID]*scheduledLane, lane *sched
 	return true
 }
 
-func TestSchedulerSpillsSustainedTrafficAcrossLanes(t *testing.T) {
+func TestSchedulerWaitsForPrimaryProgress(t *testing.T) {
 	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 1, Bytes: 2048})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer ingress.Close()
 	scheduler, err := NewScheduler(ingress)
 	if err != nil {
 		t.Fatal(err)
 	}
-	limits := packetqueue.Limits{Packets: 64, Bytes: 128 * 1024}
-	first := schedulerLaneWithLimits(t, 1, 1, 10_000, 1_000_000, limits)
-	second := schedulerLaneWithLimits(t, 2, 1, 10_000, 1_000_000, limits)
-	lanes := map[protocol.LaneID]*scheduledLane{
-		first.registration.LaneID: first, second.registration.LaneID: second,
-	}
-	payload := make([]byte, 1400)
-	copy(payload, relayWireGuardPacket(wgpacket.TransportData))
-	deadline := time.Now().Add(time.Second)
+	first := schedulerLaneWithLimits(t, 1, 1, 10_000, 1_000_000, packetqueue.Limits{Packets: 1, Bytes: 2048})
+	second := schedulerLane(t, 2, 2, 100_000, 1_000_000)
+	lanes := map[protocol.LaneID]*scheduledLane{1: first, 2: second}
+	defer func() { releaseTransmissions(first.registration.Store.drain()) }()
+	defer func() { releaseTransmissions(second.registration.Store.drain()) }()
+	payload := append(relayWireGuardPacket(wgpacket.TransportData), make([]byte, 16)...)
+	item := packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}, 1_000_000), Size: len(payload), Deadline: time.Now().Add(time.Second)}
 	var preferred protocol.LaneID
-	for range 32 {
-		item := packetqueue.Item[Packet]{
-			Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 1_000_000},
-			Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: deadline,
-		}
-		scheduled, err := scheduler.schedule(lanes, &preferred, &item)
-		if err != nil || !scheduled {
-			t.Fatalf("schedule() = %t, %v", scheduled, err)
-		}
+	if ok, err := scheduler.schedule(lanes, &preferred, &item, ingress.Now()); err != nil || !ok {
+		t.Fatalf("initial schedule = %t, %v", ok, err)
 	}
-	firstPackets, _ := first.registration.Store.backlog()
-	secondPackets, _ := second.registration.Store.backlog()
-	if firstPackets < 8 || secondPackets < 8 || firstPackets+secondPackets != 32 {
-		t.Fatalf("sustained distribution = %d and %d packets, want both lanes used", firstPackets, secondPackets)
+	item.Value = newPacket(datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}, 1_000_000)
+	if ok, err := scheduler.schedule(lanes, &preferred, &item, ingress.Now()); err != nil || ok {
+		t.Fatalf("full primary schedule = %t, %v", ok, err)
+	}
+	if packets, _ := second.registration.Store.backlog(); packets != 0 {
+		t.Fatal("unique data spilled onto the alternate")
+	}
+	first.degraded = true
+	if ok, err := scheduler.schedule(lanes, &preferred, &item, ingress.Now()); err != nil || !ok || preferred != 2 {
+		t.Fatalf("failover = %t, %v, lane %d", ok, err, preferred)
 	}
 }
 
@@ -477,7 +481,7 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 		payload[4] = byte(index + 1)
 		if err := ingress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: uint64(10_000 + index),
+				DeadlineMicros: uint64(10_000 + index), Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload},
 			},
 			Size: len(payload), Priority: packetqueue.PriorityNormal, Deadline: deadline,
 		}); err != nil {
@@ -492,7 +496,7 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 	}
 
 	var received [2]protocol.Data
-	var ownership [2]Packet
+	var ownership [2]datagram.Packet
 	count := 0
 	for count < len(received) {
 		select {
@@ -552,7 +556,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		transportPayload[4] = 1
 		if err := ingress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				Kind: wgpacket.TransportData, Payload: transportPayload, DeadlineMicros: 10_000,
+				DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: transportPayload},
 			},
 			Size: len(transportPayload), Priority: packetqueue.PriorityNormal, Deadline: deadline,
 		}); err != nil {
@@ -565,7 +569,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		controlPayload := relayWireGuardPacket(wgpacket.HandshakeInitiation)
 		if err := ingress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				Kind: wgpacket.HandshakeInitiation, Payload: controlPayload, DeadlineMicros: 10_000,
+				DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.HandshakeInitiation, Payload: controlPayload},
 			},
 			Size: len(controlPayload), Priority: packetqueue.PriorityControl, Deadline: deadline,
 		}); err != nil {
@@ -606,6 +610,7 @@ func TestSchedulerRestoresHeldPackets(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer ingress.Close()
 		scheduler, err := NewScheduler(ingress)
 		if err != nil {
 			t.Fatal(err)
@@ -623,17 +628,17 @@ func TestSchedulerRestoresHeldPackets(t *testing.T) {
 			t.Fatal(err)
 		}
 		deadline := time.Now().Add(time.Second)
-		for _, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation} {
+		for index, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation, wgpacket.HandshakeInitiation} {
 			payload := relayWireGuardPacket(kind)
 			if err := ingress.Push(packetqueue.Item[Packet]{
-				Value: Packet{Kind: kind, Payload: payload, DeadlineMicros: 10_000},
+				Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: kind, Payload: payload}},
 				Size:  len(payload), Priority: packetPriority(kind.Control()), Deadline: deadline,
 			}); err != nil {
 				t.Fatal(err)
 			}
 			synctest.Wait()
-			if ingress.Len() != 0 {
-				t.Fatal("scheduler did not take the held packet")
+			if ingress.Len() != max(0, index-1) {
+				t.Fatal("scheduler overwrote held work or did not take the first control")
 			}
 		}
 
@@ -641,21 +646,29 @@ func TestSchedulerRestoresHeldPackets(t *testing.T) {
 		if err := <-result; !errors.Is(err, context.Canceled) {
 			t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
 		}
-		if ingress.Len() != 2 {
-			t.Fatalf("restored ingress length = %d, want 2", ingress.Len())
+		if ingress.Len() != 3 {
+			t.Fatalf("restored ingress length = %d, want 3", ingress.Len())
 		}
 		var first packetqueue.Item[Packet]
-		err = ingress.TryPop(&first)
+		err = ingress.TryPop(&first, ingress.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
 		var second packetqueue.Item[Packet]
-		err = ingress.TryPop(&second)
+		err = ingress.TryPop(&second, ingress.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if first.Value.Kind != wgpacket.HandshakeInitiation || second.Value.Kind != wgpacket.TransportData {
-			t.Fatalf("restored order = %s then %s", first.Value.Kind, second.Value.Kind)
+		var third packetqueue.Item[Packet]
+		if err := ingress.TryPop(&third, ingress.Now()); err != nil {
+			t.Fatal(err)
+		}
+		defer first.Release()
+		defer second.Release()
+		defer third.Release()
+		if first.Value.Kind != wgpacket.HandshakeInitiation || second.Value.Kind != wgpacket.HandshakeInitiation ||
+			third.Value.Kind != wgpacket.TransportData {
+			t.Fatalf("restored order = %s, %s, %s", first.Value.Kind, second.Value.Kind, third.Value.Kind)
 		}
 	})
 }
@@ -678,18 +691,19 @@ func TestSchedulerCommitsPacketIDAfterAdmission(t *testing.T) {
 	lanes := map[protocol.LaneID]*scheduledLane{full.registration.LaneID: full}
 	payload := relayWireGuardPacket(wgpacket.TransportData)
 	item := packetqueue.Item[Packet]{
-		Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 10_000},
+		Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 		Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 	}
 	var preferred protocol.LaneID
-	scheduled, err := scheduler.schedule(lanes, &preferred, &item)
+	scheduled, err := scheduler.schedule(lanes, &preferred, &item, scheduler.ingress.Now())
 	if err != nil || scheduled || scheduler.packetID != 0 {
 		t.Fatalf("full schedule = %t, %v, PacketID %d", scheduled, err, scheduler.packetID)
 	}
 
 	available := schedulerLane(t, 2, 2, 1, 1_000_000)
 	lanes[available.registration.LaneID] = available
-	scheduled, err = scheduler.schedule(lanes, &preferred, &item)
+	full.degraded = true
+	scheduled, err = scheduler.schedule(lanes, &preferred, &item, scheduler.ingress.Now())
 	if err != nil || !scheduled || scheduler.packetID != 1 {
 		t.Fatalf("available schedule = %t, %v, PacketID %d", scheduled, err, scheduler.packetID)
 	}
@@ -733,7 +747,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var batch [2]protocol.Data
-	var ownership [2]Packet
+	var ownership [2]datagram.Packet
 	count, err := store.takeBatch(batch[:], ownership[:], 4096)
 	if err != nil || count != 2 {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
@@ -1199,18 +1213,20 @@ func TestScheduledLaneDeliveryRateRejectsApplicationLimitedDecrease(t *testing.T
 	for _, tt := range []struct {
 		name                string
 		dataBytes           uint64
+		observed            bool
 		deliveryConstrained bool
 		want                uint64
 	}{
-		{name: "ApplicationLimitedDecrease", dataBytes: 5000, want: 1_000_000},
-		{name: "ConstrainedDecrease", dataBytes: 5000, deliveryConstrained: true, want: 500_000},
-		{name: "ApplicationLimitedIncrease", dataBytes: 20_000, want: 2_000_000},
+		{name: "ApplicationLimitedDecrease", observed: true, dataBytes: 15_000, want: 1_000_000},
+		{name: "ConstrainedDecrease", observed: true, dataBytes: 15_000, deliveryConstrained: true, want: 937_500},
+		{name: "InitialEstimate", dataBytes: 15_000, want: 500_000},
+		{name: "ApplicationLimitedIncrease", observed: true, dataBytes: 60_000, want: 2_000_000},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			lane := &scheduledLane{
-				deliveryRate: 1_000_000,
+				deliveryRate: 1_000_000, rateObserved: tt.observed,
 			}
-			lane.updateDeliveryRate(deliverySample{bytes: tt.dataBytes, intervalMicros: 10_000}, tt.deliveryConstrained)
+			lane.updateDeliveryRate(deliverySample{bytes: tt.dataBytes, intervalMicros: 30_000}, tt.deliveryConstrained)
 			if lane.deliveryRate != tt.want {
 				t.Fatalf("delivery rate = %d, want %d", lane.deliveryRate, tt.want)
 			}
@@ -1227,7 +1243,7 @@ func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T
 	now := time.UnixMicro(1000)
 	lane.registration.Store.now = func() time.Time { return now }
 	var batch [transmissionCount]protocol.Data
-	var ownership [transmissionCount]Packet
+	var ownership [transmissionCount]datagram.Packet
 	var dataBytes uint64
 	for packetID := uint64(1); packetID <= transmissionCount; packetID++ {
 		transmission := schedulerTransmission(packetID, wgpacket.TransportData, now.Add(time.Second))
@@ -1245,7 +1261,7 @@ func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T
 		LaneID: lane.registration.LaneID, Generation: lane.registration.Generation,
 		DataPackets: transmissionCount,
 	}
-	if _, err := lane.applyReport(report, 11_000, time.Unix(1, 0)); err != nil {
+	if _, err := lane.applyReport(report, 31_000, time.Unix(1, 0)); err != nil {
 		t.Fatal(err)
 	}
 	if lane.deliveryRate >= 1_000_000 {
@@ -1270,11 +1286,11 @@ func TestSchedulerPacketIDExhaustion(t *testing.T) {
 	lanes := map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane}
 	payload := relayWireGuardPacket(wgpacket.TransportData)
 	item := packetqueue.Item[Packet]{
-		Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 10_000},
+		Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 		Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 	}
 	var preferred protocol.LaneID
-	if _, err := scheduler.schedule(lanes, &preferred, &item); !errors.Is(err, ErrCounterExhausted) {
+	if _, err := scheduler.schedule(lanes, &preferred, &item, scheduler.ingress.Now()); !errors.Is(err, ErrCounterExhausted) {
 		t.Fatalf("schedule() error = %v, want %v", err, ErrCounterExhausted)
 	}
 }
@@ -1298,7 +1314,7 @@ func TestSchedulerPendingPacketRetainsAggregateCapacity(t *testing.T) {
 		}
 		payload := relayWireGuardPacket(wgpacket.TransportData)
 		if err := ingress.Push(packetqueue.Item[Packet]{
-			Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 10_000},
+			Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 			Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 		}); err != nil {
 			t.Fatal(err)
@@ -1367,13 +1383,13 @@ func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {
 			}
 			payload := relayWireGuardPacket(wgpacket.TransportData)
 			if err := ingress.Push(packetqueue.Item[Packet]{
-				Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: 10_000},
+				Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 				Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 			}); err != nil {
 				t.Fatal(err)
 			}
 			var item packetqueue.Item[Packet]
-			err = ingress.TryPop(&item)
+			err = ingress.TryPop(&item, ingress.Now())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1431,7 +1447,7 @@ func TestSchedulerMigratesTransportOnce(t *testing.T) {
 	scheduler.migrateTransmissions(lanes, source)
 
 	var migrated [2]protocol.Data
-	var ownership [2]Packet
+	var ownership [2]datagram.Packet
 	count, err := destination.registration.Store.takeBatch(migrated[:], ownership[:], 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -1518,7 +1534,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				t.Fatal(err)
 			}
 			var sourceData, destinationData [1]protocol.Data
-			var sourceOwnership, destinationOwnership [1]Packet
+			var sourceOwnership, destinationOwnership [1]datagram.Packet
 			defer sourceOwnership[0].Release()
 			defer destinationOwnership[0].Release()
 			if test.sourceWrite {
@@ -1531,7 +1547,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 			}
 			source := &scheduledLane{registration: schedulerRegistration(1, 1, sourceStore)}
 			destination := &scheduledLane{
-				registration: schedulerRegistration(2, 2, destinationStore), rttMicros: 1000, deliveryRate: 1_000_000,
+				registration: schedulerRegistration(2, 2, destinationStore), rttMicros: 1000, deliveryRate: 1_000_000, rateObserved: true,
 			}
 			scheduler.migrateTransmissions(map[protocol.LaneID]*scheduledLane{
 				destination.registration.LaneID: destination,
@@ -1990,9 +2006,10 @@ func schedulerLaneWithLimits(t *testing.T, id, group byte, rtt, rate uint64,
 	limits packetqueue.Limits) *scheduledLane {
 	t.Helper()
 	store := schedulerStore(t, limits)
+	store.transportReported.Store(minimumRateSampleBytes)
 	lane := &scheduledLane{
 		registration: schedulerRegistration(id, group, store),
-		rttMicros:    rtt, deliveryRate: rate, rttObserved: true,
+		rttMicros:    rtt, deliveryRate: rate, rttObserved: true, rateObserved: true,
 	}
 	lane.registration.SendDeliveryReport = func(report protocol.DeliveryReport, _ time.Time, sent func()) bool {
 		frame, err := protocol.MarshalDeliveryReport(report)
@@ -2039,7 +2056,7 @@ func dataFrameSize(data protocol.Data) int {
 func takeOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data {
 	t.Helper()
 	var batch [1]protocol.Data
-	var ownership [1]Packet
+	var ownership [1]datagram.Packet
 	count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize)
 	if err != nil {
 		t.Fatal(err)
@@ -2059,7 +2076,7 @@ func awaitOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data 
 	defer timeout.Stop()
 	for {
 		var batch [1]protocol.Data
-		var ownership [1]Packet
+		var ownership [1]datagram.Packet
 		count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize)
 		switch {
 		case err == nil && count == 1:
@@ -2120,16 +2137,16 @@ func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
 				defer func() { releaseTransmissions(lane.registration.Store.drain()) }()
 				payload := make([]byte, tt.payloadSize)
 				copy(payload, relayWireGuardPacket(wgpacket.TransportData))
-				if err := ingress.Push(packetqueue.Item[Packet]{Value: Packet{Kind: wgpacket.TransportData, Payload: payload, DeadlineMicros: tt.deadline},
+				if err := ingress.Push(packetqueue.Item[Packet]{Value: Packet{DeadlineMicros: tt.deadline, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 					Size: len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second)}); err != nil {
 					t.Fatal(err)
 				}
 				var item packetqueue.Item[Packet]
-				if err := ingress.TryPop(&item); err != nil {
+				if err := ingress.TryPop(&item, ingress.Now()); err != nil {
 					t.Fatal(err)
 				}
 				var preferred protocol.LaneID
-				scheduled, err := scheduler.schedule(map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane}, &preferred, &item)
+				scheduled, err := scheduler.schedule(map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane}, &preferred, &item, scheduler.ingress.Now())
 				if err != nil || scheduled != fits {
 					t.Fatalf("fits %t: scheduled %t, error %v", fits, scheduled, err)
 				}

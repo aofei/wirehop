@@ -35,8 +35,8 @@ const (
 	handshakeResponseLength = 92
 	// cookieReplyLength is the exact WireGuard cookie reply length.
 	cookieReplyLength = 64
-	// transportDataMinimumLength is the shortest valid WireGuard transport packet.
-	transportDataMinimumLength = 32
+	// TransportKeepaliveLength is the size of an empty WireGuard transport packet and its minimum valid length.
+	TransportKeepaliveLength = 32
 )
 
 // Accepted reports whether the kind represents a structurally valid WireGuard packet.
@@ -98,7 +98,7 @@ func Inspect(packet []byte) Header {
 			return Header{Kind: CookieReply, ReceiverIndex: binary.LittleEndian.Uint32(packet[4:8])}
 		}
 	case 4:
-		if len(packet) >= transportDataMinimumLength {
+		if len(packet) >= TransportKeepaliveLength {
 			return Header{Kind: TransportData, ReceiverIndex: binary.LittleEndian.Uint32(packet[4:8])}
 		}
 	default:
