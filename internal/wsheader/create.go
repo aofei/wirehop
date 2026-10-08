@@ -105,7 +105,7 @@ func ParseCreate(request *http.Request) (Create, error) {
 		return Create{}, err
 	}
 	generation, err := strconv.ParseUint(generationValue, 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatUint(generation, 10) != generationValue {
 		return Create{}, ErrInvalid
 	}
 	pathValue, err := single(request.Header, headerPathGroupID)
@@ -129,7 +129,7 @@ func ParseCreate(request *http.Request) (Create, error) {
 		return Create{}, err
 	}
 	timestamp, err := strconv.ParseInt(timestampValue, 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatInt(timestamp, 10) != timestampValue {
 		return Create{}, ErrInvalid
 	}
 	monotonicValue, err := single(request.Header, headerMonotonicSend)
@@ -137,7 +137,7 @@ func ParseCreate(request *http.Request) (Create, error) {
 		return Create{}, err
 	}
 	monotonic, err := strconv.ParseUint(monotonicValue, 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatUint(monotonic, 10) != monotonicValue {
 		return Create{}, ErrInvalid
 	}
 	parsed := Create{

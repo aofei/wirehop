@@ -71,8 +71,7 @@ func AppendDataFrame(destination []byte, data Data) ([]byte, error) {
 	encoded := destination[start:]
 	headerSize := size - contentSize
 	encodeDataPayload(encoded[headerSize:], data)
-	encoded[0] = byte(FrameData)
-	binary.PutUvarint(encoded[1:], uint64(contentSize))
+	binary.PutUvarint(encoded, uint64(contentSize)<<4|uint64(FrameData))
 	return destination, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -20,6 +21,72 @@ import (
 
 type timingClock struct {
 	now atomic.Uint64
+}
+
+type ingressBatchEndpoint struct {
+	*testEndpoint
+	packets []datagram.Packet
+}
+
+func (e *ingressBatchEndpoint) ReadBatch(_ context.Context, packets []datagram.Packet) (int, error) {
+	return copy(packets, e.packets), io.EOF
+}
+
+func TestIngressDeadlineRepresentation(t *testing.T) {
+	const maximum = uint64(math.MaxUint64) - math.MaxUint64%protocol.DeadlineResolutionMicros
+	for _, tt := range []struct {
+		name    string
+		now     uint64
+		kinds   []wgpacket.Kind
+		wantErr error
+	}{
+		{name: "LastRepresentable", now: maximum - 1, kinds: []wgpacket.Kind{wgpacket.HandshakeInitiation}, wantErr: io.EOF},
+		{name: "RoundingOverflow", now: maximum, kinds: []wgpacket.Kind{wgpacket.HandshakeInitiation}, wantErr: ErrCounterExhausted},
+		{name: "UnsignedOverflow", now: math.MaxUint64, kinds: []wgpacket.Kind{wgpacket.HandshakeInitiation}, wantErr: ErrCounterExhausted},
+		{name: "BatchPrefix", now: maximum - 1, kinds: []wgpacket.Kind{wgpacket.HandshakeInitiation, wgpacket.TransportData, wgpacket.TransportData}, wantErr: ErrCounterExhausted},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			endpoint := &ingressBatchEndpoint{testEndpoint: newTestEndpoint()}
+			for _, kind := range tt.kinds {
+				endpoint.packets = append(endpoint.packets, datagram.Packet{Kind: kind, Payload: relayWireGuardPacket(kind)})
+			}
+			clock := &testClock{now: tt.now}
+			queue, err := packetqueue.NewWithClock[Packet](packetqueue.Limits{Packets: 4, Bytes: 1024}, func() time.Time {
+				return monotime.Time(clock.now)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer queue.Close()
+			ingress, err := NewIngress(endpoint, queue, clock, DeadlinePolicy{Control: time.Microsecond, Transport: 2 * time.Microsecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ingress.Run(t.Context()); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Run() = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr == ErrCounterExhausted {
+				if queue.Len() != 0 {
+					t.Fatal("unrepresentable deadline admitted a partial batch")
+				}
+				return
+			}
+			var item packetqueue.Item[Packet]
+			if err := queue.TryPop(&item, queue.Now()); err != nil {
+				t.Fatal(err)
+			}
+			defer item.Release()
+			data := protocol.Data{PacketID: 1, DeadlineMicros: item.Value.DeadlineMicros, Payload: item.Value.Payload}
+			frame, err := protocol.MarshalData(data)
+			if err != nil {
+				t.Fatalf("admitted deadline cannot be encoded: %v", err)
+			}
+			parsed, err := protocol.ParseData(frame)
+			if err != nil || parsed.DeadlineMicros != maximum || !item.Deadline.Equal(monotime.Time(maximum)) {
+				t.Fatalf("deadline round trip = %d, %v", parsed.DeadlineMicros, err)
+			}
+		})
+	}
 }
 
 func (c *timingClock) NowMicros() uint64 {

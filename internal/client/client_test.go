@@ -746,8 +746,7 @@ func TestRetryableCreationRejectionOutlivesSessionAttemptTimeout(t *testing.T) {
 				attempts.Add(1)
 				response := protocol.ServerHello{
 					Result: protocol.ServerRejected, RequestNonce: hello.Nonce,
-					ServerUnixSeconds: time.Now().Unix(), ReceiveMicros: hello.MonotonicMicros,
-					SendMicros: hello.MonotonicMicros, ErrorCode: protocol.ErrorUnavailable,
+					ServerUnixSeconds: time.Now().Unix(), ErrorCode: protocol.ErrorUnavailable,
 					ErrorClass: protocol.ErrorRetryable, ErrorScope: protocol.ErrorScopeSession,
 					Diagnostic: "temporarily unavailable",
 				}
@@ -850,7 +849,6 @@ func TestRuntimeSessionReplacementOutlivesSessionAttemptTimeout(t *testing.T) {
 		}
 		response := protocol.ServerHello{
 			Result: protocol.ServerRejected, RequestNonce: hello.Nonce, ServerUnixSeconds: time.Now().Unix(),
-			ReceiveMicros: hello.MonotonicMicros, SendMicros: hello.MonotonicMicros,
 			ErrorCode: protocol.ErrorSessionNotFound, ErrorClass: protocol.ErrorSessionGone,
 			ErrorScope: protocol.ErrorScopeSession, Diagnostic: "session is not available",
 		}

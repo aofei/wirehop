@@ -12,8 +12,8 @@ import (
 const (
 	// Version is the current WireHop wire protocol version.
 	Version uint16 = 1
-	// maximumFrameHeaderSize bounds the type byte and a canonical content length through MaxFrameContentSize.
-	maximumFrameHeaderSize = 4
+	// maximumFrameHeaderSize bounds the packed type and content length through MaxFrameContentSize.
+	maximumFrameHeaderSize = 3
 	// MaxFrameContentSize is the largest valid type-specific frame content.
 	MaxFrameContentSize = maximumDataHeaderSize + MaxPacketSize
 	// MaxEncodedFrameSize is the largest valid frame including its common header.
@@ -102,14 +102,13 @@ func AppendFrame(destination []byte, frame Frame) ([]byte, error) {
 	destination = destination[:offset+size]
 	headerSize := size - len(frame.Payload)
 	copy(destination[offset+headerSize:], frame.Payload)
-	destination[offset] = byte(frame.Type)
-	binary.PutUvarint(destination[offset+1:], uint64(len(frame.Payload)))
+	binary.PutUvarint(destination[offset:], uint64(len(frame.Payload))<<4|uint64(frame.Type))
 	return destination, nil
 }
 
 // FrameSize returns the complete canonical encoded size for a validated frame-content length.
 func FrameSize(contentSize int) int {
-	return 1 + uvarintSize(uint64(contentSize)) + contentSize
+	return uvarintSize(uint64(contentSize)<<4) + contentSize
 }
 
 // ReadFrame reads one complete typed and length-prefixed frame from reader.
@@ -124,11 +123,8 @@ func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
 	if _, err := io.ReadFull(reader, r.header[:1]); err != nil {
 		return Frame{}, err
 	}
-	if !FrameType(r.header[0]).Valid() {
-		return Frame{}, ErrInvalidFrameType
-	}
 	headerSize := 1
-	for headerSize < len(r.header) {
+	for r.header[headerSize-1] >= 0x80 && headerSize < len(r.header) {
 		if _, err := io.ReadFull(reader, r.header[headerSize:headerSize+1]); err != nil {
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
@@ -136,15 +132,12 @@ func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
 			return Frame{}, err
 		}
 		headerSize++
-		if r.header[headerSize-1] < 0x80 {
-			break
-		}
 	}
 	length, _, err := frameHeader(r.header[:headerSize])
 	if err != nil {
 		return Frame{}, err
 	}
-	return r.readContent(reader, FrameType(r.header[0]), length)
+	return r.readContent(reader, FrameType(r.header[0]&0x0f), length)
 }
 
 // readContent reads a validated frame body into reusable connection-local storage.
@@ -167,7 +160,7 @@ func (r *FrameReader) readContent(reader io.Reader, typeID FrameType, length int
 // valid until an operation refills or resets reader. Further ReadBufferedFrame calls preserve previous payloads.
 func ReadBufferedFrame(reader *bufio.Reader) (Frame, bool, error) {
 	buffered := reader.Buffered()
-	if buffered < 2 {
+	if buffered == 0 {
 		return Frame{}, false, nil
 	}
 	encoded, err := reader.Peek(buffered)
@@ -185,7 +178,7 @@ func ReadBufferedFrame(reader *bufio.Reader) (Frame, bool, error) {
 	if buffered < encodedLength {
 		return Frame{}, false, nil
 	}
-	frame := Frame{Type: FrameType(encoded[0]), Payload: encoded[headerSize:encodedLength]}
+	frame := Frame{Type: FrameType(encoded[0] & 0x0f), Payload: encoded[headerSize:encodedLength]}
 	reader.Discard(encodedLength)
 	return frame, true, nil
 }
@@ -222,10 +215,9 @@ func (s *FrameSequence) Next() (Frame, bool) {
 		return Frame{}, false
 	}
 	message := s.message[s.offset:]
-	contentLength, width := binary.Uvarint(message[1:])
-	headerSize := 1 + width
-	encodedLength := headerSize + int(contentLength)
-	frame := Frame{Type: FrameType(message[0]), Payload: message[headerSize:encodedLength]}
+	header, headerSize := binary.Uvarint(message)
+	encodedLength := headerSize + int(header>>4)
+	frame := Frame{Type: FrameType(header & 0x0f), Payload: message[headerSize:encodedLength]}
 	s.offset += encodedLength
 	return frame, true
 }
@@ -254,25 +246,37 @@ func AppendFrames(destination []Frame, message []byte) ([]Frame, error) {
 
 // frameHeader validates one bounded header and returns its content length and header size.
 func frameHeader(message []byte) (int, int, error) {
-	if len(message) < 2 {
+	if len(message) == 0 {
 		return 0, 0, ErrTrailingFrameData
 	}
-	if !FrameType(message[0]).Valid() {
-		return 0, 0, ErrInvalidFrameType
-	}
-	lengthBytes := message[1:min(len(message), maximumFrameHeaderSize)]
-	contentLength, width, err := parseUvarint(lengthBytes)
-	if err != nil {
-		if err == io.ErrUnexpectedEOF {
-			if len(lengthBytes) == maximumFrameHeaderSize-1 {
-				return 0, 0, ErrFrameTooLarge
-			}
+	header := uint32(message[0])
+	width := 1
+	if header >= 0x80 {
+		if len(message) < 2 {
 			return 0, 0, ErrTrailingFrameData
 		}
-		return 0, 0, err
+		header = header&0x7f | uint32(message[1])<<7
+		width = 2
+		if message[1] >= 0x80 {
+			if len(message) < 3 {
+				return 0, 0, ErrTrailingFrameData
+			}
+			if message[2] >= 0x80 {
+				return 0, 0, ErrFrameTooLarge
+			}
+			header = header&0x3fff | uint32(message[2])<<14
+			width = 3
+		}
+		if message[width-1] == 0 {
+			return 0, 0, ErrInvalidInteger
+		}
 	}
+	if !FrameType(header & 0x0f).Valid() {
+		return 0, 0, ErrInvalidFrameType
+	}
+	contentLength := header >> 4
 	if contentLength > MaxFrameContentSize {
 		return 0, 0, ErrFrameTooLarge
 	}
-	return int(contentLength), 1 + width, nil
+	return int(contentLength), width, nil
 }

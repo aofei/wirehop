@@ -10,6 +10,7 @@ import (
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
+	"github.com/aofei/wirehop/internal/protocol"
 )
 
 // Ingress reads accepted WireGuard datagrams into a bounded session queue.
@@ -51,7 +52,8 @@ func (i *Ingress) Run(ctx context.Context) error {
 			packets[index] = datagram.Packet{}
 			lifetime := i.deadlines.Lifetime(packet.Kind)
 			lifetimeMicros := durationMicros(lifetime)
-			if lifetimeMicros > math.MaxUint64-nowMicros {
+			// Millisecond ceiling must remain representable before any prepared packet enters the queue.
+			if nowMicros > math.MaxUint64-math.MaxUint64%protocol.DeadlineResolutionMicros-lifetimeMicros {
 				packet.Release()
 				releaseItems(items[:index])
 				releaseDatagrams(packets[index+1 : count])

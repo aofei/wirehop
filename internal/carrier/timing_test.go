@@ -79,7 +79,7 @@ func TestWebSocketConnReadFrames(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		message := append(prefix, byte(protocol.FrameDeliveryReport), 0x80, 0)
+		message := append(prefix, 0x85, 0)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			connection, err := websocket.Accept(w, r, nil)
 			if err != nil {

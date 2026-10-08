@@ -14,20 +14,20 @@ import (
 const (
 	// helloHeaderSize bounds the magic, version, and authenticated body length.
 	helloHeaderSize = 8
-	// clientHelloUnsignedFixedSize precedes the lane, generation, group, and target fields.
-	clientHelloUnsignedFixedSize = helloHeaderSize + 45
+	// clientHelloUnsignedFixedSize precedes lane selectors and the mode-specific session or target.
+	clientHelloUnsignedFixedSize = helloHeaderSize + 29
 	// clientHelloMinimumSize includes three single-byte integers and an authentication tag.
 	clientHelloMinimumSize = clientHelloUnsignedFixedSize + 3 + sha256.Size
 	// MaxClientHelloSize bounds all client fields and the longest canonical target.
 	MaxClientHelloSize = clientHelloUnsignedFixedSize + 3*binary.MaxVarintLen64 + target.MaxTextSize + sha256.Size
-	// serverHelloUnsignedFixedSize precedes the group, error code, and diagnostic fields.
-	serverHelloUnsignedFixedSize = helloHeaderSize + 87
-	// serverHelloMinimumSize includes two single-byte integers and an authentication tag.
-	serverHelloMinimumSize = serverHelloUnsignedFixedSize + 2 + sha256.Size
+	// serverHelloUnsignedFixedSize precedes the result-specific admission fields.
+	serverHelloUnsignedFixedSize = helloHeaderSize + 21
+	// serverHelloMinimumSize includes a rejected result's disposition, code, and authentication tag.
+	serverHelloMinimumSize = serverHelloUnsignedFixedSize + 3 + sha256.Size
 	// MaxDiagnosticSize bounds a peer-controlled handshake diagnostic.
 	MaxDiagnosticSize = 512
-	// maxServerHelloSize bounds every server admission response.
-	maxServerHelloSize = serverHelloUnsignedFixedSize + 2*binary.MaxVarintLen64 + MaxDiagnosticSize + sha256.Size
+	// MaxServerHelloSize bounds every server admission response.
+	MaxServerHelloSize = serverHelloMinimumSize + MaxDiagnosticSize
 )
 
 var (
@@ -140,18 +140,29 @@ func ParseClientHello(encoded []byte) (ClientHello, error) {
 		MonotonicMicros: binary.BigEndian.Uint64(encoded[17:25]),
 	}
 	copy(hello.Nonce[:], encoded[25:37])
-	copy(hello.SessionID[:], encoded[37:53])
 	unsignedEnd := len(encoded) - sha256.Size
-	targetBytes, err := parseIntegers(encoded[53:unsignedEnd], (*uint64)(&hello.LaneID), &hello.Generation, (*uint64)(&hello.PathGroupID))
-	if err != nil || len(targetBytes) > target.MaxTextSize {
+	remaining, err := parseIntegers(encoded[clientHelloUnsignedFixedSize:unsignedEnd],
+		(*uint64)(&hello.LaneID), &hello.Generation, (*uint64)(&hello.PathGroupID))
+	if err != nil {
 		return ClientHello{}, ErrInvalidClientHello
 	}
-	if len(targetBytes) != 0 {
-		value := string(targetBytes)
+	switch hello.Mode {
+	case HelloCreate:
+		if len(remaining) > target.MaxTextSize {
+			return ClientHello{}, ErrInvalidClientHello
+		}
+		value := string(remaining)
 		hello.Target, err = target.Parse(value)
 		if err != nil || hello.Target.String() != value {
 			return ClientHello{}, ErrInvalidClientHello
 		}
+	case HelloJoin:
+		if len(remaining) != len(hello.SessionID) {
+			return ClientHello{}, ErrInvalidClientHello
+		}
+		copy(hello.SessionID[:], remaining)
+	default:
+		return ClientHello{}, ErrInvalidClientHello
 	}
 	copy(hello.AuthTag[:], encoded[unsignedEnd:])
 	if err := validateClientHello(hello); err != nil {
@@ -183,13 +194,27 @@ func marshalClientHelloUnsigned(hello ClientHello) ([]byte, error) {
 	if err := validateClientHello(hello); err != nil {
 		return nil, err
 	}
-	encoded := integerPayload(clientHelloUnsignedFixedSize, uint64(hello.LaneID), hello.Generation, uint64(hello.PathGroupID))
+	var targetText string
+	suffixSize := len(hello.SessionID)
+	if hello.Mode == HelloCreate {
+		targetText = hello.Target.String()
+		suffixSize = len(targetText)
+	}
+	capacity := clientHelloUnsignedFixedSize + uvarintSize(uint64(hello.LaneID)) + uvarintSize(hello.Generation) +
+		uvarintSize(uint64(hello.PathGroupID)) + suffixSize
+	encoded := make([]byte, clientHelloUnsignedFixedSize, capacity)
 	encoded[8] = byte(hello.Mode)
 	binary.BigEndian.PutUint64(encoded[9:17], uint64(hello.UnixSeconds))
 	binary.BigEndian.PutUint64(encoded[17:25], hello.MonotonicMicros)
 	copy(encoded[25:37], hello.Nonce[:])
-	copy(encoded[37:53], hello.SessionID[:])
-	encoded = append(encoded, hello.Target.String()...)
+	encoded = binary.AppendUvarint(encoded, uint64(hello.LaneID))
+	encoded = binary.AppendUvarint(encoded, hello.Generation)
+	encoded = binary.AppendUvarint(encoded, uint64(hello.PathGroupID))
+	if hello.Mode == HelloJoin {
+		encoded = append(encoded, hello.SessionID[:]...)
+	} else {
+		encoded = append(encoded, targetText...)
+	}
 	encodeHelloHeader(encoded, clientMagic)
 	return encoded, nil
 }
@@ -293,25 +318,42 @@ func MarshalServerHello(hello ServerHello) ([]byte, error) {
 
 // ParseServerHello parses and validates a canonical server hello.
 func ParseServerHello(encoded []byte) (ServerHello, error) {
-	if err := validateHelloEncoding(encoded, serverMagic, serverHelloMinimumSize, maxServerHelloSize, ErrInvalidServerHello); err != nil {
+	if err := validateHelloEncoding(encoded, serverMagic, serverHelloMinimumSize, MaxServerHelloSize, ErrInvalidServerHello); err != nil {
 		return ServerHello{}, err
 	}
 	hello := ServerHello{
 		Result: ServerHelloResult(encoded[8]), ServerUnixSeconds: int64(binary.BigEndian.Uint64(encoded[21:29])),
-		ReceiveMicros: binary.BigEndian.Uint64(encoded[77:85]), SendMicros: binary.BigEndian.Uint64(encoded[85:93]),
-		ErrorClass: ErrorClass(encoded[93]), ErrorScope: ErrorScope(encoded[94]),
 	}
 	copy(hello.RequestNonce[:], encoded[9:21])
-	copy(hello.SessionID[:], encoded[29:45])
-	copy(hello.SessionSecret[:], encoded[45:77])
 	unsignedEnd := len(encoded) - sha256.Size
-	var code uint64
-	diagnostic, err := parseIntegers(encoded[95:unsignedEnd], (*uint64)(&hello.PathGroupID), &code)
-	if err != nil || code > uint64(ErrorClockSkew) || len(diagnostic) > MaxDiagnosticSize {
+	remaining := encoded[serverHelloUnsignedFixedSize:unsignedEnd]
+	switch hello.Result {
+	case ServerSessionCreated, ServerLaneAccepted:
+		size := 16 + len(hello.SessionID)
+		if hello.Result == ServerSessionCreated {
+			size += len(hello.SessionSecret)
+		}
+		if len(remaining) < size {
+			return ServerHello{}, ErrInvalidServerHello
+		}
+		hello.ReceiveMicros = binary.BigEndian.Uint64(remaining[:8])
+		hello.SendMicros = binary.BigEndian.Uint64(remaining[8:16])
+		copy(hello.SessionID[:], remaining[16:16+len(hello.SessionID)])
+		if hello.Result == ServerSessionCreated {
+			copy(hello.SessionSecret[:], remaining[16+len(hello.SessionID):size])
+		}
+		tail, err := parseIntegers(remaining[size:], (*uint64)(&hello.PathGroupID))
+		if err != nil || len(tail) != 0 {
+			return ServerHello{}, ErrInvalidServerHello
+		}
+	case ServerRejected:
+		hello.ErrorClass = ErrorClass(remaining[0])
+		hello.ErrorScope = ErrorScope(remaining[1])
+		hello.ErrorCode = ErrorCode(remaining[2])
+		hello.Diagnostic = string(remaining[3:])
+	default:
 		return ServerHello{}, ErrInvalidServerHello
 	}
-	hello.ErrorCode = ErrorCode(code)
-	hello.Diagnostic = string(diagnostic)
 	copy(hello.AuthTag[:], encoded[unsignedEnd:])
 	if err := validateServerHello(hello); err != nil {
 		return ServerHello{}, err
@@ -321,7 +363,7 @@ func ParseServerHello(encoded []byte) (ServerHello, error) {
 
 // ReadServerHello reads one variable-width server hello from reader.
 func ReadServerHello(reader io.Reader) (ServerHello, error) {
-	encoded, err := readHello(reader, serverMagic, serverHelloMinimumSize, maxServerHelloSize, ErrInvalidServerHello)
+	encoded, err := readHello(reader, serverMagic, serverHelloMinimumSize, MaxServerHelloSize, ErrInvalidServerHello)
 	if err != nil {
 		return ServerHello{}, err
 	}
@@ -345,17 +387,30 @@ func marshalServerHelloUnsigned(hello ServerHello) ([]byte, error) {
 	if err := validateServerHello(hello); err != nil {
 		return nil, err
 	}
-	encoded := integerPayload(serverHelloUnsignedFixedSize, uint64(hello.PathGroupID), uint64(hello.ErrorCode))
+	suffixSize := 3 + len(hello.Diagnostic)
+	if hello.Result != ServerRejected {
+		suffixSize = 16 + len(hello.SessionID) + uvarintSize(uint64(hello.PathGroupID))
+	}
+	if hello.Result == ServerSessionCreated {
+		suffixSize += len(hello.SessionSecret)
+	}
+	encoded := make([]byte, serverHelloUnsignedFixedSize, serverHelloUnsignedFixedSize+suffixSize)
 	encoded[8] = byte(hello.Result)
 	copy(encoded[9:21], hello.RequestNonce[:])
 	binary.BigEndian.PutUint64(encoded[21:29], uint64(hello.ServerUnixSeconds))
-	copy(encoded[29:45], hello.SessionID[:])
-	copy(encoded[45:77], hello.SessionSecret[:])
-	binary.BigEndian.PutUint64(encoded[77:85], hello.ReceiveMicros)
-	binary.BigEndian.PutUint64(encoded[85:93], hello.SendMicros)
-	encoded[93] = byte(hello.ErrorClass)
-	encoded[94] = byte(hello.ErrorScope)
-	encoded = append(encoded, hello.Diagnostic...)
+	switch hello.Result {
+	case ServerSessionCreated, ServerLaneAccepted:
+		encoded = binary.BigEndian.AppendUint64(encoded, hello.ReceiveMicros)
+		encoded = binary.BigEndian.AppendUint64(encoded, hello.SendMicros)
+		encoded = append(encoded, hello.SessionID[:]...)
+		if hello.Result == ServerSessionCreated {
+			encoded = append(encoded, hello.SessionSecret[:]...)
+		}
+		encoded = binary.AppendUvarint(encoded, uint64(hello.PathGroupID))
+	case ServerRejected:
+		encoded = append(encoded, byte(hello.ErrorClass), byte(hello.ErrorScope), byte(hello.ErrorCode))
+		encoded = append(encoded, hello.Diagnostic...)
+	}
 	encodeHelloHeader(encoded, serverMagic)
 	return encoded, nil
 }
@@ -383,7 +438,8 @@ func validateServerHello(hello ServerHello) error {
 		}
 	case ServerRejected:
 		if !hello.ErrorCode.Valid() || !validErrorDisposition(hello.ErrorClass, hello.ErrorScope) ||
-			!hello.SessionID.IsZero() || hello.SessionSecret != (SessionSecret{}) || !hello.PathGroupID.IsZero() {
+			!hello.SessionID.IsZero() || hello.SessionSecret != (SessionSecret{}) || !hello.PathGroupID.IsZero() ||
+			hello.ReceiveMicros != 0 || hello.SendMicros != 0 {
 			return ErrInvalidServerHello
 		}
 		if hello.ErrorCode == ErrorClockSkew &&

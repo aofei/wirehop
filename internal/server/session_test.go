@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -926,13 +927,12 @@ func TestLanePathGroupIsStable(t *testing.T) {
 
 func TestRawJoinRejectionUsesLaneScope(t *testing.T) {
 	instance := newSessionTestServer(t, []byte("test-token"), targetpkg.MustParse("192.0.2.1:51820"), time.Second)
-	receiveMicros := instance.config.Clock.NowMicros()
 	serverConnection, clientConnection := net.Pipe()
 	defer clientConnection.Close()
 	result := make(chan error, 1)
 	go func() {
 		defer serverConnection.Close()
-		result <- instance.rejectWithKey(serverConnection, receiveMicros, protocol.Nonce{1}, protocol.ErrorStaleGeneration,
+		result <- instance.rejectWithKey(serverConnection, protocol.Nonce{1}, protocol.ErrorStaleGeneration,
 			protocol.ErrorLaneRejected, protocol.ErrorScopeLane, "lane generation rejected", []byte("join-secret"))
 	}()
 	response, err := protocol.ReadServerHello(clientConnection)
@@ -990,6 +990,219 @@ func TestRawClockSkewIsRetryable(t *testing.T) {
 	}
 	if err := instance.replay.CheckAndStore(hello.Nonce, 2_000, 2_061); err != nil {
 		t.Fatalf("clock-skew rejection retained its nonce: %v", err)
+	}
+}
+
+func TestAdmissionReplayAfterClockRollback(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		webSocket bool
+		join      bool
+	}{
+		{name: "RawCreate"},
+		{name: "RawJoin", join: true},
+		{name: "WebSocketCreate", webSocket: true},
+		{name: "WebSocketJoin", webSocket: true, join: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const initialUnix = int64(2_000)
+			var wall atomic.Int64
+			wall.Store(initialUnix)
+			token := []byte("test-token")
+			allowed := targetpkg.MustParse("127.0.0.1:51820")
+			instance := newSessionTestServer(t, token, allowed, time.Second)
+			instance.config.WallClock = func() time.Time { return time.Unix(wall.Load(), 0) }
+			key := token
+			var sessionID protocol.SessionID
+			var secret protocol.SessionSecret
+			admittedCode := protocol.ErrorTargetDenied
+			if tt.join {
+				session, err := instance.createSession(t.Context(), t.Context(), allowed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer session.close()
+				if err := session.reserveLane(1, 1, 1); err != nil {
+					t.Fatal(err)
+				}
+				defer session.rejectReservedLane()
+				sessionID, secret = session.id, session.secret
+				key = secret[:]
+				admittedCode = protocol.ErrorStaleGeneration
+			}
+			exchange := func(nonce protocol.Nonce, timestamp int64) protocol.ServerHello {
+				t.Helper()
+				var response protocol.ServerHello
+				if tt.webSocket {
+					var headers http.Header
+					var err error
+					if tt.join {
+						join := wsheader.Join{Method: http.MethodGet, Path: "/_wirehop", SessionID: sessionID,
+							LaneID: 1, Generation: 1, PathGroupID: 1, Nonce: nonce, UnixSeconds: timestamp}
+						if err := wsheader.SignJoin(&join, secret); err != nil {
+							t.Fatal(err)
+						}
+						headers, err = wsheader.JoinHeaders(join)
+					} else {
+						headers, err = wsheader.Headers(wsheader.Create{Token: string(token),
+							Target: targetpkg.MustParse("127.0.0.1:51821"), LaneID: 1, Generation: 1,
+							PathGroupID: 1, Nonce: nonce, UnixSeconds: timestamp})
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					request := httptest.NewRequest(http.MethodGet, "http://relay.example/_wirehop", nil)
+					request.Header = headers
+					writer := httptest.NewRecorder()
+					instance.WebSocketHandler(t.Context()).ServeHTTP(writer, request)
+					response, err = wsheader.ParseRejection(writer.Header())
+					if err != nil {
+						t.Fatalf("parse rejection for HTTP %d: %v", writer.Code, err)
+					}
+				} else {
+					hello := protocol.ClientHello{Mode: protocol.HelloCreate, UnixSeconds: timestamp,
+						Nonce: nonce, LaneID: 1, Generation: 1, PathGroupID: 1,
+						Target: targetpkg.MustParse("127.0.0.1:51821")}
+					if tt.join {
+						hello.Mode, hello.SessionID, hello.Target = protocol.HelloJoin, sessionID, targetpkg.Endpoint{}
+					}
+					if err := protocol.SignClientHello(&hello, key); err != nil {
+						t.Fatal(err)
+					}
+					serverConnection, clientConnection := net.Pipe()
+					defer clientConnection.Close()
+					if err := clientConnection.SetDeadline(time.Now().Add(time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					finished := make(chan error, 1)
+					go func() {
+						finished <- instance.serveConnection(t.Context(), serverConnection, func() {})
+					}()
+					if err := protocol.WriteClientHello(clientConnection, hello); err != nil {
+						t.Fatal(err)
+					}
+					var err error
+					response, err = protocol.ReadServerHello(clientConnection)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := <-finished; err == nil {
+						t.Fatal("rejected admission returned success")
+					}
+				}
+				if response.RequestNonce != nonce || protocol.VerifyServerHello(response, key) != nil {
+					t.Fatal("rejection was not bound to the authenticated request")
+				}
+				return response
+			}
+			if response := exchange(protocol.Nonce{1}, initialUnix); response.ErrorCode != admittedCode {
+				t.Fatalf("initial request code = %d, want %d", response.ErrorCode, admittedCode)
+			}
+			advancedUnix := initialUnix + int64(instance.config.AuthenticationSkew/time.Second) + 1
+			wall.Store(advancedUnix)
+			if response := exchange(protocol.Nonce{2}, advancedUnix); response.ErrorCode != admittedCode {
+				t.Fatalf("advancing request code = %d, want %d", response.ErrorCode, admittedCode)
+			}
+			wall.Store(initialUnix)
+			response := exchange(protocol.Nonce{1}, initialUnix)
+			if response.ErrorCode != protocol.ErrorClockSkew || response.ErrorClass != protocol.ErrorRetryable ||
+				response.ErrorScope != protocol.ErrorScopeLane || response.ServerUnixSeconds != advancedUnix {
+				t.Fatalf("expired request after rollback = %+v", response)
+			}
+			if response := exchange(protocol.Nonce{3}, advancedUnix); response.ErrorCode != admittedCode {
+				t.Fatalf("corrected request code = %d, want %d", response.ErrorCode, admittedCode)
+			}
+			if response := exchange(protocol.Nonce{3}, advancedUnix); response.ErrorCode != protocol.ErrorReplay {
+				t.Fatalf("corrected request replay code = %d, want %d", response.ErrorCode, protocol.ErrorReplay)
+			}
+		})
+	}
+}
+
+func TestServerAuthenticationTime(t *testing.T) {
+	t.Run("BackwardClockAndLimit", func(t *testing.T) {
+		var wall atomic.Int64
+		instance := &Server{config: Config{WallClock: func() time.Time { return time.Unix(wall.Load(), 0) }}}
+		for _, tt := range []struct {
+			wall int64
+			want int64
+		}{
+			{wall: 2_000, want: 2_000},
+			{wall: 1_000, want: 2_000},
+			{wall: 0, want: 2_000},
+			{wall: -1, want: 2_000},
+			{wall: 3_000, want: 3_000},
+			{wall: math.MaxInt64, want: math.MaxInt64},
+			{wall: 1, want: math.MaxInt64},
+		} {
+			wall.Store(tt.wall)
+			if got := instance.authenticationTime(); got != tt.want {
+				t.Fatalf("authenticationTime() with wall %d = %d, want %d", tt.wall, got, tt.want)
+			}
+		}
+	})
+	t.Run("ConcurrentSamples", func(t *testing.T) {
+		const workers, samples = 16, 500
+		var calls atomic.Uint64
+		instance := &Server{config: Config{WallClock: func() time.Time {
+			return time.Unix(int64(calls.Add(1)*7919%65536+1), 0)
+		}}}
+		var group sync.WaitGroup
+		for range workers {
+			group.Go(func() {
+				previous := int64(0)
+				for range samples {
+					current := instance.authenticationTime()
+					if current < previous {
+						t.Errorf("authentication time regressed from %d to %d", previous, current)
+					}
+					previous = current
+				}
+			})
+		}
+		group.Wait()
+		want := int64(0)
+		for index := uint64(1); index <= workers*samples+1; index++ {
+			want = max(want, int64(index*7919%65536+1))
+		}
+		if got := instance.authenticationTime(); got != want {
+			t.Fatalf("authenticationTime() after concurrent samples = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestReplayRejection(t *testing.T) {
+	for _, terminal := range []struct {
+		name  string
+		class protocol.ErrorClass
+		scope protocol.ErrorScope
+	}{
+		{name: "Create", class: protocol.ErrorSessionRejected, scope: protocol.ErrorScopeSession},
+		{name: "Join", class: protocol.ErrorLaneRejected, scope: protocol.ErrorScopeLane},
+	} {
+		t.Run(terminal.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name  string
+				err   error
+				code  protocol.ErrorCode
+				class protocol.ErrorClass
+				scope protocol.ErrorScope
+			}{
+				{name: "Replay", err: auth.ErrReplay, code: protocol.ErrorReplay, class: terminal.class, scope: terminal.scope},
+				{name: "Capacity", err: auth.ErrReplayCacheFull, code: protocol.ErrorRateLimited,
+					class: protocol.ErrorRetryable, scope: terminal.scope},
+				{name: "ExpiredConcurrentSample", err: auth.ErrTimestampOutsideWindow, code: protocol.ErrorClockSkew,
+					class: protocol.ErrorRetryable, scope: protocol.ErrorScopeLane},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					code, class, scope := replayRejection(tt.err, terminal.class, terminal.scope)
+					if code != tt.code || class != tt.class || scope != tt.scope {
+						t.Fatalf("replayRejection(%v) = %d, %d, %d, want %d, %d, %d",
+							tt.err, code, class, scope, tt.code, tt.class, tt.scope)
+					}
+				})
+			}
+		})
 	}
 }
 

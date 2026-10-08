@@ -572,12 +572,11 @@ sample replaces the provisional 1 MB/s estimate, including when it is lower. Dup
 not alter the sampling anchors. Earlier receive timestamps release valid prefixes without moving the time anchor
 backwards.
 
-A session with at least two healthy distinct path groups starts bounded discovery after carrier admission, before real
-transport placement. An active discovery period completes even if its path becomes primary, so selection cannot freeze
-an early capacity estimate. Later periods start only on alternatives. Discovery uses the reserved zero-ID Data form
-described below, so padding cannot reach UDP or alter relay deduplication. It shares the ordinary writer, transmission
-store, process retention budget, cumulative feedback, and rate estimator. No separate probe worker, acknowledgment, or
-packet ID sequence is needed.
+A session with at least two healthy distinct path groups starts bounded discovery at admission, before real transport
+traffic chooses a primary. An active discovery period continues within its original deadline and byte cap after primary
+promotion. Later periods start only on alternatives. Discovery uses the reserved zero-ID Data form described below, so
+padding cannot reach UDP or alter relay deduplication. It shares the ordinary writer, transmission store, process
+retention budget, cumulative feedback, and rate estimator.
 
 Each discovery period lasts four seconds or eight estimated RTTs, capped at eight seconds, and admits at most 2 MiB of
 encoded padding per lane direction. Unknown capacity retains at most one unreported 4101-byte sample frame within the 16
@@ -707,10 +706,11 @@ limit cannot fit a capacity probe can still forward ordinary frames that fit.
 
 Each packet carries an absolute deadline in the sender's process-relative monotonic clock. Runtime calculations use
 microseconds. The wire deadline rounds up to milliseconds, extending it by at most 999 microseconds. The sender computes
-it once at UDP ingress from the packet-class lifetime, rounded up to whole microseconds. Queueing and scheduling use the
-same deadline and clock through a local time representation. The receiver maps the protocol deadline into its own
-protocol clock and drops the packet only when the complete clock-uncertainty interval proves that the deadline has
-expired.
+the initial deadline at UDP ingress from the packet-class lifetime, rounded up to whole microseconds. Ingress rejects an
+absolute deadline above the largest representable millisecond timestamp before admitting any prepared batch. Queueing
+and scheduling use the same deadline and clock through a local time representation. The receiver maps the protocol
+deadline into its own protocol clock and drops the packet only when the complete clock-uncertainty interval proves that
+the deadline has expired.
 
 The wire protocol permits at most five minutes of packet lifetime. A receiver rejects a deadline when its earliest
 plausible mapped value is more than five minutes plus the 999-microsecond rounding allowance in the future. A deadline
@@ -937,8 +937,9 @@ WireHop deduplicates packet IDs and forwards packets through a shared UDP write 
 buffer. Enforcing packet ID order would let one slow lane delay fresher packets from faster lanes and recreate
 head-of-line blocking.
 
-Transport data may therefore reach the WireGuard endpoint out of order. Preferred-lane stickiness and the 2 ms switching
-margin limit unnecessary reordering, especially when WireGuard carries TCP, without changing UDP delivery semantics.
+Transport data may therefore reach the WireGuard endpoint out of order. Capacity-based primary selection and its bounded
+hold interval limit unnecessary reordering, especially when WireGuard carries TCP, without changing UDP delivery
+semantics. Control duplication and deadline-risk recovery can still use other lanes.
 
 ## Reliability policy
 
@@ -1135,6 +1136,14 @@ rather than moving it backward. A later authenticated response replaces the samp
 can be corrected without widening the acceptance window. This estimate never changes the operating-system clock and is
 not used for TLS certificate validation, packet deadlines, RTT, logging, or the session clock mapping.
 
+Each server instance also keeps an authentication-only high-water mark for Unix seconds. Timestamp validation and signed
+admission responses use that same nondecreasing value. A backward server wall-clock adjustment freezes it until the wall
+clock catches up. Clients can refresh their estimate through signed `clock_skew` responses, including further
+corrections during a prolonged freeze. The acceptance window is not widened. Replay caches serialize expiration against
+their latest observed admission time, so an earlier concurrent sample cannot reopen an expired window after its nonce
+was removed. A request whose window expires while waiting for the cache receives retryable, lane-scoped `clock_skew`.
+Nonce state and the high-water marks belong to the server instance and are not persisted across restart.
+
 ### Authentication for TCP and TLS lanes
 
 For `tcp://` and `tls://`, WireHop needs its own binary client hello.
@@ -1178,8 +1187,7 @@ modifiable on `tcp://`, so raw HMAC admission does not turn the carrier into a s
 
 The server accepts timestamps only within a bounded clock-skew window and keeps the nonce in a replay cache for that
 window. A timestamp outside the window returns a retryable `clock_skew` response before the nonce enters the cache. A
-repeated nonce that already entered the cache returns terminal `replay`. Clock correction never weakens replay
-protection.
+nonce already retained by the cache returns terminal `replay`. Clock correction never weakens replay protection.
 
 ### Authentication for WebSocket lanes
 
@@ -1223,8 +1231,11 @@ timestamp (`u64`), and monotonic send time (`u64`). Fixed-width lengths and time
 Clients encode session IDs, nonces, and HMAC tags as fixed-width lowercase hexadecimal. Receivers accept either
 hexadecimal case. Lane and path group IDs are positive unsigned 64-bit selectors encoded in canonical decimal without
 leading zeroes. The client assigns them in configuration order and preserves them across reconnects. They are not
-credentials. Generations, Unix timestamps, and monotonic microsecond values use base-10 integers. The creation target
-uses its canonical logical `HOST:PORT` form.
+credentials. Generations, Unix timestamps, and monotonic microsecond values also use canonical decimal without signs or
+leading zeroes. Generations and Unix timestamps must be positive. Only monotonic send time may be zero. Unix timestamps
+fit signed 64-bit integers, and the remaining numeric headers fit unsigned 64-bit integers. Both creation and join
+parsers enforce these rules before authentication or session reservation. The creation target uses its canonical logical
+`HOST:PORT` form.
 
 WebSocket admission uses HTTP `GET`. Lane URLs and admission requests use an exact path with no query component,
 including an empty trailing query marker. The canonical escaped path is limited to 8 KiB so it fits the direct server's
@@ -1233,16 +1244,20 @@ encoding. These rules keep the endpoint identity identical to the path covered b
 
 The server validates the WireHop authentication, target, lane, generation, path-group, nonce, and timestamp fields
 before accepting the WebSocket upgrade. It applies a bounded clock-skew window to creation and join requests and caches
-each nonce until the complete inclusive timestamp-validity window has elapsed. A reused nonce is rejected as a replay.
+each nonce until the complete inclusive timestamp-validity window has elapsed. A nonce present in the cache is rejected
+as a replay.
 
 The direct server uses a 16 KiB request-header budget, and the client limits relay or proxy response headers to 16 KiB
 during the WebSocket handshake.
 
 After successfully parsing an admission request, the server represents every rejection with the same signed server hello
-used by raw-stream carriers. It writes the unpadded base64url encoding into one `WireHop-Rejection` response header.
-Creation rejections use the long-term token. Rejections for a retained session use its session secret. An
-unknown-session rejection uses the long-term token because no session secret remains. The signed response includes the
-request nonce, server Unix time, error code, class, scope, and bounded diagnostic.
+used by raw-stream carriers. It writes the unpadded base64url encoding into one `WireHop-Rejection` response header. The
+header is limited to 768 characters, derived from the 576-byte maximum server hello. Decoding rejects CR, LF, padding,
+and nonzero unused trailing bits. An explicit CR/LF check is necessary because Go
+[Base64 strict decoding](https://pkg.go.dev/encoding/base64#Encoding.Strict) still ignores those characters. Creation
+rejections use the long-term token. Rejections for a retained session use its session secret. An unknown-session
+rejection uses the long-term token because no session secret remains. The signed response includes the request nonce,
+server Unix time, error code, class, scope, and bounded diagnostic.
 
 Authentication and clock-skew rejections use HTTP 401, target denial uses 403, replay and generation conflicts use 409,
 an unknown session uses 410, admission rate limiting uses 429, and temporary server failures use 5xx.
@@ -1323,7 +1338,7 @@ Fast-path behavior:
   admitted frame. Startup uses the 1 KiB target, and a single larger frame remains indivisible
 - Keep application queues and unconfirmed retention bounded independently from kernel socket buffers
 - Use an abortive TCP close for an abandoned generation so unacknowledged stale bytes are discarded
-- Bound each WebSocket binary message to two maximum encoded frames, or 131,114 bytes, on receipt
+- Bound each WebSocket binary message to two maximum encoded frames, or 131,112 bytes, on receipt
 
 Socket write success only means that the local kernel or TLS stack accepted bytes. It never counts as peer delivery or
 as permission to release retained backlog and packet state.
@@ -1403,6 +1418,10 @@ fails before binding the local UDP socket. Operators use `NO_PROXY` to select di
 
 WireHop uses version 1 of its binary framing protocol inside each carrier lane.
 
+Protocol development may replace incompatible layouts and semantics in place while retaining version `1` and the
+`wirehop.v1` subprotocol. Older layouts need no negotiation, decoder fallback, or compatibility path. Protocol changes
+must update both peers and their tests together.
+
 The carrier provides a byte stream or WebSocket message stream. WireHop frames provide packet boundaries and control
 messages.
 
@@ -1434,11 +1453,11 @@ scope, optional lane generation, and bounded diagnostic.
 Admission messages use an eight-byte preface followed by a bounded authenticated body. The preface contains four magic
 bytes, a big-endian `u16` version, and a big-endian `u16` body length. The body length includes the HMAC tag and
 excludes the preface. Readers reject an unknown preface or an out-of-bounds body length before reading or allocating the
-body. Fixed-width timestamps use network byte order. Lane IDs, generations, path group IDs, and error codes use
-canonical `uvarint` encoding as defined below.
+body. Fixed-width timestamps use network byte order. Lane IDs, generations, and path group IDs use canonical `uvarint`
+encoding as defined below. Raw rejection error codes use one byte.
 
-The raw client hello has this layout. `V` is the combined size of its three variable integers, and `N` is the target
-length:
+The raw client hello has this layout. `V` is the combined size of its three variable integers, and `N` is the
+mode-specific suffix length:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
@@ -1449,18 +1468,16 @@ length:
 | 9 | 8 | Unix timestamp in seconds |
 | 17 | 8 | Client monotonic send time in microseconds |
 | 25 | 12 | Nonce |
-| 37 | 16 | Session ID, zero for create |
-| 53 | V | Lane ID, generation, and path group ID as three `uvarint` values |
-| 53 + V | N | Canonical target text, absent for join |
-| 53 + V + N | 32 | HMAC-SHA256 tag |
+| 37 | V | Lane ID, generation, and path group ID as three `uvarint` values |
+| 37 + V | N | Canonical target text for create, or 16-byte session ID for join |
+| 37 + V + N | 32 | HMAC-SHA256 tag |
 
-The target is the remaining unsigned body after the three integers. It is canonical ASCII `HOST:PORT` text, limited to
-259 bytes. A join has no target. A hello occupies `85 + V + N` bytes, with an absolute maximum of 374 bytes. An ordinary
-join with single-byte lane, generation, and group values occupies 88 bytes. The HMAC covers every byte before the tag,
-including the preface and body length.
+The target is canonical ASCII `HOST:PORT` text, limited to 259 bytes. Create omits the unused session ID. Join carries
+exactly its session ID and no target. A hello occupies `69 + V + N` bytes, with an absolute maximum of 358 bytes. An
+ordinary join with single-byte lane, generation, and group values occupies 88 bytes. The HMAC covers every byte before
+the tag, including the preface and body length.
 
-The raw server hello uses the following layout. `V` is the combined size of the group and error-code integers, and `N`
-is the diagnostic length:
+The raw server hello starts with the following common prefix. `U(x)` denotes the shortest unsigned LEB128 size of `x`:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
@@ -1470,19 +1487,21 @@ is the diagnostic length:
 | 8 | 1 | Result: `1` created, `2` accepted, or `3` rejected |
 | 9 | 12 | Echoed request nonce |
 | 21 | 8 | Server Unix timestamp in seconds |
-| 29 | 16 | Session ID |
-| 45 | 32 | Session secret for creation only |
-| 77 | 8 | Server receive time in microseconds |
-| 85 | 8 | Server send time in microseconds |
-| 93 | 1 | Error class |
-| 94 | 1 | Error scope |
-| 95 | V | Path group ID and error code as two `uvarint` values |
-| 95 + V | N | Remaining unsigned body as diagnostic text |
-| 95 + V + N | 32 | HMAC-SHA256 tag |
+| 29 | Variable | Result-specific suffix |
+| After suffix | 32 | HMAC-SHA256 tag |
 
-An ordinary successful response occupies 129 bytes. The reader's absolute allocation bound is 659 bytes, including a
-512-byte diagnostic and full-width integer slots. Semantic validation further constrains the error code and requires a
-rejection's path group to be zero.
+The suffix contains exactly the fields belonging to its result:
+
+| Result | Suffix | Complete size |
+| --- | --- | --- |
+| Created | Receive and send times (two `u64`), session ID (16 bytes), session secret (32 bytes), path group ID (`uvarint`) | `125 + U(group)` |
+| Accepted | Receive and send times (two `u64`), session ID (16 bytes), path group ID (`uvarint`) | `93 + U(group)` |
+| Rejected | Error class (`u8`), error scope (`u8`), error code (`u8`), remaining diagnostic | `64 + diagnostic length` |
+
+An ordinary creation response occupies 126 bytes, and a lane-accepted response occupies 94 bytes. A rejection omits
+unused credentials, path group fields, and monotonic bootstrap timestamps. Its diagnostic is bounded to 512 bytes,
+giving the exact maximum server hello size of 576 bytes. Error codes are the defined one-byte enumeration, and unknown
+values are rejected.
 
 Every client hello requires a positive Unix timestamp, nonzero nonce, lane ID, generation, and path group ID. Create
 mode requires a zero session ID and a valid target. Join mode requires a nonzero session ID and a zero target.
@@ -1490,9 +1509,10 @@ mode requires a zero session ID and a valid target. Join mode requires a nonzero
 A created response requires nonzero session ID, session secret, and path group ID with zero error fields. An accepted
 response requires nonzero session and path group IDs with a zero session secret and zero error fields. A rejected
 response requires valid error fields and zero session ID, session secret, and path group ID. Every response requires a
-positive server Unix timestamp, the request nonce being answered, and server receive time no later than server send
-time. An unsupported-version rejection may use a zero request nonce because the server cannot trust an unknown request
-layout. Diagnostics are optional printable ASCII and are limited to 512 bytes.
+positive server Unix timestamp and the request nonce being answered. Successful responses also require server receive
+time no later than server send time. Rejections omit these monotonic timestamps and use only the authenticated Unix time
+for admission-clock recovery. An unsupported-version rejection may use a zero request nonce because the server cannot
+trust an unknown request layout. Diagnostics are optional printable ASCII and are limited to 512 bytes.
 
 ### Framed messages
 
@@ -1501,9 +1521,8 @@ envelope:
 
 | Order | Encoding | Field |
 | ---: | --- | --- |
-| 1 | `u8` | Frame type |
-| 2 | `uvarint` | Type-specific content length |
-| 3 | N bytes | Type-specific payload |
+| 1 | `uvarint` | Packed header: `(content_length << 4) | frame_type` |
+| 2 | N bytes | Type-specific payload |
 
 In framed messages, `uvarint` is shortest-form unsigned LEB128. Each byte contributes seven value bits,
 least-significant group first, and its high bit indicates another byte. Zero occupies one byte. A `uint64` occupies at
@@ -1513,9 +1532,11 @@ stream that ends partway through a header or payload fails with unexpected EOF. 
 field, including content lengths. Admission hellos use the explicitly mixed fixed-width and variable-width layouts
 above.
 
-The content length excludes the common header. It occupies one to three bytes and cannot exceed 65,553 bytes. The common
-header therefore occupies two to four bytes, and the maximum encoded frame is 65,557 bytes. A reader validates the
-bounded header before allocating content storage. Data content contains:
+The low four bits of the packed header carry the frame type, and the remaining bits carry the content length. Types zero
+and 11 through 15 are invalid. The content length excludes the common header and cannot exceed 65,553 bytes. The packed
+header occupies one byte through content length 7, two bytes through 1023, and three bytes thereafter. The maximum
+encoded frame is 65,556 bytes. A reader validates the bounded header before allocating content storage. Data content
+contains:
 
 | Order | Encoding | Field |
 | ---: | --- | --- |
@@ -1524,10 +1545,11 @@ bounded header before allocating content storage. Data content contains:
 | 3 | Remaining bytes | WireGuard packet |
 
 Let `U(x)` be the shortest unsigned LEB128 length of `x`, and let `P` be the WireGuard datagram length. Data content
-length is `L = U(packet_id) + U(deadline_millis) + P`. Its complete encoded length is `1 + U(L) + L`, and its
-per-datagram overhead is `1 + U(L) + U(packet_id) + U(deadline_millis)`. The overhead ranges from 4 to 22 bytes. For
-example, a 1452-byte datagram with a five-byte packet ID and five-byte deadline has 13 bytes of overhead. The maximum
-occurs with a ten-byte packet ID, an eight-byte representable deadline, and a three-byte content length.
+length is `L = U(packet_id) + U(deadline_millis) + P`. Its complete encoded length is `U((L << 4) | 1) + L`, and its
+per-datagram overhead is `U((L << 4) | 1) + U(packet_id) + U(deadline_millis)`. For valid WireGuard datagrams, the
+overhead ranges from 4 to 21 bytes. For example, a 1452-byte datagram with a five-byte packet ID and five-byte deadline
+has 13 bytes of overhead. The maximum occurs with a ten-byte packet ID, an eight-byte representable deadline, and a
+three-byte packed header.
 
 A generic frame parser can skip or reject a complete frame without interpreting Data fields. A separate WireGuard packet
 length is unnecessary because the packet occupies the rest of the Data content after the two integers. The lane
@@ -1561,7 +1583,7 @@ used outside its allowed phase or direction is a protocol violation.
 Control payload fields appear in the following order:
 
 - `Ping`: ping ID (`uvarint`), send time (`uvarint`)
-- `Pong`: ping ID (`uvarint`), original send time (`uvarint`), receive time (`uvarint`), send time (`uvarint`)
+- `Pong`: ping ID (`uvarint`), echoed ping send time (`uvarint`), receive time (`uvarint`), send time (`uvarint`)
 - `Clock sync`: client send, server receive, server send, and client receive times (four `uvarint` values)
 - `Delivery report`: lane ID, generation, cumulative Data-frame count, latest parsed Ping ID, and report delay in
   microseconds (five `uvarint` values)
@@ -1764,6 +1786,479 @@ call that opened that message. Clock-sync admission reads enforce their phase de
 cancellation. The lane owner controls teardown, preserving abortive close when a generation must discard old stream
 bytes. For TCP and TLS lanes, length-prefixed frames are read directly from the ordered byte stream.
 
+## Protocol and performance review
+
+### Optimization objective and current architecture
+
+The review treats incompatible changes as available within version 1. Compatibility is not a reason to retain a field,
+frame, carrier adapter, or scheduling policy. A replacement still has to improve a measured workload while preserving
+the desired packet freshness, resource bounds, authentication, and recovery behavior.
+
+There is no workload-independent best configuration. Bulk inner TCP goodput, interactive tail latency, independent-path
+aggregation, idle overhead, and recovery time can favor different decisions. The current policy favors stable inner TCP
+goodput and bounded retention. Its ordinary transport traffic uses one primary per direction, even when several lanes
+are healthy. Capacity discovery and control duplication use additional lanes. A full healthy primary waits for feedback
+instead of distributing unique packets across every available lane. Therefore, multiple lanes currently provide
+selection and resilience without a guarantee of simultaneous bandwidth aggregation.
+
+The main implementation boundaries are:
+
+| Layer | Current mechanism | Principal cost or constraint |
+| --- | --- | --- |
+| Admission | Raw authenticated hellos or HTTP WebSocket headers, then an initial clock sample | Connection, TLS, proxy, DNS, and target preparation latency |
+| Data framing | Packed type and length, packet ID, absolute millisecond deadline, complete datagram | Small integer decoding and payload copies |
+| Feedback | Cumulative parsed Data count, Ping progress, and construction delay for a lane generation | Reverse-path delay, report scheduling, and retained FIFO state |
+| Scheduling | Capacity-selected primary, bounded probes, deadline prediction, and one-time migration | Estimator convergence, primary changes, and actual path diversity |
+| UDP boundary | Structural filtering, deduplication, synchronous delivery, and opportunistic Linux batching | Syscalls, buffer ownership, socket limits, and the real UDP path MTU |
+| Carrier | Independent ordered TCP streams, optionally TLS and WebSocket | TCP loss recovery, ordered delivery, kernel buffering, and record or message overhead |
+
+Shrinking the frame header cannot remove a TCP lane's ordered-delivery constraint. TCP provides an ordered byte stream
+and can segment application writes independently of WireHop frames, as described in
+[RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7). Independent lanes and bounded migration provide an
+escape from a stalled stream. Larger batching or another WireHop retransmission loop cannot make bytes behind a missing
+TCP segment arrive sooner on that same stream.
+
+### Wire overhead and possible replacements
+
+The following examples use a five-byte packet ID and a five-byte deadline. They exclude TCP, IP, TLS, and WebSocket:
+
+| WireGuard datagram | WireHop header | Complete frame | Header divided by datagram |
+| ---: | ---: | ---: | ---: |
+| 32 bytes | 12 bytes | 44 bytes | 37.50% |
+| 128 bytes | 12 bytes | 140 bytes | 9.38% |
+| 1452 bytes | 13 bytes | 1465 bytes | 0.90% |
+| 65,535 bytes | 13 bytes | 65,548 bytes | 0.02% |
+
+For the 1452-byte example, eliminating every WireHop header byte would increase payload per carrier byte by only about
+0.90 percent before other overhead. Saving one byte saves about 0.07 percent of the datagram size. Small packets can
+benefit much more, but their total carrier cost must also include packet rate, writes, records, and feedback. These
+figures are arithmetic bounds, not measured throughput gains.
+
+| Candidate | Potential benefit | Assessment |
+| --- | --- | --- |
+| Fixed-width length and metadata | Fewer variable-integer branches | A two-byte content length cannot represent the current maximum. A three-byte length adds a byte to ordinary frames. Full-width IDs and deadlines increase typical overhead |
+| Packed type and length, implemented | Save one envelope byte for content lengths 0 to 7, 128 to 1023, and 16384 upward | Never increases envelope size. Ordinary 1452-byte datagrams retain a three-byte envelope |
+| Implicit Data type with a control escape | Reserve one tag bit for Data versus control, saving another byte on ordinary Data | Requires a second control-header layout or tighter control bounds and type-dependent frame sizing. Compare complete codecs and real forwarding before replacing the uniform envelope |
+| Batch base IDs and deadlines with per-packet deltas | Amortize repeated high bits | Promising for sustained small-packet traffic. Priority selection and migration can make IDs nonmonotonic within a lane. A signed delta or absolute escape is needed. Partial-batch parsing and exact cumulative accounting must remain possible |
+| Session-relative or truncated timestamps | Reduce deadline width in long-lived processes | Requires a shared epoch or unambiguous wrap handling across idle time, suspend, reconnect, and delayed old frames. A 32-bit millisecond clock wraps in about 49.7 days |
+| Relative TTL on receipt | Remove cross-peer deadline mapping | Starts a new lifetime after TCP transit and can admit stale traffic. It does not implement the current freshness contract |
+| Reuse WireGuard transport counters as relay IDs | Remove a second sequence number | Counters belong to WireGuard keypairs and do not cover handshake or cookie packets. Rekeying and multiple public receiver indexes need additional identity state |
+| Remove the frame length on WebSocket | Use the outer message length | Prevents the current multi-frame message format or requires another subframe format. One message per datagram can increase writes and WebSocket overhead |
+| Compress or add another payload cipher | Transform the datagram | WireGuard ciphertext offers no useful general compression. Another cipher does not address carrier ordering and duplicates established secure-carrier work |
+
+The WireGuard protocol defines the transport counter as a cryptographic nonce and replay value for its current keys,
+while handshakes have different layouts. Its authenticated replay window also does not replace relay-side deduplication
+before UDP submission. These constraints follow from the [WireGuard protocol](https://www.wireguard.com/protocol/).
+Increasing WireHop's bitmap cannot extend the receiving WireGuard peer's authenticated replay window. A slow copy can
+still become unusable after sufficiently many newer transport packets overtake it.
+
+WebSocket client frames carry a four-byte masking key in addition to their common header. An unfragmented binary message
+of 1465 bytes therefore adds eight WebSocket header bytes from client to server and four in the reverse direction.
+Coalescing sixteen WireHop frames into one unfragmented message would amortize those bytes to 0.5 and 0.25 bytes per
+datagram. Actual fragmentation can increase that cost. Fragment boundaries cannot serve as WireHop packet boundaries,
+and receivers must handle interleaved control frames, as specified by
+[RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.4). Existing opportunistic coalescing and incremental
+decoding already address this without a batch-collection timer.
+
+### State that remains useful
+
+Cumulative Data counts exploit each lane's ordered stream. The sender already has the exact sent FIFO, so it can
+reconstruct acknowledged bytes without transmitting byte totals, packet-ID lists, selective ranges, or per-frame lane
+sequence numbers. Counts include expired, duplicate, and probe frames that were successfully parsed. Removing an expired
+sent entry before its cumulative acknowledgment would destroy that correspondence. Packet storage is released only by
+validated progress or generation drain.
+
+Reports need an explicit lane ID and generation because they can return on another lane. Implicitly binding them to the
+carrying connection would remove the alternate feedback path. Generation checks also prevent delayed reports from
+releasing a replacement connection's packets. Ping progress tests that path even when no real datagram is outstanding.
+The report's construction delay distinguishes delayed reporting from network transit for deadline prediction.
+
+Ping and Pong provide a four-timestamp clock observation as well as liveness. The initial ClockSync orders the server's
+mapping before client data without another round trip. Removing clock synchronization requires a replacement freshness
+model. It does not follow from TCP reliability or from a fixed packet lifetime. Likewise, global delivery ordering would
+let a stalled lane delay fresh packets from another lane and change the current UDP semantics.
+
+The delivery-rate estimator uses the longer corresponding send and feedback intervals and avoids reducing capacity from
+an unconstrained application-limited sample. This follows the measurement principles described in the
+[BBR congestion-control draft, section 4.1](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/06/#section-4.1), an
+Internet-Draft rather than an RFC. WireHop's userspace observations include carrier buffering, parsing, and the feedback
+path. They are not the kernel TCP congestion controller's packet acknowledgments, and they should not be presented as an
+implementation of BBR. Cross-lane report timing and capacity changes still need workload-level validation.
+
+The default deduplication bitmap costs 128 KiB per inbound session direction. At the server's 1024-session limit, those
+bitmaps alone can occupy 128 MiB, independently of the 256 MiB retained-packet budget. Socket buffers, scratch storage,
+and session metadata add separate costs. Memory optimization should measure full attached and detached sessions instead
+of treating the aggregate packet budget as a process-memory ceiling.
+
+Admission now uses mode-specific and result-specific suffixes. A create request saves 16 zero bytes, an ordinary
+lane-accepted response saves 35 bytes, and every rejection saves 65 bytes. Successful responses preserve authenticated
+clock bootstrap, and rejections preserve the authenticated Unix time used for admission-clock recovery. Ping and Pong
+retain their original four-timestamp format after the timing simplification experiment described below.
+
+### Additional codec boundary review
+
+Overlap tests cover 324 combinations of generic frames and Data encoders, ordinary and full-width metadata, empty and
+maximum payloads, both packed-header width transitions, destination prefixes, source offsets, and reuse versus forced
+allocation. Expected encodings preserve the original source bytes and use the standard integer encoder. Rejection-header
+regressions cover CR, LF, and CRLF at the beginning, middle, and end of a signed value. They fail against the previous
+parser and pass after the explicit check. Three shuffled race repetitions and one million fuzz executions validate
+canonical rejection-header round trips and the exact encoded size bound. This canonicality correction does not change
+HMAC verification or imply an authentication bypass in the previous implementation.
+
+### Measured admission encoding
+
+Admission signing and encoding were compared with commit `9764416` on 2026-10-07 using Go 1.27.1 on Darwin arm64 and an
+Apple M4 Pro. Each operation signs and then marshals one hello with the same short authentication key and field values.
+Each case used six one-second repetitions, with baseline and candidate runs performed sequentially. Values are medians.
+Client creation uses `127.0.0.1:51820` and single-byte selectors. Rejected responses have no diagnostic except for the
+maximum-diagnostic case, which contains 512 ASCII bytes:
+
+| Operation | Baseline ns/op | Current ns/op | Elapsed-time change | Baseline/current B/op | Baseline/current allocs/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Client create | 432.15 | 375.00 | -13.22% | 1072 / 832 | 19 / 17 |
+| Client join | 291.90 | 286.95 | -1.70% | 736 / 736 | 9 / 9 |
+| Server created | 301.50 | 293.15 | -2.77% | 880 / 832 | 9 / 9 |
+| Server accepted | 300.95 | 282.85 | -6.01% | 880 / 736 | 9 / 9 |
+| Server rejected | 301.45 | 257.05 | -14.73% | 880 / 640 | 9 / 9 |
+| Server maximum diagnostic | 919.55 | 822.60 | -10.54% | 2720 / 2240 | 11 / 9 |
+
+The client encoder reserves its complete mode-specific suffix before appending the three canonical selectors. This
+avoids an extra unsigned-buffer growth in both create and join. Server responses reserve only their actual result's
+fields. These are admission CPU and allocation measurements, not forwarding goodput or statistical confidence intervals.
+Reproduce them with:
+
+```sh
+go test ./internal/protocol -run '^$' -bench 'Benchmark(Client|Server)HelloEncoding$' \
+  -benchmem -benchtime=1s -count=6
+```
+
+### Measured packed-header implementation
+
+The implemented layout was compared with commit `9764416` on 2026-10-07 using Go 1.27.1, Darwin arm64, and an Apple M4
+Pro. Each case used six one-second repetitions. The table shows median elapsed times. Positive changes are slower, and
+these microbenchmarks do not establish WAN goodput or statistical confidence intervals:
+
+| Benchmark | Baseline | Packed header | Elapsed-time change |
+| --- | ---: | ---: | ---: |
+| Owned frame reader, 1420-byte content | 30.335 ns | 31.355 ns | +3.36% |
+| Validated 16-frame sequence | 138.00 ns | 110.90 ns | -19.64% |
+| Eight-frame Data encoding | 936.45 ns | 930.05 ns | -0.68% |
+| Buffered 16-frame Data batch, 32-byte payloads | 275.95 ns | 263.05 ns | -4.67% |
+| Buffered 16-frame Data batch, 1452-byte payloads | 557.15 ns | 582.45 ns | +4.54% |
+| WebSocket loopback 1-frame message, background context | 1813.00 ns | 1844.00 ns | +1.71% |
+| WebSocket loopback 1-frame message, cancelable context | 1719.50 ns | 1702.00 ns | -1.02% |
+| WebSocket loopback 16-frame message, background context | 3907.00 ns | 3796.00 ns | -2.84% |
+| WebSocket loopback 16-frame message, cancelable context | 3791.00 ns | 3538.00 ns | -6.67% |
+| WebSocket buffered 1-frame batch | 60.665 ns | 60.420 ns | -0.40% |
+| WebSocket buffered 16-frame batch | 555.85 ns | 546.30 ns | -1.72% |
+
+The packed ordinary header uses three LEB128 groups where the previous separate length used two, despite the same
+three-byte envelope. Its decoder specializes the bounded three-byte header to avoid the generic uint64 overflow loop.
+Scalar owned reads and the large-payload buffered microbenchmark still show a small cost. Sequence validation and
+small-packet buffered decoding improve, and batched WebSocket loopback medians do not show the rejected tail-borrow
+experiment's regression. The retained benefit is a smaller canonical layout with no envelope-size increase and smaller
+admission messages. It is not a claim that every workload becomes faster.
+
+Reproduce the protocol cases with:
+
+```sh
+go test ./internal/protocol -run '^$' \
+  -bench 'Benchmark(FrameReader|FrameSequence|BufferedDataBatch|DataBatchEncoding)$' \
+  -benchmem -benchtime=1s -count=6
+```
+
+### Round-53 routed validation
+
+The round-53 implementation, with original 4 MiB ingress and five-second packet lifetimes, completed a fresh 18-flow
+matrix on 2026-10-08 using Go 1.27.1, Linux arm64, and kernel `7.0.12-linuxkit`. A separate router applied 5-millisecond
+delay to one path and 150-millisecond delay to the other. HighCapacity assigned them 10 and 100 Mbit/s respectively.
+LowCapacity reversed those rates. Each standalone and combined configuration used three fresh twenty-second inner TCP
+flows, rotating case order between repetitions. Baseline and implementation ran sequentially with unchanged verifiers.
+The exact binary passed both standalone/combined checks and all six baseline median bounds. Values are receiver medians
+against the untouched `9764416` baseline:
+
+| Profile | Paths | Baseline Mbit/s | Final Mbit/s | Change |
+| --- | --- | ---: | ---: | ---: |
+| HighCapacity | Low alone | 8.167 | 8.158 | -0.10% |
+| HighCapacity | High alone | 47.383 | 47.544 | +0.34% |
+| HighCapacity | Both | 46.789 | 47.319 | +1.13% |
+| LowCapacity | Low alone | 87.157 | 86.618 | -0.62% |
+| LowCapacity | High alone | 6.732 | 6.474 | -3.83% |
+| LowCapacity | Both | 86.539 | 86.989 | +0.52% |
+
+Combined medians reached 99.5 and 100.4 percent of the better standalone path. The lowest HighCapacity combined flow
+retained 96.3 percent of its better standalone median. Original verification confirmed actual router traffic, zero
+router-qdisc drops, stable configured carrier identities, and the expected inner TCP connection opens. HighCapacity
+high-delay standalone samples were 47.588, 34.749, and 47.544 Mbit/s. The lower sample remains part of the evidence even
+though the original median requirement passed. LowCapacity high-delay standalone median declined 3.83 percent. These
+results establish the original regression bounds for this run, not identical startup convergence, universal optimality,
+or statistical confidence. That binary also includes the rejection-header canonicality and ingress deadline-bound fixes.
+Historical static-queue results below describe discarded runtime tuning and are not substituted for this matrix.
+
+Reproduce the routed matrix with an existing integration image and a Linux binary:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/wirehop-linux ./cmd/wirehop
+sh test/performance/run.sh /tmp/wirehop-linux /tmp/wirehop-performance 3
+go run test/performance/verify.go /tmp/wirehop-performance 3 /tmp/wirehop-baseline-performance
+```
+
+Build the baseline from `9764416` with the same Go version, architecture, and flags, and run it separately. The optional
+baseline argument checks all six median regression bounds in addition to each matrix's standalone/combined checks.
+
+### Round-53 kernel validation and remaining failures
+
+The same exact round-53 binary completed all 65 original real-kernel scenarios once on 2026-10-08. Sixty-three passed
+their original verifiers. Two failed the original throughput recovery requirement:
+
+| Scenario | Original recovery requirement | Observed recovery | Result |
+| --- | ---: | ---: | --- |
+| Capacity collapse, forward | At least 25% | 99.62% | Pass |
+| Capacity collapse, reverse | At least 25% | 0.00% | Fail |
+| Capacity collapse, bidirectional | At least 25% in each direction | 28.80% forward, 0.00% reverse | Fail |
+
+Capacity dropped at five seconds, stayed at 32 kbit/s for seven seconds, and returned at twelve seconds. Recovery uses
+the original pre-fault intervals ending by 4.5 seconds and final intervals starting at 14.5 seconds. No failed flow was
+replaced by a passing rerun. The matrix therefore does not pass complete kernel acceptance, and the implementation
+cannot be described as defect-free or universally optimal. Earlier baseline and candidate variability, including the
+rejected runtime policies below, remains relevant evidence rather than a resolution of these failures.
+
+All basic carriers, asymmetric stalls, delay, loss, idle, routing, addressing, low-bandwidth completion, rekey, UDP,
+outage, roaming, and remaining carrier-stall verifiers passed. Both 140-second rekey tests recorded new handshakes on
+both peers at 120 seconds. Every controlled UDP flow received all offered bytes: 49,998,000 for native, TCP, and WSS,
+and 49,999,200 for the direct forwarder. The fixed 600-millisecond delay flow reached 10.036 Mbit/s.
+
+Completion and recovery checks do not establish uniform throughput. Compared with the historical 4 MiB protocol
+revision, asymmetric-stall reverse and ordinary bidirectional reverse receiver samples declined 36.58 and 36.02 percent.
+TLS outage declined 20.75 percent, and distinct-path 32 kbit/s declined 15.19 percent. Those are individual historical
+comparisons, not alternating repetitions or evidence of a causal frame field. Ten passing low-bandwidth flows also had
+zero bytes in their final five-second client-report window. Their original checks require completed transfers rather
+than continuous final-window progress. These observations remain limitations even though the corresponding original
+verifiers passed. No new queue policy, shorter lifetime, adaptive state, or altered verifier conceals them.
+
+### Follow-up admission audit and recovery comparisons
+
+A subsequent admission audit tightened WebSocket generation, Unix timestamp, and monotonic-send headers to the same
+unsigned decimal spelling already used by lane and path-group selectors, with Unix time retaining its signed 64-bit
+positive range. Creation and join now reject signs and leading zeroes. Only monotonic send time permits zero. This
+removes alternate text encodings of the same authenticated values. It does not fix an authentication bypass or change
+the canonical headers produced by clients. The correction adds no dependency, runtime policy, protocol version, or
+compatibility path.
+
+The numeric admission matrix covers 140 cases across both modes and all five numeric headers, including valid zero,
+full-width bounds, nonminimal text, signs, whitespace, line breaks, and overflow. Sixteen rejection cases failed against
+the previous implementation and pass after the correction. Six server-handler regression cases also fail with the
+previous parsers and pass with the corrected parsers. They verify HTTP 400 without a signed rejection, DNS resolution,
+session retention, admission-slot retention, or creation-nonce consumption. Independent fuzzing compares both parsers
+with ASCII decimal grammar and lexical magnitude bounds rather than the production parsing or formatting functions.
+
+Before this admission-only change, the preserved round-53 binary and untouched baseline completed three alternating
+repetitions of each previously failed capacity-collapse scenario. The middle repetition reversed execution order. All
+faults, twenty-second durations, throughput windows, and original 25 percent recovery checks remained unchanged:
+
+| Scenario and direction | Baseline recovery percentages | Round-53 recovery percentages |
+| --- | --- | --- |
+| Reverse-only | 51.26, 58.02, 0.00 | 97.01, 100.64, 61.60 |
+| Bidirectional forward | 101.09, 52.97, 93.52 | 126.46, 66.27, 113.25 |
+| Bidirectional reverse | 106.82, 122.30, 118.67 | 99.43, 125.94, 111.04 |
+
+The baseline passed five of six original verifiers and the round-53 implementation passed six of six. The baseline's
+zero-recovery sample confirms that recovery failure also occurs without the packed framing or compact admission changes.
+These diagnostic repetitions do not replace the two failed original matrix samples, isolate one causal mechanism, or
+establish reliable recovery across all workloads. The later numeric-header correction affects malformed WebSocket
+admission and cannot resolve these TCP recovery failures. Round-53 matrices above describe their recorded binary, not a
+fresh complete matrix after that correction.
+
+The corrected source passed two fresh full shuffled race repetitions, `go vet`, 1,000,027 grammar-fuzz executions, and
+test compilation of all seven relevant packages for Windows amd64 and Linux 386. Its new exact Linux arm64 binary then
+ran ten original kernel scenarios once each. WebSocket, WSS, mixed TCP/WSS lanes, both WebSocket stall variants, and
+both 32 kbit/s WebSocket variants passed. Capacity-collapse reverse recovery reached 66.24 percent, and bidirectional
+recovery reached 73.42 percent forward and 112.51 percent reverse. Forward-only recovery reached 10.41 percent and
+failed the original 25 percent requirement. This targeted run therefore passed nine scenarios and failed one. Neither
+the six successful earlier diagnostic repetitions nor the two successful later recovery directions resolve this failure.
+Complete kernel acceptance remains unestablished. The exact complete and targeted matrices, binary identities, and
+failures remain distinct in the recorded evidence.
+
+### Additional validation boundaries
+
+The unchanged production code passed a further race-enabled state-machine audit using 768 distinct seeds across 128
+groups and six queue configurations, with 10,000 operations per configuration. Its 7,680,000 operations exercised
+ordinary and control packets, capacity probes, local and shared budgets, expiration, partial and invalid cumulative
+acknowledgments, and generation drain. The temporary test overlay varied the existing model's seed without modifying
+production code or retaining an additional runtime path.
+
+A separate shuffled race audit ran 63 boundary tests twenty times each with one CPU and twenty times each with four
+CPUs. All 2520 top-level executions passed. Coverage included partial carrier reads and writes, borrowed and owned
+payload lifetimes, cancellation, valid prefixes before malformed tails, partial UDP delivery, deduplication retries,
+clock synchronization, packet expiry, and malformed WebSocket admission. These stress checks do not replace the failed
+kernel recovery checks or establish that every possible execution has been tested.
+
+Protocol validation also includes six frame, buffered-frame, admission, control, and carrier fuzz targets with one
+million executions each. Final hello and restored control layouts passed additional million-execution runs. Frame-header
+checks exercise all 2,097,152 canonical values representable by a three-byte packed header, including invalid types and
+oversized lengths, against the standard LEB128 encoder. Five independent literal hello/HMAC vectors cover one-byte reads
+and writes, every truncation, byte tampering, preservation of the following frame, failed write prefixes, and
+no-progress writes. Directed checks reject zero, nonminimal, overflowing, and overlong selectors at every client
+selector position and in both successful server results, with valid declared lengths and HMACs. Foreign test binaries in
+these earlier checks were compiled rather than executed.
+
+A subsequent full suite actually executed on Linux arm64 in isolated Docker namespaces with route faults and DNS
+fallback enabled. All 26 packages passed, including 554 top-level test executions. The unsupported-firewall-mark test
+was skipped because Linux supports that option. Linux UDP batching, interrupted system calls, GSO fallback, route
+recovery, and stack-growth clock reads also passed 400 top-level executions with strict pointer checking, `GOGC=20`, and
+one or four CPUs. These Linux runs did not enable the race detector or rerun the kernel throughput matrix.
+
+An independent arbitrary-precision clock model passed 716,093 cases under the race detector on macOS. It checked signed
+averaging, four-timestamp estimates, invalid samples, translation overflow, saturated deadline bounds, representable
+inverse mappings, and conservative bounds for physical exchanges with known offsets. This temporary test overlay made no
+production change and does not resolve the capacity-collapse recovery failures.
+
+A later audit found that the rejection-header fuzz fixture used a direct `http.Header` map key with noncanonical
+capitalization. Go's `Header.Values` could not find that key, so the earlier million-execution rejection fuzz run only
+exercised missing-header rejection. It does not count as decoder or canonicality coverage. The corrected target uses
+`Header.Set` and requires both known-valid seeds, including the maximum diagnostic, to be accepted. Adding that
+requirement to the previous fixture fails both seeds. The corrected target passed one million executions, and the
+retained source passed a fresh full shuffled race suite and `go vet`. This changes the test fixture without changing
+production header parsing. Other fuzz fixtures were reviewed for the same input-construction defect.
+
+A subsequent replay audit found that a delayed time sample or server wall-clock rollback could admit a previously
+expired nonce after another request purged it. Directed tests reproduced both cache cases and all four raw/WebSocket
+creation/join paths. The fix serializes cache time advancement, uses one nondecreasing server authentication time for
+validation and signed responses, and preserves retryable classification when a window expires during admission. It
+changes no packet deadline, queue policy, wire layout, protocol version, or dependency. Repeated race checks also cover
+concurrent authentication-time samples, signed clock correction, fresh corrected requests, and terminal nonce reuse. All
+throughput matrices above predate this authentication fix and do not establish exact-source performance acceptance of
+the final source. The previously recorded capacity-collapse failures remain unresolved.
+
+Independent replay-cache models subsequently passed 524,288 sequential operations and 2,000 concurrent six-call
+histories. Arbitrary-precision comparisons passed 200,441 timestamp and replay-expiry cases. Six deliberately faulty
+cache or timestamp variants failed these assertions. Live clients on TCP, TLS, WebSocket, and secure WebSocket passed
+100 reconnects across repeated server and client clock steps in 20 macOS/Linux scenarios, retaining their sessions and
+completing 120 UDP round trips. A server variant that permitted authentication time to retreat failed the live recovery
+check. macOS checks enabled the race detector. Linux checks executed without it. These temporary overlays changed no
+production source. An initial live-test fixture inherited a one-second session grace and a connection wait shorter than
+the maximum reconnect backoff. Its session replacements and timeouts remain recorded as failures. The subsequent fixture
+uses the unchanged production two-minute session grace and waits through the maximum backoff. Neither fixture changes
+the original throughput verifiers or resolves their recorded failures.
+
+### Capacity-collapse mechanism and limits
+
+Historical forty-second socket diagnostics sampled both the untouched baseline and a protocol revision during the same
+five-second start, seven-second impairment, and twelve-second restoration. Inner TCP smoothed RTT rose from tens of
+milliseconds to several seconds. Sampled retransmission timeouts reached 8.950 seconds in the baseline and 7.782 seconds
+in the protocol revision. The latter's cumulative inner TCP ACK counter did not advance between the sampled twelve- and
+seventeen-second observations, despite restored outer capacity. Both flows eventually resumed. These are TCP socket
+observations, not WireHop delivery reports or receiver application-throughput measurements.
+
+TCP derives retransmission timeouts from smoothed RTT and RTT variation and backs off the timer after expiry, as
+specified in [RFC 6298](https://www.rfc-editor.org/rfc/rfc6298.html#section-2). Delayed inner acknowledgments and
+timeout state are therefore a plausible contributor to slow recovery after outer capacity returns. The diagnostics do
+not identify a unique causal frame field or prove the mechanism of every failed sample. Their longer duration and older
+binaries also prevent treating eventual completion as passing the current twenty-second acceptance window.
+
+An isolated scheduler candidate allowed generation reset without a healthy alternative when the oldest sent real
+transport packet expired, the path-aware progress guard elapsed, capacity was measured, and at least 4096 real transport
+bytes had previously been acknowledged. Its first six original kernel cases passed: all three capacity-collapse
+directions, single and shared-path 32 kbit/s traffic, and fixed 600-millisecond delay. The next forward-collapse
+repetition recovered 0 percent against the unchanged 25 percent requirement, despite one new client connection beyond
+iperf's control and data connections. This counter alone does not identify which scheduler branch closed a generation or
+isolate the failed flow's cause. The candidate was rejected, its remaining conditional gates were not run, and no
+scheduler or transmission-store change was retained. The first passing samples do not establish reliable recovery or
+replace the failed repetition.
+
+### Rejected queue and lifetime changes
+
+The current implementation retains the original 4 MiB ingress cap and five-second packet lifetimes. Smaller queues and
+shorter deadlines change burst retention, inner TCP loss, and latency. Their isolated recovery improvements did not
+establish acceptable behavior across the tested healthy paths and fault repetitions:
+
+| Discarded candidate | Favorable observation | Rejection evidence |
+| --- | --- | --- |
+| 256 KiB ingress, five-second lifetime | One complete 18-flow routed matrix and one 65-case kernel matrix passed | A later recovery control reached 0%. Paired asymmetric-stall forward and combined medians declined 43.35% and 14.38% |
+| 512 KiB ingress, five-second lifetime | Five capacity-collapse repetitions passed | Asymmetric-stall forward and combined medians were 24.825 and 94.904 Mbit/s, below 85% of the 45.769 and 112.517 Mbit/s reference medians |
+| One-second transport lifetime | Five original-window recovery repetitions passed | High-delay standalone median retained only 23.9% of baseline. The 600-millisecond delay flow reached 0.066 Mbit/s versus 9.934 Mbit/s before tuning |
+| Two-second transport lifetime | Recovery and some routed comparisons passed | Repeated combined startup failures remained. The 600-millisecond delay flow reached only 0.728 Mbit/s |
+| Adaptive transport lifetime | Five recovery repetitions and all directed scenario verifiers passed | A separate delay-step guard did not establish required final progress or the receiver-window comparison |
+
+The 256 KiB comparison also produced a 25.56 percent lower median for shared-path 128 kbit/s traffic. Instrumented
+queues in those low-bandwidth flows stayed below 90,024 bytes without a full-queue observation, so their variation
+cannot be attributed directly to the reduced byte cap. Passing repetitions and sample means do not erase lower medians,
+failed recovery, or uncertainty about causality.
+
+The adaptive candidate used the original 4 MiB ingress cap and limited transport lifetime to the lesser of its
+configured value and one second plus four times the slowest minimum observed RTT. Unknown paths and controls retained
+configured lifetimes. Paired asymmetric-stall median changes were +9.96 percent forward, -13.50 percent reverse, and
+-5.11 percent combined. Fixed 600-millisecond delay goodput reached 9.393 Mbit/s versus 8.456 Mbit/s in its reference.
+However, when delay increased from 5 to 600 milliseconds five seconds into a separate forty-second flow, both variants
+had zero sender bytes in their final five-second windows. Buffered server logs did not establish receiver intervals. The
+candidate was removed. No adaptive arrival metadata, policy helper, or experimental fixture remains.
+
+### Rejected timing, discovery, and receive changes
+
+The original Ping/Pong fields, admission-time bounded discovery, and WebSocket buffered-tail copy remain. Their
+alternatives passed correctness checks but did not demonstrate the required workload benefit:
+
+| Discarded candidate | Observation and decision |
+| --- | --- |
+| Omit Ping's local send timestamp and its Pong echo | Routed high-delay standalone and combined samples fell to 23.610 and 20.797 Mbit/s. Restoring fields and original framing also produced startup outliers, so no unique field was isolated. No demonstrated workload benefit justified the change |
+| Delay discovery until real traffic | A combined flow reached 29.873 Mbit/s against a 47.383 Mbit/s standalone baseline, below the unchanged 85% requirement. Later passing samples did not replace that failure |
+| Stop primary padding after real assignment or feedback | Combined samples reached 39.206 and 39.284 Mbit/s and failed their original per-flow bounds. Both experiments were removed |
+| Borrow WebSocket buffered tails | A parser-only batch median improved 13.23%, but loopback batch medians regressed 4.10% and 4.71%. An alternating comparison regressed 4.61%. Correctness and six kernel cases passed without demonstrating a performance gain |
+
+Demand-triggered discovery can move sampling and primary changes into inner TCP startup. The failed flow showed slow
+congestion-window growth during its first twelve seconds with no router-qdisc drop. Delay-sensitive startup is a
+plausible contributor, not a proven cause. No demand-gating timestamp remains. Discovery still uses its original
+four-to-eight-second period, 2 MiB cap per lane direction, and thirty-second cooldown.
+
+Compare both carrier benchmark families when evaluating another receive change. The buffered benchmark measures
+decoding, while loopback includes a concurrent sender and network reader. Neither establishes WAN goodput:
+
+```sh
+go test ./internal/carrier -run '^$' -bench 'BenchmarkWebSocketConnRead(Frames|BufferedFrames)$' \
+  -benchmem -benchtime=1s -count=6
+```
+
+### Optimization priorities
+
+Further work should follow these priorities:
+
+1. Measure CPU profiles, packet rate, allocations, and total session memory for real WS/WSS and raw TLS forwarding.
+   Compare scalar traffic, ready batches, large fragmented frames, and detached sessions. A parser-only benchmark cannot
+   establish end-to-end goodput
+2. Measure capacity discovery against useful offered load, including admission without traffic, short flows, metered
+   paths, shared bottlenecks, and changing capacity. Each lane direction can send at most 2 MiB in one discovery period.
+   Sixteen lanes in both directions have a theoretical 64 MiB ceiling per simultaneous period. A lane that reaches its
+   cap every four-second period plus thirty-second cooldown averages about 493 kbit/s of padding. Slow paths normally
+   send less. Demand-triggered discovery was rejected after a routed startup failure. A tighter budget tied to useful
+   bytes still needs comparison against startup convergence
+3. Evaluate aggregation as an explicit scheduling change. Compare same-group and independent paths, symmetric and
+   heterogeneous RTTs, single and concurrent inner TCP flows, and UDP. Measure reordering and receiver replay drops as
+   well as goodput. The current primary policy does not become aggregating by adjusting its switching margin
+4. Prototype batch metadata only if small-packet profiles show a material framing cost. Preserve immediate scalar
+   forwarding, control preemption, incremental receive delivery, and generation-specific cumulative feedback
+5. Continue evaluating admission and low-frequency controls when their complexity or reconnect cost is measurable.
+   Unifying binary and WebSocket admission after Upgrade trades fewer formats against delayed rejection and another
+   application exchange
+
+Multipath TCP illustrates that actual aggregation involves scheduling, connection-wide identity, receive buffering,
+retransmission policy, and congestion-control interactions, rather than just more sockets. Its reliable-byte-stream
+service differs from WireHop's deadline-bound datagrams, as described in
+[RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html#section-3.3). Importing its global ordering or retransmission
+semantics would be a product change. Per-inner-flow scheduling would also require access to flow identity that encrypted
+WireGuard payloads do not reveal.
+
+[QUIC DATAGRAM](https://www.rfc-editor.org/rfc/rfc9221.html) provides congestion-controlled unreliable datagrams without
+retransmitting lost application payloads. It is a plausible alternative when UDP to the relay is usable. It does not
+solve the current TCP-only reachability requirement when that UDP path is blocked. Its datagrams must fit a QUIC packet
+and the path MTU, so carrying today's largest accepted payloads would require a smaller limit or application
+fragmentation. Such a comparison should include native WireGuard and direct forwarding before adding another encrypted
+transport layer.
+
+The routed performance harness currently checks that combined lanes retain at least 85 percent of the better standalone
+result. Passing that check establishes a regression bound, not aggregation or optimality. An aggregation experiment must
+add a positive gain target relative to the better path and the measured usable sum, with tail-latency, loss, probe-byte,
+and competing-flow limits. No codec change should be described as best-performance without those workload measurements.
+
 ## CLI model
 
 WireHop receives runtime configuration from command-line flags. The client and server read authentication tokens from
@@ -1908,10 +2403,9 @@ outbound datagrams re-enter local ingress and form a UDP feedback loop.
 
 ### Carrier overhead and MTU
 
-Each datagram adds a type byte, a canonical content length, a packet ID, and an absolute deadline. Their total encoded
-overhead depends on the values and datagram length, as defined in the frame protocol. TCP/IP, TLS, and WebSocket
-overhead depends on IP family, TCP options, record boundaries, and write coalescing. WireHop does not modify the
-WireGuard interface MTU.
+Each datagram adds a packed type and content length, a packet ID, and an absolute deadline. Their total encoded overhead
+depends on the values and datagram length, as defined in the frame protocol. TCP/IP, TLS, and WebSocket overhead depends
+on IP family, TCP options, record boundaries, and write coalescing. WireHop does not modify the WireGuard interface MTU.
 
 The WireGuard interface MTU must account for WireGuard, IP, and UDP overhead on every actual UDP leg, including the
 server-to-target path. Carrier framing is removed before UDP delivery and does not reduce that UDP path's payload

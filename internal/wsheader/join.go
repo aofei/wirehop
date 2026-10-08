@@ -124,7 +124,7 @@ func ParseJoin(request *http.Request) (Join, error) {
 		return Join{}, err
 	}
 	generation, err := strconv.ParseUint(generationValue, 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatUint(generation, 10) != generationValue {
 		return Join{}, ErrInvalid
 	}
 	pathValue, err := single(request.Header, headerPathGroupID)
@@ -148,7 +148,7 @@ func ParseJoin(request *http.Request) (Join, error) {
 		return Join{}, err
 	}
 	timestamp, err := strconv.ParseInt(timestampValue, 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatInt(timestamp, 10) != timestampValue {
 		return Join{}, ErrInvalid
 	}
 	monotonicValue, err := single(request.Header, headerMonotonicSend)
@@ -156,7 +156,7 @@ func ParseJoin(request *http.Request) (Join, error) {
 		return Join{}, err
 	}
 	monotonic, err := strconv.ParseUint(monotonicValue, 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatUint(monotonic, 10) != monotonicValue {
 		return Join{}, ErrInvalid
 	}
 	path := request.URL.EscapedPath()

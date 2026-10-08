@@ -101,3 +101,129 @@ func TestValidateBearerToken(t *testing.T) {
 		}
 	}
 }
+
+func TestParseCreateCanonicalNumbers(t *testing.T) {
+	headers, err := Headers(Create{
+		Token: "token", Target: target.MustParse("wg.example.com:51820"), LaneID: 1,
+		Generation: 1, PathGroupID: 1, Nonce: protocol.Nonce{1}, UnixSeconds: 1, MonotonicMicros: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCanonicalAdmissionNumbers(t, headers, func(headers http.Header) error {
+		_, err := ParseCreate(&http.Request{
+			Method: http.MethodGet, URL: &url.URL{Path: "/_wirehop"}, Header: headers,
+		})
+		return err
+	})
+}
+
+func testCanonicalAdmissionNumbers(t *testing.T, headers http.Header, parse func(http.Header) error) {
+	t.Helper()
+	for _, field := range []struct {
+		name    string
+		header  string
+		maximum string
+		zero    bool
+	}{
+		{name: "LaneID", header: headerLaneID, maximum: "18446744073709551615"},
+		{name: "Generation", header: headerLaneGeneration, maximum: "18446744073709551615"},
+		{name: "PathGroupID", header: headerPathGroupID, maximum: "18446744073709551615"},
+		{name: "Timestamp", header: headerTimestamp, maximum: "9223372036854775807"},
+		{name: "MonotonicSend", header: headerMonotonicSend, maximum: "18446744073709551615", zero: true},
+	} {
+		t.Run(field.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name  string
+				value string
+				valid bool
+			}{
+				{name: "One", value: "1", valid: true},
+				{name: "Maximum", value: field.maximum, valid: true},
+				{name: "Zero", value: "0", valid: field.zero},
+				{name: "LeadingZero", value: "01"},
+				{name: "LeadingZeroes", value: "0001"},
+				{name: "Zeroes", value: "00"},
+				{name: "PositiveSign", value: "+1"},
+				{name: "NegativeSign", value: "-1"},
+				{name: "NegativeZero", value: "-0"},
+				{name: "LeadingSpace", value: " 1"},
+				{name: "TrailingSpace", value: "1 "},
+				{name: "LineBreak", value: "1\r\n"},
+				{name: "Overflow", value: "18446744073709551616"},
+				{name: "Empty"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					mutated := headers.Clone()
+					mutated.Set(field.header, tt.value)
+					err := parse(mutated)
+					if tt.valid {
+						if err != nil {
+							t.Fatalf("canonical %s = %q: %v", field.header, tt.value, err)
+						}
+					} else if !errors.Is(err, ErrInvalid) {
+						t.Fatalf("noncanonical %s = %q error = %v, want %v", field.header, tt.value, err, ErrInvalid)
+					}
+				})
+			}
+		})
+	}
+}
+
+func FuzzParseAdmissionNumbers(f *testing.F) {
+	creation, err := Headers(Create{
+		Token: "token", Target: target.MustParse("wg.example.com:51820"), LaneID: 1,
+		Generation: 1, PathGroupID: 1, Nonce: protocol.Nonce{1}, UnixSeconds: 1, MonotonicMicros: 1,
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	join := Join{
+		Method: http.MethodGet, Path: "/_wirehop", SessionID: protocol.SessionID{1}, LaneID: 1,
+		Generation: 1, PathGroupID: 1, Nonce: protocol.Nonce{1}, UnixSeconds: 1, MonotonicMicros: 1,
+	}
+	if err := SignJoin(&join, protocol.SessionSecret{1}); err != nil {
+		f.Fatal(err)
+	}
+	joining, err := JoinHeaders(join)
+	if err != nil {
+		f.Fatal(err)
+	}
+	for selector := range uint8(5) {
+		for _, value := range []string{
+			"", "0", "00", "1", "01", "+1", "-1", " 1", "1\r\n",
+			"9223372036854775807", "9223372036854775808", "18446744073709551615", "18446744073709551616",
+		} {
+			f.Add(selector, value)
+		}
+	}
+	f.Fuzz(func(t *testing.T, selector uint8, value string) {
+		field := []string{headerLaneID, headerLaneGeneration, headerPathGroupID, headerTimestamp,
+			headerMonotonicSend}[selector%5]
+		maximum := "18446744073709551615"
+		if field == headerTimestamp {
+			maximum = "9223372036854775807"
+		}
+		// Check decimal grammar and magnitude independently of strconv parsing and formatting.
+		valid := value != "" && len(value) <= len(maximum) && (len(value) == 1 || value[0] != '0') &&
+			(len(value) < len(maximum) || value <= maximum) && (value != "0" || field == headerMonotonicSend)
+		for index := range len(value) {
+			if value[index] < '0' || value[index] > '9' {
+				valid = false
+				break
+			}
+		}
+		request := &http.Request{Method: http.MethodGet, URL: &url.URL{Path: "/_wirehop"}, Header: creation.Clone()}
+		request.Header.Set(field, value)
+		_, createErr := ParseCreate(request)
+		request.Header = joining.Clone()
+		request.Header.Set(field, value)
+		_, joinErr := ParseJoin(request)
+		if (createErr == nil) != valid || (joinErr == nil) != valid {
+			t.Fatalf("%s = %q: create error %v, join error %v, want valid %t", field, value, createErr, joinErr, valid)
+		}
+		if !valid && (!errors.Is(createErr, ErrInvalid) || !errors.Is(joinErr, ErrInvalid)) {
+			t.Fatalf("%s = %q: create error %v, join error %v, want %v", field, value, createErr, joinErr, ErrInvalid)
+		}
+	})
+}

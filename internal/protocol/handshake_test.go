@@ -41,7 +41,11 @@ func TestClientHello(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := clientHelloMinimumSize + len(hello.Target.String()); len(encoded) != want {
+			want := clientHelloMinimumSize + len(hello.Target.String())
+			if hello.Mode == HelloJoin {
+				want += len(hello.SessionID)
+			}
+			if len(encoded) != want {
 				t.Fatalf("MarshalClientHello() length = %d, want %d", len(encoded), want)
 			}
 			if hello.Target == maximumTarget && len(encoded) > MaxClientHelloSize {
@@ -159,21 +163,22 @@ func TestServerHello(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		hello ServerHello
+		size  int
 	}{
 		{name: "Created", hello: ServerHello{
 			Result: ServerSessionCreated, RequestNonce: testNonce(4), ServerUnixSeconds: 1_700_000_000,
 			SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: testPathGroupID(3),
 			ReceiveMicros: 100, SendMicros: 110,
-		}},
+		}, size: 126},
 		{name: "Accepted", hello: ServerHello{
 			Result: ServerLaneAccepted, RequestNonce: testNonce(4), ServerUnixSeconds: 1_700_000_000,
 			SessionID: testSessionID(1), PathGroupID: testPathGroupID(3), ReceiveMicros: 100, SendMicros: 110,
-		}},
+		}, size: 94},
 		{name: "Rejected", hello: ServerHello{
 			Result: ServerRejected, RequestNonce: testNonce(4), ServerUnixSeconds: 1_700_000_000,
 			ErrorCode: ErrorAuthentication, ErrorClass: ErrorLaneRejected, ErrorScope: ErrorScopeLane,
-			Diagnostic: "authentication failed", ReceiveMicros: 100, SendMicros: 110,
-		}},
+			Diagnostic: "authentication failed",
+		}, size: 85},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			hello := tt.hello
@@ -184,8 +189,8 @@ func TestServerHello(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := serverHelloMinimumSize + len(hello.Diagnostic); len(encoded) != want {
-				t.Fatalf("MarshalServerHello() length = %d, want %d", len(encoded), want)
+			if len(encoded) != tt.size {
+				t.Fatalf("MarshalServerHello() length = %d, want %d", len(encoded), tt.size)
 			}
 			got, err := ParseServerHello(encoded)
 			if err != nil {
@@ -260,6 +265,15 @@ func TestServerHelloRejectsInconsistentErrorScope(t *testing.T) {
 	if _, err := MarshalServerHello(hello); !errors.Is(err, ErrDiagnosticTooLarge) {
 		t.Fatalf("MarshalServerHello() error = %v for oversized diagnostic", err)
 	}
+	t.Run("RejectedTiming", func(t *testing.T) {
+		for _, timing := range [][2]uint64{{0, 1}, {1, 1}} {
+			hello.Diagnostic = ""
+			hello.ReceiveMicros, hello.SendMicros = timing[0], timing[1]
+			if _, err := MarshalServerHello(hello); !errors.Is(err, ErrInvalidServerHello) {
+				t.Fatalf("MarshalServerHello() error = %v for unused rejection timing %v", err, timing)
+			}
+		}
+	})
 }
 
 func TestServerHelloAuthenticatesRequestAndTime(t *testing.T) {

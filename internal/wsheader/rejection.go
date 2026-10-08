@@ -3,6 +3,7 @@ package wsheader
 import (
 	"encoding/base64"
 	"net/http"
+	"strings"
 
 	"github.com/aofei/wirehop/internal/protocol"
 )
@@ -10,8 +11,6 @@ import (
 const (
 	// headerRejection carries one authenticated binary admission rejection.
 	headerRejection = "WireHop-Rejection"
-	// maximumEncodedRejectionSize bounds the base64url-encoded rejection header.
-	maximumEncodedRejectionSize = 1024
 )
 
 // SetRejection encodes rejection into headers.
@@ -23,18 +22,15 @@ func SetRejection(headers http.Header, rejection protocol.ServerHello) error {
 	if err != nil {
 		return err
 	}
-	value := base64.RawURLEncoding.EncodeToString(encoded)
-	if len(value) > maximumEncodedRejectionSize {
-		return ErrInvalid
-	}
-	headers.Set(headerRejection, value)
+	headers.Set(headerRejection, base64.RawURLEncoding.EncodeToString(encoded))
 	return nil
 }
 
 // ParseRejection decodes one canonical rejection from headers.
 func ParseRejection(headers http.Header) (protocol.ServerHello, error) {
 	value, err := single(headers, headerRejection)
-	if err != nil || len(value) > maximumEncodedRejectionSize {
+	if err != nil || len(value) > base64.RawURLEncoding.EncodedLen(protocol.MaxServerHelloSize) ||
+		strings.ContainsAny(value, "\r\n") {
 		return protocol.ServerHello{}, ErrInvalid
 	}
 	encoded, err := base64.RawURLEncoding.Strict().DecodeString(value)

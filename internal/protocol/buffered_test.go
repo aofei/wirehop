@@ -21,8 +21,8 @@ func (s *bufferedFrameSource) Read(buffer []byte) (int, error) {
 
 func FuzzReadBufferedFrame(f *testing.F) {
 	for _, encoded := range [][]byte{
-		{}, {byte(FramePing), 0}, {byte(FrameData), 128}, {0, 0},
-		{byte(FrameData), 128, 0}, {byte(FrameData), 128, 128, 128},
+		{}, {byte(FramePing)}, {0x81}, {0}, {0, 0},
+		{0x81, 0}, {0x81, 0x80}, {0x81, 0x80, 0x80},
 	} {
 		f.Add(encoded)
 	}
@@ -62,7 +62,7 @@ func FuzzReadBufferedFrame(f *testing.F) {
 					if !errors.Is(err, expectedErr) {
 						t.Fatalf("buffered error %v differs from stream error %v", err, expectedErr)
 					}
-				} else if before >= 2 && !errors.Is(expectedErr, io.ErrUnexpectedEOF) {
+				} else if !errors.Is(expectedErr, io.ErrUnexpectedEOF) {
 					t.Fatalf("buffered decoding suppressed stream error %v", expectedErr)
 				}
 				break

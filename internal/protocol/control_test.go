@@ -19,33 +19,33 @@ func TestControlFrameWireLayout(t *testing.T) {
 		value   any
 		encoded string
 	}{
-		{name: "Ping", value: TimingPing{ID: 128, SendMicros: 16384}, encoded: "02058001808001"},
+		{name: "Ping", value: TimingPing{ID: 128, SendMicros: 16384}, encoded: "528001808001"},
 		{name: "Pong", value: TimingPong{ID: 1, PingSendMicros: 127, ReceiveMicros: 128, SendMicros: 16384},
-			encoded: "0307017f8001808001"},
+			encoded: "73017f8001808001"},
 		{name: "ClockSync", value: ClockSync{
 			ClientSendMicros: 127, ServerReceiveMicros: 128, ServerSendMicros: 16383, ClientReceiveMicros: 16384,
-		}, encoded: "04087f8001ff7f808001"},
+		}, encoded: "84017f8001ff7f808001"},
 		{name: "DeliveryReport", value: DeliveryReport{
 			LaneID: testLaneID(1), Generation: 128, DataPackets: 127,
 			PingID: 1, DelayMicros: 16383,
-		}, encoded: "05070180017f01ff7f"},
+		}, encoded: "750180017f01ff7f"},
 		{name: "SessionCreated", value: SessionCreated{
 			SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: testPathGroupID(3),
 			ReceiveMicros: 128, SendMicros: 16384,
-		}, encoded: "0636" + id1 + secret2 + "038001808001"},
+		}, encoded: "e606" + id1 + secret2 + "038001808001"},
 		{name: "LaneAccepted", value: LaneAccepted{
 			SessionID: testSessionID(1), PathGroupID: testPathGroupID(3), ReceiveMicros: 128, SendMicros: 16384,
-		}, encoded: "0716" + id1 + "038001808001"},
-		{name: "SessionClose", value: CloseClientShutdown, encoded: "080101"},
+		}, encoded: "e702" + id1 + "038001808001"},
+		{name: "SessionClose", value: CloseClientShutdown, encoded: "1801"},
 		{name: "LaneAbandon", value: LaneGeneration{LaneID: testLaneID(1), Generation: 128},
-			encoded: "0903018001"},
+			encoded: "39018001"},
 		{name: "LaneError", value: ErrorFrame{
 			Code: ErrorProtocolViolation, Class: ErrorLaneRejected, Scope: ErrorScopeLane,
 			LaneID: testLaneID(1), Generation: 128, Diagnostic: "ok",
-		}, encoded: "0a080a02010180016f6b"},
+		}, encoded: "8a010a02010180016f6b"},
 		{name: "SessionError", value: ErrorFrame{
 			Code: ErrorAuthentication, Class: ErrorSessionRejected, Scope: ErrorScopeSession, Diagnostic: "bad",
-		}, encoded: "0a080304020000626164"},
+		}, encoded: "8a010304020000626164"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			want, err := hex.DecodeString(tt.encoded)

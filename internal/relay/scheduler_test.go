@@ -2111,11 +2111,11 @@ func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
 		{name: "OneByteDeadline", id: 1, deadline: 127000, payloadSize: 32, size: 36},
 		{name: "TwoByteDeadline", id: 1, deadline: 128000, payloadSize: 32, size: 37},
 		{name: "FullWidthDeadline", id: 1, deadline: math.MaxUint64 - math.MaxUint64%1000, payloadSize: 32, size: 43},
-		{name: "OneByteLength", id: 1, deadline: 128000, payloadSize: 124, size: 129},
-		{name: "TwoByteLength", id: 1, deadline: 128000, payloadSize: 125, size: 131},
-		{name: "TwoByteLengthMaximum", id: 1, deadline: 128000, payloadSize: 16380, size: 16386},
-		{name: "ThreeByteLength", id: 1, deadline: 128000, payloadSize: 16381, size: 16388},
-		{name: "MaximumFrame", id: math.MaxUint64, deadline: math.MaxUint64 - math.MaxUint64%1000, payloadSize: 65535, size: 65557},
+		{name: "TwoByteHeaderMaximum", id: 1, deadline: 128000, payloadSize: 1020, size: 1025},
+		{name: "ThreeByteHeader", id: 1, deadline: 128000, payloadSize: 1021, size: 1027},
+		{name: "MediumPayload", id: 1, deadline: 128000, payloadSize: 125, size: 130},
+		{name: "LargePayload", id: 1, deadline: 128000, payloadSize: 16381, size: 16387},
+		{name: "MaximumFrame", id: math.MaxUint64, deadline: math.MaxUint64 - math.MaxUint64%1000, payloadSize: 65535, size: 65556},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, fits := range []bool{true, false} {

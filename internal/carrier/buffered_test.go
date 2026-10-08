@@ -90,8 +90,8 @@ func (*fragmentedReadConn) SetReadDeadline(time.Time) error { return nil }
 func FuzzCarrierReadFrames(f *testing.F) {
 	for _, encoded := range [][]byte{
 		{}, {byte(protocol.FrameData)}, {0}, {0, 0},
-		{byte(protocol.FramePing), 0}, {byte(protocol.FrameData), 128, 0},
-		{byte(protocol.FramePing), 0, byte(protocol.FrameData), 128},
+		{byte(protocol.FramePing)}, {0x81, 0},
+		{byte(protocol.FramePing), 0x81, 0x80},
 	} {
 		f.Add(encoded, uint16(0), uint8(15))
 	}

@@ -1,6 +1,8 @@
 package carrier
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"net"
 	"net/http"
@@ -158,6 +160,45 @@ func BenchmarkWebSocketConnReadFrames(b *testing.B) {
 						}
 					}
 				})
+			}
+		})
+	}
+}
+
+func BenchmarkWebSocketConnReadBufferedFrames(b *testing.B) {
+	for _, frameCount := range []int{1, 16} {
+		b.Run(strconv.Itoa(frameCount), func(b *testing.B) {
+			var message []byte
+			payload := make([]byte, 1452)
+			payload[0] = 4
+			for index := range frameCount {
+				var err error
+				message, err = protocol.AppendDataFrame(message, protocol.Data{
+					PacketID: 1_000_000_000 + uint64(index), DeadlineMicros: 864_005_000_000,
+					Payload: payload,
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			input := bytes.NewReader(message)
+			reader := bufio.NewReaderSize(input, streamReadBufferSize)
+			stream := WebSocketConn{messageReader: reader, messageOpen: true}
+			var frames [maximumStreamReadBatchFrames]protocol.Frame
+			b.ReportAllocs()
+			b.SetBytes(int64(len(message)))
+			for b.Loop() {
+				input.Reset(message)
+				reader.Reset(input)
+				// Include the same buffer fill in both implementations without network scheduling noise.
+				if _, err := reader.Peek(len(message)); err != nil {
+					b.Fatal(err)
+				}
+				count, err := stream.ReadFrames(context.Background(), frames[:])
+				if err != nil || count != frameCount {
+					b.Fatalf("read batch = %d, %v", count, err)
+				}
+				benchmarkFrameSink = frames[count-1]
 			}
 		})
 	}

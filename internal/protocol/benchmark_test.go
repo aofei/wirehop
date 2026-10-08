@@ -2,12 +2,77 @@ package protocol
 
 import (
 	"bytes"
+	"strings"
 	"testing"
+
+	"github.com/aofei/wirehop/internal/target"
 )
 
 var benchmarkEncodingSink []byte
 
 var benchmarkFrameSink Frame
+
+func BenchmarkClientHelloEncoding(b *testing.B) {
+	for _, tt := range []struct {
+		name  string
+		hello ClientHello
+	}{
+		{name: "Create", hello: testClientHello(HelloCreate, SessionID{}, target.MustParse("127.0.0.1:51820"))},
+		{name: "Join", hello: testClientHello(HelloJoin, testSessionID(1), target.Endpoint{})},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			key := []byte("benchmark authentication key")
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := SignClientHello(&tt.hello, key); err != nil {
+					b.Fatal(err)
+				}
+				encoded, err := MarshalClientHello(tt.hello)
+				if err != nil {
+					b.Fatal(err)
+				}
+				benchmarkEncodingSink = encoded
+			}
+			b.ReportMetric(float64(len(benchmarkEncodingSink)), "wire-bytes/op")
+		})
+	}
+}
+
+func BenchmarkServerHelloEncoding(b *testing.B) {
+	for _, tt := range []struct {
+		name  string
+		hello ServerHello
+	}{
+		{name: "Created", hello: ServerHello{Result: ServerSessionCreated, RequestNonce: testNonce(1),
+			ServerUnixSeconds: 1_700_000_000, SessionID: testSessionID(1), SessionSecret: testSessionSecret(1),
+			PathGroupID: 1, ReceiveMicros: 100, SendMicros: 110}},
+		{name: "Accepted", hello: ServerHello{Result: ServerLaneAccepted, RequestNonce: testNonce(1),
+			ServerUnixSeconds: 1_700_000_000, SessionID: testSessionID(1), PathGroupID: 1,
+			ReceiveMicros: 100, SendMicros: 110}},
+		{name: "Rejected", hello: ServerHello{Result: ServerRejected, RequestNonce: testNonce(1),
+			ServerUnixSeconds: 1_700_000_000, ErrorCode: ErrorUnavailable, ErrorClass: ErrorRetryable,
+			ErrorScope: ErrorScopeSession}},
+		{name: "MaximumDiagnostic", hello: ServerHello{Result: ServerRejected, RequestNonce: testNonce(1),
+			ServerUnixSeconds: 1_700_000_000, ErrorCode: ErrorUnavailable, ErrorClass: ErrorRetryable,
+			ErrorScope: ErrorScopeSession, Diagnostic: strings.Repeat("x", MaxDiagnosticSize)}},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			key := []byte("benchmark authentication key")
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := SignServerHello(&tt.hello, key); err != nil {
+					b.Fatal(err)
+				}
+				encoded, err := MarshalServerHello(tt.hello)
+				if err != nil {
+					b.Fatal(err)
+				}
+				benchmarkEncodingSink = encoded
+			}
+			b.ReportMetric(float64(len(benchmarkEncodingSink)), "wire-bytes/op")
+		})
+	}
+}
 
 func BenchmarkDataEncoding(b *testing.B) {
 	data := Data{

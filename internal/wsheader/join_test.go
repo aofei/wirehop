@@ -71,3 +71,23 @@ func TestJoinPathBoundary(t *testing.T) {
 		t.Fatalf("SignJoin() oversized path error = %v, want %v", err, ErrInvalid)
 	}
 }
+
+func TestParseJoinCanonicalNumbers(t *testing.T) {
+	join := Join{
+		Method: http.MethodGet, Path: "/_wirehop", SessionID: protocol.SessionID{1}, LaneID: 1,
+		Generation: 1, PathGroupID: 1, Nonce: protocol.Nonce{1}, UnixSeconds: 1, MonotonicMicros: 1,
+	}
+	if err := SignJoin(&join, protocol.SessionSecret{1}); err != nil {
+		t.Fatal(err)
+	}
+	headers, err := JoinHeaders(join)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCanonicalAdmissionNumbers(t, headers, func(headers http.Header) error {
+		_, err := ParseJoin(&http.Request{
+			Method: http.MethodGet, URL: &url.URL{Path: "/_wirehop"}, Header: headers,
+		})
+		return err
+	})
+}

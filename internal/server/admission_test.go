@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -324,6 +325,68 @@ func TestCreationDeadlineRequiresAuthorization(t *testing.T) {
 					}
 					if snapshot := instance.Snapshot(); snapshot.CreatingSessions != 0 || snapshot.PendingAdmissions != 0 {
 						t.Fatalf("failed creation retained admission resources: %+v", snapshot)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestServerWebSocketAdmissionRejectsNoncanonicalNumbers(t *testing.T) {
+	now := time.Now().Unix()
+	endpoint := target.MustParse("wg.example.com:51820")
+	creation, err := wsheader.Headers(wsheader.Create{
+		Token: "test-token", Target: endpoint, LaneID: 1, Generation: 1, PathGroupID: 1,
+		Nonce: protocol.Nonce{1}, UnixSeconds: now, MonotonicMicros: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	join := wsheader.Join{
+		Method: http.MethodGet, Path: "/_wirehop", SessionID: protocol.SessionID{1}, LaneID: 1,
+		Generation: 1, PathGroupID: 1, Nonce: protocol.Nonce{1}, UnixSeconds: now, MonotonicMicros: 1,
+	}
+	if err := wsheader.SignJoin(&join, protocol.SessionSecret{1}); err != nil {
+		t.Fatal(err)
+	}
+	joining, err := wsheader.JoinHeaders(join)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []struct {
+		name    string
+		headers http.Header
+	}{
+		{name: "Create", headers: creation},
+		{name: "Join", headers: joining},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			for _, field := range []struct {
+				name   string
+				header string
+				value  string
+			}{
+				{name: "Generation", header: "WireHop-Lane-Generation", value: "01"},
+				{name: "Timestamp", header: "WireHop-Timestamp", value: "+" + strconv.FormatInt(now, 10)},
+				{name: "MonotonicSend", header: "WireHop-Monotonic-Send", value: "00"},
+			} {
+				t.Run(field.name, func(t *testing.T) {
+					instance := newSessionTestServer(t, []byte("test-token"), endpoint, time.Second)
+					resolver := &serverTestResolver{err: errors.New("test resolver failure")}
+					instance.config.Resolver = resolver
+					request := httptest.NewRequest(http.MethodGet, "http://relay.example.com/_wirehop", nil)
+					request.Header = mode.headers.Clone()
+					request.Header.Set(field.header, field.value)
+					response := httptest.NewRecorder()
+					instance.WebSocketHandler(t.Context()).ServeHTTP(response, request)
+					if response.Code != http.StatusBadRequest || response.Header().Get("WireHop-Rejection") != "" {
+						t.Fatalf("malformed admission response = %d, headers %v", response.Code, response.Header())
+					}
+					if resolver.host != "" || instance.Snapshot() != (Snapshot{}) {
+						t.Fatalf("malformed admission resolved %q or retained resources: %+v", resolver.host, instance.Snapshot())
+					}
+					if err := instance.replay.CheckAndStore(protocol.Nonce{1}, now, now+60); err != nil {
+						t.Fatalf("malformed admission consumed creation nonce: %v", err)
 					}
 				})
 			}

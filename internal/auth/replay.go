@@ -26,10 +26,11 @@ var (
 
 // ReplayCache retains authenticated nonces until their replay window expires.
 type ReplayCache struct {
-	mu       sync.Mutex
-	limit    int
-	retained map[protocol.Nonce]struct{}
-	expiry   replayHeap
+	mu         sync.Mutex
+	limit      int
+	latestUnix int64
+	retained   map[protocol.Nonce]struct{}
+	expiry     replayHeap
 }
 
 // replayEntry associates one retained nonce with its first invalid Unix second.
@@ -75,19 +76,22 @@ func NewReplayCache(limit int) (*ReplayCache, error) {
 	if limit <= 0 {
 		return nil, ErrInvalidReplayLimit
 	}
-	return &ReplayCache{limit: limit}, nil
+	return &ReplayCache{limit: limit, latestUnix: math.MinInt64}, nil
 }
 
-// CheckAndStore atomically rejects a retained nonce or stores it through expiresAtUnix.
+// CheckAndStore atomically rejects a retained nonce or stores it through expiresAtUnix. Time never moves backward
+// within the cache, so an earlier concurrent sample cannot reopen an expired window after its nonce was removed.
 func (c *ReplayCache) CheckAndStore(nonce protocol.Nonce, nowUnix, expiresAtUnix int64) error {
 	if nonce == (protocol.Nonce{}) {
 		return ErrInvalidNonce
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nowUnix = max(nowUnix, c.latestUnix)
 	if expiresAtUnix <= nowUnix {
 		return ErrTimestampOutsideWindow
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.latestUnix = nowUnix
 
 	for len(c.expiry) > 0 && c.expiry[0].expiry <= nowUnix {
 		entry := heap.Pop(&c.expiry).(replayEntry)

@@ -368,8 +368,8 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 			data[index] = protocol.Data{PacketID: math.MaxUint64 - uint64(index), DeadlineMicros: math.MaxUint64 - math.MaxUint64%protocol.DeadlineResolutionMicros,
 				Payload: bytes.Repeat([]byte{byte(index + 1)}, protocol.MaxPacketSize)}
 		}
-		if WebSocketReadLimit != 131_114 {
-			t.Fatalf("message limit = %d, want 131114", WebSocketReadLimit)
+		if WebSocketReadLimit != 131_112 {
+			t.Fatalf("message limit = %d, want 131112", WebSocketReadLimit)
 		}
 		if err := stream.WriteDataBatch(ctx, data[:]); err != nil {
 			t.Fatal(err)
@@ -617,12 +617,12 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 		{name: "TextMessage", messageType: websocket.MessageText, messages: [][]byte{encoded},
 			want: ErrInvalidWebSocketMessage},
 		{name: "TrailingPartialFrame", messageType: websocket.MessageBinary,
-			messages: [][]byte{append(append([]byte(nil), encoded...), byte(protocol.FramePing))},
+			messages: [][]byte{append(append([]byte(nil), encoded...), 0x80)},
 			want:     protocol.ErrTrailingFrameData},
 		{name: "NonminimalLength", messageType: websocket.MessageBinary,
-			messages: [][]byte{{byte(protocol.FrameDeliveryReport), 0x80, 0}}, want: protocol.ErrInvalidInteger},
+			messages: [][]byte{{0x85, 0}}, want: protocol.ErrInvalidInteger},
 		{name: "ValidPrefixBeforeNonminimalLength", messageType: websocket.MessageBinary,
-			messages: [][]byte{append(append([]byte(nil), encoded...), byte(protocol.FrameDeliveryReport), 0x80, 0)},
+			messages: [][]byte{append(append([]byte(nil), encoded...), 0x85, 0)},
 			want:     protocol.ErrInvalidInteger},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

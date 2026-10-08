@@ -56,6 +56,35 @@ func TestReplayCacheExpiresOutOfOrder(t *testing.T) {
 	}
 }
 
+func TestReplayCacheRejectsExpiredWindowAfterTimeAdvance(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		now  int64
+	}{
+		{name: "DelayedConcurrentSample", now: 109},
+		{name: "BackwardClock", now: 100},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cache, err := NewReplayCache(2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.CheckAndStore(testNonce(1), 100, 110); err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.CheckAndStore(testNonce(2), 110, 120); err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.CheckAndStore(testNonce(1), tt.now, 110); !errors.Is(err, ErrTimestampOutsideWindow) {
+				t.Fatalf("expired nonce accepted after time advanced: %v", err)
+			}
+			if err := cache.CheckAndStore(testNonce(3), tt.now, 130); err != nil {
+				t.Fatalf("still-valid window rejected after time advanced: %v", err)
+			}
+		})
+	}
+}
+
 func TestReplayCacheValidation(t *testing.T) {
 	if _, err := NewReplayCache(0); !errors.Is(err, ErrInvalidReplayLimit) {
 		t.Fatalf("NewReplayCache() error = %v", err)
