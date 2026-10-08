@@ -19,6 +19,151 @@ import (
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
 
+func TestSchedulerCloseSession(t *testing.T) {
+	frame, err := protocol.MarshalSessionClose(protocol.CloseClientShutdown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name       string
+		registered bool
+		abandoning bool
+	}{
+		{name: "NoActiveLane"},
+		{name: "ControlRejected", registered: true},
+		{name: "AbandoningLane", registered: true, abandoning: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			lanes := make(map[protocol.LaneID]*scheduledLane)
+			if tt.registered {
+				lane := schedulerLane(t, 1, 1, 1, 1_000_000)
+				lane.abandoning = tt.abandoning
+				lane.registration.SendControl = func(protocol.Frame, func()) bool {
+					if tt.abandoning {
+						t.Fatal("close routed through an abandoning lane")
+					}
+					return false
+				}
+				lanes[lane.registration.LaneID] = lane
+			}
+			result := make(chan error, 1)
+			var preferred protocol.LaneID
+			new(Scheduler).applyEvent(lanes, &preferred,
+				schedulerEvent{kind: schedulerCloseSession, frame: frame, result: result}, time.Now())
+			if err := <-result; !errors.Is(err, ErrNoActiveLane) {
+				t.Fatalf("close error = %v, want no active lane", err)
+			}
+		})
+	}
+
+	t.Run("DeferredCallbacks", func(t *testing.T) {
+		first := schedulerLane(t, 1, 1, 1, 1_000_000)
+		attempts := 0
+		first.registration.SendControl = func(protocol.Frame, func()) bool {
+			attempts++
+			return false
+		}
+		lane := schedulerLane(t, 2, 2, 2, 1_000_000)
+		var callbacks []func()
+		lane.registration.SendControl = func(_ protocol.Frame, complete func()) bool {
+			callbacks = append(callbacks, complete)
+			return true
+		}
+		lanes := map[protocol.LaneID]*scheduledLane{
+			first.registration.LaneID: first,
+			lane.registration.LaneID:  lane,
+		}
+		var preferred protocol.LaneID
+		var results [2]chan error
+		for index := range results {
+			results[index] = make(chan error, 1)
+			new(Scheduler).applyEvent(lanes, &preferred,
+				schedulerEvent{kind: schedulerCloseSession, frame: frame, result: results[index]}, time.Now())
+			select {
+			case <-results[index]:
+				t.Fatal("close completed before the carrier write callback")
+			default:
+			}
+		}
+		if len(callbacks) != len(results) {
+			t.Fatalf("close callbacks = %d, want %d", len(callbacks), len(results))
+		}
+		if attempts != len(results) {
+			t.Fatal("close did not fall back after the best lane rejected control")
+		}
+		for index := len(callbacks) - 1; index >= 0; index-- {
+			callbacks[index]()
+			select {
+			case err := <-results[index]:
+				if err != nil {
+					t.Fatal(err)
+				}
+			default:
+				t.Fatal("callback did not complete its own close request")
+			}
+		}
+	})
+
+	t.Run("SynchronousCallback", func(t *testing.T) {
+		lane := schedulerLane(t, 1, 1, 1, 1_000_000)
+		lane.registration.SendControl = func(_ protocol.Frame, complete func()) bool {
+			complete()
+			return true
+		}
+		result := make(chan error, 1)
+		var preferred protocol.LaneID
+		new(Scheduler).applyEvent(map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane}, &preferred,
+			schedulerEvent{kind: schedulerCloseSession, frame: frame, result: result}, time.Now())
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("CanceledCaller", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ingress.Close()
+			scheduler, err := NewScheduler(ingress)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lane := schedulerLane(t, 1, 1, 1, 1_000_000)
+			var complete func()
+			lane.registration.SendControl = func(frame protocol.Frame, callback func()) bool {
+				reason, err := protocol.ParseSessionClose(frame)
+				if err != nil || reason != protocol.CloseClientShutdown {
+					t.Fatalf("session close = %v, %v", reason, err)
+				}
+				complete = callback
+				return true
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- scheduler.CloseSession(ctx, protocol.CloseClientShutdown) }()
+			synctest.Wait()
+			var preferred protocol.LaneID
+			scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane},
+				&preferred, <-scheduler.events, time.Now())
+			cancel()
+			synctest.Wait()
+			if err := <-result; !errors.Is(err, context.Canceled) {
+				t.Fatalf("CloseSession() = %v, want canceled", err)
+			}
+			complete()
+			for range cap(scheduler.events) {
+				scheduler.events <- schedulerEvent{}
+			}
+			if err := scheduler.CloseSession(ctx, protocol.CloseClientShutdown); !errors.Is(err, context.Canceled) {
+				t.Fatalf("CloseSession() with full event queue = %v, want canceled", err)
+			}
+		})
+	})
+}
+
 func TestSelectCandidates(t *testing.T) {
 	first := schedulerLane(t, 1, 1, 10, 1_000_000)
 	sameGroup := schedulerLane(t, 2, 1, 12, 1_000_000)
@@ -1475,11 +1620,13 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 		sourceWrite   bool
 		sourcePending bool
 		overlap       bool
+		expired       bool
 	}{
 		{name: "Queued"},
 		{name: "Sent", sourceWrite: true},
 		{name: "ActiveWrite", sourceWrite: true, sourcePending: true},
 		{name: "OverlappingWrites", sourceWrite: true, sourcePending: true, overlap: true},
+		{name: "ExpiredActiveWrite", sourceWrite: true, sourcePending: true, expired: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			budget, err := retention.NewBudget(retention.Limits{Packets: 1, Bytes: 4096})
@@ -1487,7 +1634,8 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				t.Fatal(err)
 			}
 			limits := packetqueue.Limits{Packets: 1, Bytes: 4096}
-			now := func() time.Time { return time.Unix(123, 0) }
+			current := time.Unix(123, 0)
+			now := func() time.Time { return current }
 			ingress, err := packetqueue.NewWithClock[Packet](limits, now)
 			if err != nil {
 				t.Fatal(err)
@@ -1545,6 +1693,10 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 					sourceOwnership[0].Release()
 				}
 			}
+			if test.expired {
+				current = transmission.deadline
+				sourceStore.expire(current)
+			}
 			source := &scheduledLane{registration: schedulerRegistration(1, 1, sourceStore)}
 			destination := &scheduledLane{
 				registration: schedulerRegistration(2, 2, destinationStore), rttMicros: 1000, deliveryRate: 1_000_000, rateObserved: true,
@@ -1559,6 +1711,20 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 			case <-sourceStore.Done():
 			default:
 				t.Fatal("migration did not close the source store")
+			}
+			if test.expired {
+				if packets, bytes := destinationStore.backlog(); packets != 0 || bytes != 0 {
+					t.Fatalf("expired transport migrated %d packets and %d bytes", packets, bytes)
+				}
+				if got := budget.Usage(); got != (retention.Usage{}) {
+					t.Fatalf("expired migration retained capacity: %+v", got)
+				}
+				if string(sourceData[0].Payload) != wantPayload {
+					t.Fatal("expired migration changed the active writer payload")
+				}
+				retained := sourceOwnership[0].Retain()
+				retained.Release()
+				return
 			}
 			if packets, bytes := destinationStore.backlog(); packets != 1 || bytes != uint64(transmission.size) {
 				t.Fatalf("destination backlog = %d packets, %d bytes", packets, bytes)

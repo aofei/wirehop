@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/carrier"
+	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
@@ -16,6 +17,64 @@ import (
 )
 
 var benchmarkCandidateSink uint64
+
+func BenchmarkSchedulerApplyEvent(b *testing.B) {
+	for _, kind := range []schedulerEventKind{schedulerTiming, schedulerReport} {
+		name := "Timing"
+		if kind == schedulerReport {
+			name = "DeliveryReport"
+		}
+		b.Run(name, func(b *testing.B) {
+			now := time.Unix(100, 0)
+			store, err := newTransmissionStore(packetqueue.Limits{Packets: 256, Bytes: 2 * 1024 * 1024},
+				func() time.Time { return now })
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { releaseTransmissions(store.drain()) })
+			laneID := protocol.LaneID(1)
+			lanes := map[protocol.LaneID]*scheduledLane{
+				laneID: {registration: LaneRegistration{
+					LaneID: laneID, Generation: 1, Store: store, ValidatePingProgress: func(uint64) bool { return true },
+				}, deliveryRate: defaultInitialRateBytesPerSecond},
+			}
+			event := schedulerEvent{
+				kind: kind, laneID: laneID, generation: 1, result: make(chan error, 1),
+				report: protocol.DeliveryReport{LaneID: laneID, Generation: 1},
+				timing: clockmap.Sample{LocalSendMicros: 1, RemoteReceiveMicros: 2,
+					RemoteSendMicros: 2, LocalReceiveMicros: 3},
+			}
+			scheduler := new(Scheduler)
+			preferred := laneID
+			transmission := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Hour))
+			var data [1]protocol.Data
+			var ownership [1]datagram.Packet
+			b.ReportAllocs()
+			for b.Loop() {
+				if kind == schedulerReport {
+					event.report.DataPackets++
+					transmission.packetID = event.report.DataPackets
+					if err := store.push(transmission); err != nil {
+						b.Fatal(err)
+					}
+					count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+					releaseBatchOwnership(ownership[:count])
+					if err != nil || count != 1 {
+						b.Fatalf("takeBatch() = %d, %v", count, err)
+					}
+					now = now.Add(time.Microsecond)
+					event.receiveMicros = uint64(now.UnixMicro())
+				}
+				scheduler.applyEvent(lanes, &preferred, event, now)
+				if kind == schedulerReport {
+					if err := <-event.result; err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}
 
 type benchmarkEndpoint struct{}
 

@@ -159,7 +159,7 @@ func TestSchedulerRunRetriesSharedBudgetAfterRelease(t *testing.T) {
 						t.Fatalf("external acknowledgment = stale %t, %v", stale, err)
 					}
 				case "Expiry":
-					external.expireQueued(time.Now())
+					external.expire(time.Now())
 				case "Drain":
 					releaseTransmissions(external.drain())
 				}
@@ -673,7 +673,7 @@ func TestTransmissionStoreAcknowledgeMixedProbePrefix(t *testing.T) {
 		sizes[index] = len(encoded)
 	}
 	now = now.Add(2 * time.Second)
-	store.expireQueued(now)
+	store.expire(now)
 	for _, tt := range []struct {
 		name             string
 		packets, proof   uint64

@@ -3,9 +3,11 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,18 +58,25 @@ func TestTransmissionStoreValidation(t *testing.T) {
 }
 
 func TestTransmissionStorePreservesWriteView(t *testing.T) {
-	t.Run("Drain", func(t *testing.T) {
-		testTransmissionStorePreservesWriteView(t, false)
-	})
-	t.Run("Acknowledgment", func(t *testing.T) {
-		testTransmissionStorePreservesWriteView(t, true)
-	})
+	for _, action := range []string{
+		"Drain", "Acknowledgment", "Expiry", "ExpiryThenAcknowledgment",
+		"ConcurrentExpiryAndAcknowledgment", "ConcurrentExpiryAndDrain",
+	} {
+		t.Run(action, func(t *testing.T) {
+			testTransmissionStorePreservesWriteView(t, action)
+		})
+	}
 }
 
-func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
+func testTransmissionStorePreservesWriteView(t *testing.T, action string) {
 	t.Helper()
-	store := schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096})
-	transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
+	now := time.Unix(100, 0)
+	store, err := newTransmissionStore(packetqueue.Limits{Packets: 1, Bytes: 4096}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	transmission := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))
 	local, err := datagram.ListenLocal(netip.MustParseAddrPort("127.0.0.1:0"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +99,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 	transmission.packet = packet
 	wantPayload := string(transmission.packet.Payload)
 	if err := store.push(transmission); err != nil {
+		packet.Release()
 		t.Fatal(err)
 	}
 	var batch [1]protocol.Data
@@ -99,12 +109,70 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
 	defer ownership[0].Release()
-	if acknowledge {
+	switch action {
+	case "Acknowledgment":
 		if _, _, err := store.acknowledge(store.sentPackets, uint64(store.now().UnixMicro())); err != nil {
 			t.Fatal(err)
 		}
-	} else {
+	case "Expiry", "ExpiryThenAcknowledgment":
+		now = transmission.deadline
+		store.expire(now)
+		if store.sent.items[store.sent.head].packet.Payload != nil {
+			t.Fatal("expired sent payload remains retained")
+		}
+		if action == "ExpiryThenAcknowledgment" {
+			if _, stale, err := store.acknowledge(1, uint64(now.UnixMicro())); err != nil || stale {
+				t.Fatalf("late acknowledge() = stale %t, %v", stale, err)
+			}
+			if store.transportReported.Load() != uint64(len(wantPayload)) {
+				t.Fatal("late acknowledgment lost expired transport proof")
+			}
+		}
 		releaseTransmissions(store.drain())
+	case "Drain":
+		releaseTransmissions(store.drain())
+	case "ConcurrentExpiryAndAcknowledgment", "ConcurrentExpiryAndDrain":
+		now = transmission.deadline
+		start := make(chan struct{})
+		var workers sync.WaitGroup
+		workers.Go(func() {
+			<-start
+			for range 64 {
+				store.expire(now)
+			}
+		})
+		workers.Go(func() {
+			<-start
+			for range 64 {
+				if action == "ConcurrentExpiryAndDrain" {
+					releaseTransmissions(store.drain())
+				} else if _, stale, err := store.acknowledge(1, uint64(now.UnixMicro())); err != nil || stale {
+					t.Errorf("concurrent acknowledge() = stale %t, %v", stale, err)
+				}
+			}
+		})
+		workers.Go(func() {
+			<-start
+			for range 64 {
+				retained := ownership[0].Retain()
+				if string(retained.Payload) != wantPayload {
+					t.Error("concurrent writer payload changed")
+				}
+				retained.Release()
+			}
+		})
+		close(start)
+		workers.Wait()
+		wantProof := uint64(len(wantPayload))
+		if action == "ConcurrentExpiryAndDrain" {
+			wantProof = 0
+		}
+		if store.transportReported.Load() != wantProof {
+			t.Fatal("concurrent acknowledgment lost transport proof")
+		}
+		if packets, bytes := store.backlog(); packets != 0 || bytes != 0 {
+			t.Fatalf("concurrent acknowledgment retained %d packets and %d bytes", packets, bytes)
+		}
 	}
 	if wgpacket.Classify(ownership[0].Payload) != ownership[0].Kind {
 		t.Fatal("writer ownership changed its packet classification")
@@ -114,6 +182,234 @@ func testTransmissionStorePreservesWriteView(t *testing.T, acknowledge bool) {
 	}
 	retained := ownership[0].Retain()
 	retained.Release()
+}
+
+func testTransmissionStoreSentPayloadExpiryAfterCompaction(t *testing.T) {
+	t.Helper()
+	const total = maximumRetainedDequeCapacity * 4
+	const remaining = maximumRetainedDequeCapacity / 2
+	now := time.Unix(100, 0)
+	budget, err := retention.NewBudget(retention.Limits{Packets: total, Bytes: 1024 * 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := newTransmissionStoreWithBudget(packetqueue.Limits{Packets: total, Bytes: 1024 * 1024},
+		func() time.Time { return now }, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	for packetID := uint64(1); packetID <= total; packetID++ {
+		deadline := now.Add(time.Second)
+		if packetID%2 == 0 {
+			deadline = now.Add(10 * time.Second)
+		}
+		if err := store.push(schedulerTransmission(packetID, wgpacket.TransportData, deadline)); err != nil {
+			t.Fatal(err)
+		}
+		takeOneTransmission(t, store)
+	}
+	if cap(store.sent.items) <= maximumRetainedDequeCapacity {
+		t.Fatal("test did not grow an exceptional sent prefix")
+	}
+	acknowledged := uint64(total - remaining)
+	if _, stale, err := store.acknowledge(acknowledged, uint64(now.UnixMicro())); err != nil || stale {
+		t.Fatalf("acknowledge() = stale %t, %v", stale, err)
+	}
+	if cap(store.sent.items) != maximumRetainedDequeCapacity || store.sent.head != 0 {
+		t.Fatal("acknowledgment did not compact and shrink the sent prefix")
+	}
+	acknowledged += 5
+	if _, stale, err := store.acknowledge(acknowledged, uint64(now.UnixMicro())); err != nil || stale {
+		t.Fatalf("partial acknowledge() = stale %t, %v", stale, err)
+	}
+	if store.sent.head != 5 {
+		t.Fatal("test did not retain a consumed prefix")
+	}
+	charged := budget.Usage()
+	now = now.Add(time.Second)
+	store.expire(now)
+	assertTransmissionStoreInvariants(t, store)
+	store.sent.each(func(transmission retainedTransmission) bool {
+		if (transmission.packet.Payload == nil) != (transmission.packetID%2 != 0) {
+			t.Fatal("compacted sent payload did not respect its own deadline")
+		}
+		return true
+	})
+	now = now.Add(9 * time.Second)
+	store.expire(now)
+	assertTransmissionStoreInvariants(t, store)
+	if budget.Usage() != charged || !store.sent.earliestDeadline.IsZero() {
+		t.Fatal("full payload expiry changed accounting or retained an expiry bound")
+	}
+	if err := store.push(schedulerTransmission(total+1, wgpacket.TransportData, now.Add(time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	takeOneTransmission(t, store)
+	if !store.sent.earliestDeadline.Equal(now.Add(time.Second)) {
+		t.Fatal("compacted prefix did not rearm payload expiry")
+	}
+	if _, stale, err := store.acknowledge(total+1, uint64(now.UnixMicro())); err != nil || stale {
+		t.Fatalf("final acknowledge() = stale %t, %v", stale, err)
+	}
+	assertTransmissionStoreInvariants(t, store)
+	if budget.Usage() != (retention.Usage{}) || store.transportReported.Load() != minimumRateSampleBytes {
+		t.Fatal("final acknowledgment lost accounting or saturated transport proof")
+	}
+}
+
+func TestTransmissionStoreSentPayloadExpiry(t *testing.T) {
+	t.Run("AfterCompaction", testTransmissionStoreSentPayloadExpiryAfterCompaction)
+	t.Run("LateFeedbackAtCounterLimits", testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits)
+	for _, acknowledge := range []bool{false, true} {
+		name := "Drain"
+		if acknowledge {
+			name = "Acknowledgment"
+		}
+		t.Run(name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			budget, err := retention.NewBudget(retention.Limits{Packets: 4, Bytes: 32 * 1024})
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := newTransmissionStoreWithBudget(packetqueue.Limits{Packets: 4, Bytes: 32 * 1024},
+				func() time.Time { return now }, budget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { releaseTransmissions(store.drain()) })
+			for index, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation, wgpacket.NonWireGuard} {
+				deadline := now.Add(time.Duration(3-index) * time.Second)
+				var transmission retainedTransmission
+				if kind == wgpacket.NonWireGuard {
+					transmission = retainedTransmission{deadline: deadline, packet: datagram.Packet{Payload: probePadding[:]}}
+				} else {
+					transmission = schedulerTransmission(uint64(index+1), kind, deadline)
+				}
+				if err := store.push(transmission); err != nil {
+					t.Fatal(err)
+				}
+				takeOneTransmission(t, store)
+			}
+			charged := budget.Usage()
+			start := now
+			for elapsed := 0; elapsed <= 3; elapsed++ {
+				now = start.Add(time.Duration(elapsed) * time.Second)
+				store.expire(now)
+				assertTransmissionStoreInvariants(t, store)
+				if budget.Usage() != charged || store.sentPackets != 3 || store.reportedPackets != 0 {
+					t.Fatal("payload expiry changed cumulative progress or retained accounting")
+				}
+				for index, transmission := range store.sent.items {
+					if (transmission.packet.Payload == nil) != (elapsed >= 3-index) {
+						t.Fatalf("payload %d expiry at %d seconds is incorrect", index, elapsed)
+					}
+				}
+			}
+			if !store.sent.earliestDeadline.IsZero() {
+				t.Fatal("fully released prefix retained a payload-expiry bound")
+			}
+			// Reuse the bound with an expired descriptor still at the head.
+			if err := store.push(schedulerTransmission(4, wgpacket.TransportData, now.Add(time.Second))); err != nil {
+				t.Fatal(err)
+			}
+			takeOneTransmission(t, store)
+			if !store.sent.earliestDeadline.Equal(now.Add(time.Second)) {
+				t.Fatal("new sent payload did not rearm expiry")
+			}
+			if acknowledge {
+				for count := uint64(1); count <= 4; count++ {
+					if _, stale, err := store.acknowledge(count, uint64(now.UnixMicro())); err != nil || stale {
+						t.Fatalf("acknowledge(%d) = stale %t, %v", count, stale, err)
+					}
+				}
+				if store.transportReported.Load() != 2*wgpacket.TransportKeepaliveLength {
+					t.Fatal("late feedback lost transport proof or counted control and probe bytes")
+				}
+			}
+			releaseTransmissions(store.drain())
+			if got := budget.Usage(); got != (retention.Usage{}) {
+				t.Fatalf("completed generation retained ownership: %+v", got)
+			}
+		})
+	}
+}
+
+func testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits(t *testing.T) {
+	now := time.Unix(100, 0)
+	start := now
+	limits := packetqueue.Limits{Packets: 3, Bytes: 96 * 1024}
+	budget, err := retention.NewBudget(retention.Limits{Packets: limits.Packets, Bytes: limits.Bytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := newTransmissionStoreWithBudget(limits, func() time.Time { return now }, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	var sizes [3]int
+	for index, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.TransportData, wgpacket.HandshakeInitiation} {
+		transmission := schedulerTransmission(math.MaxUint64-uint64(2-index), kind, now.Add(time.Second))
+		transmission.wireDeadline = math.MaxUint64 - math.MaxUint64%protocol.DeadlineResolutionMicros
+		if index == 1 {
+			transmission.packet.Payload = make([]byte, protocol.MaxPacketSize)
+			transmission.packet.Payload[0] = 4
+		}
+		sizes[index] = dataFrameSize(transmission.data())
+		if err := store.push(transmission); err != nil {
+			t.Fatal(err)
+		}
+	}
+	charged := budget.Usage()
+	store.sentPackets = math.MaxUint64 - 3
+	store.reportedPackets = store.sentPackets
+	store.sentBytes = math.MaxUint64 - uint64(charged.Bytes)
+	store.reportedBytes = store.sentBytes
+	var batch [3]protocol.Data
+	var ownership [3]datagram.Packet
+	count, err := store.takeBatch(batch[:], ownership[:], limits.Bytes)
+	defer releaseBatchOwnership(ownership[:count])
+	if err != nil || count != len(batch) || store.sentPackets != math.MaxUint64 || store.sentBytes != math.MaxUint64 {
+		t.Fatalf("takeBatch() = %d, %v, want complete prefix at both cumulative limits", count, err)
+	}
+	// Carrier priority sends the control first, followed by both transport packets.
+	if batch[0].PacketID != math.MaxUint64 || len(batch[2].Payload) != protocol.MaxPacketSize {
+		t.Fatal("boundary batch changed control priority or maximum payload length")
+	}
+	now = now.Add(time.Second)
+	assessment := store.assessDeadlines(now, func(uint64) uint64 { return 0 })
+	if !assessment.retained || !assessment.atRisk || !assessment.usefulDeadline.IsZero() || assessment.usefulBytes != 0 {
+		t.Fatalf("expired prefix assessment = %+v", assessment)
+	}
+	assertTransmissionStoreInvariants(t, store)
+	if budget.Usage() != charged {
+		t.Fatal("expiry changed boundary-prefix retention charges")
+	}
+	for _, packets := range []uint64{store.reportedPackets, store.reportedPackets - 1} {
+		sample, stale, err := store.acknowledge(packets, uint64(now.UnixMicro()))
+		if err != nil || stale != (packets < store.reportedPackets) || sample != (deliverySample{}) || budget.Usage() != charged {
+			t.Fatalf("non-progress report at counter limit = %+v, stale %t, error %v", sample, stale, err)
+		}
+	}
+	var prefixBytes uint64
+	for index, size := range []int{sizes[2], sizes[0], sizes[1]} {
+		prefixBytes += uint64(size)
+		receiveMicros := uint64(start.Add(2*time.Second).UnixMicro()) + uint64(index+1)
+		sample, stale, err := store.acknowledge(math.MaxUint64-uint64(2-index), receiveMicros)
+		want := deliverySample{bytes: prefixBytes, intervalMicros: 2_000_000 + uint64(index+1)}
+		if err != nil || stale || sample != want {
+			t.Fatalf("late boundary report %d = %+v, stale %t, error %v, want %+v", index, sample, stale, err, want)
+		}
+		wantProof := []uint64{0, wgpacket.TransportKeepaliveLength, minimumRateSampleBytes}[index]
+		if store.transportReported.Load() != wantProof {
+			t.Fatalf("late boundary report %d transport proof = %d, want %d", index, store.transportReported.Load(), wantProof)
+		}
+		assertTransmissionStoreInvariants(t, store)
+	}
+	if budget.Usage() != (retention.Usage{}) || store.reportedPackets != math.MaxUint64 || store.reportedBytes != math.MaxUint64 {
+		t.Fatal("late boundary reports lost cumulative progress or retained charges")
+	}
 }
 
 func TestTransmissionStoreAggregateBudget(t *testing.T) {
@@ -321,7 +617,7 @@ func TestTransmissionStoreReclaimsUnorderedDeadlines(t *testing.T) {
 		t.Fatal(err)
 	}
 	now = start.Add(2 * time.Second)
-	store.expireQueued(now)
+	store.expire(now)
 	if got := takeOneTransmission(t, store).PacketID; got != 1 {
 		t.Fatalf("oldest live PacketID = %d, want 1", got)
 	}
@@ -336,7 +632,7 @@ func TestTransmissionStoreReclaimsUnorderedDeadlines(t *testing.T) {
 		t.Fatalf("queued FIFO PacketID = %d, want 4", got)
 	}
 	now = start.Add(10 * time.Second)
-	store.expireQueued(now)
+	store.expire(now)
 	retained := store.drain()
 	defer releaseTransmissions(retained)
 	if len(retained) != 2 || retained[0].packetID != 1 || retained[1].packetID != 4 {
@@ -752,12 +1048,16 @@ func TestTransmissionStoreStateMachine(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			testTransmissionStoreStateMachine(t, limits, budget, tt.probes)
+			for seed := range uint64(16) {
+				t.Run(fmt.Sprintf("Seed%d", seed), func(t *testing.T) {
+					testTransmissionStoreStateMachine(t, limits, budget, tt.probes, 0x4d595df4d0f33173+seed)
+				})
+			}
 		})
 	}
 }
 
-func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, budget *retention.Budget, probes bool) {
+func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, budget *retention.Budget, probes bool, seed uint64) {
 	t.Helper()
 	now := time.Unix(0, 0)
 	store, err := newTransmissionStoreWithBudget(limits, func() time.Time { return now }, budget)
@@ -774,7 +1074,6 @@ func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, 
 	var unreported []writtenFrame
 	var reported, transportProof uint64
 	var acceptedProbes, sentProbes, reportedProbes int
-	seed := uint64(0x4d595df4d0f33173)
 	next := func() uint64 {
 		seed ^= seed << 13
 		seed ^= seed >> 7
@@ -836,6 +1135,12 @@ func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, 
 		case 4:
 			now = now.Add(time.Duration(next()%5+1) * time.Millisecond)
 			store.assessDeadlines(now, func(uint64) uint64 { return 0 })
+			store.sent.each(func(transmission retainedTransmission) bool {
+				if !now.Before(transmission.deadline) && transmission.packet.Payload != nil {
+					t.Fatal("maintenance retained an expired sent payload")
+				}
+				return true
+			})
 		case 5:
 			if reported > 0 {
 				if _, stale, err := store.acknowledge(0, uint64(store.now().UnixMicro())); err != nil || !stale {
@@ -892,6 +1197,14 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 	packets := store.sent.len() + store.control.len() + store.normal.len()
 	bytes := 0
 	sentBytes := uint64(0)
+	store.sent.each(func(transmission retainedTransmission) bool {
+		if transmission.packet.Payload != nil {
+			if store.sent.earliestDeadline.IsZero() || transmission.deadline.Before(store.sent.earliestDeadline) {
+				t.Fatal("sent-payload expiry bound is missing or later than a retained deadline")
+			}
+		}
+		return true
+	})
 	for _, deque := range []*transmissionDeque{&store.control, &store.normal} {
 		if (deque.len() == 0) != deque.earliestDeadline.IsZero() {
 			t.Fatal("expiry bound does not match queued occupancy")
@@ -907,7 +1220,16 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 		})
 	}
 	validate := func(transmission retainedTransmission, sent bool) bool {
-		size, err := protocol.DataFrameSize(transmission.data())
+		data := transmission.data()
+		if data.Payload == nil {
+			if !sent || store.now().Before(transmission.deadline) {
+				t.Fatal("fresh or queued payload was released")
+			}
+			data.Payload = make([]byte, transmission.payloadBytes)
+		} else if len(data.Payload) != int(transmission.payloadBytes) {
+			t.Fatal("retained payload size differs from its descriptor")
+		}
+		size, err := protocol.DataFrameSize(data)
 		if err != nil || size != transmission.size || transmission.budget != store.budget {
 			t.Fatalf("invalid retained transmission: %+v", transmission)
 		}
@@ -915,7 +1237,8 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 			if transmission.packet.Kind != wgpacket.NonWireGuard {
 				t.Fatal("capacity probe retained a real packet classification")
 			}
-		} else if !transmission.packet.Kind.Accepted() || wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind {
+		} else if !transmission.packet.Kind.Accepted() || transmission.packet.Payload != nil &&
+			wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind {
 			t.Fatal("retained packet classification differs from its payload")
 		}
 		bytes += transmission.size

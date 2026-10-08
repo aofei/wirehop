@@ -524,7 +524,8 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		}
 		event.result <- nil
 	case schedulerCloseSession:
-		if !s.routeControl(lanes, event.frame, protocol.LaneID(0), func() { event.result <- nil }) {
+		result := event.result
+		if !s.routeControl(lanes, event.frame, protocol.LaneID(0), func() { result <- nil }) {
 			event.result <- ErrNoActiveLane
 		}
 	}
@@ -927,7 +928,7 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 		if lane.abandoning {
 			continue
 		}
-		unreportedSince, firstBytes := lane.registration.Store.expireQueued(now)
+		unreportedSince, firstBytes := lane.registration.Store.expire(now)
 		if !laneProgressStalled(lane, now, unreportedSince, firstBytes) {
 			lane.degraded = false
 			continue
@@ -1017,7 +1018,7 @@ func recoveryCandidate(lane *scheduledLane, now time.Time, frameBytes, remaining
 	if lane.degraded || lane.abandoning {
 		return scoredLane{}, false
 	}
-	since, firstBytes := lane.registration.Store.expireQueued(now)
+	since, firstBytes := lane.registration.Store.expire(now)
 	if laneProgressStalled(lane, now, since, firstBytes) || !lane.canAccept(frameBytes) {
 		return scoredLane{}, false
 	}

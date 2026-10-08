@@ -33,13 +33,15 @@ type retainedTransmission struct {
 	wireDeadline uint64
 	deadline     time.Time
 	migrated     bool
+	// payloadBytes preserves real-transport proof after the sent payload expires.
+	payloadBytes uint32
 	size         int
 	budget       *retention.Budget
 	packet       datagram.Packet
 	delivery     deliverySnapshot
 }
 
-// data builds the wire view from the transmission's single payload owner.
+// data builds the wire view while the transmission still owns its payload.
 func (t *retainedTransmission) data() protocol.Data {
 	return protocol.Data{PacketID: t.packetID, DeadlineMicros: t.wireDeadline, Payload: t.packet.Payload}
 }
@@ -82,7 +84,7 @@ func (t *retainedTransmission) releasePacket() {
 
 // transmissionDeque is a compacting first-in, first-out transmission sequence.
 type transmissionDeque struct {
-	// earliestDeadline bounds queued expiry and is rebuilt when a scan is due.
+	// earliestDeadline bounds queued-entry or sent-payload expiry and is rebuilt when a scan is due.
 	earliestDeadline time.Time
 	items            []retainedTransmission
 	head             int
@@ -206,6 +208,29 @@ func (d *transmissionDeque) removeExpired(now time.Time) (int, int) {
 	return removedPackets, removedBytes
 }
 
+// releaseExpiredPayloads relinquishes obsolete sent payloads while preserving the cumulative-report prefix.
+func (d *transmissionDeque) releaseExpiredPayloads(now time.Time) {
+	if d.head == len(d.items) || d.earliestDeadline.IsZero() || now.Before(d.earliestDeadline) {
+		return
+	}
+	d.earliestDeadline = time.Time{}
+	for index := d.head; index < len(d.items); index++ {
+		transmission := &d.items[index]
+		if transmission.packet.Payload == nil {
+			continue
+		}
+		if !now.Before(transmission.deadline) {
+			kind := transmission.packet.Kind
+			transmission.releasePacket()
+			transmission.packet.Kind = kind
+			continue
+		}
+		if d.earliestDeadline.IsZero() || transmission.deadline.Before(d.earliestDeadline) {
+			d.earliestDeadline = transmission.deadline
+		}
+	}
+}
+
 // each visits unconsumed transmissions in FIFO order until visit returns false.
 func (d *transmissionDeque) each(visit func(retainedTransmission) bool) {
 	for index := d.head; index < len(d.items); index++ {
@@ -301,6 +326,7 @@ func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.T
 		return ErrInvalidTransmission
 	}
 	transmission.size = size
+	transmission.payloadBytes = uint32(len(transmission.packet.Payload))
 	if transmission.budget != nil && transmission.budget != s.budget {
 		return ErrInvalidTransmission
 	}
@@ -375,12 +401,14 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 			s.unreportedSince = now
 			s.firstSentMicros = sentMicros
 			s.deliveredMicros = sentMicros
+			s.sent.earliestDeadline = transmission.deadline
+		} else if s.sent.earliestDeadline.IsZero() || transmission.deadline.Before(s.sent.earliestDeadline) {
+			s.sent.earliestDeadline = transmission.deadline
 		}
 		transmission.delivery = deliverySnapshot{
 			sentMicros: sentMicros, firstSentMicros: s.firstSentMicros,
 			deliveredMicros: s.deliveredMicros, deliveredBytes: s.reportedBytes,
 		}
-		// Sent entries are never reclaimed by expiry and need no queued-deadline bound.
 		s.sent.items = append(s.sent.items, transmission)
 		s.sentPackets++
 		s.sentBytes += uint64(transmission.size)
@@ -441,7 +469,7 @@ func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (delivery
 	for index := range acknowledged {
 		releasedBytes += uint64(acknowledged[index].size)
 		if needTransportProof && acknowledged[index].packet.Kind == wgpacket.TransportData {
-			transportBytes += uint64(len(acknowledged[index].packet.Payload))
+			transportBytes += uint64(acknowledged[index].payloadBytes)
 		}
 		acknowledged[index].releasePacket()
 	}
@@ -521,11 +549,12 @@ func (s *TransmissionStore) atRisk(now time.Time, delay func(uint64) uint64) boo
 	return s.assessDeadlines(now, delay).atRisk
 }
 
-// expireQueued reclaims overdue unsent work and returns the start of outstanding carrier progress.
-func (s *TransmissionStore) expireQueued(now time.Time) (time.Time, uint64) {
+// expire releases overdue queued entries and sent payloads, and returns the start of outstanding carrier progress.
+func (s *TransmissionStore) expire(now time.Time) (time.Time, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.removeExpiredQueuedLocked(now)
+	s.sent.releaseExpiredPayloads(now)
 	first, ok := s.sent.peek()
 	if !ok {
 		return time.Time{}, 0
@@ -541,6 +570,7 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 		return deadlineAssessment{}
 	}
 	s.removeExpiredQueuedLocked(now)
+	s.sent.releaseExpiredPayloads(now)
 	var assessment deadlineAssessment
 	prefixBytes := uint64(0)
 	visit := func(transmission retainedTransmission) bool {
