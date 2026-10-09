@@ -723,7 +723,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		if err := scheduler.ObserveDeliveryReport(ctx, source, protocol.DeliveryReport{
 			LaneID: registration.LaneID, Generation: registration.Generation,
 			DataPackets: 1,
-		}, 1000); err != nil {
+		}, 1000, make(chan error, 1)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -734,7 +734,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		if err := scheduler.ObserveDeliveryReport(ctx, source, protocol.DeliveryReport{
 			LaneID: registration.LaneID, Generation: registration.Generation,
 			DataPackets: 2,
-		}, 2000); err != nil {
+		}, 2000, make(chan error, 1)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -901,7 +901,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	report := protocol.DeliveryReport{
 		LaneID: registration.LaneID, Generation: registration.Generation, DataPackets: 1,
 	}
-	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 1000); err != nil {
+	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 1000, make(chan error, 1)); err != nil {
 		t.Fatal(err)
 	}
 	if packets, _ := store.backlog(); packets != 1 {
@@ -909,7 +909,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	}
 
 	report.DataPackets = 3
-	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 2000); !errors.Is(err, ErrInvalidDeliveryReport) {
+	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 2000, make(chan error, 1)); !errors.Is(err, ErrInvalidDeliveryReport) {
 		t.Fatalf("invalid report error = %v, want %v", err, ErrInvalidDeliveryReport)
 	}
 	if packets, _ := store.backlog(); packets != 1 {
@@ -917,7 +917,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	}
 
 	report.DataPackets = 2
-	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 3000); err != nil {
+	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 3000, make(chan error, 1)); err != nil {
 		t.Fatal(err)
 	}
 	if packets, bytes := store.backlog(); packets != 0 || bytes != 0 {
@@ -925,11 +925,11 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	}
 
 	report.PingID = 1
-	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 5000); err != nil {
+	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 5000, make(chan error, 1)); err != nil {
 		t.Fatal(err)
 	}
 	report.PingID = 2
-	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 6000); !errors.Is(err, ErrInvalidDeliveryReport) {
+	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 6000, make(chan error, 1)); !errors.Is(err, ErrInvalidDeliveryReport) {
 		t.Fatalf("unexposed ping report error = %v", err)
 	}
 
@@ -2093,17 +2093,40 @@ func TestSchedulerDuplicatesReportAcrossLanes(t *testing.T) {
 }
 
 func TestSchedulerRejectsUnroutableReport(t *testing.T) {
-	scheduler := new(Scheduler)
-	lane := schedulerLane(t, 1, 1, 1, 1_000_000)
-	lane.registration.SendControl = func(protocol.Frame, func()) bool { return false }
-	completed := make(chan bool, 1)
-	scheduler.routeReport(map[protocol.LaneID]*scheduledLane{
-		lane.registration.LaneID: lane,
-	}, protocol.DeliveryReport{
-		LaneID: lane.registration.LaneID, Generation: 1,
-	}, time.Now(), func(sent bool) { completed <- sent })
-	if sent := <-completed; sent {
-		t.Fatal("unroutable report completed as sent")
+	for _, tt := range []struct {
+		name       string
+		lanes      int
+		abandoning bool
+		wantWrites int
+	}{
+		{name: "NoLanes"},
+		{name: "AbandoningLanes", lanes: 2, abandoning: true},
+		{name: "RejectedQueues", lanes: 2, wantWrites: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scheduler := new(Scheduler)
+			lanes := make(map[protocol.LaneID]*scheduledLane, tt.lanes)
+			writes := 0
+			for index := range tt.lanes {
+				lane := schedulerLane(t, byte(index+1), byte(index+1), 1, 1_000_000)
+				lane.abandoning = tt.abandoning
+				lane.registration.SendDeliveryReport = func(protocol.DeliveryReport, time.Time, func()) bool {
+					writes++
+					return false
+				}
+				lanes[lane.registration.LaneID] = lane
+			}
+			completed := 0
+			scheduler.routeReport(lanes, protocol.DeliveryReport{LaneID: 1, Generation: 1}, time.Now(), func(sent bool) {
+				if sent {
+					t.Error("unroutable report completed as sent")
+				}
+				completed++
+			})
+			if writes != tt.wantWrites || completed != 1 {
+				t.Fatalf("report writes = %d, completions = %d, want %d, 1", writes, completed, tt.wantWrites)
+			}
+		})
 	}
 }
 
@@ -2332,4 +2355,76 @@ func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSchedulerObserveDeliveryReport(t *testing.T) {
+	t.Run("ReusableResult", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			scheduler := &Scheduler{events: make(chan schedulerEvent, 1)}
+			result := make(chan error, 1)
+			source := protocol.LaneGeneration{LaneID: 1, Generation: 2}
+			report := protocol.DeliveryReport{LaneID: 3, Generation: 4}
+			go func() {
+				for _, err := range []error{nil, ErrInvalidDeliveryReport, nil} {
+					event := <-scheduler.events
+					if event.kind != schedulerReport || event.laneID != source.LaneID || event.generation != source.Generation ||
+						event.report != report || event.receiveMicros != 123 || event.result != result {
+						t.Error("unexpected report event")
+					}
+					event.result <- err
+				}
+			}()
+			for _, want := range []error{nil, ErrInvalidDeliveryReport, nil} {
+				if err := scheduler.ObserveDeliveryReport(t.Context(), source, report, 123, result); !errors.Is(err, want) {
+					t.Fatalf("ObserveDeliveryReport() = %v, want %v", err, want)
+				}
+			}
+		})
+	})
+	t.Run("CanceledReader", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			scheduler := &Scheduler{events: make(chan schedulerEvent, 1)}
+			oldResult := make(chan error, 1)
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() {
+				done <- scheduler.ObserveDeliveryReport(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1},
+					protocol.DeliveryReport{LaneID: 1, Generation: 1}, 123, oldResult)
+			}()
+			synctest.Wait()
+			event := <-scheduler.events
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled report = %v", err)
+			}
+			var preferred protocol.LaneID
+			scheduler.applyEvent(nil, &preferred, event, time.Now())
+			if len(oldResult) != 1 {
+				t.Fatal("late completion did not remain in the retired reader's channel")
+			}
+			newResult := make(chan error, 1)
+			go func() {
+				event := <-scheduler.events
+				event.result <- ErrInvalidDeliveryReport
+			}()
+			if err := scheduler.ObserveDeliveryReport(t.Context(), protocol.LaneGeneration{LaneID: 1, Generation: 2},
+				protocol.DeliveryReport{LaneID: 1, Generation: 2}, 456, newResult); !errors.Is(err, ErrInvalidDeliveryReport) {
+				t.Fatalf("replacement reader received %v", err)
+			}
+		})
+	})
+	t.Run("CanceledBeforeQueue", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			scheduler := &Scheduler{events: make(chan schedulerEvent)}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			result := make(chan error, 1)
+			if err := scheduler.ObserveDeliveryReport(ctx, protocol.LaneGeneration{}, protocol.DeliveryReport{}, 123, result); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled report = %v", err)
+			}
+			if len(result) != 0 {
+				t.Fatal("unqueued report produced a completion")
+			}
+		})
+	})
 }

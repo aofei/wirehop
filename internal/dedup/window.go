@@ -27,13 +27,12 @@ type Window struct {
 	highest  uint64
 }
 
-// NewWindow returns a fixed-capacity deduplication window.
+// NewWindow returns a fixed-capacity deduplication window whose bitmap grows as ring positions are observed.
 func NewWindow(capacity int) (*Window, error) {
 	if capacity <= 0 {
 		return nil, ErrInvalidCapacity
 	}
-	words := (capacity-1)/64 + 1
-	return &Window{bits: make([]uint64, words), capacity: uint64(capacity)}, nil
+	return &Window{capacity: uint64(capacity)}, nil
 }
 
 // Classify reports how sequence relates to the retained window without recording it.
@@ -84,14 +83,14 @@ func (w *Window) advance(sequence uint64) {
 
 // clearLinear clears count consecutive bitmap positions without wrapping around capacity.
 func (w *Window) clearLinear(start, count uint64) {
-	if count == 0 {
+	end := min(start+count, uint64(len(w.bits))*64)
+	if start >= end {
 		return
 	}
-	end := start + count
 	firstWord := start / 64
 	lastWord := (end - 1) / 64
 	if firstWord == lastWord {
-		w.bits[firstWord] &^= lowBits(count) << (start % 64)
+		w.bits[firstWord] &^= lowBits(end-start) << (start % 64)
 		return
 	}
 	if offset := start % 64; offset != 0 {
@@ -116,12 +115,18 @@ func lowBits(count uint64) uint64 {
 // contains reports whether the ring position for sequence is set.
 func (w *Window) contains(sequence uint64) bool {
 	word, mask := w.position(sequence)
-	return w.bits[word]&mask != 0
+	return word < uint64(len(w.bits)) && w.bits[word]&mask != 0
 }
 
 // set records sequence in its ring position.
 func (w *Window) set(sequence uint64) {
 	word, mask := w.position(sequence)
+	if word >= uint64(len(w.bits)) {
+		words := min((w.capacity-1)/64+1, max(word+1, uint64(len(w.bits))*2))
+		bits := make([]uint64, words)
+		copy(bits, w.bits)
+		w.bits = bits
+	}
 	w.bits[word] |= mask
 }
 

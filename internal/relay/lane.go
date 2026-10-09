@@ -137,6 +137,8 @@ type Lane struct {
 	pendingPingBuilt  bool
 	lastReceivedAt    time.Time
 	pingChanged       chan struct{}
+	// reportResult belongs to the serial carrier reader and is discarded when that reader exits.
+	reportResult chan error
 }
 
 // controlWrite builds a control frame immediately before the carrier writer sends it.
@@ -763,9 +765,12 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 		if err != nil {
 			return err
 		}
+		if l.reportResult == nil {
+			l.reportResult = make(chan error, 1)
+		}
 		return l.observer.ObserveDeliveryReport(ctx, protocol.LaneGeneration{
 			LaneID: l.laneID, Generation: l.generation,
-		}, report, l.clock.NowMicros())
+		}, report, l.clock.NowMicros(), l.reportResult)
 	case protocol.FrameSessionClose:
 		reason, err := protocol.ParseSessionClose(frame)
 		if err != nil {

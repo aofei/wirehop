@@ -1,6 +1,7 @@
 package dedup
 
 import (
+	"encoding/binary"
 	"errors"
 	"math"
 	"testing"
@@ -50,29 +51,92 @@ func TestNewWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(window.bits); got != 1024 {
-		t.Fatalf("storage words = %d, want 1024", got)
+	if window.bits != nil {
+		t.Fatal("empty window allocated a bitmap")
+	}
+	if got := window.Observe(0); got != TooOld || window.bits != nil {
+		t.Fatalf("Observe(0) = %d, allocated = %t, want %d and false", got, window.bits != nil, TooOld)
+	}
+	if got := window.Classify(1); got != New || window.bits != nil || window.Highest() != 0 {
+		t.Fatalf("Classify(1) = %d, allocated = %t, highest = %d", got, window.bits != nil, window.Highest())
+	}
+	if got := window.Observe(1); got != New || len(window.bits) != 1 {
+		t.Fatalf("Observe(1) = %d, storage words = %d, want %d and 1", got, len(window.bits), New)
+	}
+	if got := window.Observe(63); got != New || len(window.bits) != 1 {
+		t.Fatalf("Observe(63) = %d, storage words = %d, want %d and 1", got, len(window.bits), New)
+	}
+	if got := window.Observe(64); got != New || len(window.bits) != 2 {
+		t.Fatalf("Observe(64) = %d, storage words = %d, want %d and 2", got, len(window.bits), New)
+	}
+}
+
+func TestWindowSparseStorage(t *testing.T) {
+	for _, capacity := range []int{1, 63, 64, 65, 257, 65_536, 1_048_576} {
+		window, err := NewWindow(capacity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed := make(map[uint64]bool)
+		var highest uint64
+		for _, sequence := range []uint64{
+			uint64(capacity), uint64(capacity) - 1, 1, 63, 64, 65, uint64(capacity) + 1,
+			2*uint64(capacity) - 1, 2 * uint64(capacity), 2*uint64(capacity) + 1,
+			math.MaxUint64 - 3, math.MaxUint64, math.MaxUint64 - 1, math.MaxUint64 - uint64(capacity),
+		} {
+			words := len(window.bits)
+			want := referenceResult(sequence, highest, uint64(capacity), observed)
+			if got := window.Classify(sequence); got != want || len(window.bits) != words {
+				t.Fatalf("capacity %d Classify(%d) = %d with %d words, want %d with %d words", capacity, sequence,
+					got, len(window.bits), want, words)
+			}
+			if got := window.Observe(sequence); got != want {
+				t.Fatalf("capacity %d Observe(%d) = %d, want %d", capacity, sequence, got, want)
+			}
+			if want == New {
+				observed[sequence] = true
+				highest = max(highest, sequence)
+			}
+			if got := window.Highest(); got != highest {
+				t.Fatalf("capacity %d Highest() = %d, want %d", capacity, got, highest)
+			}
+			if len(window.bits) > (capacity-1)/64+1 {
+				t.Fatalf("capacity %d allocated %d words beyond its ring", capacity, len(window.bits))
+			}
+		}
 	}
 }
 
 func TestWindowSequenceLimit(t *testing.T) {
-	window, err := NewWindow(4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, sequence := range []uint64{math.MaxUint64 - 1, math.MaxUint64} {
-		if got := window.Observe(sequence); got != New {
-			t.Fatalf("Observe(%d) = %d, want %d", sequence, got, New)
-		}
-	}
-	if got := window.Observe(math.MaxUint64); got != Duplicate {
-		t.Fatalf("Observe(MaxUint64) = %d, want %d", got, Duplicate)
-	}
-	if got := window.Observe(math.MaxUint64 - 4); got != TooOld {
-		t.Fatalf("Observe(MaxUint64 - 4) = %d, want %d", got, TooOld)
-	}
-	if got := window.Observe(math.MaxUint64 - 3); got != New {
-		t.Fatalf("Observe(MaxUint64 - 3) = %d, want %d", got, New)
+	for _, tt := range []struct {
+		name     string
+		capacity int
+	}{{name: "SmallCapacity", capacity: 4}, {name: "MaximumCapacity", capacity: math.MaxInt}} {
+		t.Run(tt.name, func(t *testing.T) {
+			window, err := NewWindow(tt.capacity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, sequence := range []uint64{math.MaxUint64 - 1, math.MaxUint64} {
+				if got := window.Observe(sequence); got != New {
+					t.Fatalf("Observe(%d) = %d, want %d", sequence, got, New)
+				}
+			}
+			if got := window.Observe(math.MaxUint64); got != Duplicate {
+				t.Fatalf("Observe(MaxUint64) = %d, want %d", got, Duplicate)
+			}
+			if got := window.Observe(math.MaxUint64 - uint64(tt.capacity)); got != TooOld {
+				t.Fatalf("Observe(MaxUint64 - capacity) = %d, want %d", got, TooOld)
+			}
+			if got := window.Observe(math.MaxUint64 - uint64(tt.capacity) + 1); got != New {
+				t.Fatalf("Observe(MaxUint64 - capacity + 1) = %d, want %d", got, New)
+			}
+			if tt.capacity == math.MaxInt {
+				if got := window.Classify(math.MaxUint64 - 63); got != New || len(window.bits) != 1 {
+					t.Fatalf("virtual classification = %d with %d words, want %d with one word", got, len(window.bits), New)
+				}
+			}
+		})
 	}
 }
 
@@ -109,7 +173,12 @@ func TestWindowAdvanceAcrossPartialWordBoundary(t *testing.T) {
 }
 
 func TestWindowMatchesReferenceAcrossCapacities(t *testing.T) {
+	capacities := make([]int, 0, 260)
 	for capacity := 1; capacity <= 257; capacity++ {
+		capacities = append(capacities, capacity)
+	}
+	capacities = append(capacities, 1024, 65_536, 1_048_576)
+	for _, capacity := range capacities {
 		window, err := NewWindow(capacity)
 		if err != nil {
 			t.Fatal(err)
@@ -130,6 +199,11 @@ func TestWindowMatchesReferenceAcrossCapacities(t *testing.T) {
 				}
 			}
 			want := referenceResult(sequence, highest, uint64(capacity), observed)
+			words := len(window.bits)
+			if got := window.Classify(sequence); got != want || len(window.bits) != words {
+				t.Fatalf("capacity %d Classify(%d) = %d with %d words, want %d with %d words", capacity, sequence,
+					got, len(window.bits), want, words)
+			}
 			if got := window.Observe(sequence); got != want {
 				t.Fatalf("capacity %d Observe(%d) = %d, want %d at highest %d", capacity, sequence, got, want,
 					highest)
@@ -152,6 +226,47 @@ func referenceResult(sequence, highest, capacity uint64, observed map[uint64]boo
 		return Duplicate
 	}
 	return New
+}
+
+func FuzzWindow(f *testing.F) {
+	for _, capacity := range []uint32{1, 63, 64, 65, 257, 65_536, 1_048_576} {
+		var encoded []byte
+		for _, sequence := range []uint64{0, 1, 63, 64, uint64(capacity), uint64(capacity) - 1,
+			uint64(capacity) + 1, 2 * uint64(capacity), math.MaxUint64 - 3, math.MaxUint64, math.MaxUint64 - 1} {
+			encoded = binary.LittleEndian.AppendUint64(encoded, sequence)
+		}
+		f.Add(capacity-1, encoded)
+	}
+	f.Fuzz(func(t *testing.T, selector uint32, encoded []byte) {
+		capacity := uint64(selector%1_048_576) + 1
+		window, err := NewWindow(int(capacity))
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded = encoded[:min(len(encoded), 1024)]
+		observed := make(map[uint64]bool)
+		var highest uint64
+		for len(encoded) >= 8 {
+			sequence := binary.LittleEndian.Uint64(encoded)
+			encoded = encoded[8:]
+			want := referenceResult(sequence, highest, capacity, observed)
+			words := len(window.bits)
+			if got := window.Classify(sequence); got != want || len(window.bits) != words {
+				t.Fatalf("Classify(%d) = %d with %d words, want %d with %d words", sequence, got,
+					len(window.bits), want, words)
+			}
+			if got := window.Observe(sequence); got != want {
+				t.Fatalf("Observe(%d) = %d, want %d at highest %d and capacity %d", sequence, got, want, highest, capacity)
+			}
+			if want == New {
+				observed[sequence] = true
+				highest = max(highest, sequence)
+			}
+			if window.Highest() != highest {
+				t.Fatalf("Highest() = %d, want %d", window.Highest(), highest)
+			}
+		}
+	})
 }
 
 func BenchmarkWindowLargeAdvance(b *testing.B) {

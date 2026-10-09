@@ -781,7 +781,7 @@ The command uses these packet and resource limits:
 | Combined transmission store per lane direction | 65,536 packets and 32 MiB |
 | Aggregate retained relay work per client process | 131,072 packets and 256 MiB |
 | Aggregate retained relay work per server process | 262,144 packets and 256 MiB |
-| Deduplication window per session direction | 1,048,576 packet IDs in a 128 KiB sliding bitmap |
+| Deduplication window per session direction | 1,048,576 packet IDs, up to 128 KiB allocated on demand |
 | Internally generated controls per lane direction | 64 pending frames |
 | Scheduler events per session direction | 256 pending events |
 | Client TLS session cache | 64 entries scoped by carrier role, scheme, and socket endpoint |
@@ -1890,8 +1890,10 @@ Internet-Draft rather than an RFC. WireHop's userspace observations include carr
 path. They are not the kernel TCP congestion controller's packet acknowledgments, and they should not be presented as an
 implementation of BBR. Cross-lane report timing and capacity changes still need workload-level validation.
 
-The default deduplication bitmap costs 128 KiB per inbound session direction. At the server's 1024-session limit, those
-bitmaps alone can occupy 128 MiB, independently of the 256 MiB retained-packet budget. Socket buffers, scratch storage,
+The default deduplication bitmap grows as successful UDP deliveries observe new ring positions, up to 128 KiB per
+inbound session direction. An unused receiver retains only the descriptor. A first observation at ID one allocates an
+eight-byte bitmap word. The logical 1,048,576-ID horizon is unchanged. At the server's 1024-session limit, fully grown
+bitmaps can still occupy 128 MiB, independently of the 256 MiB retained-packet budget. Socket buffers, scratch storage,
 and session metadata add separate costs. Memory optimization should measure full attached and detached sessions instead
 of treating the aggregate packet budget as a process-memory ceiling.
 
@@ -1942,15 +1944,15 @@ Queue packet counts matter independently of byte caps. At 1452 bytes per datagra
 holds at most 1.42 MiB of payload, below its nominal 4 MiB cap. At 32 bytes it holds only 32 KiB. Changing the byte cap
 without observing packet occupancy can therefore leave the effective queue unchanged. On arm64, a retained transmission
 also occupies 136 bytes of descriptor storage, including a 32-byte delivery snapshot, before its payload buffer and
-slice spare capacity. Neither descriptor storage nor the 128 KiB receive deduplication bitmap is covered by the encoded
-packet-byte budget.
+slice spare capacity. Neither descriptor storage nor the receive deduplication bitmap, which can grow to 128 KiB, is
+covered by the encoded packet-byte budget.
 
 Sent expiry cannot remove an entry from the cumulative-count FIFO. The retained implementation now releases expired
 payloads while retaining the size, kind, delivery snapshot, and accounting descriptor needed for subsequent feedback.
 The writer keeps independent buffer ownership, and an original payload-length field preserves real-transport recovery
 proof after a late report. On arm64 that field occupies existing descriptor padding and keeps the descriptor at 136
-bytes. Smaller descriptors and lazy bitmap allocation for untouched sessions remain memory experiments, not reasons to
-lower deduplication capacity without measuring packet overtaking.
+bytes. Smaller descriptors remain memory experiments. The allocation follow-up below implements growing bitmaps for
+quiet session directions without lowering deduplication capacity.
 
 All inbound lanes share one receiver UDP write slot. An endpoint write can hold it for up to the UDP write budget while
 other lane readers wait. Each reader acknowledges its validated batch before this wait, but cannot parse its following
@@ -2236,6 +2238,243 @@ convergence before approaching the other samples' later rates. These sequential 
 establish statistical confidence. The passing unchanged-source control does not justify dismissing the candidate's
 failed sample as environmental noise. Both full acceptance failures remain unresolved.
 
+### Current-source allocation follow-up
+
+The follow-up on 2026-10-08 and 2026-10-09 uses `141d2b2` as its unchanged reference and permits incompatible changes
+while retaining V1. A fresh Linux arm64 ten-second TCP pipeline profile placed 60.82 percent of CPU samples at the
+syscall entry and about 0.43 percent directly in protocol-package functions. The suspend-aware protocol clock accounted
+for 5.69 percent cumulatively, including its syscall. The benchmark's UDP driver and echo target contribute to these
+totals. These synthetic loopback results do not bound the benefit from removing scheduler state or entire I/O stages.
+
+The reference allocation profile placed 22.31 percent of sampled bytes in `ObserveDeliveryReport`, 12.75 percent in
+`queueDeliveryReport`, 10.62 percent in `SendDeliveryReport`, and 10.62 percent directly in `routeReport`. Three
+retained changes address concrete allocation costs:
+
+- Each serial carrier reader lazily creates one capacity-one report-result channel and reuses it for synchronous
+  scheduler validation. Cancellation or a protocol error ends that reader. A delayed scheduler completion can occupy the
+  retired channel without blocking the scheduler or reaching another generation. Client and server construct a new
+  `Lane` for every generation. The internal observer API documents this ownership contract
+- The report router applies `sync.Once` directly around successful carrier-write completion. If every queue rejects the
+  report, no writer owns a callback and the router invokes failure completion directly. Multiple accepted writers still
+  share one success callback. If no eligible lane exists, failure completes before callback state is allocated
+- The deduplication bitmap grows geometrically as ring positions are observed, up to its original maximum size.
+  Unallocated positions read as zero, clearing intersects only allocated storage, and growth preserves existing bits.
+  Classification and zero-ID rejection do not allocate. The receiver records observations only after successful UDP
+  submission. The logical capacity, sequence horizon, and duplicate classification remain unchanged
+
+An untouched default window saves exactly 131,072 bitmap bytes, or 128 MiB across 1024 such server sessions. The first
+observation at ID one allocates eight bitmap bytes and saves 131,064 bytes. A far first ring position can immediately
+require the full bitmap. These figures exclude other session storage. Storage does not shrink after traffic stops, lanes
+change, or a session detaches. Filling the first complete default window sequentially allocates 262,136 bitmap bytes
+cumulatively across 15 arrays, compared with one 131,072-byte array in the reference. The final retained bitmap still
+occupies 128 KiB. A reader similarly retains its one result channel until its generation is released.
+
+Focused measurements used identical benchmark source on Go 1.27.1, Darwin arm64, and an Apple M4 Pro. Three alternating
+pairs, with the middle pair reversed, supplied six half-second samples per variant. The reference overlay restores the
+original window and scheduler implementations. It adapts the report method signature to accept and ignore the new
+argument, while still creating the original per-request channel. Both sides use the updated Lane reader, including its
+one-time channel allocation. Report routing retains and invokes the actual writer callbacks. The handoff benchmark uses
+a minimal event responder and excludes full scheduler validation and carrier I/O:
+
+| Operation | Reference B/op | Final B/op | Reference allocs/op | Final allocs/op |
+| --- | ---: | ---: | ---: | ---: |
+| Empty 1,048,576-ID window | About 131,120 | 48 | 2 | 1 |
+| Window creation and first observation at ID one | About 131,120 | 56 | 2 | 2 |
+| Creation and sequential fill of 1,048,576 IDs | 131,120 | 262,184 | 2 | 16 |
+| Report validation handoff after first use | 128 | 0 | 2 | 0 |
+| Single or duplicate report routing | 56 | 40 | 3 | 2 |
+| Empty-lane report routing | 56 | 0 | 3 | 0 |
+| Steady sequential or duplicate window observation | 0 | 0 | 0 | 0 |
+
+The report handoff median changed from 234.55 to 198.30 ns, a 15.46 percent reduction in this focused benchmark. Before
+the later empty-lane guard, single, duplicate, and unroutable routing medians fell by 12.73, 10.09, and 33.92 percent.
+Steady sequential and sequential-plus-duplicate observations were 4.66 and 3.37 percent slower. Creating and filling a
+complete default window changed from 3.884 to 4.045 milliseconds, a 4.13 percent increase. This trades extra initial
+allocation and copying for much smaller untouched and sparsely observed sessions. These operation timings do not
+establish packet latency or forwarding throughput improvements.
+
+A later route audit found that the callback state was still allocated when no eligible lane existed. Moving that case
+before callback creation reduced empty-lane routing from 40 bytes and two allocations to zero. Three consecutive
+one-second samples per variant measured medians of 16.99 ns before the guard and 6.500 ns after it. Single and duplicate
+routes retained 40 bytes and two allocations. These samples were not interleaved and do not establish a timing change
+for the normal routes. The existing failure-completion regression now covers no lanes, two abandoning lanes, and two
+rejected queues, and verifies one failure completion and the expected write attempts. These cases and the existing
+duplicate-routing and control-order tests passed 100 race-enabled repetitions.
+
+The final-candidate Linux arm64 pipeline comparison used three alternating pairs, two seconds per carrier, the existing
+128-request window, 1452-byte structurally valid datagrams, and 1024-ID test windows. Every sample contributes to these
+medians:
+
+| Carrier | Reference ns/op | Final ns/op | Time change | Reference/final B/op |
+| --- | ---: | ---: | ---: | ---: |
+| TCP | 3101 | 3340 | +7.71% | 10 / 9 |
+| TLS | 2781 | 3505 | +26.03% | 13 / 10 |
+| WebSocket | 3977 | 4132 | +3.90% | 9 / 10 |
+| Secure WebSocket | 3700 | 4248 | +14.81% | 12 / 10 |
+
+The initial full-on-first-observation candidate also produced slower secure-WebSocket medians in separate short
+comparisons: +11.11 percent on Darwin and +9.00 percent on Linux. These negative results remain part of the evidence.
+The stronger isolated secure-WebSocket check rotated four variants through five six-second samples each:
+
+| Variant | ns/op samples | Median ns/op | Median B/op |
+| --- | --- | ---: | ---: |
+| Reference window and scheduler | 3797, 3797, 3646, 3945, 3869 | 3797 | 10 |
+| Full-on-first-observation bitmap, both report changes | 3781, 3758, 4213, 3856, 3654 | 3781 | 7 |
+| Growing bitmap and callback change, per-report result allocation | 3877, 3978, 3833, 3758, 3934 | 3877 | 10 |
+| Final growing bitmap and both report changes | 3831, 3782, 3881, 3868, 3791 | 3831 | 7 |
+
+The final isolated median is 0.90 percent slower than the reference. This does not reproduce the earlier double-digit
+secure-WebSocket difference and does not establish a throughput gain. A longer all-carrier check used the same three
+alternating pairs with two three-second samples per carrier in each run, giving six samples per variant:
+
+| Carrier | Reference ns/op samples | Final ns/op samples | Median time change | Reference/final median B/op |
+| --- | --- | --- | ---: | ---: |
+| TCP | 3396, 3337, 3035, 3419, 2886, 2912 | 3204, 3183, 3195, 3017, 2959, 3036 | -2.40% | 8 / 5 |
+| TLS | 3140, 3077, 3479, 3466, 3072, 3016 | 3033, 3015, 2853, 2811, 3387, 3262 | -2.72% | 11 / 7 |
+| WebSocket | 4019, 3974, 4303, 4222, 4197, 4006 | 3901, 3873, 3712, 3696, 3936, 3716 | -7.63% | 8 / 5.5 |
+| Secure WebSocket | 4352, 4130, 4253, 4281, 3668, 3741 | 3895, 3852, 3643, 3623, 3839, 3850 | -8.28% | 10.5 / 7 |
+
+The pooled longer medians favor the final candidate, while individual samples overlap and the separate secure-WebSocket
+check differs. Comparing within each alternating pair also reveals slower final samples in the third pair: +3.40 percent
+for TCP, +9.21 percent for TLS, and +3.78 percent for secure WebSocket. WebSocket favors the final candidate in all
+three paired runs. These are laboratory samples with substantial scheduling variation, not confidence intervals or a
+universal throughput guarantee. A displayed zero allocations per packet hides infrequent feedback allocations. Pipeline
+measurements describe amortized synthetic throughput rather than packet RTT, first-packet latency, real WireGuard
+authentication, or impaired-network inner TCP goodput.
+
+Reproduce the focused final benchmarks with:
+
+```sh
+go test ./internal/dedup ./internal/relay -run '^$' \
+  -bench 'Benchmark(NewWindow|WindowObserve|WindowFill|SchedulerObserveDeliveryReport|SchedulerRouteReport)$' \
+  -benchmem -benchtime=500ms -count=6
+```
+
+A recovery experiment allowed an established carrier to reconnect without a proven alternative after two path-aware
+progress guards, provided measured capacity, at least 4096 acknowledged real transport bytes, and useful unmigrated
+transport remained. The first six original kernel scenarios passed: capacity collapse in all three directions, single
+and shared-path 32 kbit/s, and fixed 600-millisecond one-way delay. Its first repeated bidirectional collapse then
+recovered only 0.2 percent in one direction against the unchanged 25 percent requirement. The untouched reference
+independently failed reverse recovery at 0.8 percent. The recovery change and its altered test invariants were removed.
+Passing first samples do not resolve the repeated failure. The earlier allocation candidate completed 46 original
+network cases before its run was stopped to test the refined bitmap. Its reverse-collapse result recovered only 10.4
+percent. That incomplete run is not a passing full matrix.
+
+Deterministic tests cover sparse ring positions, partial words, repeated wrapping, maximum-width sequence numbers,
+maximum-int capacity, repeated report-channel use, cancellation before and after event queueing, delayed completion, and
+generation replacement. An independent set-based oracle checks 1,300,000 operations across 260 capacities. The new
+window fuzz target completed 4,970,450 executions, and the receiver batch target completed 465,691 executions. Seven
+existing protocol fuzz targets also passed five seconds each. Existing tests cover concurrent duplicate writers, failed
+writes, full queues, retry suppression, late callbacks, partial UDP submission, and pooled packet ownership.
+
+The retained implementation passed the complete shuffled Darwin race suite, the complete shuffled Linux suite, Darwin
+and Windows static checks, Linux 32-bit static checks for deduplication and relay, and 100 race-enabled repetitions of
+report cancellation, replacement, and concurrent completion. The initial Linux fixture could not execute test binaries
+from a nonexecutable temporary filesystem. The corrected executable-tmpfs fixture passed without source or
+test-threshold changes. None of these changes alters wire encoding, cumulative report validation, report timing policy,
+clock mapping, queue limits, discovery, primary selection, or migration policy.
+
+Twenty full source-review passes covered the retained changes: ten for the initial candidate and ten after the final
+bitmap refinement. Each pass restarted from the production diff and traced the relevant callers, failure paths, tests,
+and documentation. The final ten examined construction and virtual bits, sparse clearing, integer limits, the
+independent oracle, UDP ownership, report cancellation, wire/control boundaries, benchmark attribution, recovery
+invariants, and the complete retained diff. Review fixes included benchmark metric arithmetic and resource/measurement
+descriptions.
+
+A subsequent audit on 2026-10-09 added a reader-to-scheduler regression test for serial feedback, validation errors,
+malformed reports, and cancellation within a prefetched frame batch. All four cases passed 100 race-enabled repetitions.
+Temporary source overlays confirmed that the test rejects continuing after validation failure and reallocating the
+result channel for each report. An external bitmap harness checked all 2,813 reachable logical states for capacities one
+through eight with IDs from zero through twice the capacity plus two, covering 48,889 transitions. A further translated
+word-boundary check covered 1,524,832 transitions and 505,256,320 classifications at different word and ring offsets,
+including IDs that reach the uint64 limit. Removing the bitmap history copy during growth made this independent model
+fail. A separate synthetic handoff stressor ran ten race-enabled repetitions with 32 serial owners and 32,000 report
+attempts per repetition. Tagged completions checked result ownership while cancellation and completion competed for the
+same request. This stressor excludes full scheduler validation and carrier I/O. These finite domains supplement the
+full-width sequence tests and fuzzing. The complete shuffled Darwin race suite and Darwin and Windows amd64 static
+checks passed again. Linux 32-bit static checks for deduplication and relay also passed. An intervening restricted
+relay-suite attempt could not bind its local TCP and UDP test listeners. Rerunning the full suite with local socket
+permission passed. Those audits changed tests and documentation only. The later empty-lane routing guard changes
+allocation on a detached or abandoning session. The two network acceptance failures below remain unresolved, and their
+original binaries predate that guard.
+
+A further receiver audit extended partial-UDP delivery coverage from one bitmap word to a 257-ID window. Its 56 cases
+combine scalar or vector delivery, probes, bitmap growth, sequence numbers reaching the uint64 limit, per-datagram
+drops, missing peers, endpoint failure, cancellation, and expiry. They verify the successful prefix, exact retry
+payloads, and cumulative parsing counts. Eight concurrent receiver callers additionally submit rotated batches around
+word and ring boundaries sixteen times each. All thirteen IDs remain within the logical horizon and must each reach the
+endpoint exactly once. Both checks passed 100 race-enabled repetitions on each of one and four CPUs. A temporary variant
+that discarded history during bitmap growth failed these tests through duplicate submissions, rather than a build error.
+These fixtures exercise the real receiver and lane batch logic with in-memory endpoints. They do not replace carrier
+network tests or resolve the performance failures below. After this extension, the complete shuffled Darwin race suite
+and executable Linux arm64 suite passed again. Darwin and Windows amd64 static checks passed for all packages, and Linux
+386 static checks passed for deduplication and relay. This extension changes tests and documentation only.
+
+A separate receiver set model checks scalar and vector delivery against successful writes without using the production
+bitmap or run-splitting logic. It varies deduplication capacities from 1 through 257, full-width sequence bases,
+unsorted batches, duplicate IDs, per-datagram drops, missing peers, endpoint failure, clock advancement, expiry, and
+retries. Each input contains up to 64 packets, submitted in batches of at most sixteen across three passes. The final
+pass reverses packet order and refreshes deadlines to check whether unsuccessful earlier submissions remain eligible
+under the current logical horizon. The model checks attempted writes, exact successful payload order, committed sequence
+state, and temporary-buffer cleanup. Its initial zero-offset version passed ten race-enabled repetitions on each of one
+and four CPUs for 144 seeds and completed 6,359,503 fuzz executions in 120 seconds. The current target also covers seven
+clock fixtures with positive and negative offsets, timestamps beyond the signed range, upper unsigned boundaries,
+maximum admitted uncertainty, and expiry exactly at the conservative deadline. During this extension, two timing
+mutations initially passed because the seed's short-deadline packet duplicated an earlier successfully delivered ID and
+was filtered before expiry mattered. Replacing that ID with a new one exposed both errors. All 1,008 final seeds passed
+100 race-enabled repetitions on each of one and four CPUs, and a fresh 120-second fuzz run completed 4,542,280
+executions without a mismatch. Temporary variants that ignored uncertainty, delayed expiry at equality, removed
+non-increasing run boundaries, or committed an unwritten suffix failed runtime assertions. A separate temporary
+arbitrary-precision oracle checked 202,592 deadline cases under the race detector, including translation overflow,
+saturated bounds, and the quantized lifetime limit. The full shuffled Darwin race suite and executable Linux arm64 suite
+passed all 26 packages with stronger pointer checks and `GOGC=20`. Darwin and Windows amd64 full static checks and Linux
+386 deduplication and relay static checks passed again. These checks changed tests and documentation only. The receiver
+model uses in-memory endpoints and fixed clock mappings. It does not exercise real carrier scheduling, kernel UDP
+vectors, or network performance acceptance.
+
+The final implementation completed all 65 original kernel WireGuard scenarios. The unchanged verifier passed 64 and
+rejected forward capacity-collapse recovery: the sender reported zero interval bytes in the final five seconds, or 0.0
+percent of the pre-fault rate, below the original 25 percent requirement. Reverse recovery reached 96.1 percent. The
+bidirectional case reached 64.0 and 111.4 percent in its two directions. All remaining carrier, low-rate, loss, delay,
+outage, roaming, IPv6, policy-routing, UDP-delivery, idle, and rekey checks passed. Both long-lived rekey cases observed
+a fresh kernel handshake 120 seconds after flow start.
+
+The untouched reference and initial allocation candidate also failed capacity-collapse checks in separate runs. This
+establishes an existing unstable acceptance target, but does not identify a unique cause or prove the retained changes
+free from timing regressions. The final failed sample remains unresolved.
+
+The independent three-repetition routed matrix completed all 18 original flows. Receiver goodput samples in Mbit/s were:
+
+| Capacity profile | Path | Three receiver-goodput samples | Median |
+| --- | --- | --- | ---: |
+| HighCapacity | Low | 8.164, 8.165, 8.160 | 8.164 |
+| HighCapacity | High | 46.841, 47.674, 47.442 | 47.442 |
+| HighCapacity | Both | 46.797, 47.946, 37.296 | 46.797 |
+| LowCapacity | Low | 87.236, 87.039, 87.242 | 87.236 |
+| LowCapacity | High | 6.730, 6.851, 6.617 | 6.730 |
+| LowCapacity | Both | 86.909, 86.330, 87.198 | 86.909 |
+
+The original verifier rejected the third HighCapacity combined flow. Its 37.296 Mbit/s retained only 78.61 percent of
+the 47.442 Mbit/s best standalone median, below the unchanged 85 percent requirement. The combined profile median
+retained 98.64 percent, which does not excuse that individual failure. The original verifier stops at this profile. A
+supplemental driver reused its unchanged flow and evidence functions to check all 18 flows and both capacity profiles.
+All connection-identity, routing, shaping, and no-drop evidence checks passed. LowCapacity retained 99.62 percent in its
+combined median and at least 98.96 percent in every combined flow. The supplemental driver preserves sample order before
+using the verifier's in-place median helper.
+
+The failed combined flow's existing interval records contain zero inner TCP retransmissions. Its reported inner RTT
+rises from approximately 304 milliseconds in interval zero to 933 milliseconds in interval three. Sender throughput then
+remains between 10.45 and 31.46 Mbit/s in intervals three through seven, before its final five intervals reach 41.95 to
+62.93 Mbit/s. The successful preceding combined flow reaches 62.93 Mbit/s in interval three. This narrows the observed
+deficit to slow early progress accompanied by increased inner RTT. It does not establish which queue, probe, feedback
+path, or scheduling transition produced that delay.
+
+This routed run compares combined and standalone paths within the final implementation. It does not establish a
+source-versus-reference throughput improvement. Capacity-collapse recovery and individual routed-flow stability remain
+failed acceptance targets. No fault schedule, verification threshold, compatibility path, or recovery heuristic was
+changed to turn these samples into passes. The retained benefits are lower report allocation and much smaller quiet
+session bitmaps, with the measured growth cost and throughput uncertainty described above.
+
 ### Additional protocol candidates
 
 The following incompatible candidates remain available within V1. They address different costs and need separate
@@ -2247,6 +2486,7 @@ acceptance targets:
 | Batch bases with independent packet deltas | Amortize packet IDs and deadlines for dense small-packet traffic | Support priority-induced negative deltas, migrated IDs, immediate scalar writes, and incremental delivery without waiting for the complete batch |
 | Elide a zero WireGuard reserved field | Save three payload bytes in the common case | Preserve arbitrary nonzero bytes with an explicit escape. This is reversible header coding rather than ciphertext compression |
 | Combine timing replies with parsing progress | Reduce writes and control allocations on the same lane | Keep alternate-lane feedback and refresh report-construction delay at the actual writer. Waiting for the next Pong cannot delay normal feedback |
+| One binary admission header before WebSocket Upgrade | Reuse the raw hello field codec and remove repeated textual selectors without an extra application round trip | Preserve the WebSocket method and escaped-path MAC context, writer-sampled clock bootstrap, strict base64url canonicality, header bounds, duplicate-header rejection, and pre-upgrade signed errors |
 | One authenticated binary admission after WebSocket Upgrade | Remove duplicated raw and HTTP admission formats | Weigh a simpler state machine against unauthenticated upgraded connections, delayed HTTP rejection, and startup exchange timing |
 | One-stream length-only tunnel | Establish a lower-complexity forwarding comparison | Removing deadlines, deduplication, reports, and migration changes freshness and recovery. Compare fault behavior as well as CPU before selecting this product model |
 
@@ -2529,6 +2769,30 @@ iperf's control and data connections. This counter alone does not identify which
 isolate the failed flow's cause. The candidate was rejected, its remaining conditional gates were not run, and no
 scheduler or transmission-store change was retained. The first passing samples do not establish reliable recovery or
 replace the failed repetition.
+
+Further diagnostics on 2026-10-09 used the retained allocation changes with temporary scheduler logging and socket
+sampling every 250 milliseconds. The three original twenty-second capacity-collapse directions passed the unchanged
+verifier, but the forward sender still recorded ten consecutive zero-byte one-second intervals before resuming in the
+interval starting at fifteen seconds. Its sampled inner TCP RTO reached 12.334 seconds. The inner ACK counter stayed at
+838,945,982 bytes from approximately eleven through fourteen seconds, across the recorded capacity restoration at twelve
+seconds. At approximately thirteen seconds, the scheduler had no queued frames and retained metadata for 622 sent,
+unreported frames totaling 907,291 bytes. Its last report counter had not advanced since approximately ten seconds. The
+inner socket still had about 2.8 MB awaiting acknowledgment. At the same time, the outer data socket retained 885,760
+send-queue bytes, including 718,884 unsent bytes, with a 4.471-second RTO. The peer outer socket had received
+895,386,144 bytes in both its approximately twelve- and thirteen-second snapshots. By approximately fifteen seconds,
+that counter had advanced to 896,292,961 and the sender outer queue was empty, while the inner ACK counter still had not
+advanced. Times are relative to the fixture's second-resolution start marker. This sample therefore includes stalled
+outer progress after capacity restoration, followed by a remaining inner recovery delay. It cannot be attributed solely
+to either the scheduler queue or the inner TCP timeout. Instrumentation changes timing, and these passing runs do not
+resolve the earlier failed sample. These three runs preceded the empty-lane guard.
+
+Three separately instrumented HighCapacity combined flows included the empty-lane guard and measured 47.495, 46.720, and
+46.733 Mbit/s with zero inner TCP retransmissions. The unchanged flow-completion and topology-evidence helpers accepted
+all three, including carrier identity, router traversal, and absence of qdisc drops. The high-capacity lane was primary
+from the first sampled transport assignment in each flow and did not change afterward. These runs did not reproduce the
+earlier 37.296 Mbit/s failure or establish its cause. Only the combined HighCapacity path was sampled, so this is
+neither a replacement 18-flow matrix nor a paired source-versus-reference comparison. No queue limit, lifetime, fault
+schedule, or acceptance threshold changed during these diagnostics.
 
 ### Rejected queue and lifetime changes
 

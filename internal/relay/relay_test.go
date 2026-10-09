@@ -2,10 +2,14 @@ package relay
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
+	"math"
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aofei/wirehop/internal/clockmap"
@@ -29,13 +33,15 @@ type testLaneObserver struct {
 	source        protocol.LaneGeneration
 	report        protocol.DeliveryReport
 	receiveMicros uint64
+	result        chan error
 }
 
 func (o *testLaneObserver) ObserveDeliveryReport(_ context.Context, source protocol.LaneGeneration,
-	report protocol.DeliveryReport, receiveMicros uint64) error {
+	report protocol.DeliveryReport, receiveMicros uint64, result chan error) error {
 	o.source = source
 	o.report = report
 	o.receiveMicros = receiveMicros
+	o.result = result
 	return nil
 }
 
@@ -58,6 +64,110 @@ func TestLaneReadControlDeliveryReportSource(t *testing.T) {
 	wantSource := protocol.LaneGeneration{LaneID: lane.laneID, Generation: lane.generation}
 	if observer.source != wantSource || observer.report != report || observer.receiveMicros != 12345 {
 		t.Fatalf("observed report = %+v, want source %+v, report %+v, time 12345", observer, wantSource, report)
+	}
+	result := observer.result
+	if cap(result) != 1 {
+		t.Fatal("report reader did not allocate a buffered result channel")
+	}
+	if err := lane.readControl(context.Background(), frame, &clockSyncPending); err != nil {
+		t.Fatal(err)
+	}
+	if observer.result != result {
+		t.Fatal("report reader did not reuse its result channel")
+	}
+	replacement := &Lane{laneID: lane.laneID, generation: lane.generation + 1, clock: lane.clock, observer: observer}
+	if err := replacement.readControl(context.Background(), frame, &clockSyncPending); err != nil {
+		t.Fatal(err)
+	}
+	if observer.result == result {
+		t.Fatal("replacement reader reused the previous generation's result channel")
+	}
+}
+
+func TestLaneReadDeliveryReports(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		invalid   bool
+		malformed bool
+		cancel    bool
+		completed int
+		want      error
+	}{
+		{name: "SerialResults", completed: 3, want: io.ErrUnexpectedEOF},
+		{name: "ValidationError", invalid: true, completed: 2, want: ErrInvalidDeliveryReport},
+		{name: "MalformedReport", malformed: true, completed: 1, want: protocol.ErrInvalidControlFrame},
+		{name: "CanceledReader", cancel: true, completed: 1, want: context.Canceled},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				connection := &prefixErrorCarrier{testCarrier: newTestCarrier()}
+				lane := newTestLane(t, connection.testCarrier, newTestEndpoint())
+				lane.carrier = connection
+				scheduler := &Scheduler{events: make(chan schedulerEvent, 1)}
+				lane.observer = scheduler
+				registered := schedulerLane(t, byte(lane.laneID), 1, 1, 1_000_000)
+				lanes := map[protocol.LaneID]*scheduledLane{lane.laneID: registered}
+				for index := range 3 {
+					report := protocol.DeliveryReport{LaneID: lane.laneID, Generation: lane.generation}
+					if tt.invalid && index == 1 {
+						report.DataPackets = 1
+					}
+					frame, err := protocol.MarshalDeliveryReport(report)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if tt.malformed && index == 1 {
+						frame.Payload = nil
+					}
+					connection.frames = append(connection.frames, frame)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				done := make(chan error, 1)
+				go func() { done <- lane.read(ctx) }()
+				var result chan error
+				var preferred protocol.LaneID
+				for range tt.completed {
+					synctest.Wait()
+					if len(scheduler.events) != 1 {
+						t.Fatal("reader did not enqueue the expected report")
+					}
+					event := <-scheduler.events
+					if result == nil {
+						result = event.result
+					}
+					if event.result != result || cap(result) != 1 || len(result) != 0 {
+						t.Fatal("serial reader changed its channel or left an outstanding completion")
+					}
+					synctest.Wait()
+					if len(scheduler.events) != 0 || len(done) != 0 {
+						t.Fatal("reader advanced before scheduler validation completed")
+					}
+					if tt.cancel {
+						cancel()
+						synctest.Wait()
+					}
+					scheduler.applyEvent(lanes, &preferred, event, time.Now())
+				}
+				synctest.Wait()
+				if len(done) != 1 {
+					t.Fatal("reader did not exit at the expected boundary")
+				}
+				if err := <-done; !errors.Is(err, tt.want) {
+					t.Fatalf("read() = %v, want %v", err, tt.want)
+				}
+				if len(scheduler.events) != 0 {
+					t.Fatal("retired reader queued another report")
+				}
+				pending := 0
+				if tt.cancel {
+					pending = 1
+				}
+				if len(result) != pending {
+					t.Fatalf("retired channel has %d completions, want %d", len(result), pending)
+				}
+			})
+		})
 	}
 }
 
@@ -756,11 +866,16 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 		name    string
 		batched bool
 		probes  bool
+		firstID uint64
 	}{
-		{name: "Scalar"},
-		{name: "Vector", batched: true},
-		{name: "ScalarWithProbes", probes: true},
-		{name: "VectorWithProbes", batched: true, probes: true},
+		{name: "Scalar", firstID: 1},
+		{name: "Vector", batched: true, firstID: 1},
+		{name: "ScalarWithProbes", probes: true, firstID: 1},
+		{name: "VectorWithProbes", batched: true, probes: true, firstID: 1},
+		{name: "ScalarBitmapGrowth", firstID: 63},
+		{name: "VectorBitmapGrowth", batched: true, firstID: 63},
+		{name: "ScalarSequenceLimit", firstID: math.MaxUint64 - 4},
+		{name: "VectorSequenceLimit", batched: true, firstID: math.MaxUint64 - 4},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			for _, test := range []struct {
@@ -793,7 +908,13 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 						testEndpoint: newTestEndpoint(), failureAt: test.failureAt, failure: test.failure,
 					}
 					lane := newTestLane(t, newTestCarrier(), endpoint.testEndpoint)
-					lane.receiver.endpoint = endpoint
+					receiver, err := NewReceiver(ReceiverConfig{
+						Endpoint: endpoint, Clock: lane.clock, DeduplicationSize: 257,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					lane.receiver = receiver
 					if mode.batched {
 						lane.receiver.endpoint = &partialBatchWriteEndpoint{partialWriteEndpoint: endpoint}
 					}
@@ -810,7 +931,7 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 					var encodedBytes uint64
 					for index := range 5 {
 						packet := protocol.Data{
-							PacketID: uint64(index + 1), DeadlineMicros: 1_000_000,
+							PacketID: mode.firstID + uint64(index), DeadlineMicros: 1_000_000,
 							Payload: relayWireGuardPacket(wgpacket.TransportData),
 						}
 						packet.Payload[4] = byte(index + 1)
@@ -1318,6 +1439,59 @@ func TestReceiverFailedHighPacketIDDoesNotAdvanceWindow(t *testing.T) {
 }
 
 func TestReceiverDeliverBatch(t *testing.T) {
+	t.Run("ConcurrentBitmapGrowth", func(t *testing.T) {
+		const lanes = 8
+		const repetitions = 16
+		packetIDs := [...]uint64{1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257}
+		endpoint := newTestEndpoint()
+		endpoint.writes = make(chan []byte, lanes*repetitions*len(packetIDs))
+		receiver, err := NewReceiver(ReceiverConfig{
+			Endpoint: endpoint, Clock: &testClock{now: 1000}, DeduplicationSize: 257,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		results := make(chan error, lanes)
+		for lane := range lanes {
+			go func() {
+				var batch [len(packetIDs)]protocol.Data
+				for index := range batch {
+					packetID := packetIDs[(index+lane)%len(packetIDs)]
+					payload := relayWireGuardPacket(wgpacket.TransportData)
+					binary.LittleEndian.PutUint64(payload[4:12], packetID)
+					batch[index] = protocol.Data{PacketID: packetID, DeadlineMicros: 100_900, Payload: payload}
+				}
+				<-start
+				for range repetitions {
+					if err := receiver.deliverBatch(t.Context(), batch[:]); err != nil {
+						results <- err
+						return
+					}
+				}
+				results <- nil
+			}()
+		}
+		close(start)
+		for range lanes {
+			if err := <-results; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(endpoint.writes) != len(packetIDs) {
+			t.Fatalf("successful UDP writes = %d, want %d", len(endpoint.writes), len(packetIDs))
+		}
+		written := make(map[uint64]int, len(packetIDs))
+		for range packetIDs {
+			written[binary.LittleEndian.Uint64((<-endpoint.writes)[4:12])]++
+		}
+		for _, packetID := range packetIDs {
+			if written[packetID] != 1 {
+				t.Fatalf("PacketID %d was submitted %d times, want 1", packetID, written[packetID])
+			}
+		}
+	})
+
 	t.Run("PreservesPacketIDOrder", func(t *testing.T) {
 		endpoint := &recordingBatchEndpoint{testEndpoint: newTestEndpoint()}
 		receiver, err := NewReceiver(ReceiverConfig{

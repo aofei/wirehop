@@ -62,7 +62,7 @@ type LaneRegistration struct {
 
 // LaneObserver receives cumulative lane feedback parsed by any carrier reader.
 type LaneObserver interface {
-	ObserveDeliveryReport(context.Context, protocol.LaneGeneration, protocol.DeliveryReport, uint64) error
+	ObserveDeliveryReport(context.Context, protocol.LaneGeneration, protocol.DeliveryReport, uint64, chan error) error
 	ObserveTiming(protocol.LaneID, uint64, clockmap.Sample)
 	ObserveLaneAbandon(context.Context, protocol.LaneGeneration) error
 	RouteDeliveryReport(protocol.DeliveryReport, time.Time, func(bool)) bool
@@ -205,9 +205,10 @@ func (s *Scheduler) Remove(ctx context.Context, laneID protocol.LaneID, generati
 }
 
 // ObserveDeliveryReport validates cumulative parsing feedback received over one exact carrier generation.
+// The reader owns result, which must have capacity one and no outstanding request. A canceled request ends that
+// reader's lifetime, so its channel is never reused while the scheduler may still complete the request.
 func (s *Scheduler) ObserveDeliveryReport(ctx context.Context, source protocol.LaneGeneration, report protocol.DeliveryReport,
-	receiveMicros uint64) error {
-	result := make(chan error, 1)
+	receiveMicros uint64, result chan error) error {
 	select {
 	case s.events <- schedulerEvent{
 		kind: schedulerReport, report: report, receiveMicros: receiveMicros, result: result,
@@ -534,11 +535,14 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 // routeReport duplicates feedback over its own connected lane and one best alternate lane.
 func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report protocol.DeliveryReport,
 	parsedAt time.Time, complete func(bool)) {
-	var completeOnce sync.Once
-	completed := func(sent bool) { completeOnce.Do(func() { complete(sent) }) }
-	onSent := func() { completed(true) }
-	accepted := false
 	candidates := s.orderedControlLanes(lanes)
+	if len(candidates) == 0 {
+		complete(false)
+		return
+	}
+	var completeOnce sync.Once
+	onSent := func() { completeOnce.Do(func() { complete(true) }) }
+	accepted := false
 	for _, scored := range candidates {
 		candidate := scored.lane
 		if candidate.registration.LaneID == report.LaneID {
@@ -555,7 +559,7 @@ func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report
 		}
 	}
 	if !accepted {
-		completed(false)
+		complete(false)
 	}
 }
 

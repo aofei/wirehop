@@ -18,6 +18,57 @@ import (
 
 var benchmarkCandidateSink uint64
 
+func BenchmarkSchedulerRouteReport(b *testing.B) {
+	for _, tt := range []struct {
+		name  string
+		lanes int
+	}{{name: "Unroutable"}, {name: "Single", lanes: 1}, {name: "Duplicate", lanes: 2}} {
+		b.Run(tt.name, func(b *testing.B) {
+			var callbacks [2]func()
+			callbackCount := 0
+			lanes := make(map[protocol.LaneID]*scheduledLane, tt.lanes)
+			for index := range tt.lanes {
+				store, err := NewTransmissionStore(packetqueue.Limits{Packets: 256, Bytes: 2 * 1024 * 1024})
+				if err != nil {
+					b.Fatal(err)
+				}
+				laneID := protocol.LaneID(index + 1)
+				lanes[laneID] = &scheduledLane{registration: LaneRegistration{
+					LaneID: laneID, Generation: 1, Store: store,
+					SendDeliveryReport: func(_ protocol.DeliveryReport, _ time.Time, onSent func()) bool {
+						callbacks[callbackCount] = onSent
+						callbackCount++
+						return true
+					},
+				}, deliveryRate: defaultInitialRateBytesPerSecond}
+			}
+			scheduler := new(Scheduler)
+			report := protocol.DeliveryReport{LaneID: 1, Generation: 1}
+			parsedAt := time.Now()
+			completed := 0
+			complete := func(sent bool) {
+				if sent != (tt.lanes > 0) {
+					b.Fatalf("completion sent = %t, lanes = %d", sent, tt.lanes)
+				}
+				completed++
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				callbackCount = 0
+				completed = 0
+				scheduler.routeReport(lanes, report, parsedAt, complete)
+				for index := range callbackCount {
+					callbacks[index]()
+					callbacks[index] = nil
+				}
+				if completed != 1 {
+					b.Fatalf("completion calls = %d, want 1", completed)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkSchedulerApplyEvent(b *testing.B) {
 	for _, kind := range []schedulerEventKind{schedulerTiming, schedulerReport} {
 		name := "Timing"
@@ -293,5 +344,30 @@ func BenchmarkLaneWriteControlBatch(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkSchedulerObserveDeliveryReport(b *testing.B) {
+	scheduler := &Scheduler{events: make(chan schedulerEvent, schedulerEventCapacity)}
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		for event := range scheduler.events {
+			event.result <- nil
+		}
+	}()
+	defer func() {
+		close(scheduler.events)
+		<-workerDone
+	}()
+	result := make(chan error, 1)
+	source := protocol.LaneGeneration{LaneID: 1, Generation: 1}
+	report := protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := scheduler.ObserveDeliveryReport(ctx, source, report, 123, result); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

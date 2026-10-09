@@ -183,7 +183,7 @@ func TestSchedulerRunRetriesSharedBudgetAfterRelease(t *testing.T) {
 					t.Fatalf("resumed packet retention = %+v", got)
 				}
 				if err := scheduler.ObserveDeliveryReport(ctx, protocol.LaneGeneration{LaneID: 2, Generation: 1},
-					protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}, uint64(time.Now().UnixMicro())); err != nil {
+					protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}, uint64(time.Now().UnixMicro()), make(chan error, 1)); err != nil {
 					t.Fatal(err)
 				}
 				synctest.Wait()
