@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.3.0](https://github.com/aofei/wirehop/compare/v0.2.1...v0.3.0) (2026-10-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* V1 frame and handshake encodings have changed. Deploy matching clients and servers together. The protocol version remains V1.
+* Reserve zero-ID Data with a zero deadline for exactly 4096 padding bytes. Deploy matching client and server builds together. Protocol version remains 1.
+* Replace the v1 admission and relay wire layouts, remove Probe frames, and use numeric lane and path group selectors. Deploy matching client and server builds together. Protocol version remains 1.
+* Redefine the v1 frame format with canonical unsigned LEB128 fields and remove Probe IDs and diagnostic length fields. Deploy matching client and server builds together. Protocol version remains 1.
+
+### Bug Fixes
+
+* improve recovery on slow and changing networks ([1833888](https://github.com/aofei/wirehop/commit/18338884db11b44e25a45295a25650213a5bea44))
+* preserve delivery sampling provenance and compact relay state ([4e2f59f](https://github.com/aofei/wirehop/commit/4e2f59fb0e24acd2cc5287f94091c7853005cafb))
+* preserve relay feedback and batch receive accounting ([b8d619c](https://github.com/aofei/wirehop/commit/b8d619c65e0c8bdc52bf48e622c71bedac3a1d34))
+* recover stalled relay paths and reduce receive overhead ([8115564](https://github.com/aofei/wirehop/commit/8115564297bdf9693a7136c15d5a8b2669191fce))
+* release expired relay payloads and avoid event allocations ([141d2b2](https://github.com/aofei/wirehop/commit/141d2b2f5bd631a6a4f5518db08ec1c088287924))
+* stabilize multipath throughput with bounded capacity discovery ([9764416](https://github.com/aofei/wirehop/commit/97644163fed83afa3c9061f3e11e56520fddebca))
+
+
+### Code Refactoring
+
+* compact v1 framing and coalesce queued controls ([80e9d23](https://github.com/aofei/wirehop/commit/80e9d2325d02649ffb6fc97c3ed8f2012bbb0928))
+* compact v1 framing and handshake encoding ([4bf361d](https://github.com/aofei/wirehop/commit/4bf361db9706c6a11789e097df9061edfabe231f))
+* reduce relay feedback and deduplication allocations ([c62c761](https://github.com/aofei/wirehop/commit/c62c76126d147a73c3524de5dcf424bafbf21c65))
+* reduce relay queue scans and maintenance work ([49b25a9](https://github.com/aofei/wirehop/commit/49b25a94a12a7495ffcea6bb7bc1e7a351d888dd))
+* simplify v1 admission and delivery feedback ([d2e334d](https://github.com/aofei/wirehop/commit/d2e334dc901d9c64d3f364a07441ba1e8bc60476))
+
 ## [0.2.1](https://github.com/aofei/wirehop/compare/v0.2.0...v0.2.1) (2026-09-10)
 
 
