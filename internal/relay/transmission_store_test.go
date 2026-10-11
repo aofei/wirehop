@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -41,7 +42,7 @@ func TestTransmissionStoreValidation(t *testing.T) {
 	for _, transmission := range []retainedTransmission{
 		{},
 		{
-			packetID: valid.packetID, wireDeadline: valid.wireDeadline, deadline: valid.deadline,
+			packetID: valid.packetID, deadlineMicros: valid.deadlineMicros,
 			packet: datagram.Packet{Kind: wgpacket.HandshakeInitiation, Payload: valid.packet.Payload},
 		},
 		migratedControl,
@@ -51,7 +52,7 @@ func TestTransmissionStoreValidation(t *testing.T) {
 		}
 	}
 	expired := valid
-	expired.deadline = now
+	expired.deadlineMicros = uint64(now.UnixMicro())
 	if err := store.push(expired); !errors.Is(err, packetqueue.ErrExpired) {
 		t.Fatalf("expired push error = %v, want %v", err, packetqueue.ErrExpired)
 	}
@@ -115,7 +116,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, action string) {
 			t.Fatal(err)
 		}
 	case "Expiry", "ExpiryThenAcknowledgment":
-		now = transmission.deadline
+		now = monotime.Time(transmission.deadlineMicros)
 		store.expire(now)
 		if store.sent.items[store.sent.head].packet.Payload != nil {
 			t.Fatal("expired sent payload remains retained")
@@ -132,7 +133,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, action string) {
 	case "Drain":
 		releaseTransmissions(store.drain())
 	case "ConcurrentExpiryAndAcknowledgment", "ConcurrentExpiryAndDrain":
-		now = transmission.deadline
+		now = monotime.Time(transmission.deadlineMicros)
 		start := make(chan struct{})
 		var workers sync.WaitGroup
 		workers.Go(func() {
@@ -239,14 +240,14 @@ func testTransmissionStoreSentPayloadExpiryAfterCompaction(t *testing.T) {
 	now = now.Add(9 * time.Second)
 	store.expire(now)
 	assertTransmissionStoreInvariants(t, store)
-	if budget.Usage() != charged || !store.sent.earliestDeadline.IsZero() {
+	if budget.Usage() != charged || store.sent.earliestDeadline != 0 {
 		t.Fatal("full payload expiry changed accounting or retained an expiry bound")
 	}
 	if err := store.push(schedulerTransmission(total+1, wgpacket.TransportData, now.Add(time.Second))); err != nil {
 		t.Fatal(err)
 	}
 	takeOneTransmission(t, store)
-	if !store.sent.earliestDeadline.Equal(now.Add(time.Second)) {
+	if store.sent.earliestDeadline != uint64(now.Add(time.Second).UnixMicro()) {
 		t.Fatal("compacted prefix did not rearm payload expiry")
 	}
 	if _, stale, err := store.acknowledge(total+1, uint64(now.UnixMicro())); err != nil || stale {
@@ -282,7 +283,7 @@ func TestTransmissionStoreSentPayloadExpiry(t *testing.T) {
 				deadline := now.Add(time.Duration(3-index) * time.Second)
 				var transmission retainedTransmission
 				if kind == wgpacket.NonWireGuard {
-					transmission = retainedTransmission{deadline: deadline, packet: datagram.Packet{Payload: probePadding[:]}}
+					transmission = retainedTransmission{deadlineMicros: uint64(deadline.UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}}
 				} else {
 					transmission = schedulerTransmission(uint64(index+1), kind, deadline)
 				}
@@ -306,7 +307,7 @@ func TestTransmissionStoreSentPayloadExpiry(t *testing.T) {
 					}
 				}
 			}
-			if !store.sent.earliestDeadline.IsZero() {
+			if store.sent.earliestDeadline != 0 {
 				t.Fatal("fully released prefix retained a payload-expiry bound")
 			}
 			// Reuse the bound with an expired descriptor still at the head.
@@ -314,7 +315,7 @@ func TestTransmissionStoreSentPayloadExpiry(t *testing.T) {
 				t.Fatal(err)
 			}
 			takeOneTransmission(t, store)
-			if !store.sent.earliestDeadline.Equal(now.Add(time.Second)) {
+			if store.sent.earliestDeadline != uint64(now.Add(time.Second).UnixMicro()) {
 				t.Fatal("new sent payload did not rearm expiry")
 			}
 			if acknowledge {
@@ -336,7 +337,7 @@ func TestTransmissionStoreSentPayloadExpiry(t *testing.T) {
 }
 
 func testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits(t *testing.T) {
-	now := time.Unix(100, 0)
+	now := monotime.Time(math.MaxUint64 - math.MaxUint64%protocol.DeadlineResolutionMicros - 4_000_000)
 	start := now
 	limits := packetqueue.Limits{Packets: 3, Bytes: 96 * 1024}
 	budget, err := retention.NewBudget(retention.Limits{Packets: limits.Packets, Bytes: limits.Bytes})
@@ -351,7 +352,6 @@ func testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits(t *testin
 	var sizes [3]int
 	for index, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.TransportData, wgpacket.HandshakeInitiation} {
 		transmission := schedulerTransmission(math.MaxUint64-uint64(2-index), kind, now.Add(time.Second))
-		transmission.wireDeadline = math.MaxUint64 - math.MaxUint64%protocol.DeadlineResolutionMicros
 		if index == 1 {
 			transmission.packet.Payload = make([]byte, protocol.MaxPacketSize)
 			transmission.packet.Payload[0] = 4
@@ -457,12 +457,12 @@ func TestTransmissionStoreReclaimsExpiredAggregateCapacity(t *testing.T) {
 	now := time.Unix(100, 0)
 	expired := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Millisecond))
 	live := schedulerTransmission(2, wgpacket.TransportData, now.Add(time.Second))
-	budget, err := retention.NewBudget(retention.Limits{Packets: 2, Bytes: expired.size + live.size})
+	budget, err := retention.NewBudget(retention.Limits{Packets: 2, Bytes: int(expired.size + live.size)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, err := newTransmissionStoreWithBudget(packetqueue.Limits{
-		Packets: 4, Bytes: 4 * expired.size,
+		Packets: 4, Bytes: int(4 * expired.size),
 	}, func() time.Time { return now }, budget)
 	if err != nil {
 		t.Fatal(err)
@@ -481,7 +481,7 @@ func TestTransmissionStoreReclaimsExpiredAggregateCapacity(t *testing.T) {
 	if packets, bytes := store.backlog(); packets != 2 || bytes != uint64(live.size+fresh.size) {
 		t.Fatalf("backlog = %d packets, %d bytes", packets, bytes)
 	}
-	if got := budget.Usage(); got != (retention.Usage{Packets: 2, Bytes: live.size + fresh.size}) {
+	if got := budget.Usage(); got != (retention.Usage{Packets: 2, Bytes: int(live.size + fresh.size)}) {
 		t.Fatalf("budget usage = %+v", got)
 	}
 	releaseTransmissions(store.drain())
@@ -662,7 +662,7 @@ func TestTransmissionStoreTakeBatchSkipsExpiredWork(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	now = now.Add(2 * time.Millisecond)
+	now = now.Add(time.Millisecond)
 	var batch [4]protocol.Data
 	var ownership [4]datagram.Packet
 	count, err := store.takeBatch(batch[:], ownership[:], 4096)
@@ -690,7 +690,7 @@ func TestTransmissionStoreReclaimsExpiredLocalCapacity(t *testing.T) {
 	expired := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Millisecond))
 	live := schedulerTransmission(2, wgpacket.TransportData, now.Add(time.Second))
 	store, err := newTransmissionStore(packetqueue.Limits{
-		Packets: 2, Bytes: expired.size + live.size,
+		Packets: 2, Bytes: int(expired.size + live.size),
 	}, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
@@ -852,32 +852,6 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 	}
 }
 
-func TestTransmissionStoreDeliveryConstrained(t *testing.T) {
-	store, err := NewTransmissionStore(packetqueue.Limits{Packets: 4, Bytes: 4096})
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
-	if err := store.push(first); err != nil {
-		t.Fatal(err)
-	}
-	if !store.deliveryConstrained(uint64(store.limits.Bytes)) {
-		t.Fatal("queued work did not constrain delivery")
-	}
-	takeOneTransmission(t, store)
-	if store.deliveryConstrained(uint64(store.limits.Bytes)) {
-		t.Fatal("small sent prefix constrained an application-limited sample")
-	}
-	second := schedulerTransmission(2, wgpacket.TransportData, time.Now().Add(time.Second))
-	if err := store.push(second); err != nil {
-		t.Fatal(err)
-	}
-	takeOneTransmission(t, store)
-	if !store.deliveryConstrained(uint64(store.limits.Bytes)) {
-		t.Fatal("half-full retained window did not constrain delivery")
-	}
-}
-
 func TestTransmissionDequeDiscardPrefix(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -893,7 +867,7 @@ func TestTransmissionDequeDiscardPrefix(t *testing.T) {
 			backing := make([]retainedTransmission, tt.total)
 			for index := range backing {
 				backing[index] = retainedTransmission{
-					size: index + 1, packet: datagram.Packet{Payload: []byte{byte(index)}},
+					size: uint32(index + 1), packet: datagram.Packet{Payload: []byte{byte(index)}},
 				}
 			}
 			deque := transmissionDeque{items: backing}
@@ -904,7 +878,7 @@ func TestTransmissionDequeDiscardPrefix(t *testing.T) {
 			for index, transmission := range backing {
 				if index >= deque.head && index < len(deque.items) {
 					original := tt.count + index - deque.head
-					if transmission.size != original+1 || len(transmission.packet.Payload) != 1 || transmission.packet.Payload[0] != byte(original) {
+					if transmission.size != uint32(original+1) || len(transmission.packet.Payload) != 1 || transmission.packet.Payload[0] != byte(original) {
 						t.Fatalf("retained entry %d does not match original entry %d", index, original)
 					}
 				} else if transmission.size != 0 || transmission.packet.Payload != nil {
@@ -947,20 +921,20 @@ func TestTransmissionDequeCapacityRetention(t *testing.T) {
 			name: "Expiry",
 			empty: func(_ *testing.T, deque *transmissionDeque) {
 				for index := range deque.items {
-					deque.items[index].deadline = time.Unix(100, 0)
+					deque.items[index].deadlineMicros = uint64(time.Unix(100, 0).UnixMicro())
 				}
-				deque.earliestDeadline = time.Unix(100, 0)
+				deque.earliestDeadline = uint64(time.Unix(100, 0).UnixMicro())
 				deque.removeExpired(time.Unix(101, 0))
 			},
 			retain: func(_ *testing.T, deque *transmissionDeque, count int) {
 				boundary := len(deque.items) - count
 				for index := range deque.items {
-					deque.items[index].deadline = time.Unix(102, 0)
+					deque.items[index].deadlineMicros = uint64(time.Unix(102, 0).UnixMicro())
 					if index < boundary {
-						deque.items[index].deadline = time.Unix(100, 0)
+						deque.items[index].deadlineMicros = uint64(time.Unix(100, 0).UnixMicro())
 					}
 				}
-				deque.earliestDeadline = time.Unix(100, 0)
+				deque.earliestDeadline = uint64(time.Unix(100, 0).UnixMicro())
 				deque.removeExpired(time.Unix(101, 0))
 			},
 		},
@@ -981,7 +955,7 @@ func TestTransmissionDequeCapacityRetention(t *testing.T) {
 					t.Fatalf("empty deque capacity = %d, head = %d", cap(deque.items), deque.head)
 				}
 				for index := range maximumRetainedDequeCapacity {
-					deque.push(retainedTransmission{size: index})
+					deque.push(retainedTransmission{size: uint32(index)})
 				}
 				test.empty(t, &deque)
 				if len(deque.items) != 0 || cap(deque.items) != maximumRetainedDequeCapacity || deque.head != 0 {
@@ -994,14 +968,14 @@ func TestTransmissionDequeCapacityRetention(t *testing.T) {
 				const total = maximumRetainedDequeCapacity * 8
 				deque := transmissionDeque{items: make([]retainedTransmission, total)}
 				for index := range deque.items {
-					deque.items[index].size = index
+					deque.items[index].size = uint32(index)
 				}
 				test.retain(t, &deque, retained)
 				if deque.len() != retained || cap(deque.items) != maximumRetainedDequeCapacity {
 					t.Fatalf("retained deque length = %d, capacity = %d, head = %d",
 						deque.len(), cap(deque.items), deque.head)
 				}
-				if got := deque.items[deque.head].size; got != total-retained {
+				if got := deque.items[deque.head].size; got != uint32(total-retained) {
 					t.Fatalf("first retained size = %d, want %d", got, total-retained)
 				}
 			})
@@ -1092,7 +1066,7 @@ func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, 
 			deadline := now.Add(time.Duration(next()%20+1) * time.Millisecond)
 			transmission := schedulerTransmission(packetID, kind, deadline)
 			if probes && next()%3 == 0 {
-				transmission = retainedTransmission{deadline: deadline, packet: datagram.Packet{Payload: padding}}
+				transmission = retainedTransmission{deadlineMicros: uint64(deadline.UnixMicro()), packet: datagram.Packet{Payload: padding}}
 			}
 			err := store.push(transmission)
 			if err != nil && !errors.Is(err, packetqueue.ErrFull) {
@@ -1136,7 +1110,7 @@ func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, 
 			now = now.Add(time.Duration(next()%5+1) * time.Millisecond)
 			store.assessDeadlines(now, func(uint64) uint64 { return 0 })
 			store.sent.each(func(transmission retainedTransmission) bool {
-				if !now.Before(transmission.deadline) && transmission.packet.Payload != nil {
+				if uint64(now.UnixMicro()) >= transmission.deadlineMicros && transmission.packet.Payload != nil {
 					t.Fatal("maintenance retained an expired sent payload")
 				}
 				return true
@@ -1199,21 +1173,21 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 	sentBytes := uint64(0)
 	store.sent.each(func(transmission retainedTransmission) bool {
 		if transmission.packet.Payload != nil {
-			if store.sent.earliestDeadline.IsZero() || transmission.deadline.Before(store.sent.earliestDeadline) {
+			if store.sent.earliestDeadline == 0 || transmission.deadlineMicros < store.sent.earliestDeadline {
 				t.Fatal("sent-payload expiry bound is missing or later than a retained deadline")
 			}
 		}
 		return true
 	})
 	for _, deque := range []*transmissionDeque{&store.control, &store.normal} {
-		if (deque.len() == 0) != deque.earliestDeadline.IsZero() {
+		if (deque.len() == 0) != (deque.earliestDeadline == 0) {
 			t.Fatal("expiry bound does not match queued occupancy")
 		}
 		deque.each(func(transmission retainedTransmission) bool {
 			if transmission.packet.Kind.Control() != (deque == &store.control) {
 				t.Fatal("queued packet classification does not match carrier priority")
 			}
-			if transmission.deadline.Before(deque.earliestDeadline) {
+			if transmission.deadlineMicros < deque.earliestDeadline {
 				t.Fatal("expiry bound is later than a queued deadline")
 			}
 			return true
@@ -1222,7 +1196,7 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 	validate := func(transmission retainedTransmission, sent bool) bool {
 		data := transmission.data()
 		if data.Payload == nil {
-			if !sent || store.now().Before(transmission.deadline) {
+			if !sent || uint64(store.now().UnixMicro()) < transmission.deadlineMicros {
 				t.Fatal("fresh or queued payload was released")
 			}
 			data.Payload = make([]byte, transmission.payloadBytes)
@@ -1230,7 +1204,7 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 			t.Fatal("retained payload size differs from its descriptor")
 		}
 		size, err := protocol.DataFrameSize(data)
-		if err != nil || size != transmission.size || transmission.budget != store.budget {
+		if err != nil || size != int(transmission.size) || transmission.budget != store.budget {
 			t.Fatalf("invalid retained transmission: %+v", transmission)
 		}
 		if transmission.packetID == 0 {
@@ -1241,7 +1215,7 @@ func assertTransmissionStoreInvariants(t *testing.T, store *TransmissionStore) {
 			wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind {
 			t.Fatal("retained packet classification differs from its payload")
 		}
-		bytes += transmission.size
+		bytes += int(transmission.size)
 		if sent {
 			sentBytes += uint64(transmission.size)
 		}

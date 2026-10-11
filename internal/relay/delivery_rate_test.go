@@ -19,19 +19,19 @@ func TestTransmissionStoreDeliverySample(t *testing.T) {
 	now = time.UnixMicro(51_000)
 	sendDeliverySamplePacket(t, store, 2)
 	sample, stale, err := store.acknowledge(1, 101_000)
-	if err != nil || stale || sample != (deliverySample{bytes: 4096, intervalMicros: 100_000}) {
+	if err != nil || stale || sample != (deliverySample{applicationLimited: true, bytes: 4096, intervalMicros: 100_000}) {
 		t.Fatalf("first acknowledgement = %+v, stale %t, error %v", sample, stale, err)
 	}
 	now = time.UnixMicro(102_000)
 	sendDeliverySamplePacket(t, store, 3)
 	sample, stale, err = store.acknowledge(3, 152_000)
-	if err != nil || stale || sample != (deliverySample{bytes: 2 * 4096, intervalMicros: 101_000}) {
+	if err != nil || stale || sample != (deliverySample{applicationLimited: true, bytes: 2 * 4096, intervalMicros: 101_000}) {
 		t.Fatalf("send-limited sample = %+v, stale %t, error %v", sample, stale, err)
 	}
 	now = time.UnixMicro(2_000_000)
 	sendDeliverySamplePacket(t, store, 4)
 	sample, stale, err = store.acknowledge(4, 2_010_000)
-	if err != nil || stale || sample != (deliverySample{bytes: 4096, intervalMicros: 10_000}) {
+	if err != nil || stale || sample != (deliverySample{applicationLimited: true, bytes: 4096, intervalMicros: 10_000}) {
 		t.Fatalf("sample after idle = %+v, stale %t, error %v", sample, stale, err)
 	}
 }
@@ -67,7 +67,7 @@ func TestTransmissionStoreDeliverySamplePreservesProgress(t *testing.T) {
 			now = time.UnixMicro(112_000)
 			sendDeliverySamplePacket(t, store, 4)
 			sample, stale, err = store.acknowledge(4, 220_000)
-			want := deliverySample{bytes: test.sampleSize, intervalMicros: 119_000}
+			want := deliverySample{applicationLimited: true, bytes: test.sampleSize, intervalMicros: 119_000}
 			if err != nil || stale || sample != want {
 				t.Fatalf("next valid report = %+v, stale %t, error %v, want %+v", sample, stale, err, want)
 			}
@@ -93,7 +93,7 @@ func TestTransmissionStoreDeliverySampleClockRange(t *testing.T) {
 			store := newDeliverySampleStore(t, &now)
 			sendDeliverySamplePacket(t, store, 1)
 			sample, stale, err := store.acknowledge(1, test.start+1000)
-			want := deliverySample{bytes: 4096, intervalMicros: 1000}
+			want := deliverySample{applicationLimited: true, bytes: 4096, intervalMicros: 1000}
 			if err != nil || stale || sample != want {
 				t.Fatalf("clock sample = %+v, stale %t, error %v, want %+v", sample, stale, err, want)
 			}
@@ -102,26 +102,38 @@ func TestTransmissionStoreDeliverySampleClockRange(t *testing.T) {
 }
 
 func TestTransmissionStoreDeliverySampleMigratedPacket(t *testing.T) {
-	now := time.UnixMicro(1000)
-	source := newDeliverySampleStore(t, &now)
-	sendDeliverySamplePacket(t, source, 1)
-	retained := source.drain()
-	if len(retained) != 1 {
-		t.Fatalf("drained %d packets, want 1", len(retained))
-	}
-	now = time.UnixMicro(11_000)
-	destination := newDeliverySampleStore(t, &now)
-	transmission := retained[0]
-	transmission.migrated = true
-	if err := destination.push(transmission); err != nil {
-		releaseTransmissions(retained)
-		t.Fatal(err)
-	}
-	takeOneTransmission(t, destination)
-	sample, stale, err := destination.acknowledge(1, 12_000)
-	want := deliverySample{bytes: 4096, intervalMicros: 1000}
-	if err != nil || stale || sample != want {
-		t.Fatalf("migrated sample = %+v, stale %t, error %v, want %+v", sample, stale, err, want)
+	for _, test := range []struct {
+		name        string
+		window      uint64
+		wantLimited bool
+	}{
+		{name: "SparseDestination", window: 32_768, wantLimited: true},
+		{name: "ConstrainedDestination", window: 8192},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.UnixMicro(1000)
+			source := newDeliverySampleStore(t, &now)
+			sendDeliverySamplePacket(t, source, 1)
+			retained := source.drain()
+			if len(retained) != 1 {
+				t.Fatalf("drained %d packets, want 1", len(retained))
+			}
+			now = time.UnixMicro(11_000)
+			destination := newDeliverySampleStore(t, &now)
+			destination.deliveryWindow.Store(test.window)
+			transmission := retained[0]
+			transmission.migrated = true
+			if err := destination.push(transmission); err != nil {
+				releaseTransmissions(retained)
+				t.Fatal(err)
+			}
+			takeOneTransmission(t, destination)
+			sample, stale, err := destination.acknowledge(1, 12_000)
+			want := deliverySample{applicationLimited: test.wantLimited, bytes: 4096, intervalMicros: 1000}
+			if err != nil || stale || sample != want {
+				t.Fatalf("migrated sample = %+v, stale %t, error %v, want %+v", sample, stale, err, want)
+			}
+		})
 	}
 }
 
@@ -131,13 +143,26 @@ func newDeliverySampleStore(t *testing.T, now *time.Time) *TransmissionStore {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.deliveryWindow.Store(uint64(store.limits.Bytes))
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
 	return store
 }
 
 func sendDeliverySamplePacket(t *testing.T, store *TransmissionStore, packetID uint64) {
 	t.Helper()
-	transmission := schedulerTransmission(packetID, wgpacket.TransportData, store.now().Add(time.Second))
+	if err := store.push(deliverySampleTransmission(t, store, packetID)); err != nil {
+		t.Fatal(err)
+	}
+	takeOneTransmission(t, store)
+}
+
+func deliverySampleTransmission(t *testing.T, store *TransmissionStore, packetID uint64) retainedTransmission {
+	t.Helper()
+	deadline := store.now().Add(time.Second)
+	if uint64(deadline.UnixMicro()) < uint64(store.now().UnixMicro()) {
+		deadline = monotime.Time(math.MaxUint64 - math.MaxUint64%protocol.DeadlineResolutionMicros)
+	}
+	transmission := schedulerTransmission(packetID, wgpacket.TransportData, deadline)
 	metadata := transmission.data()
 	metadata.Payload = nil
 	frame, err := protocol.MarshalData(metadata)
@@ -147,8 +172,5 @@ func sendDeliverySamplePacket(t *testing.T, store *TransmissionStore, packetID u
 	payload := make([]byte, 4096-3-len(frame.Payload))
 	copy(payload, transmission.packet.Payload)
 	transmission.packet.Payload = payload
-	if err := store.push(transmission); err != nil {
-		t.Fatal(err)
-	}
-	takeOneTransmission(t, store)
+	return transmission
 }

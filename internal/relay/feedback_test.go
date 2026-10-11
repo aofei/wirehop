@@ -128,9 +128,9 @@ func TestLaneDeliveryThresholdReleasesHighBandwidthWindow(t *testing.T) {
 		payload[4] = byte(index)
 		err := firstIngress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload},
+				Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload},
 			},
-			Size: len(payload), Deadline: deadline,
+			Size: len(payload), Deadline: time.UnixMicro(1_000_000),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -166,7 +166,7 @@ func TestLaneDeliveryThresholdReleasesHighBandwidthWindow(t *testing.T) {
 // feedbackScheduler returns a scheduler with an ingress queue sized above the delivery-report packet threshold.
 func feedbackScheduler(t *testing.T) (*packetqueue.Queue[Packet], *Scheduler) {
 	t.Helper()
-	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 2048, Bytes: 8 * 1024 * 1024})
+	ingress, err := packetqueue.NewWithClock[Packet](packetqueue.Limits{Packets: 2048, Bytes: 8 * 1024 * 1024}, func() time.Time { return time.UnixMicro(1000) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,10 +180,10 @@ func feedbackScheduler(t *testing.T) (*packetqueue.Queue[Packet], *Scheduler) {
 // feedbackStore returns one transmission store whose packet capacity matches the delivery-report threshold.
 func feedbackStore(t *testing.T) *TransmissionStore {
 	t.Helper()
-	store, err := NewTransmissionStore(packetqueue.Limits{
+	store, err := newTransmissionStore(packetqueue.Limits{
 		Packets: reportPacketThreshold,
 		Bytes:   8 * 1024 * 1024,
-	})
+	}, func() time.Time { return time.UnixMicro(1000) })
 	if err != nil {
 		t.Fatal(err)
 	}

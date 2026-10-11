@@ -50,12 +50,11 @@ func (p DeadlinePolicy) Lifetime(kind wgpacket.Kind) time.Duration {
 // Packet is one ingress-owned WireGuard packet awaiting session scheduling.
 type Packet struct {
 	datagram.Packet
-	DeadlineMicros uint64
 }
 
 // newPacket transfers ownership of packet into relay scheduling metadata.
-func newPacket(packet datagram.Packet, deadlineMicros uint64) Packet {
-	return Packet{Packet: packet, DeadlineMicros: deadlineMicros}
+func newPacket(packet datagram.Packet) Packet {
+	return Packet{Packet: packet}
 }
 
 // Retain returns another ownership reference to p.
@@ -70,10 +69,10 @@ func (p *Packet) Release() {
 	*p = Packet{}
 }
 
-// Validate verifies the packet classification, payload, and lifetime metadata.
+// Validate verifies the packet classification and payload.
 func (p Packet) Validate() error {
 	if !p.Kind.Accepted() || len(p.Payload) > protocol.MaxPacketSize ||
-		wgpacket.Classify(p.Payload) != p.Kind || p.DeadlineMicros == 0 {
+		wgpacket.Classify(p.Payload) != p.Kind {
 		return ErrInvalidPacket
 	}
 	return nil

@@ -31,7 +31,7 @@ func TestSchedulerPrioritizesRealTrafficOverProbeBudget(t *testing.T) {
 		}
 		defer ingress.Close()
 		if err := ingress.Push(packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: wgpacket.TransportData,
-			Payload: payload}, 1_000_000), Size: len(payload), Deadline: time.Now().Add(time.Second)}); err != nil {
+			Payload: payload}), Size: len(payload), Deadline: time.Now().Add(time.Second)}); err != nil {
 			t.Fatal(err)
 		}
 		scheduler, err := NewScheduler(ingress)
@@ -102,7 +102,7 @@ func TestSchedulerRunRetriesSharedBudgetAfterRelease(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer func() { releaseTransmissions(external.drain()) }()
-				if err := external.push(retainedTransmission{deadline: time.Now().Add(time.Millisecond),
+				if err := external.push(retainedTransmission{deadlineMicros: uint64(time.Now().Add(time.Millisecond).UnixMicro()),
 					packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
 					t.Fatal(err)
 				}
@@ -114,9 +114,10 @@ func TestSchedulerRunRetriesSharedBudgetAfterRelease(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
+				deadline := time.Now().Add(time.Second)
 				if err := ingress.Push(packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{
 					Kind: wgpacket.TransportData, Payload: payload,
-				}, 1_000_000), Size: len(payload), Deadline: time.Now().Add(time.Second)}); err != nil {
+				}), Size: len(payload), Deadline: deadline}); err != nil {
 					t.Fatal(err)
 				}
 				scheduler, err := NewScheduler(ingress)
@@ -169,7 +170,7 @@ func TestSchedulerRunRetriesSharedBudgetAfterRelease(t *testing.T) {
 				time.Sleep(abandonmentCheckInterval)
 				synctest.Wait()
 				data := takeOneTransmission(t, stores[0])
-				if data.PacketID != 1 || data.DeadlineMicros != 1_000_000 || !slices.Equal(data.Payload, payload) {
+				if data.PacketID != 1 || data.DeadlineMicros != uint64(deadline.UnixMicro()) || !slices.Equal(data.Payload, payload) {
 					t.Fatal("shared capacity release did not resume the pending real packet")
 				}
 				if packets, _ := stores[1].backlog(); packets != 0 {
@@ -575,7 +576,7 @@ func TestSchedulerSelectTransportCandidatesCapacity(t *testing.T) {
 		t.Fatalf("capacity selection = %+v", got)
 	}
 	item := packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: wgpacket.TransportData,
-		Payload: append(relayWireGuardPacket(wgpacket.TransportData), make([]byte, 16)...)}, 1_000_000), Deadline: time.Now().Add(time.Second), Size: 32}
+		Payload: append(relayWireGuardPacket(wgpacket.TransportData), make([]byte, 16)...)}), Deadline: time.Now().Add(time.Second), Size: 32}
 	preferred := protocol.LaneID(1)
 	if ok, err := scheduler.schedule(lanes, &preferred, &item, ingress.Now()); err != nil || !ok || preferred != 2 {
 		t.Fatalf("capacity promotion = %t, %v, lane %d", ok, err, preferred)
@@ -602,7 +603,7 @@ func TestTransmissionStoreProbeDeadlineAssessment(t *testing.T) {
 	store := schedulerStore(t, packetqueue.Limits{Packets: 4, Bytes: 32 * 1024})
 	store.now = func() time.Time { return now }
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
-	if err := store.push(retainedTransmission{deadline: now.Add(time.Second), packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
+	if err := store.push(retainedTransmission{deadlineMicros: uint64(now.Add(time.Second).UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
 		t.Fatal(err)
 	}
 	takeOneTransmission(t, store)
@@ -615,7 +616,7 @@ func TestTransmissionStoreProbeDeadlineAssessment(t *testing.T) {
 	}
 	var prefix uint64
 	assessment := store.assessDeadlines(now, func(bytes uint64) uint64 { prefix = bytes; return 0 })
-	if !assessment.retained || assessment.atRisk || assessment.usefulDeadline != transmission.deadline ||
+	if !assessment.retained || assessment.atRisk || uint64(assessment.usefulDeadline.UnixMicro()) != transmission.deadlineMicros ||
 		prefix != uint64(4101+transmission.size) {
 		t.Fatalf("padding did not preserve useful carrier order: %+v, prefix %d", assessment, prefix)
 	}
@@ -645,7 +646,7 @@ func TestTransmissionStoreAcknowledgeMixedProbePrefix(t *testing.T) {
 	large.packet.Payload[0] = 4
 	for _, transmission := range []retainedTransmission{
 		first,
-		{deadline: now.Add(time.Second), packet: datagram.Packet{Payload: probePadding[:]}},
+		{deadlineMicros: uint64(now.Add(time.Second).UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}},
 		migrated,
 		schedulerTransmission(2, wgpacket.HandshakeResponse, now.Add(time.Second)),
 		large,
@@ -715,7 +716,7 @@ func TestSchedulerInitialPrimaryWaitsForLowDelayPath(t *testing.T) {
 	t.Cleanup(func() { releaseTransmissions(second.registration.Store.drain()) })
 	first.registration.Store.now = func() time.Time { return now }
 	second.rateObserved = false
-	if err := first.registration.Store.push(retainedTransmission{deadline: now.Add(time.Second),
+	if err := first.registration.Store.push(retainedTransmission{deadlineMicros: uint64(now.Add(time.Second).UnixMicro()),
 		packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
 		t.Fatal(err)
 	}
@@ -729,19 +730,19 @@ func TestSchedulerInitialPrimaryWaitsForLowDelayPath(t *testing.T) {
 
 func TestScheduledLaneRateFilterStartupAndCapacityDrop(t *testing.T) {
 	lane := &scheduledLane{deliveryRate: defaultInitialRateBytesPerSecond}
-	lane.updateDeliveryRate(deliverySample{bytes: 5000, intervalMicros: 25_000}, true)
-	lane.updateDeliveryRate(deliverySample{bytes: 50_000, intervalMicros: 25_000}, true)
+	lane.updateDeliveryRate(deliverySample{bytes: 5000, intervalMicros: 25_000}, 0)
+	lane.updateDeliveryRate(deliverySample{bytes: 50_000, intervalMicros: 25_000}, 0)
 	if lane.deliveryRate != 2_000_000 {
 		t.Fatalf("startup growth delayed: %d", lane.deliveryRate)
 	}
 	for range len(lane.rateHistory) {
-		lane.updateDeliveryRate(deliverySample{bytes: 5000, intervalMicros: 25_000}, true)
+		lane.updateDeliveryRate(deliverySample{bytes: 5000, intervalMicros: 25_000}, 0)
 	}
 	if lane.deliveryRate >= 2_000_000 {
 		t.Fatal("expired peak prevented a constrained capacity decrease")
 	}
 	before := *lane
-	lane.updateDeliveryRate(deliverySample{bytes: 100_000, intervalMicros: 999}, true)
+	lane.updateDeliveryRate(deliverySample{bytes: 100_000, intervalMicros: 999}, 0)
 	if lane.deliveryRate != before.deliveryRate || lane.rateHistory != before.rateHistory ||
 		lane.rateHistoryCount != before.rateHistoryCount || lane.rateHistoryNext != before.rateHistoryNext {
 		t.Fatal("compressed feedback changed the capacity filter")
@@ -769,7 +770,7 @@ func TestSchedulerTransportSelectionBoundaries(t *testing.T) {
 			t.Cleanup(func() { releaseTransmissions(second.registration.Store.drain()) })
 			first.degraded = tt.failed
 			if tt.full {
-				if err := first.registration.Store.push(retainedTransmission{deadline: now.Add(time.Second),
+				if err := first.registration.Store.push(retainedTransmission{deadlineMicros: uint64(now.Add(time.Second).UnixMicro()),
 					packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
 					t.Fatal(err)
 				}
@@ -865,7 +866,7 @@ func TestSchedulerDiscoveryPreservesQueuedControl(t *testing.T) {
 	}
 	payload := relayWireGuardPacket(wgpacket.HandshakeInitiation)
 	item := packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: wgpacket.HandshakeInitiation,
-		Payload: payload}, 1_000_000), Deadline: now.Add(time.Second), Size: len(payload)}
+		Payload: payload}), Deadline: now.Add(time.Second), Size: len(payload)}
 	var preferred protocol.LaneID
 	if ok, err := scheduler.schedule(lanes, &preferred, &item, now); err != nil || !ok {
 		t.Fatalf("initial handshake = %t, %v", ok, err)
@@ -899,7 +900,7 @@ func TestSchedulerInitialKeepaliveStartsDiscoveryWithoutPrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 	item := packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: wgpacket.TransportData,
-		Payload: relayWireGuardPacket(wgpacket.TransportData)}, 1_000_000), Deadline: now.Add(time.Second), Size: 32}
+		Payload: relayWireGuardPacket(wgpacket.TransportData)}), Deadline: now.Add(time.Second), Size: 32}
 	var preferred protocol.LaneID
 	lanes := map[protocol.LaneID]*scheduledLane{1: first, 2: second}
 	if ok, err := scheduler.schedule(lanes, &preferred, &item, now); err != nil || !ok || preferred != 0 || scheduler.packetID != 1 {
@@ -954,7 +955,7 @@ func TestScheduledLaneDeliveryRateSamplingInterval(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			lane := &scheduledLane{deliveryRate: defaultInitialRateBytesPerSecond, minimumRTTMicros: tt.rtt}
-			lane.updateDeliveryRate(deliverySample{bytes: tt.bytes, intervalMicros: tt.interval}, true)
+			lane.updateDeliveryRate(deliverySample{bytes: tt.bytes, intervalMicros: tt.interval}, 0)
 			if lane.rateObserved != tt.observed {
 				t.Fatalf("rate observed = %t, want %t", lane.rateObserved, tt.observed)
 			}
@@ -998,7 +999,7 @@ func TestSchedulerStalledProbePermitsInitialFailover(t *testing.T) {
 	first.registration.Abandon = func() { abandoned = true }
 	t.Cleanup(func() { releaseTransmissions(first.registration.Store.drain()) })
 	t.Cleanup(func() { releaseTransmissions(second.registration.Store.drain()) })
-	if err := first.registration.Store.push(retainedTransmission{deadline: now.Add(4 * time.Second),
+	if err := first.registration.Store.push(retainedTransmission{deadlineMicros: uint64(now.Add(4 * time.Second).UnixMicro()),
 		packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1080,7 +1081,7 @@ func TestSchedulerMigrateDiscardsCapacityProbe(t *testing.T) {
 	}
 	source, destination, third := makeLane(1), makeLane(2), makeLane(3)
 	for _, transmission := range []retainedTransmission{
-		{deadline: now.Add(time.Second), packet: datagram.Packet{Payload: probePadding[:]}},
+		{deadlineMicros: uint64(now.Add(time.Second).UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}},
 		schedulerTransmission(17, wgpacket.TransportData, now.Add(time.Second)),
 		schedulerTransmission(18, wgpacket.HandshakeInitiation, now.Add(time.Second)),
 	} {
@@ -1173,7 +1174,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	old.probeUntil = now.Add(minimumTransportProbeDuration)
 	old.nextProbeAt = old.probeUntil.Add(transportProbeInterval)
 	old.probeBytes = 4101
-	if err := oldStore.push(retainedTransmission{deadline: old.probeUntil,
+	if err := oldStore.push(retainedTransmission{deadlineMicros: uint64(old.probeUntil.UnixMicro()),
 		packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1216,7 +1217,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	}
 	fresh := lanes[1]
 	if !fresh.probeUntil.IsZero() || !fresh.nextProbeAt.IsZero() || fresh.probeBytes != 0 ||
-		fresh.rateHistoryCount != 0 || fresh.rateHistory != ([5]uint64{}) || fresh.rateObserved {
+		fresh.rateHistoryCount != 0 || fresh.rateHistory != ([5]rateObservation{}) || fresh.rateObserved {
 		t.Fatal("replacement inherited old capacity-discovery state")
 	}
 	if err := freshStore.push(transmission); err != nil {

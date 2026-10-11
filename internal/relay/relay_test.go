@@ -471,7 +471,7 @@ func TestDeadlinePolicy(t *testing.T) {
 
 func TestPacketValidation(t *testing.T) {
 	valid := Packet{
-		DeadlineMicros: 1, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: relayWireGuardPacket(wgpacket.TransportData)},
+		Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: relayWireGuardPacket(wgpacket.TransportData)},
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatal(err)
@@ -813,7 +813,7 @@ func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
 			payloadSizes := [...]int{32, 123, 124, 16_379, 16_380, protocol.MaxPacketSize}
 			for index := range frames {
 				transmission := schedulerTransmission(test.firstID+uint64(index), wgpacket.TransportData, now.Add(time.Second))
-				transmission.wireDeadline = 1_000_000
+				transmission.deadlineMicros = 1_000_000
 				transmission.packet.Payload = make([]byte, payloadSizes[index%len(payloadSizes)])
 				transmission.packet.Payload[0] = 4
 				transmission.packet.Payload[4] = byte(index)
@@ -1282,7 +1282,7 @@ func TestIngress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if item.Value.Kind != wgpacket.HandshakeInitiation || item.Value.DeadlineMicros != 2734 ||
+	if item.Value.Kind != wgpacket.HandshakeInitiation || uint64(item.Deadline.UnixMicro()) != 2734 ||
 		item.Priority != packetqueue.PriorityControl {
 		t.Fatalf("ingress item = %+v", item)
 	}
@@ -2163,7 +2163,6 @@ func TestLaneWriterBoundsInternalControlBurst(t *testing.T) {
 		}
 	}
 	transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
-	transmission.wireDeadline = 1_000_000
 	if err := lane.store.push(transmission); err != nil {
 		t.Fatal(err)
 	}

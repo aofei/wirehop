@@ -76,7 +76,7 @@ func TestIngressDeadlineRepresentation(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer item.Release()
-			data := protocol.Data{PacketID: 1, DeadlineMicros: item.Value.DeadlineMicros, Payload: item.Value.Payload}
+			data := protocol.Data{PacketID: 1, DeadlineMicros: uint64(item.Deadline.UnixMicro()), Payload: item.Value.Payload}
 			frame, err := protocol.MarshalData(data)
 			if err != nil {
 				t.Fatalf("admitted deadline cannot be encoded: %v", err)

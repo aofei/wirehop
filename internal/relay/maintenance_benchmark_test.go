@@ -40,7 +40,7 @@ func BenchmarkSaturatedIngress(b *testing.B) {
 			payload := make([]byte, 1452)
 			payload[0] = 4
 			item := packetqueue.Item[Packet]{
-				Value: Packet{DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+				Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 				Size:  1452, Deadline: now.Add(time.Second),
 			}
 			for range packets {
@@ -71,7 +71,7 @@ func BenchmarkIngressExpiryReclaim(b *testing.B) {
 	payload := make([]byte, 1452)
 	payload[0] = 4
 	live := packetqueue.Item[Packet]{
-		Value: Packet{DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+		Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 		Size:  1452, Deadline: now.Add(time.Hour),
 	}
 	for range packets - 1 {

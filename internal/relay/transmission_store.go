@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -29,21 +30,25 @@ const maximumRetainedDequeCapacity = 2 * reportPacketThreshold
 
 // retainedTransmission is one assigned packet retained until parsing is reported or its generation is drained.
 type retainedTransmission struct {
-	packetID     uint64
-	wireDeadline uint64
-	deadline     time.Time
-	migrated     bool
+	packetID       uint64
+	deadlineMicros uint64
+	budget         *retention.Budget
+	packet         datagram.Packet
+	delivery       deliverySnapshot
+	size           uint32
 	// payloadBytes preserves real-transport proof after the sent payload expires.
-	payloadBytes uint32
-	size         int
-	budget       *retention.Budget
-	packet       datagram.Packet
-	delivery     deliverySnapshot
+	payloadBytes       uint16
+	migrated           bool
+	applicationLimited bool
 }
 
 // data builds the wire view while the transmission still owns its payload.
 func (t *retainedTransmission) data() protocol.Data {
-	return protocol.Data{PacketID: t.packetID, DeadlineMicros: t.wireDeadline, Payload: t.packet.Payload}
+	deadline := t.deadlineMicros
+	if t.packetID == 0 {
+		deadline = 0
+	}
+	return protocol.Data{PacketID: t.packetID, DeadlineMicros: deadline, Payload: t.packet.Payload}
 }
 
 // deliverySnapshot anchors one transmission to the preceding delivery curve and send interval.
@@ -56,8 +61,9 @@ type deliverySnapshot struct {
 
 // deliverySample measures bytes delivered over the longer corresponding send or acknowledgement interval.
 type deliverySample struct {
-	bytes          uint64
-	intervalMicros uint64
+	bytes              uint64
+	intervalMicros     uint64
+	applicationLimited bool
 }
 
 // deadlineAssessment summarizes retained deadline state in carrier order.
@@ -72,7 +78,7 @@ type deadlineAssessment struct {
 func (t *retainedTransmission) release() {
 	t.releasePacket()
 	if t.budget != nil {
-		t.budget.Release(1, t.size)
+		t.budget.Release(1, int(t.size))
 		t.budget = nil
 	}
 }
@@ -85,7 +91,7 @@ func (t *retainedTransmission) releasePacket() {
 // transmissionDeque is a compacting first-in, first-out transmission sequence.
 type transmissionDeque struct {
 	// earliestDeadline bounds queued-entry or sent-payload expiry and is rebuilt when a scan is due.
-	earliestDeadline time.Time
+	earliestDeadline uint64
 	items            []retainedTransmission
 	head             int
 }
@@ -101,8 +107,8 @@ func (d *transmissionDeque) peek() (retainedTransmission, bool) {
 // push appends transmission to the deque.
 func (d *transmissionDeque) push(transmission retainedTransmission) {
 	d.items = append(d.items, transmission)
-	if len(d.items) == 1 || transmission.deadline.Before(d.earliestDeadline) {
-		d.earliestDeadline = transmission.deadline
+	if len(d.items) == 1 || transmission.deadlineMicros < d.earliestDeadline {
+		d.earliestDeadline = transmission.deadlineMicros
 	}
 }
 
@@ -132,7 +138,7 @@ func (d *transmissionDeque) resetEmpty() {
 		d.items = d.items[:0]
 	}
 	d.head = 0
-	d.earliestDeadline = time.Time{}
+	d.earliestDeadline = 0
 }
 
 // compact releases consumed capacity when enough of the backing slice is unused.
@@ -171,28 +177,29 @@ func (d *transmissionDeque) clear() {
 	clear(d.items)
 	d.items = nil
 	d.head = 0
-	d.earliestDeadline = time.Time{}
+	d.earliestDeadline = 0
 }
 
 // removeExpired removes queued transmissions at or beyond their local deadlines.
 func (d *transmissionDeque) removeExpired(now time.Time) (int, int) {
-	if d.head == len(d.items) || now.Before(d.earliestDeadline) {
+	nowMicros := uint64(now.UnixMicro())
+	if d.head == len(d.items) || nowMicros < d.earliestDeadline {
 		return 0, 0
 	}
-	d.earliestDeadline = time.Time{}
+	d.earliestDeadline = 0
 	write := 0
 	removedPackets := 0
 	removedBytes := 0
 	for read := d.head; read < len(d.items); read++ {
 		transmission := d.items[read]
-		if !now.Before(transmission.deadline) {
+		if nowMicros >= transmission.deadlineMicros {
 			removedPackets++
-			removedBytes += transmission.size
+			removedBytes += int(transmission.size)
 			d.items[read].releasePacket()
 			continue
 		}
-		if write == 0 || transmission.deadline.Before(d.earliestDeadline) {
-			d.earliestDeadline = transmission.deadline
+		if write == 0 || transmission.deadlineMicros < d.earliestDeadline {
+			d.earliestDeadline = transmission.deadlineMicros
 		}
 		d.items[write] = transmission
 		write++
@@ -210,23 +217,24 @@ func (d *transmissionDeque) removeExpired(now time.Time) (int, int) {
 
 // releaseExpiredPayloads relinquishes obsolete sent payloads while preserving the cumulative-report prefix.
 func (d *transmissionDeque) releaseExpiredPayloads(now time.Time) {
-	if d.head == len(d.items) || d.earliestDeadline.IsZero() || now.Before(d.earliestDeadline) {
+	nowMicros := uint64(now.UnixMicro())
+	if d.head == len(d.items) || d.earliestDeadline == 0 || nowMicros < d.earliestDeadline {
 		return
 	}
-	d.earliestDeadline = time.Time{}
+	d.earliestDeadline = 0
 	for index := d.head; index < len(d.items); index++ {
 		transmission := &d.items[index]
 		if transmission.packet.Payload == nil {
 			continue
 		}
-		if !now.Before(transmission.deadline) {
+		if nowMicros >= transmission.deadlineMicros {
 			kind := transmission.packet.Kind
 			transmission.releasePacket()
 			transmission.packet.Kind = kind
 			continue
 		}
-		if d.earliestDeadline.IsZero() || transmission.deadline.Before(d.earliestDeadline) {
-			d.earliestDeadline = transmission.deadline
+		if d.earliestDeadline == 0 || transmission.deadlineMicros < d.earliestDeadline {
+			d.earliestDeadline = transmission.deadlineMicros
 		}
 	}
 }
@@ -247,22 +255,24 @@ func (d *transmissionDeque) appendTo(destination []retainedTransmission) []retai
 
 // TransmissionStore owns queued and sent-unreported work for one lane generation.
 type TransmissionStore struct {
-	mu              sync.Mutex
-	limits          packetqueue.Limits
-	now             func() time.Time
-	control         transmissionDeque
-	normal          transmissionDeque
-	sent            transmissionDeque
-	unreportedSince time.Time
-	packets         int
-	bytes           int
-	budget          *retention.Budget
-	sentPackets     uint64
-	sentBytes       uint64
-	reportedPackets uint64
-	reportedBytes   uint64
-	firstSentMicros uint64
-	deliveredMicros uint64
+	mu                      sync.Mutex
+	limits                  packetqueue.Limits
+	now                     func() time.Time
+	control                 transmissionDeque
+	normal                  transmissionDeque
+	sent                    transmissionDeque
+	unreportedSince         time.Time
+	packets                 int
+	bytes                   int
+	budget                  *retention.Budget
+	sentPackets             uint64
+	sentBytes               uint64
+	reportedPackets         uint64
+	reportedBytes           uint64
+	firstSentMicros         uint64
+	deliveredMicros         uint64
+	applicationLimitedUntil uint64
+	deliveryWindow          atomic.Uint64
 	// transportReported saturates at minimumRateSampleBytes and excludes capacity padding.
 	transportReported atomic.Uint64
 	writeBudget       atomic.Uint64
@@ -298,13 +308,15 @@ func newTransmissionStoreWithBudget(limits packetqueue.Limits, now func() time.T
 	if limits.Packets <= 0 || limits.Bytes <= 0 || limits.ControlPreemption || now == nil {
 		return nil, ErrInvalidTransmissionStore
 	}
-	return &TransmissionStore{
+	store := &TransmissionStore{
 		limits: limits,
 		now:    now,
 		budget: budget,
 		notify: make(chan struct{}, 1),
 		done:   make(chan struct{}),
-	}, nil
+	}
+	store.deliveryWindow.Store(min(uint64(limits.Bytes), initialDeliveryWindow))
+	return store, nil
 }
 
 // push retains one transmission when all limits and invariants permit it.
@@ -315,7 +327,7 @@ func (s *TransmissionStore) push(transmission retainedTransmission) error {
 // pushAt retains one transmission when all limits and invariants permit it at now.
 func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.Time) error {
 	size, err := protocol.DataFrameSize(transmission.data())
-	if err != nil || transmission.deadline.IsZero() || transmission.migrated && transmission.packet.Kind != wgpacket.TransportData {
+	if err != nil || transmission.deadlineMicros == 0 || transmission.migrated && transmission.packet.Kind != wgpacket.TransportData {
 		return ErrInvalidTransmission
 	}
 	if transmission.packetID == 0 {
@@ -325,8 +337,8 @@ func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.T
 	} else if !transmission.packet.Kind.Accepted() || wgpacket.Classify(transmission.packet.Payload) != transmission.packet.Kind {
 		return ErrInvalidTransmission
 	}
-	transmission.size = size
-	transmission.payloadBytes = uint32(len(transmission.packet.Payload))
+	transmission.size = uint32(size)
+	transmission.payloadBytes = uint16(len(transmission.packet.Payload))
 	if transmission.budget != nil && transmission.budget != s.budget {
 		return ErrInvalidTransmission
 	}
@@ -336,7 +348,7 @@ func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.T
 	if s.closed {
 		return packetqueue.ErrClosed
 	}
-	if !now.Before(transmission.deadline) {
+	if uint64(now.UnixMicro()) >= transmission.deadlineMicros {
 		return packetqueue.ErrExpired
 	}
 	reclaimedExpired := false
@@ -386,7 +398,7 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 	count := 0
 	bytes := 0
 	for count < len(destination) && bytes < targetBytes {
-		source, transmission, ok := s.nextQueuedLocked(now)
+		source, transmission, ok := s.nextQueuedLocked(sentMicros)
 		if !ok {
 			break
 		}
@@ -401,9 +413,9 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 			s.unreportedSince = now
 			s.firstSentMicros = sentMicros
 			s.deliveredMicros = sentMicros
-			s.sent.earliestDeadline = transmission.deadline
-		} else if s.sent.earliestDeadline.IsZero() || transmission.deadline.Before(s.sent.earliestDeadline) {
-			s.sent.earliestDeadline = transmission.deadline
+			s.sent.earliestDeadline = transmission.deadlineMicros
+		} else if s.sent.earliestDeadline == 0 || transmission.deadlineMicros < s.sent.earliestDeadline {
+			s.sent.earliestDeadline = transmission.deadlineMicros
 		}
 		transmission.delivery = deliverySnapshot{
 			sentMicros: sentMicros, firstSentMicros: s.firstSentMicros,
@@ -415,19 +427,30 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 		destination[count] = transmission.data()
 		ownership[count] = transmission.packet.Retain()
 		count++
-		bytes += transmission.size
-	}
-	if s.control.len()+s.normal.len() > 0 {
-		s.notifyLocked()
+		bytes += int(transmission.size)
 	}
 	if count == 0 {
 		return 0, packetqueue.ErrEmpty
+	}
+	// Preserve supply state with the committed batch. Later queue arrivals cannot reclassify its samples.
+	window := s.deliveryWindow.Load()
+	constrained := s.control.len()+s.normal.len() > 0 || s.packets >= s.limits.Packets/2+s.limits.Packets%2 ||
+		uint64(s.bytes) >= window/2+window%2
+	if !constrained {
+		s.applicationLimitedUntil = s.sentPackets
+	}
+	limited := s.reportedPackets < s.applicationLimitedUntil
+	for index := len(s.sent.items) - count; index < len(s.sent.items); index++ {
+		s.sent.items[index].applicationLimited = limited
+	}
+	if s.control.len()+s.normal.len() > 0 {
+		s.notifyLocked()
 	}
 	return count, nil
 }
 
 // nextQueuedLocked returns the next live transmission in carrier priority order.
-func (s *TransmissionStore) nextQueuedLocked(now time.Time) (*transmissionDeque, retainedTransmission, bool) {
+func (s *TransmissionStore) nextQueuedLocked(nowMicros uint64) (*transmissionDeque, retainedTransmission, bool) {
 	for {
 		source := &s.control
 		transmission, ok := source.peek()
@@ -438,12 +461,12 @@ func (s *TransmissionStore) nextQueuedLocked(now time.Time) (*transmissionDeque,
 		if !ok {
 			return nil, retainedTransmission{}, false
 		}
-		if now.Before(transmission.deadline) {
+		if nowMicros < transmission.deadlineMicros {
 			return source, transmission, true
 		}
 		transmission = source.pop()
 		transmission.releasePacket()
-		s.releaseBacklogLocked(1, transmission.size)
+		s.releaseBacklogLocked(1, int(transmission.size))
 	}
 }
 
@@ -462,7 +485,8 @@ func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (delivery
 		return deliverySample{}, false, ErrInvalidDeliveryReport
 	}
 	acknowledged := s.sent.items[s.sent.head : s.sent.head+int(deltaPackets)]
-	delivery := acknowledged[len(acknowledged)-1].delivery
+	last := acknowledged[len(acknowledged)-1]
+	delivery := last.delivery
 	var releasedBytes uint64
 	var transportBytes uint64
 	needTransportProof := s.transportReported.Load() < minimumRateSampleBytes
@@ -480,8 +504,9 @@ func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (delivery
 	var sample deliverySample
 	if receiveMicros > s.deliveredMicros && receiveMicros >= delivery.sentMicros && delivery.sentMicros >= delivery.firstSentMicros {
 		sample = deliverySample{
-			bytes:          bytes - delivery.deliveredBytes,
-			intervalMicros: max(receiveMicros-delivery.deliveredMicros, delivery.sentMicros-delivery.firstSentMicros),
+			bytes:              bytes - delivery.deliveredBytes,
+			intervalMicros:     max(receiveMicros-delivery.deliveredMicros, delivery.sentMicros-delivery.firstSentMicros),
+			applicationLimited: last.applicationLimited,
 		}
 	}
 	s.sent.discardPrefix(len(acknowledged))
@@ -507,16 +532,6 @@ func (s *TransmissionStore) deliveryBacklog() (uint64, uint64) {
 	defer s.mu.Unlock()
 	retained := uint64(s.bytes)
 	return retained - (s.sentBytes - s.reportedBytes), retained
-}
-
-// deliveryConstrained reports whether queued work or retained occupancy makes a lower rate sample meaningful.
-func (s *TransmissionStore) deliveryConstrained(windowBytes uint64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	queued := s.control.len()+s.normal.len() > 0
-	halfPackets := s.limits.Packets/2 + s.limits.Packets%2
-	halfBytes := windowBytes/2 + windowBytes%2
-	return queued || s.packets >= halfPackets || uint64(s.bytes) >= halfBytes
 }
 
 // hasProbe reports whether the queued or sent prefix already contains capacity padding.
@@ -573,22 +588,22 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 	s.sent.releaseExpiredPayloads(now)
 	var assessment deadlineAssessment
 	prefixBytes := uint64(0)
+	nowMicros := uint64(now.UnixMicro())
 	visit := func(transmission retainedTransmission) bool {
 		prefixBytes += uint64(transmission.size)
 		if transmission.packetID == 0 {
 			return true
 		}
 		assessment.retained = true
-		if transmission.packet.Kind == wgpacket.TransportData && !transmission.migrated && now.Before(transmission.deadline) &&
-			(assessment.usefulDeadline.IsZero() || transmission.deadline.Before(assessment.usefulDeadline)) {
-			assessment.usefulDeadline = transmission.deadline
+		if transmission.packet.Kind == wgpacket.TransportData && !transmission.migrated && nowMicros < transmission.deadlineMicros &&
+			(assessment.usefulDeadline.IsZero() || transmission.deadlineMicros < uint64(assessment.usefulDeadline.UnixMicro())) {
+			assessment.usefulDeadline = monotime.Time(transmission.deadlineMicros)
 			assessment.usefulBytes = uint64(transmission.size)
 		}
 		if assessment.atRisk {
 			return true
 		}
-		remaining := transmission.deadline.Sub(now)
-		if remaining <= 0 || delay(prefixBytes) >= uint64(remaining/time.Microsecond) {
+		if nowMicros >= transmission.deadlineMicros || delay(prefixBytes) >= transmission.deadlineMicros-nowMicros {
 			assessment.atRisk = true
 		}
 		return true

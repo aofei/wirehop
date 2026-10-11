@@ -166,7 +166,7 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 			probe.probeBytes+uint64(size) > maximumTransportProbeBytes {
 			break
 		}
-		transmission := retainedTransmission{deadline: deadline, packet: datagram.Packet{Payload: probePadding[:]}}
+		transmission := retainedTransmission{deadlineMicros: uint64(deadline.UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}}
 		if err := probe.registration.Store.pushAt(transmission, now); err != nil {
 			break
 		}

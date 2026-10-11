@@ -13,6 +13,7 @@ import (
 
 	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -230,7 +231,7 @@ func TestSelectCandidatesSeparatesQueuedAndUnreportedData(t *testing.T) {
 				payload := make([]byte, 1400)
 				copy(payload, transmission.packet.Payload)
 				transmission.packet.Payload = payload
-				transmission.size = dataFrameSize(transmission.data())
+				transmission.size = uint32(dataFrameSize(transmission.data()))
 				if err := store.push(transmission); err != nil {
 					t.Fatal(err)
 				}
@@ -407,8 +408,9 @@ func TestSelectCandidatesExhaustiveGroupScores(t *testing.T) {
 }
 
 func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
+	deadline := time.Now().Add(time.Second)
 	payload := relayWireGuardPacket(wgpacket.HandshakeInitiation)
-	encodedSize := dataFrameSize(protocol.Data{PacketID: 1, DeadlineMicros: 1_000_000, Payload: payload})
+	encodedSize := dataFrameSize(protocol.Data{PacketID: 1, DeadlineMicros: uint64(deadline.UnixMicro()), Payload: payload})
 	budget, err := retention.NewBudget(retention.Limits{Packets: 2, Bytes: 2 * encodedSize})
 	if err != nil {
 		t.Fatal(err)
@@ -419,10 +421,9 @@ func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
 	if err := ingress.Push(packetqueue.Item[Packet]{
 		Value: Packet{
-			DeadlineMicros: 1_000_000, Packet: datagram.Packet{Kind: wgpacket.HandshakeInitiation, Payload: payload},
+			Packet: datagram.Packet{Kind: wgpacket.HandshakeInitiation, Payload: payload},
 		},
 		Size: len(payload), Priority: packetqueue.PriorityControl, Deadline: deadline,
 	}); err != nil {
@@ -589,12 +590,12 @@ func TestSchedulerWaitsForPrimaryProgress(t *testing.T) {
 	defer func() { releaseTransmissions(first.registration.Store.drain()) }()
 	defer func() { releaseTransmissions(second.registration.Store.drain()) }()
 	payload := append(relayWireGuardPacket(wgpacket.TransportData), make([]byte, 16)...)
-	item := packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}, 1_000_000), Size: len(payload), Deadline: time.Now().Add(time.Second)}
+	item := packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}), Size: len(payload), Deadline: time.Now().Add(time.Second)}
 	var preferred protocol.LaneID
 	if ok, err := scheduler.schedule(lanes, &preferred, &item, ingress.Now()); err != nil || !ok {
 		t.Fatalf("initial schedule = %t, %v", ok, err)
 	}
-	item.Value = newPacket(datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}, 1_000_000)
+	item.Value = newPacket(datagram.Packet{Kind: wgpacket.TransportData, Payload: payload})
 	if ok, err := scheduler.schedule(lanes, &preferred, &item, ingress.Now()); err != nil || ok {
 		t.Fatalf("full primary schedule = %t, %v", ok, err)
 	}
@@ -626,7 +627,7 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 		payload[4] = byte(index + 1)
 		if err := ingress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				DeadlineMicros: uint64(10_000 + index), Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload},
+				Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload},
 			},
 			Size: len(payload), Priority: packetqueue.PriorityNormal, Deadline: deadline,
 		}); err != nil {
@@ -701,7 +702,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		transportPayload[4] = 1
 		if err := ingress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: transportPayload},
+				Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: transportPayload},
 			},
 			Size: len(transportPayload), Priority: packetqueue.PriorityNormal, Deadline: deadline,
 		}); err != nil {
@@ -714,7 +715,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		controlPayload := relayWireGuardPacket(wgpacket.HandshakeInitiation)
 		if err := ingress.Push(packetqueue.Item[Packet]{
 			Value: Packet{
-				DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.HandshakeInitiation, Payload: controlPayload},
+				Packet: datagram.Packet{Kind: wgpacket.HandshakeInitiation, Payload: controlPayload},
 			},
 			Size: len(controlPayload), Priority: packetqueue.PriorityControl, Deadline: deadline,
 		}); err != nil {
@@ -776,7 +777,7 @@ func TestSchedulerRestoresHeldPackets(t *testing.T) {
 		for index, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation, wgpacket.HandshakeInitiation} {
 			payload := relayWireGuardPacket(kind)
 			if err := ingress.Push(packetqueue.Item[Packet]{
-				Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: kind, Payload: payload}},
+				Value: Packet{Packet: datagram.Packet{Kind: kind, Payload: payload}},
 				Size:  len(payload), Priority: packetPriority(kind.Control()), Deadline: deadline,
 			}); err != nil {
 				t.Fatal(err)
@@ -836,7 +837,7 @@ func TestSchedulerCommitsPacketIDAfterAdmission(t *testing.T) {
 	lanes := map[protocol.LaneID]*scheduledLane{full.registration.LaneID: full}
 	payload := relayWireGuardPacket(wgpacket.TransportData)
 	item := packetqueue.Item[Packet]{
-		Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+		Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 		Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 	}
 	var preferred protocol.LaneID
@@ -1363,7 +1364,7 @@ func TestScheduledLaneDeliveryRateRejectsApplicationLimitedDecrease(t *testing.T
 		want                uint64
 	}{
 		{name: "ApplicationLimitedDecrease", observed: true, dataBytes: 15_000, want: 1_000_000},
-		{name: "ConstrainedDecrease", observed: true, dataBytes: 15_000, deliveryConstrained: true, want: 937_500},
+		{name: "ConstrainedDecrease", observed: true, dataBytes: 15_000, deliveryConstrained: true, want: 500_000},
 		{name: "InitialEstimate", dataBytes: 15_000, want: 500_000},
 		{name: "ApplicationLimitedIncrease", observed: true, dataBytes: 60_000, want: 2_000_000},
 	} {
@@ -1371,7 +1372,7 @@ func TestScheduledLaneDeliveryRateRejectsApplicationLimitedDecrease(t *testing.T
 			lane := &scheduledLane{
 				deliveryRate: 1_000_000, rateObserved: tt.observed,
 			}
-			lane.updateDeliveryRate(deliverySample{bytes: tt.dataBytes, intervalMicros: 30_000}, tt.deliveryConstrained)
+			lane.updateDeliveryRate(deliverySample{bytes: tt.dataBytes, intervalMicros: 30_000, applicationLimited: !tt.deliveryConstrained}, 0)
 			if lane.deliveryRate != tt.want {
 				t.Fatalf("delivery rate = %d, want %d", lane.deliveryRate, tt.want)
 			}
@@ -1431,7 +1432,7 @@ func TestSchedulerPacketIDExhaustion(t *testing.T) {
 	lanes := map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane}
 	payload := relayWireGuardPacket(wgpacket.TransportData)
 	item := packetqueue.Item[Packet]{
-		Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+		Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 		Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 	}
 	var preferred protocol.LaneID
@@ -1459,7 +1460,7 @@ func TestSchedulerPendingPacketRetainsAggregateCapacity(t *testing.T) {
 		}
 		payload := relayWireGuardPacket(wgpacket.TransportData)
 		if err := ingress.Push(packetqueue.Item[Packet]{
-			Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+			Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
 			Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
 		}); err != nil {
 			t.Fatal(err)
@@ -1515,21 +1516,21 @@ func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {
 			ingress, err := packetqueue.NewWithBudget[Packet](packetqueue.Limits{
 				Packets: 1,
 				Bytes:   payloadSize,
-			}, budget, time.Now)
+			}, budget, func() time.Time { return monotime.Time(1000) })
 			if err != nil {
 				t.Fatal(err)
 			}
 			store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{
 				Packets: 1,
 				Bytes:   encodedSize,
-			}, budget, time.Now)
+			}, budget, func() time.Time { return monotime.Time(1000) })
 			if err != nil {
 				t.Fatal(err)
 			}
 			payload := relayWireGuardPacket(wgpacket.TransportData)
 			if err := ingress.Push(packetqueue.Item[Packet]{
-				Value: Packet{DeadlineMicros: 10_000, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
-				Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second),
+				Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+				Size:  len(payload), Priority: packetqueue.PriorityNormal, Deadline: monotime.Time(10_000),
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -1539,7 +1540,7 @@ func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {
 				t.Fatal(err)
 			}
 			lane := &scheduledLane{registration: LaneRegistration{Store: store}}
-			if queued := lane.enqueue(&item, 1, time.Now()); queued != test.wantQueued {
+			if queued := lane.enqueue(&item, 1, monotime.Time(1000)); queued != test.wantQueued {
 				t.Fatalf("enqueue() = %t, want %t", queued, test.wantQueued)
 			}
 			if test.wantQueued {
@@ -1694,7 +1695,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				}
 			}
 			if test.expired {
-				current = transmission.deadline
+				current = monotime.Time(transmission.deadlineMicros)
 				sourceStore.expire(current)
 			}
 			source := &scheduledLane{registration: schedulerRegistration(1, 1, sourceStore)}
@@ -1729,7 +1730,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 			if packets, bytes := destinationStore.backlog(); packets != 1 || bytes != uint64(transmission.size) {
 				t.Fatalf("destination backlog = %d packets, %d bytes", packets, bytes)
 			}
-			if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: transmission.size}) {
+			if got := budget.Usage(); got != (retention.Usage{Packets: 1, Bytes: int(transmission.size)}) {
 				t.Fatalf("budget usage after migration = %+v", got)
 			}
 			if test.sourcePending && !test.overlap {
@@ -1743,7 +1744,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				t.Fatalf("destination takeBatch() = %d, %v", count, err)
 			}
 			if destinationData[0].PacketID != transmission.packetID ||
-				destinationData[0].DeadlineMicros != transmission.wireDeadline {
+				destinationData[0].DeadlineMicros != transmission.deadlineMicros {
 				t.Fatalf("migrated packet metadata = %+v", destinationData[0])
 			}
 			if _, _, err := destinationStore.acknowledge(1, uint64(now().UnixMicro())); err != nil {
@@ -2226,11 +2227,11 @@ func schedulerRegistration(id, group byte, store *TransmissionStore) LaneRegistr
 }
 
 func schedulerTransmission(packetID uint64, kind wgpacket.Kind, deadline time.Time) retainedTransmission {
-	data := protocol.Data{PacketID: packetID, DeadlineMicros: packetID + 1000, Payload: relayWireGuardPacket(kind)}
+	data := protocol.Data{PacketID: packetID, DeadlineMicros: uint64(deadline.UnixMicro()), Payload: relayWireGuardPacket(kind)}
 	return retainedTransmission{
-		packetID: packetID, wireDeadline: data.DeadlineMicros, deadline: deadline,
+		packetID: packetID, deadlineMicros: uint64(deadline.UnixMicro()),
 		packet: datagram.Packet{Kind: kind, Payload: data.Payload},
-		size:   dataFrameSize(data),
+		size:   uint32(dataFrameSize(data)),
 	}
 }
 
@@ -2308,7 +2309,7 @@ func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, fits := range []bool{true, false} {
-				ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 1, Bytes: protocol.MaxPacketSize})
+				ingress, err := packetqueue.NewWithClock[Packet](packetqueue.Limits{Packets: 1, Bytes: protocol.MaxPacketSize}, func() time.Time { return monotime.Time(tt.deadline - 100_000) })
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2323,11 +2324,12 @@ func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
 					limit--
 				}
 				lane := schedulerLaneWithLimits(t, 1, 1, 10, 1_000_000, packetqueue.Limits{Packets: 1, Bytes: limit})
+				lane.registration.Store.now = ingress.Now
 				defer func() { releaseTransmissions(lane.registration.Store.drain()) }()
 				payload := make([]byte, tt.payloadSize)
 				copy(payload, relayWireGuardPacket(wgpacket.TransportData))
-				if err := ingress.Push(packetqueue.Item[Packet]{Value: Packet{DeadlineMicros: tt.deadline, Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
-					Size: len(payload), Priority: packetqueue.PriorityNormal, Deadline: time.Now().Add(time.Second)}); err != nil {
+				if err := ingress.Push(packetqueue.Item[Packet]{Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+					Size: len(payload), Priority: packetqueue.PriorityNormal, Deadline: monotime.Time(tt.deadline)}); err != nil {
 					t.Fatal(err)
 				}
 				var item packetqueue.Item[Packet]

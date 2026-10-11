@@ -58,7 +58,6 @@ func TestLaneWriteControlBatch(t *testing.T) {
 					}
 				}
 				transmission := schedulerTransmission(1, wgpacket.TransportData, time.Now().Add(time.Second))
-				transmission.wireDeadline = 1_000_000
 				if err := lane.store.push(transmission); err != nil {
 					t.Fatal(err)
 				}

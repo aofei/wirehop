@@ -202,7 +202,7 @@ func BenchmarkTransmissionStoreCycle(b *testing.B) {
 }
 
 func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
-	now := time.Now()
+	now := time.UnixMicro(1000)
 	store, err := newTransmissionStoreWithBudget(
 		packetqueue.Limits{Packets: 256, Bytes: 2 * 1024 * 1024}, func() time.Time { return now }, budget,
 	)
@@ -234,7 +234,7 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 
 func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 	const backlogPackets = 1024
-	now := time.Now()
+	now := time.UnixMicro(1000)
 	store, err := newTransmissionStore(
 		packetqueue.Limits{Packets: backlogPackets, Bytes: 16 * 1024 * 1024}, func() time.Time { return now },
 	)

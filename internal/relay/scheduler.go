@@ -103,6 +103,12 @@ type schedulerEvent struct {
 	result         chan error
 }
 
+// rateObservation records one accepted delivery rate and its local sampling time.
+type rateObservation struct {
+	rate           uint64
+	receivedMicros uint64
+}
+
 // scheduledLane contains direction-local predictive state for one generation.
 type scheduledLane struct {
 	registration        LaneRegistration
@@ -112,7 +118,7 @@ type scheduledLane struct {
 	deliveryRate        uint64
 	lastDataPackets     uint64
 	lastPingID          uint64
-	rateHistory         [5]uint64
+	rateHistory         [5]rateObservation
 	rateHistoryCount    int
 	rateHistoryNext     int
 	rateObserved        bool
@@ -508,12 +514,14 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			if source := lanes[event.laneID]; source != nil && source.registration.Generation == event.generation {
 				lane.feedbackDelayMicros = saturatingAdd(lane.feedbackDelayMicros, source.minimumRTTMicros/2)
 			}
+			lane.registration.Store.deliveryWindow.Store(lane.deliveryWindowBytes())
 		}
 		event.result <- nil
 	case schedulerTiming:
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation {
 			lane.applyTiming(event.timing)
+			lane.registration.Store.deliveryWindow.Store(lane.deliveryWindowBytes())
 		}
 	case schedulerRouteReport:
 		s.routeReport(lanes, event.report, event.parsedAt, event.reportComplete)
@@ -604,7 +612,7 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 		return false, ErrCounterExhausted
 	}
 	size, err := protocol.DataFrameSize(protocol.Data{
-		PacketID: packetID, DeadlineMicros: item.Value.DeadlineMicros, Payload: item.Value.Payload,
+		PacketID: packetID, DeadlineMicros: uint64(item.Deadline.UnixMicro()), Payload: item.Value.Payload,
 	})
 	if err != nil {
 		item.Release()
@@ -797,7 +805,7 @@ func (l *scheduledLane) retentionDelay(bytes uint64) uint64 {
 func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64, now time.Time) bool {
 	packet := item.Value.Retain()
 	data := protocol.Data{
-		PacketID: packetID, DeadlineMicros: packet.DeadlineMicros, Payload: packet.Payload,
+		PacketID: packetID, DeadlineMicros: uint64(item.Deadline.UnixMicro()), Payload: packet.Payload,
 	}
 	size, err := protocol.DataFrameSize(data)
 	if err != nil {
@@ -810,7 +818,7 @@ func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64,
 		return false
 	}
 	transmission := retainedTransmission{
-		packetID: packetID, wireDeadline: packet.DeadlineMicros, deadline: item.Deadline,
+		packetID: packetID, deadlineMicros: uint64(item.Deadline.UnixMicro()),
 		budget: budget, packet: packet.Packet,
 	}
 	if l.registration.Store.pushAt(transmission, now) == nil {
@@ -843,13 +851,11 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	if dataDirection == 0 && pingDirection == 0 {
 		return false, nil
 	}
-	windowBytes := l.deliveryWindowBytes()
-	deliveryConstrained := l.registration.Store.deliveryConstrained(windowBytes)
 	sample, stale, err := l.registration.Store.acknowledge(report.DataPackets, receiveMicros)
 	if err != nil || stale {
 		return false, err
 	}
-	l.updateDeliveryRate(sample, deliveryConstrained)
+	l.updateDeliveryRate(sample, receiveMicros)
 	quantum := uint64(1024)
 	if l.rateObserved {
 		quantum = targetDataBatchBytes
@@ -866,36 +872,35 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	return true, nil
 }
 
-// updateDeliveryRate uses a send-bounded sample without reducing capacity from an application-limited sample. Reports
-// can return over another carrier, so the data lane's Ping RTT cannot bound their sampling interval.
-func (l *scheduledLane) updateDeliveryRate(sample deliverySample, deliveryConstrained bool) {
+// updateDeliveryRate keeps a time-bounded maximum of send-bounded samples. Application-limited observations can raise
+// capacity but cannot lower it or evict a useful peak. Reports may return over a different carrier.
+func (l *scheduledLane) updateDeliveryRate(sample deliverySample, receiveMicros uint64) {
 	if sample.bytes < minimumRateSampleBytes || sample.intervalMicros < uint64(time.Millisecond/time.Microsecond) ||
 		sample.bytes > math.MaxUint64/1_000_000 {
 		return
 	}
 	rate := sample.bytes * 1_000_000 / sample.intervalMicros
-	if rate == 0 {
+	if rate == 0 || l.rateObserved && sample.applicationLimited && rate <= l.deliveryRate {
 		return
 	}
-	l.rateHistory[l.rateHistoryNext] = rate
+	l.rateHistory[l.rateHistoryNext] = rateObservation{rate: rate, receivedMicros: receiveMicros}
 	l.rateHistoryNext = (l.rateHistoryNext + 1) % len(l.rateHistory)
 	l.rateHistoryCount = min(l.rateHistoryCount+1, len(l.rateHistory))
+	rtt := l.minimumRTTMicros
+	if rtt == 0 {
+		rtt = l.rttMicros
+	}
+	lifetime := uint64(math.MaxUint64)
+	if rtt <= math.MaxUint64/4 {
+		lifetime = max(uint64(time.Second/time.Microsecond), rtt*4)
+	}
 	for _, previous := range l.rateHistory[:l.rateHistoryCount] {
-		rate = max(rate, previous)
+		if receiveMicros >= previous.receivedMicros && receiveMicros-previous.receivedMicros < lifetime {
+			rate = max(rate, previous.rate)
+		}
 	}
-	if l.rateObserved && rate <= l.deliveryRate && !deliveryConstrained {
-		return
-	}
-	if !l.rateObserved {
-		l.deliveryRate = rate
-		l.rateObserved = true
-		return
-	}
-	if rate > l.deliveryRate {
-		l.deliveryRate = rate
-	} else {
-		l.deliveryRate = weightedAverage7(l.deliveryRate, rate)
-	}
+	l.deliveryRate = rate
+	l.rateObserved = true
 }
 
 // applyTiming updates a bounded RTT exponential moving average.
@@ -1059,21 +1064,21 @@ func (s *Scheduler) routeControl(lanes map[protocol.LaneID]*scheduledLane, frame
 // migrateTransmissions moves each still-fresh transport packet at most once after generation removal.
 func (s *Scheduler) migrateTransmissions(lanes map[protocol.LaneID]*scheduledLane, removed *scheduledLane) {
 	now := s.ingress.Now()
+	nowMicros := uint64(now.UnixMicro())
 	retained := removed.registration.Store.drain()
 	sort.SliceStable(retained, func(left, right int) bool {
-		return retained[left].deadline.Before(retained[right].deadline)
+		return retained[left].deadlineMicros < retained[right].deadlineMicros
 	})
 	for index := range retained {
 		transmission := &retained[index]
 		if transmission.packet.Kind != wgpacket.TransportData || transmission.migrated ||
-			!now.Before(transmission.deadline) {
+			nowMicros >= transmission.deadlineMicros {
 			transmission.release()
 			continue
 		}
 		transmission.migrated = true
 		frameBytes := uint64(transmission.size)
-		remaining := transmission.deadline.Sub(now)
-		deadlineMicros := uint64(remaining / time.Microsecond)
+		deadlineMicros := transmission.deadlineMicros - nowMicros
 		var best scoredLane
 		for _, lane := range lanes {
 			candidate, eligible := recoveryCandidate(lane, now, frameBytes, deadlineMicros)

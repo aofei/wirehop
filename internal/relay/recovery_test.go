@@ -157,7 +157,7 @@ func TestTransmissionStoreRecoveryProofExcludesPaddingAndControls(t *testing.T) 
 		{kind: wgpacket.TransportData, size: 2048, want: minimumRateSampleBytes},
 		{kind: wgpacket.TransportData, size: 32, want: minimumRateSampleBytes},
 	} {
-		transmission := retainedTransmission{deadline: now.Add(time.Second), packet: datagram.Packet{Payload: probePadding[:]}}
+		transmission := retainedTransmission{deadlineMicros: uint64(now.Add(time.Second).UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}}
 		if tt.kind != wgpacket.NonWireGuard {
 			transmission = schedulerTransmission(uint64(index), tt.kind, now.Add(time.Second))
 			transmission.packet.Payload = make([]byte, tt.size)
@@ -496,7 +496,7 @@ func TestSchedulerMigrateTransmissionsChecksCurrentProgress(t *testing.T) {
 			pending.packet.Payload = make([]byte, 1452)
 			pending.packet.Payload[0] = 4
 			if tt.expiredQueued {
-				pending.deadline = now.Add(100 * time.Millisecond)
+				pending.deadlineMicros = uint64(now.Add(100 * time.Millisecond).UnixMicro())
 			}
 			if err := destination.push(pending); err != nil {
 				t.Fatal(err)

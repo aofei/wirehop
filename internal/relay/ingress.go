@@ -60,7 +60,7 @@ func (i *Ingress) Run(ctx context.Context) error {
 				return fmt.Errorf("compute relay ingress deadline: %w", ErrCounterExhausted)
 			}
 			items[index] = packetqueue.Item[Packet]{
-				Value:    newPacket(packet, nowMicros+lifetimeMicros),
+				Value:    newPacket(packet),
 				Size:     len(packet.Payload),
 				Priority: packetPriority(packet.Kind.Control()),
 				Deadline: monotime.Time(nowMicros + lifetimeMicros),

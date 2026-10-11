@@ -145,7 +145,7 @@ func TestSelectCandidatesKeepsCommittedSamePath(t *testing.T) {
 		copy(payload, transmission.packet.Payload)
 		transmission.packet.Release()
 		transmission.packet = datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}
-		transmission.size = dataFrameSize(transmission.data())
+		transmission.size = uint32(dataFrameSize(transmission.data()))
 		if err := store.push(transmission); err != nil {
 			t.Fatal(err)
 		}
@@ -205,7 +205,7 @@ func TestScheduledLaneDeliveryWindow(t *testing.T) {
 }
 
 func TestScheduledLaneFeedbackDelayIncludesReportWait(t *testing.T) {
-	lane := schedulerLane(t, 1, 1, 20_000, 1_000_000)
+	lane := schedulerLaneWithLimits(t, 1, 1, 20_000, 1_000_000, packetqueue.Limits{Packets: 65_536, Bytes: 32 << 20})
 	source := schedulerLane(t, 2, 2, 100_000, 1_000_000)
 	source.minimumRTTMicros = 100_000
 	var scheduler Scheduler
@@ -220,60 +220,39 @@ func TestScheduledLaneFeedbackDelayIncludesReportWait(t *testing.T) {
 	if lane.feedbackDelayMicros != 75_000 {
 		t.Fatalf("feedback delay = %d", lane.feedbackDelayMicros)
 	}
+	if window := lane.registration.Store.deliveryWindow.Load(); window != lane.deliveryWindowBytes() {
+		t.Fatalf("sampling window = %d, want %d after feedback", window, lane.deliveryWindowBytes())
+	}
+	scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{1: lane}, &preferred, schedulerEvent{
+		kind: schedulerTiming, laneID: 1, generation: 1,
+		timing: clockmap.Sample{LocalSendMicros: 1000, RemoteReceiveMicros: 2000, RemoteSendMicros: 2000, LocalReceiveMicros: 11_000},
+	}, time.Now())
+	if window := lane.registration.Store.deliveryWindow.Load(); window != lane.deliveryWindowBytes() {
+		t.Fatalf("sampling window = %d, want %d after timing", window, lane.deliveryWindowBytes())
+	}
 	if saturatingAdd(math.MaxUint64, 1) != math.MaxUint64 {
 		t.Fatal("feedback delay wrapped")
 	}
 }
 
 func TestRetainedTransmissionLayout(t *testing.T) {
-	type originalTransmission struct {
-		data     protocol.Data
-		kind     wgpacket.Kind
-		priority packetqueue.Priority
-		deadline time.Time
-		migrated bool
-		size     int
-		budget   *retention.Budget
-		packet   datagram.Packet
-		delivery deliverySnapshot
+	type previousTransmission struct {
+		packetID     uint64
+		wireDeadline uint64
+		deadline     time.Time
+		migrated     bool
+		payloadBytes uint32
+		size         int
+		budget       *retention.Budget
+		packet       datagram.Packet
+		delivery     deliverySnapshot
 	}
-	t.Logf("retained transmission metadata: %d bytes, original %d bytes", unsafe.Sizeof(retainedTransmission{}), unsafe.Sizeof(originalTransmission{}))
+	t.Logf("retained transmission metadata: %d bytes, previous %d bytes", unsafe.Sizeof(retainedTransmission{}), unsafe.Sizeof(previousTransmission{}))
 	type previousPacket struct {
-		Kind           wgpacket.Kind
-		Payload        []byte
+		datagram.Packet
 		DeadlineMicros uint64
-		datagram       datagram.Packet
 	}
 	t.Logf("ingress packet metadata: %d bytes, previous %d bytes", unsafe.Sizeof(Packet{}), unsafe.Sizeof(previousPacket{}))
-	t.Logf("writer ownership: %d bytes, previous %d bytes", unsafe.Sizeof(datagram.Packet{}), unsafe.Sizeof(previousPacket{}))
-}
-
-func TestScheduledLaneRatePressureUsesEstimatedWindow(t *testing.T) {
-	lane := schedulerLaneWithLimits(t, 1, 1, 20_000, 10_000_000, packetqueue.Limits{Packets: 65_536, Bytes: 32 << 20})
-	lane.rateObserved = true
-	store := lane.registration.Store
-	store.now = func() time.Time { return time.UnixMicro(1) }
-	t.Cleanup(func() { releaseTransmissions(store.drain()) })
-	for id := uint64(1); id <= 300; id++ {
-		transmission := schedulerTransmission(id, wgpacket.TransportData, store.now().Add(time.Second))
-		payload := make([]byte, 4096)
-		copy(payload, transmission.packet.Payload)
-		transmission.packet.Payload = payload
-		if err := store.push(transmission); err != nil {
-			t.Fatal(err)
-		}
-		takeOneTransmission(t, store)
-	}
-	if store.deliveryConstrained(uint64(store.limits.Bytes)) || !store.deliveryConstrained(lane.deliveryWindowBytes()) {
-		t.Fatal("estimated-window pressure did not differ from the hard limit")
-	}
-	before := lane.deliveryRate
-	if _, err := lane.applyReport(protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}, 100_001, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if lane.deliveryRate >= before {
-		t.Fatal("sustained estimated-window pressure did not reduce the capacity estimate")
-	}
 }
 
 func TestLanePhaseSpreadsCompactIdentifiers(t *testing.T) {
