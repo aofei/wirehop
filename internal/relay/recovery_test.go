@@ -14,6 +14,7 @@ import (
 )
 
 func TestSchedulerRecoversStallBeforeSalvageWindowCloses(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	for _, expiredPrefix := range []bool{false, true} {
 		name := "FreshPrefix"
 		if expiredPrefix {
@@ -47,12 +48,12 @@ func TestSchedulerRecoversStallBeforeSalvageWindowCloses(t *testing.T) {
 			})
 			lanes := map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}
 			var scheduler Scheduler
-			scheduler.checkAbandonment(lanes, now.Add(249*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(249*time.Millisecond))
 			if abandonments != 0 {
 				t.Fatal("generation abandoned before the progress guard elapsed")
 			}
-			scheduler.checkAbandonment(lanes, now.Add(250*time.Millisecond))
-			scheduler.checkAbandonment(lanes, now.Add(500*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(250*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(500*time.Millisecond))
 			if abandonments != 1 || !source.degraded || !source.abandoning {
 				t.Fatalf("stall recovery: %d abandonments, degraded %t, abandoning %t", abandonments, source.degraded, source.abandoning)
 			}
@@ -61,6 +62,7 @@ func TestSchedulerRecoversStallBeforeSalvageWindowCloses(t *testing.T) {
 }
 
 func TestSchedulerRecoveryRequiresMigratableTransport(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	for _, tt := range []struct {
 		name     string
 		kind     wgpacket.Kind
@@ -89,11 +91,11 @@ func TestSchedulerRecoveryRequiresMigratableTransport(t *testing.T) {
 			takeOneTransmission(t, source.registration.Store)
 			var scheduler Scheduler
 			lanes := map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}
-			scheduler.checkAbandonment(lanes, now.Add(500*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(500*time.Millisecond))
 			if source.abandoning || source.degraded {
 				t.Fatal("fresh unmigratable work justified predictive recovery")
 			}
-			scheduler.checkAbandonment(lanes, now.Add(2*time.Second))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(2*time.Second))
 			if source.abandoning || !source.degraded {
 				t.Fatal("expired unmigratable work did not preserve degradation without abandonment")
 			}
@@ -102,6 +104,7 @@ func TestSchedulerRecoveryRequiresMigratableTransport(t *testing.T) {
 }
 
 func TestSchedulerProbeCapacityDivertsBeforeProvenRecovery(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	now := time.Unix(100, 0)
 	source := schedulerLane(t, 1, 1, 10_000, 12_500_000)
 	alternate := schedulerLane(t, 2, 2, 10_000, 12_500_000)
@@ -120,12 +123,12 @@ func TestSchedulerProbeCapacityDivertsBeforeProvenRecovery(t *testing.T) {
 	lanes := map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}
 	var scheduler Scheduler
 	now = now.Add(250 * time.Millisecond)
-	scheduler.checkAbandonment(lanes, now)
+	scheduler.checkAbandonment(lanes, &rescuePreferred, now)
 	if !source.degraded || source.abandoning || abandonments != 0 {
 		t.Fatal("padding-only capacity did not divert new traffic without abandoning the source")
 	}
 	transmission := schedulerTransmission(2, wgpacket.TransportData, now.Add(time.Second))
-	transmission.packet.Payload = make([]byte, minimumRateSampleBytes)
+	transmission.packet.Payload = make([]byte, minimumTransportProofBytes)
 	transmission.packet.Payload[0] = 4
 	if err := alternate.registration.Store.push(transmission); err != nil {
 		t.Fatal(err)
@@ -135,7 +138,7 @@ func TestSchedulerProbeCapacityDivertsBeforeProvenRecovery(t *testing.T) {
 	if _, err := alternate.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil {
 		t.Fatal(err)
 	}
-	scheduler.checkAbandonment(lanes, now)
+	scheduler.checkAbandonment(lanes, &rescuePreferred, now)
 	if !source.abandoning || abandonments != 1 {
 		t.Fatal("validated real transport progress did not permit recovery")
 	}
@@ -154,8 +157,8 @@ func TestTransmissionStoreRecoveryProofExcludesPaddingAndControls(t *testing.T) 
 		{kind: wgpacket.NonWireGuard, size: protocol.ProbePayloadSize},
 		{kind: wgpacket.HandshakeResponse, size: 92},
 		{kind: wgpacket.TransportData, size: 2048, want: 2048},
-		{kind: wgpacket.TransportData, size: 2048, want: minimumRateSampleBytes},
-		{kind: wgpacket.TransportData, size: 32, want: minimumRateSampleBytes},
+		{kind: wgpacket.TransportData, size: 2048, want: minimumTransportProofBytes},
+		{kind: wgpacket.TransportData, size: 32, want: minimumTransportProofBytes},
 	} {
 		transmission := retainedTransmission{deadlineMicros: uint64(now.Add(time.Second).UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}}
 		if tt.kind != wgpacket.NonWireGuard {
@@ -203,6 +206,7 @@ func TestProgressGuardIncludesSerializationAndFeedback(t *testing.T) {
 }
 
 func TestSchedulerRecoveryRequiresObservedCapacity(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	for _, tt := range []struct {
 		name              string
 		sourceObserved    bool
@@ -243,12 +247,12 @@ func TestSchedulerRecoveryRequiresObservedCapacity(t *testing.T) {
 			})
 			var scheduler Scheduler
 			lanes := map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}
-			scheduler.checkAbandonment(lanes, now.Add(249*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(249*time.Millisecond))
 			if source.abandoning {
 				t.Fatal("generation abandoned before the progress guard elapsed")
 			}
-			scheduler.checkAbandonment(lanes, now.Add(250*time.Millisecond))
-			scheduler.checkAbandonment(lanes, now.Add(500*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(250*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(500*time.Millisecond))
 			if source.abandoning != tt.wantAbandon {
 				t.Fatalf("abandoning = %t, want %t", source.abandoning, tt.wantAbandon)
 			}
@@ -260,6 +264,7 @@ func TestSchedulerRecoveryRequiresObservedCapacity(t *testing.T) {
 }
 
 func TestSchedulerDoesNotRecoverThroughAnotherStalledLane(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	now := time.Unix(100, 0)
 	lanes := make(map[protocol.LaneID]*scheduledLane)
 	for id := byte(1); id <= 2; id++ {
@@ -277,11 +282,12 @@ func TestSchedulerDoesNotRecoverThroughAnotherStalledLane(t *testing.T) {
 	}
 	var scheduler Scheduler
 	for range 10 {
-		scheduler.checkAbandonment(lanes, now.Add(time.Second))
+		scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(time.Second))
 	}
 }
 
 func TestSchedulerRecoversThroughHealthyLastLaneInGroup(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	for _, tt := range []struct {
 		name              string
 		count             byte
@@ -343,7 +349,7 @@ func TestSchedulerRecoversThroughHealthyLastLaneInGroup(t *testing.T) {
 			}
 			now = now.Add(250 * time.Millisecond)
 			if !tt.beforeMaintenance {
-				scheduler.checkAbandonment(lanes, now)
+				scheduler.checkAbandonment(lanes, &rescuePreferred, now)
 			}
 			for id := byte(1); id <= tt.count; id++ {
 				wantAbandon := !tt.beforeMaintenance && id != tt.count
@@ -400,6 +406,7 @@ func TestSchedulerRecoversThroughHealthyLastLaneInGroup(t *testing.T) {
 }
 
 func TestSchedulerRecoveryUsesObservedStallWithoutPrematurelyClosingSlowLinks(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	for _, tt := range []struct {
 		name         string
 		sourceRate   uint64
@@ -432,7 +439,7 @@ func TestSchedulerRecoveryUsesObservedStallWithoutPrematurelyClosingSlowLinks(t 
 				releaseTransmissions(alternate.registration.Store.drain())
 			})
 			var scheduler Scheduler
-			scheduler.checkAbandonment(map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}, now.Add(tt.checkAt))
+			scheduler.checkAbandonment(map[protocol.LaneID]*scheduledLane{1: source, 2: alternate}, &rescuePreferred, now.Add(tt.checkAt))
 			if source.abandoning != tt.wantAbandon {
 				t.Fatalf("abandoning = %t, want %t", source.abandoning, tt.wantAbandon)
 			}

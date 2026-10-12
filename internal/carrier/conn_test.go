@@ -608,6 +608,7 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 		name        string
 		messageType websocket.MessageType
 		messages    [][]byte
+		prefix      []protocol.Frame
 		want        error
 	}{
 		{name: "SplitFrame", messageType: websocket.MessageBinary, messages: [][]byte{encoded[:3], encoded[3:]},
@@ -618,14 +619,18 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 			want: ErrInvalidWebSocketMessage},
 		{name: "TrailingPartialFrame", messageType: websocket.MessageBinary,
 			messages: [][]byte{append(append([]byte(nil), encoded...), 0x80)},
+			prefix:   frames,
 			want:     protocol.ErrTrailingFrameData},
 		{name: "NonminimalLength", messageType: websocket.MessageBinary,
 			messages: [][]byte{{0x85, 0}}, want: protocol.ErrInvalidInteger},
 		{name: "ValidPrefixBeforeNonminimalLength", messageType: websocket.MessageBinary,
 			messages: [][]byte{append(append([]byte(nil), encoded...), 0x85, 0)},
+			prefix:   frames,
 			want:     protocol.ErrInvalidInteger},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
 			result := make(chan error, 1)
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				connection, err := websocket.Accept(writer, request, nil)
@@ -635,14 +640,17 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 				}
 				defer connection.CloseNow()
 				stream := NewWebSocketConn(connection)
-				for err == nil {
-					_, err = stream.ReadFrame(request.Context())
+				for _, expected := range tt.prefix {
+					frame, err := stream.ReadFrame(ctx)
+					if err != nil || !reflect.DeepEqual(frame, expected) {
+						result <- errors.New("valid WebSocket frame prefix was rejected or changed")
+						return
+					}
 				}
+				_, err = stream.ReadFrame(ctx)
 				result <- err
 			}))
 			defer server.Close()
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
 			connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 			if err != nil {
 				t.Fatal(err)
@@ -653,8 +661,13 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := <-result; !errors.Is(err, tt.want) {
-				t.Fatalf("ReadFrame() error = %v, want %v", err, tt.want)
+			select {
+			case err := <-result:
+				if !errors.Is(err, tt.want) {
+					t.Fatalf("ReadFrame() error = %v, want %v", err, tt.want)
+				}
+			case <-ctx.Done():
+				t.Fatalf("ReadFrame() did not reject the malformed message: %v", ctx.Err())
 			}
 		})
 	}

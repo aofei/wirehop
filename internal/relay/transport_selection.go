@@ -27,12 +27,19 @@ const (
 	maximumTransportHoldDuration = 8 * time.Second
 )
 
-// selectTransportCandidates keeps a capacity-selected transport primary. A full primary
-// waits for progress rather than spilling unique packets onto a path with a different arrival time.
+// selectTransportCandidates preserves healthy transport despite predicted deadline risk and permits capacity promotion.
+// Active timing pauses retain the current healthy primary without changing its assignment.
 func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*scheduledLane, preferred protocol.LaneID,
 	frameBytes, maximumScore uint64, now time.Time) laneCandidates {
 	primary := lanes[preferred]
-	holding := primary != nil && !primary.degraded && !primary.abandoning && now.Before(s.transportHoldUntil)
+	healthyPreferred := primary != nil && !primary.degraded && !primary.abandoning
+	if !s.measurementStarted.IsZero() {
+		if !healthyPreferred || !primary.canAccept(frameBytes) {
+			return laneCandidates{}
+		}
+		return laneCandidates{lanes: [2]*scheduledLane{primary}, count: 1, available: true}
+	}
+	holding := healthyPreferred && now.Before(s.transportHoldUntil)
 	if primary == nil || primary.degraded || primary.abandoning {
 		primary = nil
 		for _, candidate := range lanes {
@@ -68,7 +75,7 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 			primary = best
 		}
 	}
-	if primary.score(frameBytes) >= maximumScore {
+	if !healthyPreferred && primary.score(frameBytes) >= maximumScore {
 		return selectCandidates(lanes, preferred, frameBytes, maximumScore)
 	}
 	if !primary.canAccept(frameBytes) {
@@ -83,6 +90,10 @@ var probePadding [protocol.ProbePayloadSize]byte
 // fillTransportProbe samples one eligible path without consuming packet IDs or producing UDP traffic.
 func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane, preferred protocol.LaneID,
 	now time.Time, reserveBytes uint64) bool {
+	if !s.measurementStarted.IsZero() {
+		return false
+	}
+	waitingDrain := s.measurementDrain != nil || s.pendingMeasurementDrain.Load()
 	var group protocol.PathGroupID
 	distinct := false
 	for _, lane := range lanes {
@@ -103,6 +114,9 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 	var first, next *scheduledLane
 	for _, candidate := range lanes {
 		active := now.Before(candidate.probeUntil)
+		if waitingDrain && !active {
+			continue
+		}
 		if candidate.degraded || candidate.abandoning || candidate.registration.LaneID == preferred && !active {
 			continue
 		}
@@ -215,6 +229,7 @@ func (l *scheduledLane) probeWindowBytes(reserveBytes uint64) uint64 {
 	window := l.deliveryWindowBytes()
 	if l.rateObserved && reserveBytes == 0 {
 		size, _ := protocol.DataFrameSize(protocol.Data{Payload: probePadding[:]})
+		window = max(window, min(uint64(size), uint64(l.registration.Store.limits.Bytes)))
 		capacity := window - min(window, minimumDeliveryWindow)
 		if capacity >= 2*uint64(size) {
 			window = min(uint64(l.registration.Store.limits.Bytes), saturatingAdd(window, capacity))
@@ -223,25 +238,35 @@ func (l *scheduledLane) probeWindowBytes(reserveBytes uint64) uint64 {
 	return window - min(window, reserveBytes)
 }
 
-// deliveryWindowBytes bounds retained work by four unloaded feedback cycles and a small sampling allowance.
+// deliveryWindowBytes bounds committed-unreported flight by four recent feedback cycles and a small sampling allowance.
 func (l *scheduledLane) deliveryWindowBytes() uint64 {
 	maximum := uint64(l.registration.Store.limits.Bytes)
 	if !l.rateObserved {
 		return min(maximum, initialDeliveryWindow)
 	}
-	rtt := l.minimumRTTMicros
-	if rtt == 0 {
-		rtt = l.rttMicros
-	}
-	cycle := max(rtt, saturatingAdd(rtt/2, l.feedbackDelayMicros))
-	cycle = saturatingAdd(cycle, uint64(defaultReportInterval/time.Microsecond))
-	if cycle > math.MaxUint64/4 {
-		return maximum
-	}
-	interval := cycle * 4
-	if l.deliveryRate > math.MaxUint64/interval {
+	interval := l.deliveryWindowHorizonMicros()
+	if interval == math.MaxUint64 || l.deliveryRate > math.MaxUint64/interval {
 		return maximum
 	}
 	bytes := l.deliveryRate * interval / 1_000_000
 	return min(maximum, max(uint64(minimumDeliveryWindow), saturatingAdd(bytes, minimumDeliveryWindow)))
+}
+
+// deliveryWindowHorizonMicros returns four feedback cycles before byte conversion and the sampling allowance.
+func (l *scheduledLane) deliveryWindowHorizonMicros() uint64 {
+	rtt := l.minimumRTTMicros
+	if rtt == 0 {
+		rtt = l.rttMicros
+	}
+	cycle := l.deliveryFeedbackCycleMicros(rtt)
+	if cycle > math.MaxUint64/4 {
+		return math.MaxUint64
+	}
+	return cycle * 4
+}
+
+// deliveryFeedbackCycleMicros includes the RTT, routed feedback delay, and report interval allowance.
+func (l *scheduledLane) deliveryFeedbackCycleMicros(rtt uint64) uint64 {
+	cycle := max(rtt, saturatingAdd(rtt/2, l.feedbackDelayMicros))
+	return saturatingAdd(cycle, uint64(defaultReportInterval/time.Microsecond))
 }

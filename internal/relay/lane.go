@@ -256,8 +256,8 @@ func (l *Lane) reportProtocolViolation(parent context.Context, violation error) 
 		return
 	}
 	select {
-	case <-written:
 	case <-ctx.Done():
+	case <-written:
 	}
 }
 
@@ -284,10 +284,10 @@ func (l *Lane) ping(ctx context.Context) error {
 	dataActive := false
 	for {
 		select {
-		case <-timer.C:
-		case <-l.pingChanged:
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-timer.C:
+		case <-l.pingChanged:
 		}
 
 		now := time.Now()
@@ -406,7 +406,7 @@ func (l *Lane) recordPingWritten(identifier uint64, now time.Time) {
 	}
 }
 
-// cancelPing removes a request that could not enter the bounded control queue.
+// cancelPing removes only the matching pending request.
 func (l *Lane) cancelPing(identifier uint64) {
 	l.pingMu.Lock()
 	if l.pendingPingID == identifier {
@@ -476,21 +476,16 @@ func (l *Lane) write(ctx context.Context) error {
 	}
 	controlFrames := 0
 	for {
-		if controlFrames == maximumConsecutiveControlFrames {
-			select {
-			case <-l.store.Ready():
-				if err := l.writeReadyData(carrierContext); err != nil {
-					return err
-				}
-				controlFrames = 0
-				continue
-			default:
-				controlFrames = 0
-			}
+		if served, err := l.writeDataAfterControlBurst(carrierContext, &controlFrames); err != nil {
+			return err
+		} else if served {
+			continue
 		}
 		request, ready := l.nextControl(controlFrames == 0)
 		if !ready {
 			select {
+			case <-ctx.Done():
+				return ctx.Err()
 			case request = <-l.pong:
 			case request = <-l.control:
 			case <-l.store.Ready():
@@ -501,8 +496,6 @@ func (l *Lane) write(ctx context.Context) error {
 				continue
 			case <-l.store.Done():
 				return ErrLaneAbandoned
-			case <-ctx.Done():
-				return ctx.Err()
 			}
 		}
 		count, err := l.writeControlBatch(carrierContext, request, maximumConsecutiveControlFrames-controlFrames)
@@ -510,6 +503,25 @@ func (l *Lane) write(ctx context.Context) error {
 			return err
 		}
 		controlFrames += count
+	}
+}
+
+// writeDataAfterControlBurst offers ready Data one turn after the shared control allowance is exhausted.
+// A paused or empty store does not block controls or reopen the timing gate.
+func (l *Lane) writeDataAfterControlBurst(ctx context.Context, controlFrames *int) (bool, error) {
+	if *controlFrames != maximumConsecutiveControlFrames {
+		return false, nil
+	}
+	select {
+	case <-l.store.Ready():
+		if err := l.writeReadyData(ctx); err != nil {
+			return false, err
+		}
+		*controlFrames = 0
+		return true, nil
+	default:
+		*controlFrames = 0
+		return false, nil
 	}
 }
 
@@ -573,11 +585,14 @@ collect:
 		if err != nil {
 			return count, err
 		}
+		if frame.Type == 0 {
+			break collect
+		}
 		frames[count] = frame
 		callbacks[count] = request.sent
 		count++
 		switch frame.Type {
-		case protocol.FramePing, protocol.FramePong, protocol.FrameClockSync,
+		case protocol.FramePing, protocol.FramePong, protocol.FrameMeasurement, protocol.FrameClockSync,
 			protocol.FrameSessionClose, protocol.FrameLaneAbandon, protocol.FrameError:
 			break collect
 		}
@@ -589,6 +604,9 @@ collect:
 		if !ready {
 			break collect
 		}
+	}
+	if count == 0 {
+		return 0, nil
 	}
 	if err := l.writeFrames(ctx, frames[:count]); err != nil {
 		return count, err
@@ -734,10 +752,10 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 		if err != nil {
 			return err
 		}
+		receiveMicros := l.clock.NowMicros()
 		if !l.completePing(pong.ID, pong.PingSendMicros) {
 			return ErrUnexpectedPong
 		}
-		receiveMicros := l.clock.NowMicros()
 		sample := clockmap.Sample{
 			LocalSendMicros: pong.PingSendMicros, RemoteReceiveMicros: pong.ReceiveMicros,
 			RemoteSendMicros: pong.SendMicros, LocalReceiveMicros: receiveMicros,
@@ -751,6 +769,12 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 			l.observeTiming(sample)
 		}
 		return nil
+	case protocol.FrameMeasurement:
+		value, err := protocol.ParseMeasurement(frame)
+		if err != nil {
+			return err
+		}
+		return l.observer.ObserveMeasurement(protocol.LaneGeneration{LaneID: l.laneID, Generation: l.generation}, value, l.clock.NowMicros())
 	case protocol.FrameClockSync:
 		if !*clockSyncPending {
 			return ErrUnexpectedFrame
@@ -1023,11 +1047,10 @@ func (p *deliveryProgress) noteParseLocked() {
 func (l *Lane) observeTiming(sample clockmap.Sample) {
 	roundTrip := sample.LocalReceiveMicros - sample.LocalSendMicros
 	processing := sample.RemoteSendMicros - sample.RemoteReceiveMicros
-	if processing < roundTrip {
-		roundTrip -= processing
-	} else {
-		roundTrip = 1
+	if processing > roundTrip {
+		return
 	}
+	roundTrip = max(1, roundTrip-processing)
 	l.reportRTTMicros.Store(roundTrip)
 	l.progress.signal()
 	l.observer.ObserveTiming(l.laneID, l.generation, sample)
@@ -1052,6 +1075,30 @@ func (l *Lane) SendDeliveryReport(report protocol.DeliveryReport, parsedAt time.
 	}
 	select {
 	case l.control <- request:
+		return true
+	default:
+		return false
+	}
+}
+
+// RequestMeasurement asks the session coordinator to consider a bounded measurement of this carrier.
+func (l *Lane) RequestMeasurement() {
+	l.observer.RequestMeasurement(protocol.LaneGeneration{LaneID: l.laneID, Generation: l.generation})
+}
+
+// SendMeasurement queues a transaction phase without blocking the carrier writer during drain preparation.
+func (l *Lane) SendMeasurement(request MeasurementWrite) bool {
+	select {
+	case l.control <- controlWrite{
+		build: func(sendMicros uint64) (protocol.Frame, error) {
+			value, valid := request.Build(sendMicros)
+			if !valid {
+				return protocol.Frame{}, nil
+			}
+			return protocol.MarshalMeasurement(value)
+		},
+		sent: request.Sent,
+	}:
 		return true
 	default:
 		return false

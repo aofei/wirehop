@@ -13,13 +13,52 @@ import (
 	"testing/iotest"
 )
 
+func TestFrameTypeWireLayout(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		frameType FrameType
+		id        byte
+	}{
+		{name: "SessionCreated", frameType: FrameSessionCreated, id: 1},
+		{name: "LaneAccepted", frameType: FrameLaneAccepted, id: 2},
+		{name: "Data", frameType: FrameData, id: 3},
+		{name: "DeliveryReport", frameType: FrameDeliveryReport, id: 4},
+		{name: "ClockSync", frameType: FrameClockSync, id: 5},
+		{name: "Ping", frameType: FramePing, id: 6},
+		{name: "Pong", frameType: FramePong, id: 7},
+		{name: "Measurement", frameType: FrameMeasurement, id: 8},
+		{name: "LaneAbandon", frameType: FrameLaneAbandon, id: 9},
+		{name: "SessionClose", frameType: FrameSessionClose, id: 10},
+		{name: "Error", frameType: FrameError, id: 11},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if byte(tt.frameType) != tt.id {
+				t.Fatalf("frame type = %d, want %d", tt.frameType, tt.id)
+			}
+			encoded, err := MarshalFrame(Frame{Type: tt.frameType})
+			if err != nil || !bytes.Equal(encoded, []byte{tt.id}) {
+				t.Fatalf("empty frame = %x, %v, want %02x", encoded, err, tt.id)
+			}
+		})
+	}
+}
+
+func TestFrameTypeValid(t *testing.T) {
+	for value := range 256 {
+		want := value >= 1 && value <= 11
+		if got := FrameType(value).Valid(); got != want {
+			t.Fatalf("FrameType(%d).Valid() = %t, want %t", value, got, want)
+		}
+	}
+}
+
 func TestFrameRoundTrip(t *testing.T) {
 	want := Frame{Type: FrameDeliveryReport, Payload: []byte{1, 2, 3}}
 	encoded, err := MarshalFrame(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(encoded, []byte{0x35, 1, 2, 3}) {
+	if !bytes.Equal(encoded, []byte{0x34, 1, 2, 3}) {
 		t.Fatalf("MarshalFrame() = %v", encoded)
 	}
 
@@ -54,7 +93,7 @@ func TestAppendFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(encoded, []byte{9, 0x22, 1, 2}) {
+	if !bytes.Equal(encoded, []byte{9, 0x26, 1, 2}) {
 		t.Fatalf("AppendFrame() = %v", encoded)
 	}
 }
@@ -290,7 +329,7 @@ func TestDataRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(direct, generic) || !bytes.Equal(direct[:1], []byte{0x71}) {
+	if !bytes.Equal(direct, generic) || !bytes.Equal(direct[:1], []byte{0x73}) {
 		t.Fatalf("MarshalDataFrame() = %v, want %v", direct, generic)
 	}
 	if size, err := DataFrameSize(want); err != nil || size != len(direct) {
@@ -397,12 +436,12 @@ func TestFrameReaderLengthBoundaries(t *testing.T) {
 		size   int
 		header []byte
 	}{
-		{name: "Empty", header: []byte{1}},
-		{name: "OneByte", size: 7, header: []byte{0x71}},
-		{name: "TwoBytes", size: 8, header: []byte{0x81, 1}},
-		{name: "TwoByteMaximum", size: 1023, header: []byte{0xf1, 0x7f}},
-		{name: "ThreeBytes", size: 1024, header: []byte{0x81, 0x80, 1}},
-		{name: "Maximum", size: 65553, header: []byte{0x91, 0x82, 0x40}},
+		{name: "Empty", header: []byte{3}},
+		{name: "OneByte", size: 7, header: []byte{0x73}},
+		{name: "TwoBytes", size: 8, header: []byte{0x83, 1}},
+		{name: "TwoByteMaximum", size: 1023, header: []byte{0xf3, 0x7f}},
+		{name: "ThreeBytes", size: 1024, header: []byte{0x83, 0x80, 1}},
+		{name: "Maximum", size: 65553, header: []byte{0x93, 0x82, 0x40}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			payload := bytes.Repeat([]byte{0xa5}, tt.size)

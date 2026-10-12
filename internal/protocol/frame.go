@@ -31,35 +31,41 @@ var (
 	ErrTrailingFrameData = errors.New("trailing frame data")
 )
 
-// FrameType identifies one data-plane or control-plane frame.
+// FrameType identifies one data-plane or control-plane frame. IDs group related messages and do not imply ordering or
+// priority.
 type FrameType uint8
 
 const (
-	// FrameData carries one WireGuard UDP datagram or fixed capacity padding.
-	FrameData FrameType = iota + 1
-	// FramePing requests a lane timing response.
-	FramePing
-	// FramePong responds to a lane timing request.
-	FramePong
-	// FrameClockSync updates the shared session clock mapping.
-	FrameClockSync
-	// FrameDeliveryReport reports cumulative peer parsing progress.
-	FrameDeliveryReport
 	// FrameSessionCreated accepts a newly created session.
-	FrameSessionCreated
+	FrameSessionCreated FrameType = 1
 	// FrameLaneAccepted accepts a lane joined to an existing session.
-	FrameLaneAccepted
-	// FrameSessionClose explicitly closes a session.
-	FrameSessionClose
+	FrameLaneAccepted FrameType = 2
+
+	// FrameData carries one WireGuard UDP datagram or fixed capacity padding.
+	FrameData FrameType = 3
+	// FrameDeliveryReport reports cumulative peer parsing progress.
+	FrameDeliveryReport FrameType = 4
+
+	// FrameClockSync updates the shared session clock mapping.
+	FrameClockSync FrameType = 5
+	// FramePing requests a lane timing response.
+	FramePing FrameType = 6
+	// FramePong responds to a lane timing request.
+	FramePong FrameType = 7
+	// FrameMeasurement coordinates one bounded session measurement on its target carrier.
+	FrameMeasurement FrameType = 8
+
 	// FrameLaneAbandon coordinates generation-specific connection abandonment.
-	FrameLaneAbandon
+	FrameLaneAbandon FrameType = 9
+	// FrameSessionClose explicitly closes a session.
+	FrameSessionClose FrameType = 10
 	// FrameError reports an in-session protocol or policy error.
-	FrameError
+	FrameError FrameType = 11
 )
 
 // Valid reports whether the frame type is defined by this protocol version.
 func (t FrameType) Valid() bool {
-	return t >= FrameData && t <= FrameError
+	return t >= FrameSessionCreated && t <= FrameError
 }
 
 // Frame is one decoded WireHop frame. Callers must treat Payload as read-only and honor the lifetime documented by the

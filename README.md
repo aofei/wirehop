@@ -150,6 +150,10 @@ long outage does not replay a large stale backlog. These limits tolerate multi-s
 uninterrupted service across every network transition. WireHop Ping maintains the carrier connection, not an external
 WireGuard UDP NAT mapping. Configure WireGuard's `PersistentKeepalive` separately when that UDP leg needs it.
 
+Restored connectivity does not guarantee immediate progress in an existing TCP flow inside WireGuard. The inner TCP
+sender can remain in retransmission backoff after delay or loss. Reconnecting a carrier or refreshing its RTT does not
+reset that sender's timer.
+
 Linux and Darwin protocol clocks include system suspend. Established lanes and pending connection attempts compare that
 clock with Go runtime elapsed time to discard obsolete work after resume. Detection waits for a scheduled check, which
 can take up to 15 seconds on an idle lane when runtime timers pause. There is no native Android or iOS lifecycle or

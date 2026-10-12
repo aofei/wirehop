@@ -217,7 +217,7 @@ func registerFeedbackLane(t *testing.T, ctx context.Context, scheduler *Schedule
 	t.Helper()
 	err := scheduler.Register(ctx, LaneRegistration{
 		LaneID: protocol.LaneID(1), Generation: 1, PathGroupID: protocol.PathGroupID(1), Store: store,
-		Abandon: func() {}, SendControl: lane.SendControl, ValidatePingProgress: lane.ValidatePingProgress, SendDeliveryReport: lane.SendDeliveryReport,
+		Abandon: func() {}, SendControl: lane.SendControl, ValidatePingProgress: lane.ValidatePingProgress, RequestMeasurement: lane.RequestMeasurement, SendMeasurement: lane.SendMeasurement, SendDeliveryReport: lane.SendDeliveryReport,
 	})
 	if err != nil {
 		t.Fatal(err)

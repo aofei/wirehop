@@ -19,6 +19,17 @@ import (
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
 
+func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (deliverySample, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.reportedPackets
+	sample, stale, err := s.acknowledgeLocked(packets, receiveMicros)
+	if s.reportedPackets > previous && s.control.len()+s.normal.len() > 0 {
+		s.notifyLocked()
+	}
+	return sample, stale, err
+}
+
 func TestTransmissionStoreValidation(t *testing.T) {
 	for _, limits := range []packetqueue.Limits{
 		{},
@@ -55,6 +66,34 @@ func TestTransmissionStoreValidation(t *testing.T) {
 	expired.deadlineMicros = uint64(now.UnixMicro())
 	if err := store.push(expired); !errors.Is(err, packetqueue.ErrExpired) {
 		t.Fatalf("expired push error = %v, want %v", err, packetqueue.ErrExpired)
+	}
+}
+
+func TestTransmissionStoreTimingResumeAtCounterLimit(t *testing.T) {
+	now := time.UnixMicro(1000)
+	store := newDeliverySampleStore(t, &now)
+	store.deliveryWindow = 8192
+	store.sentPackets = math.MaxUint64 - 1
+	store.reportedPackets = math.MaxUint64 - 1
+	store.beginMeasurementPause()
+	store.endMeasurementPause()
+	sendDeliverySamplePacket(t, store, 1)
+	now = now.Add(300 * time.Millisecond)
+	sample, stale, err := store.acknowledge(math.MaxUint64, uint64(now.UnixMicro()))
+	if err != nil || stale || !sample.applicationLimited || sample.bytes != 4096 {
+		t.Fatalf("last resumed packet sample = %+v, stale %t, error %v", sample, stale, err)
+	}
+	store.beginMeasurementPause()
+	store.endMeasurementPause()
+	if err := store.push(deliverySampleTransmission(t, store, 2)); err != nil {
+		t.Fatal(err)
+	}
+	var data [1]protocol.Data
+	var ownership [1]datagram.Packet
+	count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+	releaseBatchOwnership(ownership[:count])
+	if count != 0 || !errors.Is(err, ErrCounterExhausted) {
+		t.Fatalf("takeBatch() after counter exhaustion = %d, %v", count, err)
 	}
 }
 
@@ -200,6 +239,7 @@ func testTransmissionStoreSentPayloadExpiryAfterCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	store.setDeliveryWindows(1024*1024, 1024*1024)
 	for packetID := uint64(1); packetID <= total; packetID++ {
 		deadline := now.Add(time.Second)
 		if packetID%2 == 0 {
@@ -254,7 +294,7 @@ func testTransmissionStoreSentPayloadExpiryAfterCompaction(t *testing.T) {
 		t.Fatalf("final acknowledge() = stale %t, %v", stale, err)
 	}
 	assertTransmissionStoreInvariants(t, store)
-	if budget.Usage() != (retention.Usage{}) || store.transportReported.Load() != minimumRateSampleBytes {
+	if budget.Usage() != (retention.Usage{}) || store.transportReported.Load() != minimumTransportProofBytes {
 		t.Fatal("final acknowledgment lost accounting or saturated transport proof")
 	}
 }
@@ -349,6 +389,7 @@ func testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits(t *testin
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	store.setDeliveryWindows(uint64(limits.Bytes), uint64(limits.Bytes))
 	var sizes [3]int
 	for index, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.TransportData, wgpacket.HandshakeInitiation} {
 		transmission := schedulerTransmission(math.MaxUint64-uint64(2-index), kind, now.Add(time.Second))
@@ -401,7 +442,7 @@ func testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits(t *testin
 		if err != nil || stale || sample != want {
 			t.Fatalf("late boundary report %d = %+v, stale %t, error %v, want %+v", index, sample, stale, err, want)
 		}
-		wantProof := []uint64{0, wgpacket.TransportKeepaliveLength, minimumRateSampleBytes}[index]
+		wantProof := []uint64{0, wgpacket.TransportKeepaliveLength, minimumTransportProofBytes}[index]
 		if store.transportReported.Load() != wantProof {
 			t.Fatalf("late boundary report %d transport proof = %d, want %d", index, store.transportReported.Load(), wantProof)
 		}
@@ -590,6 +631,61 @@ func TestTransmissionStoreExpiryDistinguishesQueuedAndSent(t *testing.T) {
 	drained := store.drain()
 	if len(drained) != 1 || drained[0].packetID != sent.packetID {
 		t.Fatalf("drain() = %+v", drained)
+	}
+}
+
+func TestTransmissionStoreAssessDeadlinesAfterSentExpiry(t *testing.T) {
+	for _, realPacket := range []bool{false, true} {
+		name := "PaddingOnly"
+		if realPacket {
+			name = "PaddingAndPacket"
+		}
+		t.Run(name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			store, err := newTransmissionStore(packetqueue.Limits{Packets: 4, Bytes: 16384}, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { releaseTransmissions(store.drain()) })
+			padding := retainedTransmission{
+				deadlineMicros: uint64(now.Add(time.Second).UnixMicro()),
+				packet:         datagram.Packet{Payload: probePadding[:]},
+			}
+			if err := store.push(padding); err != nil {
+				t.Fatal(err)
+			}
+			takeOneTransmission(t, store)
+			if realPacket {
+				if err := store.push(schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))); err != nil {
+					t.Fatal(err)
+				}
+				takeOneTransmission(t, store)
+			}
+			committed := store.sentBytes
+			now = now.Add(2 * time.Second)
+			if assessment := store.assessDeadlines(now, func(uint64) uint64 { return 0 }); assessment.retained != realPacket || assessment.atRisk != realPacket || !assessment.usefulDeadline.IsZero() {
+				t.Fatalf("expired sent assessment = %+v", assessment)
+			}
+			queued := schedulerTransmission(2, wgpacket.TransportData, now.Add(time.Second))
+			if err := store.push(queued); err != nil {
+				t.Fatal(err)
+			}
+			var prefixBytes uint64
+			assessment := store.assessDeadlines(now, func(bytes uint64) uint64 {
+				prefixBytes = bytes
+				return 0
+			})
+			if !assessment.retained || assessment.atRisk != realPacket ||
+				uint64(assessment.usefulDeadline.UnixMicro()) != queued.deadlineMicros ||
+				assessment.usefulBytes != uint64(queued.size) || assessment.queuedDeadline != assessment.usefulDeadline ||
+				assessment.queuedBytes != uint64(queued.size) {
+				t.Fatalf("queued assessment after sent expiry = %+v", assessment)
+			}
+			if !realPacket && prefixBytes != committed+uint64(queued.size) {
+				t.Fatalf("prediction prefix = %d bytes, want %d", prefixBytes, committed+uint64(queued.size))
+			}
+			assertTransmissionStoreInvariants(t, store)
+		})
 	}
 }
 
@@ -1099,7 +1195,7 @@ func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, 
 				t.Fatalf("acknowledge() = stale %t, error %v", stale, err)
 			}
 			for _, written := range unreported[:count] {
-				transportProof = min(minimumRateSampleBytes, transportProof+written.transportBytes)
+				transportProof = min(minimumTransportProofBytes, transportProof+written.transportBytes)
 				if written.probe {
 					reportedProbes++
 				}

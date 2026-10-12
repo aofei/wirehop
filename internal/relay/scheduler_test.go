@@ -965,11 +965,11 @@ func TestSchedulerDeliveryReportUsesFeedbackCarrierDelay(t *testing.T) {
 				source.applyTiming(clockmap.Sample{
 					LocalSendMicros: 1000, RemoteReceiveMicros: 1000, RemoteSendMicros: 1000,
 					LocalReceiveMicros: 201_000,
-				})
+				}, false)
 				source.applyTiming(clockmap.Sample{
 					LocalSendMicros: 301_000, RemoteReceiveMicros: 301_000, RemoteSendMicros: 301_000,
 					LocalReceiveMicros: 1_101_000,
-				})
+				}, false)
 			}
 			if test.changedSource {
 				source.registration.Generation++
@@ -1048,6 +1048,7 @@ func TestSchedulerObserveTiming(t *testing.T) {
 					event.timing != want.timing || len(scheduler.events) != 0 {
 					t.Fatal("timing observation replaced queued work or lost an accepted sample")
 				}
+
 			})
 		})
 	}
@@ -1055,19 +1056,20 @@ func TestSchedulerObserveTiming(t *testing.T) {
 
 func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		sample *clockmap.Sample
-		want   uint64
+		name     string
+		sample   *clockmap.Sample
+		want     uint64
+		observed bool
 	}{
 		{name: "MissingSample", want: defaultInitialRTTMicros},
 		{name: "AdmissionSample", sample: &clockmap.Sample{
 			LocalSendMicros: 1000, RemoteReceiveMicros: 9000, RemoteSendMicros: 11_000, LocalReceiveMicros: 7000,
-		}, want: 4000},
-		{name: "HighRTTSample", sample: &clockmap.Sample{LocalReceiveMicros: 1_200_000}, want: 1_200_000},
-		{name: "ZeroSpan", sample: &clockmap.Sample{}, want: 1},
+		}, want: 4000, observed: true},
+		{name: "HighRTTSample", sample: &clockmap.Sample{LocalReceiveMicros: 1_200_000}, want: 1_200_000, observed: true},
+		{name: "ZeroSpan", sample: &clockmap.Sample{}, want: 1, observed: true},
 		{name: "ProcessingExceedsSpan", sample: &clockmap.Sample{
 			LocalReceiveMicros: 1, RemoteSendMicros: 2,
-		}, want: 1},
+		}, want: defaultInitialRTTMicros},
 		{name: "InvalidLocalOrder", sample: &clockmap.Sample{LocalSendMicros: 1}, want: defaultInitialRTTMicros},
 		{name: "InvalidRemoteOrder", sample: &clockmap.Sample{RemoteReceiveMicros: 1}, want: defaultInitialRTTMicros},
 	} {
@@ -1088,8 +1090,12 @@ func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 			if lane.rttMicros != test.want {
 				t.Fatalf("initial RTT = %d, want %d", lane.rttMicros, test.want)
 			}
-			if lane.rttObserved && lane.minimumRTTMicros != test.want {
-				t.Fatal("admission sample did not initialize the generation minimum RTT")
+			minimum := uint64(0)
+			if test.observed {
+				minimum = test.want
+			}
+			if lane.rttObserved != test.observed || lane.minimumRTTMicros != minimum {
+				t.Fatal("admission sample changed the expected observation state or minimum RTT")
 			}
 			before := lane.rttMicros
 			scheduler.applyEvent(lanes, &preferred, schedulerEvent{
@@ -1807,6 +1813,7 @@ func TestSchedulerRunReleasesAggregateBudget(t *testing.T) {
 }
 
 func TestSchedulerRetainsExpiredSentPrefixUntilReport(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	for _, alternate := range []bool{false, true} {
 		name := "SoleLane"
 		if alternate {
@@ -1829,7 +1836,7 @@ func TestSchedulerRetainsExpiredSentPrefixUntilReport(t *testing.T) {
 				other := schedulerLane(t, 2, 2, 1, 1_000_000)
 				lanes[other.registration.LaneID] = other
 			}
-			scheduler.checkAbandonment(lanes, now.Add(1100*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(1100*time.Millisecond))
 			if source.abandoning || source.degraded {
 				t.Fatalf("expired lane: abandoning=%t degraded=%t", source.abandoning, source.degraded)
 			}
@@ -1853,6 +1860,7 @@ func TestSchedulerRetainsExpiredSentPrefixUntilReport(t *testing.T) {
 }
 
 func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	for _, allDegraded := range []bool{false, true} {
 		name := "SoleDegradedLane"
 		if allDegraded {
@@ -1870,7 +1878,7 @@ func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
 			takeOneTransmission(t, source.registration.Store)
 			t.Cleanup(func() { releaseTransmissions(source.registration.Store.drain()) })
 			lanes := map[protocol.LaneID]*scheduledLane{source.registration.LaneID: source}
-			scheduler.checkAbandonment(lanes, now.Add(960*time.Millisecond))
+			scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(960*time.Millisecond))
 			if !source.degraded || source.abandoning {
 				t.Fatal("expected an unexpired degraded lane")
 			}
@@ -1905,6 +1913,7 @@ func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
 }
 
 func TestSchedulerDoesNotCountIdleTimeAsProgressStall(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	now := time.Now()
 	source := schedulerLane(t, 1, 1, 100_000, 112)
 	store := source.registration.Store
@@ -1930,7 +1939,7 @@ func TestSchedulerDoesNotCountIdleTimeAsProgressStall(t *testing.T) {
 			takeOneTransmission(t, store)
 			bytes += uint64(transmission.size)
 		}
-		scheduler.checkAbandonment(lanes, now.Add(25*time.Millisecond))
+		scheduler.checkAbandonment(lanes, &rescuePreferred, now.Add(25*time.Millisecond))
 		if source.degraded {
 			t.Fatal("fresh burst was degraded before one report could return")
 		}
@@ -1944,6 +1953,7 @@ func TestSchedulerDoesNotCountIdleTimeAsProgressStall(t *testing.T) {
 }
 
 func TestSchedulerRequiresProgressStallForEarlyAbandonment(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024})
 	if err != nil {
 		t.Fatal(err)
@@ -1978,7 +1988,7 @@ func TestSchedulerRequiresProgressStallForEarlyAbandonment(t *testing.T) {
 			scheduler.checkAbandonment(map[protocol.LaneID]*scheduledLane{
 				source.registration.LaneID:    source,
 				alternate.registration.LaneID: alternate,
-			}, now)
+			}, &rescuePreferred, now)
 			if abandonments != tt.wantAbandonments {
 				t.Fatalf("abandonments = %d, want %d", abandonments, tt.wantAbandonments)
 			}
@@ -2016,6 +2026,7 @@ func TestLaneProgressStalled(t *testing.T) {
 }
 
 func TestSchedulerRecoversAfterQueuedExpiry(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 1, Bytes: 1024})
 	if err != nil {
 		t.Fatal(err)
@@ -2041,7 +2052,7 @@ func TestSchedulerRecoversAfterQueuedExpiry(t *testing.T) {
 	now = now.Add(2 * time.Millisecond)
 	scheduler.checkAbandonment(map[protocol.LaneID]*scheduledLane{
 		lane.registration.LaneID: lane,
-	}, now)
+	}, &rescuePreferred, now)
 	if lane.degraded {
 		t.Fatal("lane remained degraded after its final queued transmission expired")
 	}
@@ -2164,21 +2175,21 @@ func TestScheduledLaneTimingUsesFirstSample(t *testing.T) {
 	lane.applyTiming(clockmap.Sample{
 		LocalSendMicros: 1000, RemoteReceiveMicros: 1010, RemoteSendMicros: 1020,
 		LocalReceiveMicros: 1110,
-	})
+	}, false)
 	if lane.rttMicros != 100 || lane.minimumRTTMicros != 100 || !lane.rttObserved {
 		t.Fatalf("first timing state = %d, observed %t", lane.rttMicros, lane.rttObserved)
 	}
 	lane.applyTiming(clockmap.Sample{
 		LocalSendMicros: 2000, RemoteReceiveMicros: 2010, RemoteSendMicros: 2020,
 		LocalReceiveMicros: 2190,
-	})
+	}, false)
 	if lane.rttMicros != weightedAverage7(100, 180) || lane.minimumRTTMicros != 100 {
 		t.Fatalf("smoothed RTT = %d", lane.rttMicros)
 	}
 	lane.applyTiming(clockmap.Sample{
 		LocalSendMicros: 3000, RemoteReceiveMicros: 3010, RemoteSendMicros: 3020,
 		LocalReceiveMicros: 3070,
-	})
+	}, false)
 	if lane.minimumRTTMicros != 60 {
 		t.Fatalf("minimum RTT = %d, want 60", lane.minimumRTTMicros)
 	}
@@ -2196,11 +2207,12 @@ func schedulerLaneWithLimits(t *testing.T, id, group byte, rtt, rate uint64,
 	limits packetqueue.Limits) *scheduledLane {
 	t.Helper()
 	store := schedulerStore(t, limits)
-	store.transportReported.Store(minimumRateSampleBytes)
+	store.transportReported.Store(minimumTransportProofBytes)
 	lane := &scheduledLane{
 		registration: schedulerRegistration(id, group, store),
 		rttMicros:    rtt, deliveryRate: rate, rttObserved: true, rateObserved: true,
 	}
+	store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
 	lane.registration.SendDeliveryReport = func(report protocol.DeliveryReport, _ time.Time, sent func()) bool {
 		frame, err := protocol.MarshalDeliveryReport(report)
 		return err == nil && lane.registration.SendControl(frame, sent)
@@ -2222,6 +2234,8 @@ func schedulerRegistration(id, group byte, store *TransmissionStore) LaneRegistr
 		LaneID: protocol.LaneID(id), Generation: 1, PathGroupID: protocol.PathGroupID(group),
 		Store: store, Abandon: func() {}, SendControl: func(protocol.Frame, func()) bool { return true },
 		ValidatePingProgress: func(uint64) bool { return true },
+		RequestMeasurement:   func() {},
+		SendMeasurement:      func(MeasurementWrite) bool { return true },
 		SendDeliveryReport:   func(protocol.DeliveryReport, time.Time, func()) bool { return true },
 	}
 }

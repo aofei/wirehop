@@ -831,6 +831,7 @@ func (c *Client) runLaneGeneration(ctx context.Context, configured clientLane, g
 		InitialTiming: &timing,
 		Abandon:       abandon, SendControl: lane.SendControl,
 		ValidatePingProgress: lane.ValidatePingProgress, SendDeliveryReport: lane.SendDeliveryReport,
+		RequestMeasurement: lane.RequestMeasurement, SendMeasurement: lane.SendMeasurement, MeasurementInitiator: true,
 	}); err != nil {
 		return err
 	}

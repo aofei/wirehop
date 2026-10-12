@@ -554,49 +554,73 @@ An initial or failed primary is selected by RTT and stable lane identity, includ
 alternative can replace a healthy primary when its delivery rate exceeds the primary estimate by more than 25 percent
 and it can meet the current packet deadline. A change from an existing primary holds that choice for at least two
 seconds and four estimated RTTs, capped at eight seconds. The first assignment does not delay a proven capacity
-improvement. This hold does not suppress failure recovery. A primary that cannot meet the deadline permits a timely
-alternative. If no eligible lane can meet the deadline, the packet is dropped. A full primary retains the pending
-ingress item until feedback, expiry, or a lifecycle transition permits another decision. WireGuard controls can still
-preempt that pending transport item. An initial empty 32-byte WireGuard keepalive uses predicted delivery without fixing
-the bulk-data primary or restarting idle capacity discovery.
+improvement. This hold does not suppress failure recovery. A healthy transport primary retains ownership until actual
+packet expiry instead of discarding or redirecting a live packet solely because its current delivery prediction exceeds
+the remaining lifetime. Startup and recovery from a missing, degraded, or abandoning primary can still use unmeasured
+lanes. Same-group idle siblings do not receive discovery padding and can remain unmeasured until real traffic or
+failover uses them. Previously measured capacity can become stale, and capacity promotion can reorder in-flight packets.
+A primary at its hard memory limit retains the pending ingress item until feedback, expiry, or a lifecycle transition
+permits another decision. WireGuard controls can still preempt that pending transport item. An initial empty 32-byte
+WireGuard keepalive uses predicted delivery without fixing the bulk-data primary or restarting idle capacity discovery.
 
 Each committed transmission records its send time, send-interval anchor, and the preceding cumulative delivered byte
 count and time. Valid feedback samples the bytes since that anchor over the longer corresponding send and feedback
-interval. New flights exclude idle time. Samples need at least 4 KiB and an interval no shorter than one millisecond.
-The data lane's Ping RTT does not bound a sample because feedback can return over another carrier. The interval includes
-the newly acknowledged transmission's actual feedback latency and is bounded by its corresponding send interval. The
-estimate uses the maximum of the last five accepted samples that are younger than the greater of one second or four
-minimum RTTs. Smoothed RTT supplies the fallback before a minimum exists. An accepted increase or decrease replaces the
-estimate directly without another smoothing stage.
+interval. New flights exclude idle time. Samples need positive delivered bytes and an interval no shorter than one
+millisecond. The first capacity sample additionally requires 4 KiB. Isolated handshake, keepalive, and small transport
+frames therefore retain the provisional estimate and startup credit. Once capacity is measured, smaller positive samples
+remain eligible to recover capacity. Applying the byte floor after initialization would reject every observation from a
+small flight indefinitely, including continuously queued traffic and repeated partial acknowledgments. This
+qualification is separate from cumulative real-transport proof for abandonment. The data lane's Ping RTT does not bound
+a sample because feedback can return over another carrier. The interval includes the newly acknowledged transmission's
+actual feedback latency and is bounded by its corresponding send interval. The estimate uses the maximum of the last
+five accepted samples that are younger than the greater of one second or four minimum RTTs. Smoothed RTT supplies the
+fallback before a minimum exists. An accepted increase or decrease replaces the estimate directly without another
+smoothing stage.
 
-Application-limited provenance is recorded when a batch enters the carrier prefix. A batch is constrained when queued
-work remains or at least half the hard packet limit or current estimated byte window is occupied. Otherwise, its
-cumulative sent-packet counter extends the application-limited flight marker. Subsequent batches retain that marker
-until feedback has reported the entire limited flight. Every batch entry carries the same captured state, so partial
-reports and later queue arrivals cannot reclassify it. The estimated sampling window is published after rate, feedback
-delay, and timing updates. Lower or equal application-limited samples neither reduce measured capacity nor evict its
-history. Higher samples remain useful evidence. The first valid sample replaces the provisional 1 MB/s estimate,
-including when it is lower. Duplicate, stale, and invalid reports do not alter the sampling anchors. Earlier receive
-timestamps release valid prefixes without moving the time anchor backwards.
+Application-limited provenance is recorded when a batch enters the carrier prefix. A batch is constrained when at least
+half the hard packet limit or current estimated byte window is occupied. Queued work alone does not establish pressure:
+a finite burst can span multiple writer batches while remaining far below the measured flight window. When neither
+occupancy threshold is reached, the cumulative sent-packet counter extends the application-limited flight marker.
+Subsequent batches retain that marker until feedback has reported the entire limited flight. Every batch entry carries
+the same captured state, so partial reports and later queue arrivals cannot reclassify it. The estimated sampling window
+is published after rate, feedback delay, and timing updates. Lower or equal application-limited samples neither reduce
+measured capacity nor evict its history. Higher samples remain useful evidence. The first valid sample replaces the
+provisional 1 MB/s estimate, including when it is lower. Duplicate, stale, and invalid reports do not alter the sampling
+anchors. Earlier receive timestamps release valid prefixes without moving the time anchor backwards.
 
-A session with at least two healthy distinct path groups starts bounded discovery at admission, before real transport
-traffic chooses a primary. An active discovery period continues within its original deadline and byte cap after primary
-promotion. Later periods start only on alternatives. Discovery uses the reserved zero-ID Data form described below, so
-padding cannot reach UDP or alter relay deduplication. It shares the ordinary writer, transmission store, process
-retention budget, cumulative feedback, and rate estimator.
+A timing pause also interrupts application supply. When its Data gate actually reopens, the existing limited-flight
+marker advances to the next cumulative packet number, saturating at the counter limit. All descriptors committed before
+the first post-resume acknowledgment capture limited provenance even when queued demand fills the window. A late
+pre-pause acknowledgment cannot reach that boundary. The first acknowledgment covering resumed Data permits later
+constrained commits to measure capacity loss, while previously committed descriptors retain their captured provenance.
+Repeated cleanup without another pause does not rearm the marker. This requires no additional state and prevents early
+partial feedback from treating an intentionally restarted flight as evidence of lower capacity.
+
+A session with at least two healthy distinct path groups becomes eligible for bounded discovery at admission without
+waiting for real transport traffic. Active or pending timing drains defer fresh discovery, and useful traffic keeps
+scheduling priority. After admitting a useful packet, the scheduler serves already-waiting ingress and any preempted
+normal packet before adding padding. A blocked useful packet still permits bounded discovery on other paths. This
+ordering does not cover concurrent arrivals after the queue check or guarantee discovery progress while continuously
+supplied useful traffic keeps fitting. An active discovery period continues within its original deadline and byte cap
+after primary promotion. Later periods start only on alternatives. Discovery uses the reserved zero-ID Data form
+described below, so padding cannot reach UDP or alter relay deduplication. It shares the ordinary writer, transmission
+store, process retention budget, cumulative feedback, and rate estimator.
 
 Each discovery period lasts four seconds or eight estimated RTTs, capped at eight seconds, and admits at most 2 MiB of
 encoded padding per lane direction. Unknown capacity retains at most one unreported 4101-byte sample frame within the 16
 KiB startup window. A measured path with less than half a probe frame per unloaded feedback cycle also keeps at most one
-unreported probe. The normal byte window still leaves useful-traffic headroom. Other measured paths use eight feedback
-cycles plus one real-data sampling allowance while no real packet is pending. Useful traffic is scheduled before
-padding. A pending packet restores the normal window and reserves its maximum encoded size and one packet slot before
-probe admission. A round-robin lane cursor prevents one training path from monopolizing discovery work. Another period
-is eligible 30 seconds after the preceding period ends, and only while real transport traffic has been scheduled within
-the last second. Single-path and same-group configurations send no padding. Padding deadlines do not themselves justify
-generation abandonment. Padding bytes still count in the carrier prefix preceding any useful datagram. Stalled
-probe-only progress can temporarily degrade a lane so it cannot block initial traffic on a healthy alternative. It does
-not abandon the generation, and validated progress restores eligibility.
+unreported probe. With no useful packet pending, measured padding credit fits at least one complete encoded probe,
+subject to the hard byte limit. This prevents a small initial estimate from disabling further discovery. Normal flight
+credit is unchanged. The normal byte window still leaves useful-traffic headroom. Other measured paths use eight
+feedback cycles plus one real-data sampling allowance while no real packet is pending. Useful traffic is scheduled
+before padding. For new probe admission, a pending packet restricts retained work to the normal window and reserves its
+maximum encoded size and one packet slot. Already queued padding keeps its writer credit. A round-robin lane cursor
+prevents one training path from monopolizing discovery work. Another period is eligible 30 seconds after the preceding
+period ends, and only while real transport traffic has been scheduled within the last second. Single-path and same-group
+configurations send no padding. Padding deadlines do not themselves justify generation abandonment. Padding bytes still
+count in the carrier prefix preceding any useful datagram. Stalled probe-only progress can temporarily degrade a lane so
+it cannot block initial traffic on a healthy alternative. It does not abandon the generation, and validated progress
+restores eligibility.
 
 The feedback event identifies its incoming carrier separately from the generation whose progress it reports. Return
 correction combines report-construction delay with the incoming carrier's minimum observed half RTT. Duplicate and
@@ -607,7 +631,8 @@ failure recovery. Padding never migrates.
 Timing requests remain small liveness and clock-mapping messages. They do not estimate capacity. First timing requests
 are phase-spread across the first quarter of the active interval, and idle timing backs off to 15 seconds. Admission's
 four timestamps initialize RTT without an extra exchange. The first usable timing sample replaces 100 ms directly, and
-later RTT samples use a seven-to-one moving average.
+later ordinary RTT samples use a seven-to-one moving average. A successful drained refresh replaces the minimum while
+preserving the operating average unless the new minimum is higher.
 
 This policy favors stable bulk throughput after capacity discovery. It does not guarantee capacity aggregation, optimal
 interactive latency, or fairness between independent kernel TCP connections. A capacity change can temporarily stale an
@@ -636,10 +661,11 @@ Costs of more lanes:
 - More bufferbloat risk
 - More proxy and NAT state
 
-Transport uses one primary at a time. Initial selection uses RTT and stable lane identity. Deadline fallback retains
-deterministic delivery prediction and same-group preference. Measured capacity promotion can select any healthy timely
-lane. Other connected lanes remain available for controls, feedback, bounded capacity discovery, and failure recovery.
-Recovery considers every eligible lane rather than limiting the alternatives to the ordinary selection rank.
+Transport uses one primary at a time. Initial selection uses RTT and stable lane identity. A healthy transport primary
+does not redirect individual packets because of predicted deadline risk. Measured capacity promotion can select any
+healthy timely lane. Other connected lanes remain available for controls, feedback, bounded capacity discovery, and
+failure recovery. Recovery considers every eligible lane rather than limiting the alternatives to the ordinary selection
+rank.
 
 Two configured lanes in one path group isolate TCP sequence spaces and permit progress around one stalled stream. They
 do not prove that the underlying path has additional bandwidth. Large numbers of parallel TCP connections are not a
@@ -665,7 +691,7 @@ Packet duplication policy:
 - Duplicate handshake response on up to two deadline-eligible lanes
 - Duplicate cookie reply on up to two deadline-eligible lanes
 - Do not proactively duplicate transport data during normal scheduling
-- Permit one migration attempt for an unexpired transport packet when its original connection generation ends
+- Permit one migration for an unexpired transport packet when its lane degrades or its connection generation ends
 
 The first control-packet copy uses the eligible lane with the earliest predicted arrival. The second copy prefers an
 eligible lane in another path group. When none is available, it uses the next eligible independent lane in the same
@@ -745,19 +771,27 @@ per-lane feedback window. Sustainable throughput is bounded by that packet and b
 time. Reports trigger at 256 Data frames or 256 KiB, with an adaptive interval bounded by 25 milliseconds. Report
 workers use one-shot timers only while progress or a retry remains pending.
 
-The default hard limits are 65,536 packets and 32 MiB per lane direction. Startup retention is additionally bounded to
-16 KiB. Once capacity is observed, the byte window covers four feedback cycles plus 4 KiB, with a 4 KiB floor and the
-configured hard byte limit as its ceiling. A cycle is the larger of minimum RTT and half minimum RTT plus feedback
-return delay, with 25 milliseconds of reporting headroom. Minimum RTT prevents queue growth from increasing its own
-allowance. An empty store can admit one larger datagram when the hard limits permit it. The packet ceiling protects
-small-packet workloads, and the shared process budget also charges every padding transmission.
+The default hard limits are 65,536 packets and 32 MiB per lane direction. These limits bound queued and committed memory
+together. A separate byte window limits the committed but unreported prefix, starting at 16 KiB. Once capacity is
+observed, this window covers four feedback cycles plus 4 KiB, with a 4 KiB floor and the configured hard byte limit as
+its ceiling. A cycle is the larger of minimum RTT and half minimum RTT plus feedback return delay, with 25 milliseconds
+of reporting headroom. Ordinary timing samples can only lower the minimum. Raising it requires the coordinated drain
+described below, so passive sample expiry cannot increase the window from its own queued Data. The scheduler can retain
+live work within the hard memory limits while committed credit is exhausted. A window reduction below the current flight
+stops new commitments without discarding queued work or sent descriptors. The writer checks credit for each frame under
+the same mutex used for cumulative progress and window publication. An empty committed prefix can send one larger
+datagram when the hard limits permit it. Progress, window updates, queued expiry, and pause completion wake a waiting
+writer without a polling loop. Ordinary Data and WireGuard controls share normal credit. Padding uses its existing
+discovery allowance, and all types count against the same committed prefix. The packet ceiling protects small-packet
+workloads, and the shared process budget also charges every padding transmission.
 
 An emptied transmission deque retains at most 512 metadata slots. This accommodates one 256-packet report batch plus
 in-flight progress without repeated allocation and copying under steady traffic. Larger historical capacities still
 shrink as occupancy falls. Retained metadata is separate from the charged packet payload and frame bytes.
 
-The scheduler also drops a packet before assignment when no eligible lane predicts delivery before its deadline. It does
-not enqueue work that is already expected to arrive stale.
+Actual deadlines remain authoritative for transport retained on a healthy primary. Delivery prediction still guides
+control selection, initial keepalives, capacity promotion, and failure recovery. Keeping a live transport packet can
+retain work that later expires, but avoids treating a temporarily depressed delivery estimate as certain packet loss.
 
 Each queued priority deque and the sent-payload deque maintains a conservative earliest-deadline bound to skip expiry
 scans before any retained entry or payload can have expired. Partial dequeues may leave an earlier stale bound, which a
@@ -789,7 +823,7 @@ The command uses these packet and resource limits:
 | Aggregate retained relay work per client process | 131,072 packets and 256 MiB |
 | Aggregate retained relay work per server process | 262,144 packets and 256 MiB |
 | Deduplication window per session direction | 1,048,576 packet IDs, up to 128 KiB allocated on demand |
-| Internally generated controls per lane direction | 64 pending frames |
+| Ordinary internal-control queue per lane direction | 64 pending frames |
 | Scheduler events per session direction | 256 pending events |
 | Client TLS session cache | 64 entries scoped by carrier role, scheme, and socket endpoint |
 
@@ -863,17 +897,8 @@ successful connection, listener, or retained target endpoint.
 
 ### Time units
 
-Go duration literals use the largest standard `time` unit that represents the value with an integer multiplier. A
-multiplier of one is omitted. For example, use `2 * time.Minute`, `time.Minute`, `66 * time.Second`, and
-`1500 * time.Millisecond`. Derived budgets retain their meaningful arithmetic, such as the dial budget plus six
-handshake budgets. This is a project readability convention, not a change to timeout values or precision.
-
 Protocol timing samples and runtime packet deadlines use unsigned integer microseconds. Encoded Data deadlines use
 unsigned integer milliseconds rounded up from runtime deadlines. Authentication timestamps remain Unix seconds.
-Conversions at these boundaries name the required unit explicitly, such as `uint64(5 * time.Minute / time.Microsecond)`.
-Wire-format test vectors retain exact integer values. External tools use their documented input units, including seconds
-for `sleep`, `timeout`, and `iperf3`. Documentation uses readable units, with full unit names in policy tables and
-explicit units in formulas.
 
 ## Connection abandonment and packet migration
 
@@ -891,6 +916,18 @@ Once progress stalls, a lane becomes `degraded` when retained work is at deadlin
 exists. Prediction follows the sent FIFO, queued WireGuard control packets, and queued WireGuard transport packets in
 transmission-store order. Bytes ordered after a frame cannot make that earlier frame appear late. Risk is recomputed
 during periodic scans and queued expiry.
+
+Maintenance also transfers useful unsent transport from a degraded lane to one eligible alternative without waiting for
+new ingress. An unmeasured alternative may receive this work, as it may receive ordinary failover traffic. Transfer
+preserves the original packet ID, deadline, payload ownership, and aggregate retention charge. It consumes the same
+single migration allowance as generation removal. Committed frames, controls, and padding remain on the original lane,
+which stays connected for its existing traffic in both directions.
+
+The transfer holds both stores' mutexes, enforces destination hard capacity and each packet's predicted deadline, and
+preserves the relative order of both transferred and remaining entries. Only the serialized scheduler transfers between
+stores. It changes neither store's cumulative sent or reported counters. Both writers receive a retry notification when
+queued work remains. A partial transfer is reconsidered on later maintenance ticks. The preferred lane changes only
+after successfully transferring work from that preferred lane.
 
 The progress guard starts no earlier than the first outstanding carrier write. Fully reporting that sent prefix resets
 the outstanding interval. Time spent idle or holding only queued work cannot make the next fresh burst appear stalled.
@@ -963,6 +1000,10 @@ Reasons:
   loops
 - Retransmitting stale encrypted packets can increase latency
 - TCP carrier reliability is already present per lane
+
+Carrier recovery and inner TCP recovery have independent state. Restoring an outer stream cannot reset an inner TCP
+sender's retransmission timer. Severe delay or loss can leave that sender waiting in retransmission backoff after the
+carrier is usable again. Packet expiry bounds retained encrypted work without promising immediate inner-flow recovery.
 
 Delivery reports are scheduling feedback, not reliable application acknowledgments. A changed delivery snapshot remains
 eligible for later report intervals until a carrier write completes. Carrier admission and failed lanes follow their own
@@ -1428,10 +1469,6 @@ fails before binding the local UDP socket. Operators use `NO_PROXY` to select di
 
 WireHop uses version 1 of its binary framing protocol inside each carrier lane.
 
-Protocol development may replace incompatible layouts and semantics in place while retaining version `1` and the
-`wirehop.v1` subprotocol. Older layouts need no negotiation, decoder fallback, or compatibility path. Protocol changes
-must update both peers and their tests together.
-
 The carrier provides a byte stream or WebSocket message stream. WireHop frames provide packet boundaries and control
 messages.
 
@@ -1543,20 +1580,78 @@ field, including content lengths. Admission hellos use the explicitly mixed fixe
 above.
 
 The low four bits of the packed header carry the frame type, and the remaining bits carry the content length. Types zero
-and 11 through 15 are invalid. The content length excludes the common header and cannot exceed 65,553 bytes. The packed
+and 12 through 15 are invalid. The content length excludes the common header and cannot exceed 65,553 bytes. The packed
 header occupies one byte through content length 7, two bytes through 1023, and three bytes thereafter. The maximum
-encoded frame is 65,556 bytes. A reader validates the bounded header before allocating content storage. Data content
-contains:
+encoded frame is 65,556 bytes. A reader validates the bounded header before allocating content storage.
 
-| Order | Encoding | Field |
-| ---: | --- | --- |
-| 1 | `uvarint` | Direction-local packet ID |
-| 2 | `uvarint` | Absolute deadline in sender monotonic milliseconds, rounded up |
-| 3 | Remaining bytes | WireGuard packet |
+Protocol version 1 frame types are grouped by purpose: admission responses, Data and delivery feedback, clock mapping
+and timing measurements, then lane and session termination and errors. The registry and payload descriptions use the
+same order:
+
+| ID | Frame | Payload size | Allowed use |
+| ---: | --- | ---: | --- |
+| 1 | Session created | 51 to 78 bytes | Server to client, first WebSocket create response |
+| 2 | Lane accepted | 19 to 46 bytes | Server to client, first WebSocket join response |
+| 3 | Data | 34 to 65,553 bytes | Both directions after admission |
+| 4 | Delivery report | 5 to 50 bytes | Both directions after admission |
+| 5 | Clock sync | 4 to 40 bytes | Client to server, first post-admission frame |
+| 6 | Ping | 2 to 20 bytes | Both directions after admission |
+| 7 | Pong | 4 to 40 bytes | Both directions after admission |
+| 8 | Measurement | 1 to 65,533 bytes | Direction and phase depend on the measurement operation |
+| 9 | Lane abandon | 2 to 20 bytes | Both directions after admission |
+| 10 | Session close | 1 byte | Client to server after admission |
+| 11 | Error | 5 to 535 bytes | Both directions after admission |
+
+Frame IDs identify message types and do not define sending order or scheduling priority. In the client-to-server
+direction, no other in-session frame may precede the generation's clock-sync frame. The server-to-client direction may
+carry in-session frames immediately after admission.
+
+A valid pong must match the sole outstanding ping ID and original send timestamp on the carrying lane. Session-created
+and lane-accepted are valid only in their first-response positions and never on an admitted lane. Any recognized frame
+used outside its allowed phase or direction is a protocol violation.
+
+Ping and Pong have no Data-pause semantics. Independent Measurement frames coordinate one session operation on an exact
+carrier generation. Request asks the client to consider a measurement. Begin, Probe, and Result travel from client to
+server. Ready and Reply travel from server to client. Only the client allocates operation IDs. A late operation or a
+frame on a retired target cannot change the active operation. Direction is checked before operation identity. Any phase
+used in the wrong direction is a protocol violation. A current operation used in the wrong phase is also a protocol
+violation. Correctly directed stale operations are ignored. Measurement fields use canonical unsigned integers and must
+end at the phase's final field.
+
+Payload descriptions follow frame-type order. Fields within each payload appear in the listed order:
+
+- `Session created`: session ID (16 bytes), session secret (32 bytes), path group ID (`uvarint`), server receive time
+  (`uvarint`), and server send time (`uvarint`)
+- `Lane accepted`: session ID (16 bytes), path group ID (`uvarint`), server receive time (`uvarint`), and server send
+  time (`uvarint`)
+- `Data`: direction-local packet ID (`uvarint`), absolute deadline in sender monotonic milliseconds rounded up
+  (`uvarint`), and the remaining WireGuard packet bytes
+- `Delivery report`: lane ID, generation, cumulative Data-frame count, latest parsed Ping ID, and report delay in
+  microseconds (five `uvarint` values)
+- `Clock sync`: client send, server receive, server send, and client receive times (four `uvarint` values)
+- `Ping`: ping ID and send time (two `uvarint` values)
+- `Pong`: ping ID, echoed ping send time, receive time, and send time (four `uvarint` values)
+- `Measurement Request`: kind `1`
+- `Measurement Begin`: kind `2`, operation ID, target count, and that many lane ID and generation pairs. Targets are
+  nonempty and strictly ordered by lane ID. Every generation is nonzero
+- `Measurement Ready`: kind `3`, operation ID, and acceptance flag (`0` or `1`)
+- `Measurement Probe`: kind `4`, operation ID, probe send time `t1`, and remaining hold in microseconds
+- `Measurement Reply`: kind `5`, operation ID, echoed `t1`, receive time `t2`, reply send time `t3`, and remaining hold
+  in microseconds
+- `Measurement Result`: kind `6`, operation ID, valid flag (`0` or `1`), and reply receive time `t4`. A rejected result
+  has flag `0` and timestamp `0`
+- `Lane abandon`: lane ID and generation (two `uvarint` values)
+- `Session close`: close reason (`u8`)
+- `Error`: code (`uvarint`), class (`u8`), scope (`u8`), lane ID (`uvarint`), generation (`uvarint`), and remaining
+  diagnostic bytes, limited to 512 printable-ASCII bytes
+
+Integer fields retain their full unsigned 64-bit value range where their semantics permit it. Payloads with a fixed
+field sequence must end after their final field. Data and Error consume their remaining content as explicitly specified
+above. The table's Data minimum includes the shortest recognized WireGuard packet.
 
 Let `U(x)` be the shortest unsigned LEB128 length of `x`, and let `P` be the WireGuard datagram length. Data content
-length is `L = U(packet_id) + U(deadline_millis) + P`. Its complete encoded length is `U((L << 4) | 1) + L`, and its
-per-datagram overhead is `U((L << 4) | 1) + U(packet_id) + U(deadline_millis)`. For valid WireGuard datagrams, the
+length is `L = U(packet_id) + U(deadline_millis) + P`. Its complete encoded length is `U((L << 4) | 3) + L`, and its
+per-datagram overhead is `U((L << 4) | 3) + U(packet_id) + U(deadline_millis)`. For valid WireGuard datagrams, the
 overhead ranges from 4 to 21 bytes. For example, a 1452-byte datagram with a five-byte packet ID and five-byte deadline
 has 13 bytes of overhead. The maximum occurs with a ten-byte packet ID, an eight-byte representable deadline, and a
 three-byte packed header.
@@ -1568,52 +1663,14 @@ handshake binds every frame to a session, so data frames do not repeat the sessi
 WireGuard class and duplicate or migration state are not transmitted. Both peers derive the class from the public
 WireGuard packet structure. The sender keeps migration state locally, while copies share the same packet ID.
 
-Protocol version 1 frame types and phase constraints are:
-
-| ID | Frame | Payload size | Allowed use |
-| ---: | --- | ---: | --- |
-| 1 | Data | 34 to 65,553 bytes | Both directions after admission |
-| 2 | Ping | 2 to 20 bytes | Both directions after admission |
-| 3 | Pong | 4 to 40 bytes | Both directions after admission |
-| 4 | Clock sync | 4 to 40 bytes | Client to server, first post-admission frame |
-| 5 | Delivery report | 5 to 50 bytes | Both directions after admission |
-| 6 | Session created | 51 to 78 bytes | Server to client, first WebSocket create response |
-| 7 | Lane accepted | 19 to 46 bytes | Server to client, first WebSocket join response |
-| 8 | Session close | 1 byte | Client to server after admission |
-| 9 | Lane abandon | 2 to 20 bytes | Both directions after admission |
-| 10 | Error | 5 to 535 bytes | Both directions after admission |
-
-In the client-to-server direction, no other in-session frame may precede the generation's clock-sync frame. The
-server-to-client direction may carry in-session frames immediately after admission.
-
-A valid pong must match the sole outstanding ping ID and original send timestamp on the carrying lane. Session-created
-and lane-accepted are valid only in their first-response positions and never on an admitted lane. Any recognized frame
-used outside its allowed phase or direction is a protocol violation.
-
-Control payload fields appear in the following order:
-
-- `Ping`: ping ID (`uvarint`), send time (`uvarint`)
-- `Pong`: ping ID (`uvarint`), echoed ping send time (`uvarint`), receive time (`uvarint`), send time (`uvarint`)
-- `Clock sync`: client send, server receive, server send, and client receive times (four `uvarint` values)
-- `Delivery report`: lane ID, generation, cumulative Data-frame count, latest parsed Ping ID, and report delay in
-  microseconds (five `uvarint` values)
-- `Session created`: session ID (16 bytes), session secret (32 bytes), path group ID (`uvarint`), server receive time
-  (`uvarint`), and server send time (`uvarint`)
-- `Lane accepted`: session ID (16 bytes), path group ID (`uvarint`), server receive time (`uvarint`), and server send
-  time (`uvarint`)
-- `Session close`: close reason (`u8`)
-- `Lane abandon`: lane ID and generation (two `uvarint` values)
-- `Error`: code (`uvarint`), class (`u8`), scope (`u8`), lane ID (`uvarint`), generation (`uvarint`), and remaining
-  diagnostic bytes, limited to 512 printable-ASCII bytes
-
-Integer fields retain their full unsigned 64-bit value range where their semantics permit it. Payloads with a fixed
-field sequence must end after their final field. Data and Error consume their remaining content as explicitly specified
-above. The table's Data minimum includes the shortest recognized WireGuard packet.
-
-Ping and pong IDs are nonzero. Ping ID counters start at 1 for each connection generation and never wrap. Exhausting the
-counter ends that generation. Delivery reports and lane-abandon frames require a nonzero lane ID and generation.
-Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted requires nonzero session and path
-group IDs. Encoded receive and send timestamp pairs must not run backward.
+Ping and Pong IDs are nonzero. Ping counters start at 1 for each connection generation and never wrap. Exhausting the
+counter ends that generation. Measurement operation IDs are nonzero session counters, independent of Ping counters.
+Request has no operation ID. Exhausting the operation counter disables further measurements without disrupting Data.
+Measurement holds cannot exceed 4,000,000 microseconds. The target limit is derived from the existing frame bound and
+permits 3276 full-width identities. The default client lane limit remains 16. Ready rejection acquires no pause. Probe
+requires a positive hold. A zero Reply hold rejects the measurement. Delivery reports and lane-abandon frames require a
+nonzero lane ID and generation. Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted
+requires nonzero session and path group IDs. Encoded receive and send timestamp pairs must not run backward.
 
 Version 1 control enums are:
 
@@ -1650,14 +1707,15 @@ The Data codec requires two complete canonical integers. Ordinary datagrams requ
 deadlines. The relay additionally requires a recognized WireGuard packet of at least 32 bytes. ID zero is reserved for a
 capacity probe. It requires a zero deadline and exactly 4096 padding bytes. Padding contents are opaque and discarded.
 This form occupies 4101 encoded bytes, counts in cumulative Data-frame feedback and byte thresholds, and never enters
-UDP, deduplication, or transport migration. Every other zero-ID form is a protocol violation. Protocol version remains
-1.
+UDP, deduplication, or transport migration. Every other zero-ID form is a protocol violation.
 
 The WireHop protocol accepts at most 65,535 bytes of UDP payload for one datagram. UDP ingress reserves one additional
 receive-buffer byte and drops any larger datagram, so an unsupported IPv6 UDP jumbogram cannot be truncated into an
 apparently valid frame.
 
 ### Clock mapping and liveness
+
+#### Clock mapping
 
 The creation exchange bootstraps the session clock mapping with four monotonic timestamps:
 
@@ -1687,26 +1745,16 @@ lane-specific RTT and delivery-rate observations continue in the background. For
 timestamp is sampled when HTTP headers are written, after proxy and TLS preparation. Preparation delay does not enter
 that clock sample.
 
+A matching Pong still confirms liveness when its peer processing span exceeds locally measured elapsed time. A usable
+clock mapping can still update, but that sample does not change RTT or feedback cadence. Clock-rate differences during a
+long processing wait can produce this negative adjusted RTT. Treating it as a one-microsecond RTT would corrupt the
+delivery window's minimum. An exactly zero adjusted RTT retains a one-microsecond floor because timestamp quantization
+can produce zero for a genuinely short exchange.
+
 Every accepted join produces the same four-timestamp sample, and the client sends exactly one clock-sync frame first on
 the new generation. An additional lane updates the mapping without blocking traffic on existing active lanes. The server
 never sends a clock-sync frame to the client. Later bidirectional clock updates use ping and pong. The receiver maps the
 sender's absolute deadline into its local protocol clock and drops an expired frame before writing its payload to UDP.
-
-Each lane permits one outstanding ping. A valid pong echoes both its ID and original send timestamp. A queued request
-cannot accept a pong until the carrier writer has generated that timestamp. Zero is a valid timestamp, so a separate
-state records whether the request has been built. A matching pong can arrive before the local write-completion callback,
-and a late callback cannot restore a completed request or change a newer request. The inactivity timeout starts only
-after the complete ping frame is written to the carrier. While the pong remains pending, valid received frames extend
-the budget. Ten seconds without receive progress fails the generation. Timing requests use a 1-second interval during
-real data transfer and exponential idle backoff capped at 15 seconds, which bounds idle traffic without delaying
-active-path measurements.
-
-Each lane reserves a separate one-slot Pong queue, so ordinary control queue pressure cannot drop a timing response. The
-single writer prefers a ready Pong at the start of each eight-frame control burst, then prefers ordinary controls in the
-remaining budget. Continuous timing requests therefore cannot starve queued reports or local Pings. A peer cannot issue
-its next Ping until it receives the previous Pong. That response has already left the reserved queue, even if the local
-carrier write has not returned. An additional Ping while that queue is occupied violates the one-outstanding-request
-rule and fails the generation instead of silently discarding a response.
 
 Clock samples are measurements rather than authorization data. The estimator rejects reversed spans and values outside
 safe signed arithmetic. Deadline checks use the latest edge of the mapped uncertainty interval, so asymmetric delay does
@@ -1726,6 +1774,160 @@ during suspend, ordinary expired budgets provide recovery instead. This is not a
 waits for the next scheduled wake, which can be up to the 15-second idle Ping interval after resume on a platform whose
 runtime timers pause. Process suspension, background execution restrictions, and display-off behavior are separate from
 system suspend. WireHop does not provide a native Android or iOS lifecycle integration.
+
+#### Ping and Pong
+
+Each lane permits one outstanding ping. A valid pong echoes both its ID and original send timestamp. A queued request
+cannot accept a pong until the carrier writer has generated that timestamp. Zero is a valid timestamp, so a separate
+state records whether the request has been built. A matching pong can arrive before the local write-completion callback,
+and a late callback cannot restore a completed request or change a newer request. The inactivity timeout starts only
+after the complete ping frame is written to the carrier. While the pong remains pending, valid received frames extend
+the budget. Ten seconds without receive progress fails the generation. Timing requests use a 1-second interval during
+local Data writes, including padding, and exponential idle backoff capped at 15 seconds. Receive-only activity does not
+restore the active cadence, and an outstanding Ping can defer the next exchange.
+
+Parsing a matching Pong completes that lane-local exchange without waiting for scheduler publication. It can update
+clock mapping and ordinary RTT, but it cannot raise the minimum or acquire a Data pause. A separate one-slot Pong queue
+preserves responses when the ordinary control queue is full. The writer prefers Pong at the start of each eight-control
+burst and ordinary controls within the remaining budget. Ready Data gets a turn after eight controls. A paused store
+remains gated without blocking control writes. Measurement phases end a control batch so their timestamps are sampled
+near carrier exposure. A phase that expired while queued is skipped without failing the lane.
+
+A peer cannot issue its next Ping until it receives the previous Pong. That response has already left the reserved queue
+even if the local write has not returned. Another Ping while the queue is occupied violates the one-outstanding request
+rule and fails the generation instead of silently discarding a response.
+
+#### Coordinated RTT measurement
+
+Coordinated RTT measurement uses an independent, client-owned session transaction. At most one operation can prepare,
+measure, or publish at a time across all lanes. Repeated requests coalesce. Each operation snapshots a fixed cohort of
+eligible lane IDs and generations. Every cohort member is measured on its actual carrier, so one pause can refresh all
+lanes without serializing their round trips. Preparation messages use the requesting carrier. Timing and result messages
+never switch to a faster feedback carrier. An unmatched generation declines preparation rather than silently changing
+the cohort.
+
+The measurement exchange proceeds as follows:
+
+1. The client reserves the session operation, requests its local Data pause, and sends Measurement Begin with the fixed
+   cohort immediately. Begin requests preparation and does not assert that the client's prefix has already drained
+2. The server closes its session Data gates, waits until cumulative DeliveryReports cover every committed prefix, and
+   sends Measurement Ready. Client preparation proceeds concurrently
+3. Only after both its local prefix proof and the server's Ready arrive does the client queue probes on every cohort
+   carrier. Each writer samples that carrier's `t1` and sends Measurement Probe
+4. The server samples `t2` when parsing each Probe and `t3` when its writer builds the corresponding Reply. A positive
+   Reply hold promises continued session Data quiescence from `t3` until that fixed remaining budget expires
+5. The client samples `t4`, validates `RTT = (t4 - t1) - (t3 - t2)`, applies the result, and sends Measurement Result on
+   that same carrier. The server reconstructs and independently checks the sample before applying it. Client Data
+   resumes after every cohort result completes its carrier write. Server Data resumes after every cohort result is
+   applied or rejected
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>C: Reserve operation and request Data pause
+    C->>S: Begin(id, fixed cohort)
+    par Client preparation
+        C->>C: Close Data gates and await parsed prefixes
+    and Server preparation
+        S->>S: Close Data gates and await parsed prefixes
+        S->>C: Ready(id)
+    end
+    Note over C,S: Require local proof and peer readiness before any Probe
+    Note over C,S: Each carrier runs the following exchange in parallel
+    C->>S: Probe(id, t1, remaining hold)
+    S->>C: Reply(id, t1, t2, t3, remaining hold)
+    C->>C: Validate and apply or reject the actual carrier's RTT
+    C->>S: Result(id, valid, t4)
+    S->>S: Independently validate and apply or reject RTT
+    C->>C: Resume after all Results finish writing
+    S->>S: Resume after all Results finish processing
+    Note over C,S: A fixed local deadline also reopens Data gates
+```
+
+Both endpoints have already drained before `t1`, so the timed request cannot encounter the session's undrained Data
+prefix. Subtracting server processing time alone would not remove queueing encountered before the request reaches the
+server. Prefix proof establishes peer parsing of committed Data, not acknowledgment of every underlying TCP segment.
+Protocol controls, transport control traffic, and retransmissions can still occur. The resulting measurement bounds new
+Data commitment from this session. It does not prove that unrelated traffic or the physical path is unloaded.
+
+Both local preparation and wire completion share one non-extendable four-second transaction deadline. This is
+independent of the ten-second Ping failure and carrier-write timeouts. Multiple carrier round trips and any drain wait
+must fit this same budget, so a live lane may still be unable to complete an active measurement. Probe and Reply
+advertise remaining budgets in whole microseconds. The adjusted RTT must be strictly below the Reply budget, and the
+complete client-side span must be strictly below the Probe budget. Reversed timestamps, unsafe arithmetic, expired
+budgets, revoked prefix proof, and changed target generation reject the evidence. Exactly zero adjusted RTT retains the
+one-microsecond quantization floor. The scheduler checks transaction ownership and prefix proof again when applying a
+queued result. A full event queue rejects publication rather than claiming that the controller applied the sample.
+
+One target's completion cannot release another target's hold. Both endpoints retain session ownership until all cohort
+members complete or the common deadline expires. An exposed Probe or positive Reply must honor its fixed promise after
+ambiguous write failure or lane cancellation. Missing phases cannot extend a pause. Deadline expiry resumes Data, and
+session shutdown releases the operation immediately. Old completions cannot release a newer operation. Failure to
+measure is not a connection-liveness failure. Ordinary carrier errors still follow normal lane teardown.
+
+A server that wants a refresh sends a throttled Measurement Request without pausing Data. The client decides when to
+start. Every local attempt is followed by at least five seconds without another attempt and a quiet interval of at least
+49 times its actual Data pause duration, measured from closing the gates until every current store reopens. Waiting for
+discovery does not incur pause cost. This bounds recurring pause cost to at most two percent in the runtime clock. This
+is a local controller policy, not a wire requirement. Natural low RTT observations can still lower the minimum without
+any measurement transaction. Whether an active measurement's benefit exceeds its cost must be checked against a
+controller-identical no-active-measurement variant.
+
+During preparation, new transport may remain on the existing healthy primary within hard memory limits. Queued unsent
+Data does not participate in the committed-prefix proof. Every retained packet keeps its original deadline. An active
+capacity-discovery period finishes before a pause begins. Pending admission prevents fresh discovery periods, while
+existing periods retain their duration, padding allowance, and cooldown. Preparation can expire while waiting for
+discovery. Begin may already be queued or sent, but no timed Probe can start until both preparations finish. The
+endpoint waiting for discovery does not pause Data prematurely. Once paused, capacity padding cannot start.
+
+Data commitment and pause admission use the same store mutex. A carrier registered during a pause is gated before
+becoming eligible. Replacing, removing, or abandoning any generation revokes prefix proof because discarding a prefix
+does not prove that the peer parsed it. Revocation does not retract an exposed quiet promise. Expiry maintenance,
+DeliveryReports, Ping/Pong, and other controls continue independently. Drain preparation runs outside the carrier
+writer, so it cannot prevent control progress. Measurement phases use the ordinary bounded control queue. Saturation
+before exposure drops the attempt. Saturation after a promise leaves expiry responsible for bounded recovery.
+
+WireGuard handshake and cookie packets use Data frames and therefore share this bounded pause. No packet lifetime is
+extended. The four-second operation limit stays below the default five-second packet lifetime, although an already old
+packet can still expire during the pause. Resume provenance protects delivery-rate sampling from the artificial pause.
+
+Locally triggered refresh requests require measured delivery capacity and a newly accepted ordinary timing sample. Both
+its processing-adjusted RTT and the operating RTT average must yield feedback cycles longer than the four-cycle time
+horizon used to calculate the delivery window. Each cycle includes routed return feedback and 25 milliseconds of
+reporting headroom. The committed-flight horizon uses minimum RTT. Reports update capacity and credit without requesting
+a refresh from historical timing, and validated proofs do not initiate another request. A new low RTT therefore prevents
+old queue delay in the average from requesting a pause. This first comparison occurs before conversion to bytes. Fresh
+RTT can include queueing and does not prove insufficient byte credit or changed physical propagation.
+
+A Ping can follow a complete committed flight, so the controller also models that flight's serialization and one
+unloaded feedback cycle. If `H` is the four-cycle time horizon, `C` is one minimum-RTT feedback cycle, and `B` is the
+recent accepted capacity in bytes per second, the expected loaded cycle is `H + 4096 * 1000000 / B + C` microseconds.
+This includes the sampling allowance at every rate. If either fresh or smoothed feedback fits this expected cycle, the
+evidence is ambiguous. A rate decline alone cannot distinguish increased propagation from temporary loss or queueing.
+The controller delays the first ambiguous calibration by 49 times the estimated pause, capped at 49 times the
+four-second operation limit. Both feedback observations exceeding the expected cycle bypass this delay. The same recent
+estimate controls flight credit and its queue explanation. An expired startup burst cannot make a stable queue appear
+unexplained. Falling window-limited throughput can enlarge the expected loaded cycle, but the fixed ambiguity start and
+four-second cost cap still make calibration eligible within 196 seconds. This prevents permanent suppression even when
+bulk traffic only starts after the path has changed and no earlier high capacity is known. Clean feedback within the
+original time horizon clears the ambiguous interval, avoiding an unnecessary pause when a new burst follows natural
+queue relief. Another valid ordinary sample, session admission, and successful exchange are still required. This is a
+heuristic with a recovery-delay tradeoff, not proof that propagation stayed unchanged. The recurring governor charges
+actual pause duration separately. The estimated first-attempt budget is not an absolute short-flow throughput guarantee.
+
+Retries require another accepted ordinary sample and are separated by at least the default one-second active Ping
+interval. Outstanding exchanges, event delivery, and idle backoff can extend that wait. The session transaction deadline
+and cost-based quiet interval bound interruption independently. A successful refresh records the current delivery rate
+and operating RTT after applying the new propagation floor. Subsequent accepted rate updates raise that capacity
+reference, and valid ordinary timing observations lower the RTT reference as the average converges. These improvements
+update references even when cooldown or horizon checks suppress a request. Another local attempt requires a rate
+decrease exceeding 25 percent from that reference or an RTT increase of at least the greater of 50 milliseconds and one
+quarter of the minimum. A rate increase or falling RTT alone does not request another proof. A server request can
+trigger client measurement without client capacity evidence. In-flight request suppression still applies, and later low
+samples do not cancel already queued requests because a peer demand can describe a different outbound condition. Failed
+or unusable exchanges preserve eligibility for a later retry. A successfully applied measurement replaces the minimum
+without pulling the ordinary RTT average down merely because the session temporarily emptied its own queues.
 
 ### Delivery feedback and packet identity
 
@@ -1756,18 +1958,24 @@ Data count or a Ping ID not yet exposed to the target generation's writer is a p
 progress must advance monotonically together. A mixed regression and advance is invalid, while a duplicate or wholly
 stale snapshot is ignored without changing capacity, timing, or ownership.
 
+Applying an accepted report releases the cumulative prefix and publishes its derived delivery estimate, routed feedback
+delay, and normal and probe send windows under the same store mutex. A queued writer cannot refill the preceding window
+between acknowledgment and the estimate update. Already committed bytes can exceed a newly reduced window and must drain
+before further frames fit. Invalid, duplicate, or stale reports do not change the windows.
+
 The single carrier writer gives internally generated controls priority in bursts of at most eight frames. It coalesces
 only already-queued controls by nonblocking dequeue, without a collection timer, and caps each batch by the burst's
 remaining frame budget. When WireGuard data is ready after such a burst, the writer sends one data batch before another
-control burst. Fairness counts frames rather than carrier writes.
+control burst. Fairness counts frames rather than carrier writes. During a bounded timing drain, Data writes pause while
+ordinary controls remain eligible, so report progress can complete the drain.
 
-Ping, Pong, ClockSync, SessionClose, LaneAbandon, and Error end the current control batch. A boundary frame at the head
-is sent alone. A boundary frame after ordinary controls is the last frame in their batch. Ordinary control queue order
-is preserved, while the reserved Pong queue has priority at the start of a control burst. Builders sample timestamps at
-the writer, and success callbacks run in queue order only after the complete carrier write succeeds. Ping exposure is
-published before writing because feedback can return on another lane before local completion. A rejected queue admission
-does not consume a Ping ID. A builder or carrier failure ends the generation and does not imply per-frame transactional
-completion.
+Ping, Pong, Measurement, ClockSync, SessionClose, LaneAbandon, and Error end the current control batch. A boundary frame
+at the head is sent alone. A boundary frame after ordinary controls is the last frame in their batch. Ordinary control
+queue order is preserved, while the reserved Pong queue has priority at the start of a control burst. Builders sample
+timestamps at the writer, and success callbacks run in queue order only after the complete carrier write succeeds. Ping
+exposure is published before writing because feedback can return on another lane before local completion. A rejected
+queue admission does not consume a Ping ID. A builder or carrier failure ends the generation and does not imply
+per-frame transactional completion.
 
 Each control batch retains the carrier stall deadline. WebSocket receivers expose each complete WireHop frame as it
 arrives, without waiting for the remaining WebSocket message or its closing fragment. A later malformed frame cannot
@@ -1795,1632 +2003,6 @@ violations. Decoding is incremental within a message, and cancellation belongs t
 call that opened that message. Clock-sync admission reads enforce their phase deadline independently of lane
 cancellation. The lane owner controls teardown, preserving abortive close when a generation must discard old stream
 bytes. For TCP and TLS lanes, length-prefixed frames are read directly from the ordered byte stream.
-
-## Protocol and performance review
-
-### 2026-10-11 implementation follow-up
-
-The implementation addresses sampling provenance and retained metadata within V1. It removes report-time queue sampling,
-redundant ingress deadlines, duplicate retained wire/local deadlines, and the second delivery-rate smoothing stage. The
-scalar wire layout, authentication, packet identity, clock mapping, carrier semantics, and external dependencies do not
-change. Compatibility did not constrain this choice. The measured codec cost and rejected recovery experiments do not
-justify replacing these mechanisms without stronger workload evidence.
-
-#### Sampling and storage
-
-The send-time application-limited marker follows the limited flight until its cumulative packet prefix is reported.
-Every committed batch entry records its provenance. Later queue arrivals, partial reports, expired payloads, and
-migration cannot retroactively change that observation. Migration takes a fresh destination snapshot and provenance at
-its next send commitment. Accepted peaks have both a five-observation bound and a time bound of one second or four
-minimum RTTs, whichever is greater. Lower application-limited samples leave both the estimate and history untouched. A
-constrained decrease replaces the aged filtered estimate directly. This uses the sampling principle in the
-[BBR Internet-Draft](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-06#section-4.1.2), not BBR's pacing or
-congestion controller. The filter bounds are local scheduler policy rather than wire constants.
-
-The packet queue owns the sole ingress deadline. A retained transmission stores the corresponding unsigned protocol
-microseconds, and only the zero-ID capacity probe substitutes zero for its wire deadline. Deadline scans and migration
-compare that integer directly. A `uint32` stores the encoded size only after protocol validation. The original payload
-length fits `uint16` because the admitted maximum is 65,535 bytes. Payload expiry still preserves kind, original length,
-encoded accounting, delivery anchors, and the cumulative sent prefix for late feedback.
-
-On Darwin arm64, a retained descriptor now occupies 104 bytes instead of 136 bytes, including the added provenance bit.
-Ingress packet metadata occupies 40 bytes instead of 48 bytes. At 262,144 retained entries, the descriptor difference is
-8 MiB before spare deque capacity, payloads, and allocator overhead. The timestamped rate history adds 40 bytes per
-scheduled lane. The marker and published window add 16 bytes per store on arm64 before the three deque-deadline
-reductions. These layout measurements do not imply a 23.5 percent reduction in total process memory or a measured
-throughput increase.
-
-#### Repeated review and defect injection
-
-The review used fresh production-source overlays for each independent defect injection and ran the complete relay test
-package for every compiled variant. No mutant was written into production files. The first set caught 63 of 64 defects.
-The survivor exposed a test gap at the exact queued-write expiry boundary. Moving the existing fixture to equality
-caught that defect without changing production expiry semantics. A further source review found that the published
-sampling window preceded the current report's feedback-delay update and was not refreshed after timing changes. The
-regression reproduced a published 184,096-byte window where 444,096 bytes were required. Publishing after the complete
-scheduler event fixed it, and a timing-update assertion covers the other path.
-
-The final reduced source completed the following 58 independent rounds. Every variant compiled and failed runtime
-assertions in the complete relay test package. None was counted because compilation failed or the Go test process timed
-out. One initial expiry-kind injection left an unused variable. That invalid variant was excluded, corrected, and rerun
-successfully. These are defect-oriented review rounds rather than a claim that repetition proves absolute correctness.
-Rejected recovery-policy mutations are excluded because those policies are absent from the final implementation.
-
-| Round | Injected defect | Detecting regression |
-| ---: | --- | --- |
-| 1 | `WireDeadlineLost` | `TestLaneWriteControlBatch` |
-| 2 | `ProbeDeadlineNonzero` | `TestSchedulerRunRetriesSharedBudgetAfterRelease` |
-| 3 | `EncodedSizeTruncated` | `TestTransmissionStoreAcknowledgeMixedProbePrefix` |
-| 4 | `TransportProofTruncated` | `TestTransmissionStoreAcknowledgeMixedProbePrefix` |
-| 5 | `DrainBudgetUndercharged` | `TestSchedulerPrioritizesRealTrafficOverProbeBudget` |
-| 6 | `PushAllowsExpiredBoundary` | `TestTransmissionStoreValidation` |
-| 7 | `WriterAllowsExpiredBoundary` | `TestTransmissionStoreTakeBatchSkipsExpiredWork` |
-| 8 | `QueueRetainsExpiredBoundary` | `TestSchedulerRunRetriesSharedBudgetAfterRelease` |
-| 9 | `SentRetainsExpiredBoundary` | `TestTransmissionStorePreservesWriteView` |
-| 10 | `FirstReportAnchorSelected` | `TestTransmissionStoreDeliverySample` |
-| 11 | `DuplicateReportStale` | `TestTransmissionStoreDeliverySamplePreservesProgress` |
-| 12 | `ExactSentPrefixRejected` | `TestTransmissionStoreDeliverySample` |
-| 13 | `OverlappingDeliveryBytesLost` | `TestTransmissionStoreSentPayloadExpiry` |
-| 14 | `ShorterSampleIntervalUsed` | `TestTransmissionStoreDeliverySample` |
-| 15 | `ReportBacklogOffByOne` | `TestTransmissionStoreDeliverySamplePreservesProgress` |
-| 16 | `DrainLeavesOpenGeneration` | `TestTransmissionStoreDeliverySampleMigratedPacket` |
-| 17 | `ExpiryLosesTransportKind` | `TestTransmissionStoreAcknowledgeMixedProbePrefix` |
-| 18 | `LimitedFlightMarkerLost` | `TestTransmissionStoreDeliverySample` |
-| 19 | `LimitedFlightBoundaryInclusive` | `TestTransmissionStoreDeliverySampleMigratedPacket` |
-| 20 | `OddWindowPressureRoundedDown` | `TestTransmissionStoreCapturesSupplyPressureAtSend` |
-| 21 | `HardCapUsedAsSupplyWindow` | `TestTransmissionStoreDeliverySampleMigratedPacket` |
-| 22 | `QueuedSupplyPressureLost` | `TestTransmissionStoreCapturesSupplyPressureAtSend` |
-| 23 | `PacketPressureBoundaryLost` | `TestTransmissionStoreCapturesSupplyPressureAtSend` |
-| 24 | `OnlyLastBatchEntryMarked` | `TestTransmissionStorePreservesSupplyStateAcrossPartialBatchReports` |
-| 25 | `ReportSupplyFlagIgnored` | `TestScheduledLaneReportIgnoresLaterQueuePressure` |
-| 26 | `IdleSampleLowersRate` | `TestScheduledLaneReportIgnoresLaterQueuePressure` |
-| 27 | `ConstrainedDropIgnored` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 28 | `IdleIncreaseIgnored` | `TestScheduledLaneApplicationLimitedSamplesPreserveHistory` |
-| 29 | `MinimumByteSampleRejected` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 30 | `MinimumIntervalRejected` | `TestScheduledLaneDeliveryRateSamplingInterval` |
-| 31 | `RateMultiplicationOverflows` | `TestScheduledLaneDeliveryRateSamplingInterval` |
-| 32 | `PeakRingDoesNotAdvance` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 33 | `PeakTimestampLost` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 34 | `MaximumRTTAgeOverflows` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 35 | `HighRTTPeakExpiresTooSoon` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 36 | `QueuedRTTInflatesPeakAge` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 37 | `ExactPeakAgeRetained` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 38 | `MinimumRateFiltered` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 39 | `SlowDownSmoothingRestored` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 40 | `MeasuredRateFlagLost` | `TestScheduledLaneApplicationLimitedSamplesPreserveHistory` |
-| 41 | `ExactStallBoundaryMissed` | `TestSchedulerProbeCapacityDivertsBeforeProvenRecovery` |
-| 42 | `FirstFrameSerializationLost` | `TestProgressGuardIncludesSerializationAndFeedback` |
-| 43 | `FeedbackDelayLost` | `TestProgressGuardIncludesSerializationAndFeedback` |
-| 44 | `MinimumStallGuardLost` | `TestSchedulerRecoversStallBeforeSalvageWindowCloses` |
-| 45 | `ReportDropsUnsentBacklog` | `TestLaneDeliveryThresholdReleasesHighBandwidthWindow` |
-| 46 | `ExpiredDeadlineRiskIgnored` | `TestSchedulerRecoveryRequiresMigratableTransport` |
-| 47 | `MigrationEligibilityBoundaryLost` | `TestTransmissionStoreProbeDeadlineAssessment` |
-| 48 | `PacketCountNotPublished` | `TestSchedulerExpiryUsesIngressClock` |
-| 49 | `ByteCountNotPublished` | `TestSchedulerFillTransportProbe` |
-| 50 | `SentPacketCounterNotAdvanced` | `TestTransmissionStoreDeliverySample` |
-| 51 | `SentByteCounterNotAdvanced` | `TestSelectCandidatesSeparatesQueuedAndUnreportedData` |
-| 52 | `ProbeDeadlineUsesLocalExpiry` | `TestSchedulerRunRetriesSharedBudgetAfterRelease` |
-| 53 | `ReportTransportProofCountsPadding` | `TestTransmissionStoreAcknowledgeMixedProbePrefix` |
-| 54 | `PacketOwnershipNotRetained` | `TestSchedulerMigrateTransmissions` |
-| 55 | `ReportWindowNotUpdated` | `TestScheduledLaneFeedbackDelayIncludesReportWait` |
-| 56 | `TimingWindowNotUpdated` | `TestScheduledLaneFeedbackDelayIncludesReportWait` |
-| 57 | `PeakRTTWindowMultiplicationOverflows` | `TestScheduledLaneDeliveryRateAgesSamples` |
-| 58 | `MigrationKeepsSourceSupplyFlag` | `TestTransmissionStoreDeliverySampleMigratedPacket` |
-
-#### Recovery experiments and fixed acceptance bounds
-
-Unconditional reset on any expired sent transport payload regressed recovery and opened eight connections instead of
-three on the single-lane 32 kbit/s case. A bounded standby trial that copied at least 4 KiB of fresh transport while
-preserving packet IDs also failed the original recovery requirement. Its first three directional results recovered 0.0,
-1.1, and 6.2 percent. A refined trial still recovered only 0.2 percent forward and zero percent in the forward half of
-the bidirectional case. Both trial implementations and their extra state were removed. Removing the startup-flight
-allowance from fresh work also failed the existing slow-flight regression and was rejected.
-
-An intermediate policy passed five repetitions of the three capacity-collapse flows, but its full 65-case run failed the
-WSS 32 kbit/s connection-count bound with four connections instead of three. Five alternating baseline and traced
-candidate repetitions did not reproduce that extra connection, so its individual close cause remains unconfirmed. Source
-review and failing boundary regressions independently established that the expiry shortcut could abandon a healthy small
-flight before its normal serialization allowance elapsed. The bounded experiment therefore also required more than 16
-KiB of sent-unreported encoded bytes. Equality and queued bytes cannot authorize the shortcut.
-
-The intermediate implementation completed five repetitions of all three original capacity-collapse directions. Capacity
-fell at five seconds, returned at twelve seconds, and each flow ended at twenty seconds. The original verifier requires
-the final window to recover at least 25 percent of the pre-fault rate. No duration, queue cap, packet lifetime, or
-acceptance threshold changed. The table gives each direction's recovery percentage, not whole-flow goodput.
-
-| Repetition | Forward | Reverse | Bidirectional forward | Bidirectional reverse |
-| --- | ---: | ---: | ---: | ---: |
-| 1 | 100.390% | 67.450% | 31.957% | 105.976% |
-| 2 | 100.120% | 59.082% | 74.728% | 103.477% |
-| 3 | 99.670% | 79.522% | 101.988% | 116.038% |
-| 4 | 97.447% | 100.083% | 85.214% | 111.162% |
-| 5 | 99.766% | 103.793% | 128.646% | 67.571% |
-
-All fifteen flows passed. The first set also passed single and shared-path 32 kbit/s scenarios without extra carrier
-connections, and the fixed 600-millisecond delay scenario. These preliminary results did not establish full acceptance,
-as the later WSS failure demonstrated. They do not describe the final reduced implementation.
-
-#### Bounded-flight candidate and migration diagnosis
-
-The bounded-flight candidate passed all 65 original Linux kernel WireGuard integration scenarios. The matrix covered
-native and direct forwarding, all four carriers, asymmetric paths, loss, latency, idle recovery, rekeying, route
-failures, UDP traffic, IPv6, route marks, shared and distinct slow links, capacity collapse, outages, roaming, and
-stalled carriers. No case, duration, or verifier requirement changed. WSS at 32, 64, and 128 kbit/s each retained the
-required three TCP connections including the iperf3 control and data connections. The previously observed extra
-connection did not recur in this matrix. A subsequent reverse capacity-collapse repetition nevertheless recovered zero
-percent in the final window. An instrumented bidirectional repetition reproduced zero reverse recovery. This candidate
-therefore did not pass repeated acceptance.
-
-The trace recorded a reverse inner TCP RTO of 11.612 seconds after the shared fault. An unmeasured alternate carrying
-migrated packets remained outstanding while a reconnected generation started carrying newer traffic. Its next inner TCP
-retransmission fell outside the twenty-second flow. The trace does not establish whether deadline expiry, WireGuard's
-replay window, or both discarded the last retransmission. A trial requiring measured migration capacity still failed a
-forward repetition with zero recovery and was removed. The provisional startup estimate remains available for ordinary
-admission and eligible migration.
-
-The reconnect-only handoff candidate passed its six initial gates and four additional three-direction repetitions. Its
-fifth repetition failed forward recovery at zero percent. Restricting handoff to reconnecting generations left the same
-ordering gap when the scheduler first selected an initial alternate. That generation restriction was removed from
-selection-time handoff. Initial registration alone still cannot retire another lane.
-
-The ordered handoff candidate extended retirement to initial-alternate selection and reused recovery eligibility to
-exclude stalled or full replacements. Directed tests covered preserved IDs, deadlines, FIFO ordering, one-time cleanup,
-slow serialization, and WireGuard replay counters. The original bidirectional gate nevertheless recovered only 16.480
-percent in its reverse direction, below the unchanged 25 percent requirement.
-
-All new recovery policies, their counters, helper functions, and policy-specific tests were removed. The final
-implementation retains the original recovery decisions. Integer deadline storage preserves their existing boundary
-semantics. The current experiments do not establish a reliable fix for the existing TCP capacity-collapse failure.
-Retaining additional heuristics after these failed acceptance runs would add complexity without establishing the
-required behavior. Final-source network results are recorded separately below, including any failures.
-
-#### Paired performance measurements
-
-The baseline is `c62c761`. Both variants use Go 1.27.2 and Linux arm64 on kernel `7.0.14-linuxkit`. Baseline and
-candidate runs alternate, reverse order on alternate repetitions, and do not overlap other test or build jobs. Unrelated
-existing service containers remain running. These are local measurements, not hardware capacity limits or statistical
-confidence intervals. The pipeline uses a fixed 128-packet window and synthetic WireGuard-shaped UDP echo traffic
-without WireGuard encryption or inner TCP. Amortized ns/op is not packet RTT, and payload MB/s counts each packet once
-even though the echo traverses the relay in both directions.
-
-Three two-second repetitions per variant and payload on the final reduced source produced these medians. The 32-byte
-overlay changes only the benchmark payload.
-
-| Payload bytes | Carrier | Baseline ns/op | Candidate ns/op | Baseline MB/s | Candidate MB/s |
-| ---: | --- | ---: | ---: | ---: | ---: |
-| 1452 | TCP | 3045 | 3156 | 476.90 | 460.04 |
-| 1452 | TLS | 3136 | 2972 | 463.02 | 488.51 |
-| 1452 | WebSocket | 3915 | 3836 | 370.89 | 378.56 |
-| 1452 | SecureWebSocket | 3773 | 3715 | 384.87 | 390.84 |
-| 32 | TCP | 2471 | 2442 | 12.95 | 13.10 |
-| 32 | TLS | 2442 | 2427 | 13.10 | 13.19 |
-| 32 | WebSocket | 2414 | 2439 | 13.25 | 13.12 |
-| 32 | SecureWebSocket | 2436 | 2443 | 13.14 | 13.10 |
-
-The MTU-sized medians range from a 3.54 percent TCP deficit to a 5.51 percent TLS gain. The three paired TCP
-operation-time changes were -1.74, -8.26, and +9.94 percent, so the ratio of medians does not describe every pair. The
-small-packet goodput changes range from -0.98 to +1.16 percent. These measurements do not establish a uniform end-to-end
-throughput improvement.
-
-Earlier intermediate-source short samples showed WebSocket and secure-WebSocket deficits of 9.45 and 6.39 percent. Five
-longer five-second repetitions reduced those differences to about -1.25 and +1.17 percent. They illustrate the noise in
-local pipeline measurements rather than validating the final source. All raw samples, including unfavorable ones and
-rejected candidates, remain in the temporary review artifacts.
-
-An initial storage comparison used different wire deadlines because the old test helper maintained an independent wire
-value while the new helper used the local deadline. That comparison is excluded. The retained benchmark fixtures use
-protocol time 1000 microseconds. A baseline-only overlay also makes its wire deadline equal its local deadline, so both
-versions encode identical metadata. Three two-second repetitions with those normalized fixtures produced:
-
-| Storage operation | Baseline ns/op | Candidate ns/op | Operation time reduction |
-| --- | ---: | ---: | ---: |
-| BacklogCycle | 2167.0 | 1652.0 | 23.77% |
-| Cycle/Aggregate | 156.2 | 116.9 | 25.16% |
-| Cycle/Local | 151.9 | 106.9 | 29.62% |
-
-All normalized storage samples reported zero allocated bytes and zero allocations per operation. These are storage
-operation costs rather than real WireGuard goodput. The memory-layout reduction and faster storage operations support
-the simplification. Whole-pipeline acceleration remains unproven.
-
-#### Final-source network results
-
-The final reduced implementation passed all 65 original Linux kernel WireGuard integration scenarios. WSS at 32, 64, and
-128 kbit/s each opened exactly three TCP connections, including iperf3 control and data. The original scripts, scenario
-durations, packet lifetimes, queue limits, topology checks, and acceptance thresholds remained unchanged. Capacity falls
-at five seconds and returns at twelve seconds in the twenty-second recovery flows. The verifier requires at least 25
-percent recovery in each direction's final window.
-
-| Run | Forward | Reverse | Bidirectional forward | Bidirectional reverse |
-| --- | ---: | ---: | ---: | ---: |
-| Full matrix | 97.870% | 100.734% | 71.657% | 76.194% |
-| Repetition 1 | 100.253% | 97.121% | 100.662% | 111.905% |
-| Repetition 2 | 97.438% | 98.970% | 110.913% | 116.760% |
-| Repetition 3 | 99.944% | 68.020% | 112.398% | 100.151% |
-
-All three additional sets passed their original verifiers, including WSS at 32 kbit/s. All sixteen recovery directions
-exceeded the unchanged threshold. The lowest recovery ratio was 68.020 percent. These repeated results do not prove that
-TCP recovery is free from timing-dependent failures.
-
-The final source also passed all eighteen original routed performance flows, covering two capacity profiles and three
-repetitions of each standalone and combined path. The combined/best-standalone median ratios were 0.979 and 0.998. Every
-individual combined flow also exceeded the required 85 percent of the best standalone median.
-
-A fresh eighteen-flow baseline matrix used the unchanged `c62c761` executable with the same Go compiler and kernel.
-Candidate runs preceded baseline runs as separate blocks rather than alternating per flow. The original six-way
-candidate-versus-baseline comparison passed:
-
-| Profile | Path | Baseline median Mbit/s | Candidate median Mbit/s | Candidate/baseline |
-| --- | --- | ---: | ---: | ---: |
-| HighCapacity | Low | 8.167 | 8.158 | 0.999 |
-| HighCapacity | High | 47.881 | 47.595 | 0.994 |
-| HighCapacity | Both | 46.694 | 46.612 | 0.998 |
-| LowCapacity | Low | 86.855 | 87.190 | 1.004 |
-| LowCapacity | High | 6.661 | 6.430 | 0.965 |
-| LowCapacity | Both | 86.490 | 87.035 | 1.006 |
-
-The baseline matrix itself failed its original individual-flow floor. Its first HighCapacity combined flow achieved
-35.589 Mbit/s against a 47.881 Mbit/s best-standalone median, or about 74.3 percent. Its other two combined samples were
-48.175 and 46.694 Mbit/s. No sample was discarded or replaced. The independent baseline comparison still passed all six
-median bounds. These observations establish passing final-source acceptance in this environment, not a uniform
-throughput gain or freedom from timing-dependent network behavior.
-
-The tested Linux arm64 executable has SHA-256 `ca804c6d2081fbba33af446229a32d45bda2d694adfba0f3a65bed781b10a486`.
-Production source hashes were frozen before correctness and performance validation. The repeated recovery and routed
-matrices use that same executable.
-
-#### Correctness checks
-
-The final reduced source passed all 26 packages with shuffled race checking on Darwin arm64 and all 26 packages by
-actual Linux arm64 execution. Linux 386, Linux amd64, Windows amd64, and FreeBSD amd64 passed test compilation only. The
-receiver and lane fuzz targets completed 481,344 and 584,522 executions in ten seconds each with four workers. Static
-analysis passed. Directed coverage includes the full unsigned clock domain, maximum admitted payloads, exact expiry,
-nonmonotonic retained deadlines, partial late feedback, counter exhaustion, shared retention ownership, writer-held
-references, migration, constrained-destination sampling, RTT-window multiplication overflow, and repeated cleanup.
-Production hashes remained unchanged throughout these checks.
-
-### 2026-10-10 architecture audit
-
-This audit uses the unchanged production source at `c62c761`. Other worktrees contain independent, uncommitted
-experiments and are outside this assessment. Incompatible changes, including a complete replacement, remain available
-within V1. The immediate recommendation is to improve recovery, sample provenance, and I/O before replacing the compact
-scalar codec. No production implementation or wire layout changed in this audit.
-
-The current protocol is an authenticated session carrying deadline-bound datagrams over independent ordered TCP lanes.
-It forwards complete packets independently and uses additional lanes for path selection, control duplication, and
-bounded recovery. TCP, TLS, WS, and WSS share the same post-admission Data and control semantics. The full wire layouts
-appear in the frame protocol section above.
-
-| Mechanism | Current purpose | Decision |
-| --- | --- | --- |
-| Raw HMAC hellos or WebSocket admission headers | Authenticate creation and joins, bind a generation, authorize the target, and bootstrap time | Preserve authentication and pre-upgrade rejection. A single binary HTTP admission header is a useful simplification candidate |
-| `uvarint((content_length << 4) | frame_type)` | Delimit typed frames, independently of TCP segmentation and WebSocket fragmentation | Already compact. A one-bit Data envelope has little measured codec benefit |
-| Global direction-local packet ID | Suppress copies across lanes and migration | Keep for the present delivery contract. It is not the cumulative lane acknowledgment number |
-| Absolute millisecond deadline | Bound stale delivery using the sender's ingress time | Keep an equivalent freshness mechanism. A TTL restarted at receipt changes the contract |
-| Four-timestamp timing and initial ClockSync | Map independent clocks and measure lane RTT without another bootstrap round trip | Retain until a replacement handles asymmetry, suspend, drift, and generation changes |
-| Generation-specific cumulative parsing reports | Reconstruct the sent prefix and return feedback over an alternate lane | Retain peer parsing evidence. Kernel acknowledgment and UDP submission are different events |
-| Stable transport primary and bounded discovery | Select capacity while limiting inner TCP reordering | Provides selection and resilience. Aggregation needs a different scheduling policy and a positive gain target |
-| One-time migration | Salvage fresh transport packets after generation removal | Keep bounded. An additional ordinary retransmission loop would compound TCP's recovery behavior |
-
-#### Fresh measurements and acceptance results
-
-Fresh Linux measurements used Go 1.27.2, Linux arm64, kernel `7.0.14-linuxkit`, an Apple M4 Pro host, and the existing
-`wirehop-integration` image. Benchmarks and kernel flows ran sequentially without concurrent test or build jobs.
-Containers used disposable resources and did not modify host routes or sysctls. Existing unrelated service containers
-remained running, so these are local observations rather than isolated hardware capacity measurements.
-
-A five-second TCP pipeline CPU profile recorded 3148 ns/op and 461.31 MB/s. The benchmark uses a 128-packet window, a
-UDP echo target, and synthetic 1452-byte WireGuard-shaped packets. Its amortized ns/op is not packet RTT. Its MB/s
-counts a payload once although it travels both ways, and the driver and echo target contribute to CPU samples. Of 37.74
-sampled CPU seconds, 62.24 percent landed directly at the Linux syscall entry. Protocol-package instructions accounted
-for 0.53 percent directly, or 1.93 percent when counting each stack containing a protocol function once. That latter
-category includes payload copies and underlying I/O. Suspend-aware clock calls accounted for 5.33 percent by stack
-membership. These categories overlap and must not be added together or interpreted as guaranteed removable overhead.
-
-Three unprofiled two-second repetitions per carrier produced the following medians. The 32-byte comparison changed only
-the existing benchmark payload through a temporary source overlay. All original samples remain in the experiment output.
-
-| Carrier | 1452-byte ns/op | 1452-byte MB/s | 1452-byte B/op | 32-byte ns/op | 32-byte MB/s |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| TCP | 3438 | 422.30 | 9 | 2441 | 13.11 |
-| TLS | 3564 | 407.42 | 10 | 2423 | 13.21 |
-| WebSocket | 4304 | 337.38 | 7 | 2420 | 13.22 |
-| SecureWebSocket | 3887 | 373.52 | 9 | 2425 | 13.19 |
-
-The smaller-packet comparison measures packet-rate costs without real WireGuard encryption or inner TCP. It cannot
-establish WAN capacity, tail latency, or a production ranking between TLS and WebSocket variants. Integer-rounded
-allocation counts of zero also do not imply zero total allocation. The failed kernel recovery checks below are
-independent of these favorable loopback rates.
-
-The original three twenty-second kernel WireGuard capacity-collapse scenarios ran once each. Their original schedule
-reduced the shared carrier capacity to 32 kbit/s at five seconds and restored it at twelve seconds. Neither the fault
-schedule nor the verifier changed. The recovery metric uses sender interval bytes in the original pre-fault and
-final-five-second windows, rather than receiver goodput or the whole-flow average.
-
-| Scenario and direction | Pre-fault Mbit/s | Final-window Mbit/s | Recovery | Original 25% requirement |
-| --- | ---: | ---: | ---: | --- |
-| Forward | 1346.866 | 182.667 | 13.56% | Fail |
-| Reverse | 1352.612 | 181.328 | 13.41% | Fail |
-| Bidirectional, forward | 735.829 | 897.581 | 121.98% | Pass |
-| Bidirectional, reverse | 1338.273 | 1379.448 | 103.08% | Pass |
-
-The failed forward flow had zero sender interval bytes from approximately six through nineteen seconds. The reverse flow
-retained a small trickle during impairment, then had zero interval bytes from approximately eleven through nineteen
-seconds. Both resumed substantial traffic only in the last interval. Capacity had already been restored at twelve
-seconds. This reproduces delayed recovery on current source and a newer kernel. It does not identify whether the
-decisive delay arose from carrier retransmission, inner TCP timeout, retained state, or their interaction. A successful
-bidirectional run does not resolve either failure. Server UDP receive-buffer and send-buffer error counters were zero in
-both failed cases, which does not exclude other queues or the client UDP boundary. The full 65-case kernel matrix and
-18-flow routed matrix were not rerun for this documentation audit. A fresh `go test -race -shuffle=on -count=1 ./...`
-passed all 26 packages. The temporary behavioral traces also passed on Darwin and Linux arm64.
-
-Reproduce the unchanged-source profile and original fault checks with:
-
-```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go test -c -o /tmp/wirehop-audit-client.test ./internal/client
-docker run --rm --network none -v /tmp:/audit --entrypoint /audit/wirehop-audit-client.test \
-  wirehop-integration -test.run '^$' -test.bench '^BenchmarkRelayPipeline/TCP$' \
-  -test.benchtime=5s -test.count=1 -test.cpuprofile /audit/wirehop-audit-cpu.pprof
-go tool pprof -top /tmp/wirehop-audit-client.test /tmp/wirehop-audit-cpu.pprof
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/wirehop-audit-linux ./cmd/wirehop
-sh test/integration/run.sh /tmp/wirehop-audit-linux /tmp/wirehop-audit-kernel \
-  tcp-multipath-capacity-change tcp-multipath-capacity-change-reverse \
-  tcp-multipath-capacity-change-bidir
-```
-
-#### Estimator and recovery findings
-
-`scheduledLane.applyReport` classifies a sample using `TransmissionStore.deliveryConstrained` immediately before
-acknowledging it. The classification uses current queued work and current occupancy. `deliverySnapshot` records delivery
-and send anchors, but no marker describing whether the sampled transmission was application-limited. Consequently,
-unrelated work arriving after transmission can change how the earlier sample affects capacity.
-
-A temporary behavioral test sent exactly one 4096-byte encoded frame at time 1000 microseconds and reported it 300
-milliseconds later. Both cases began with an observed rate of 1,000,000 B/s and a 10-millisecond RTT. When no new work
-was queued, the estimate stayed at 1,000,000 B/s. Queuing one new transport frame immediately before the identical
-report lowered it to 876,706 B/s. The acknowledgment, transmission history, and elapsed sample time were unchanged. This
-proves sensitivity to later queue occupancy, rather than proving a specific network failure's cause.
-
-The next estimator experiment should preserve application-limited provenance with the sampled transmission and carry it
-into the associated delivery sample. The
-[BBR draft's delivery sampler](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/06/#section-4.1.2) records this
-information when sending. WireHop need not adopt BBR's congestion controller. Its application parsing feedback includes
-different queueing and return paths, so the change still requires burst, sparse-load, feedback-delay, and capacity-step
-validation.
-
-The five-sample maximum filter and seven-to-one decrease also have a concrete convergence cost. A temporary trace first
-filled the rate history with five 10,000,000 B/s observations, then supplied accepted, constrained samples of 4096 bytes
-over one second each:
-
-| Number of low-rate samples | Resulting estimate, B/s |
-| ---: | ---: |
-| 1 | 10,000,000 |
-| 4 | 10,000,000 |
-| 5 | 8,750,512 |
-| 10 | 4,490,209 |
-| 20 | 1,184,280 |
-| 40 | 85,772 |
-
-This is a deterministic estimator trace, not a simulation of the kernel flow. Actual sample intervals and bytes differ.
-It nevertheless shows why a fixed count of samples is not a fixed adaptation time, especially when feedback becomes
-sparse. No eligible observations means the peak never ages. Consider explicit sample age and a separate response to
-confirmed capacity reduction, while preserving the rule that ordinary application idleness does not prove lower
-capacity.
-
-Rate error matters beyond path ranking. The same estimate controls the application delivery window, serialization
-prediction, write quantum, and progress guard. These decisions interact with kernel TCP congestion control and the inner
-TCP sender. Separate the estimate used to compare paths from the mechanisms that bound queued work and detect an
-unusable generation. Removing all application backpressure would still allow stale bytes to accumulate in kernel and
-proxy queues.
-
-Recovery has a second structural dependency. `hasTimelyAlternative` requires measured rates on both paths and at least
-4096 previously reported real transport bytes on the alternative before abandoning the primary. Padding can establish a
-rate but cannot establish that real-transport proof. A standby that has carried only probes and controls therefore
-cannot alone authorize abandonment. If the inner sender has already stopped producing packets, proving the alternative
-can require the very progress recovery is meant to restore. This is a reachable feedback dependency to test, not
-evidence that its removal alone fixes the failed scenarios. Earlier unconditional-reset experiments also failed recovery
-checks.
-
-Distinguish four events in diagnostics: local carrier write completion, kernel acknowledgment on the immediate TCP leg,
-peer WireHop parsing, and UDP submission. Reports currently acknowledge parsing before the receiver acquires its shared
-UDP write slot. A report cannot prove UDP delivery or successful WireGuard authentication. Across a terminating reverse
-proxy, TCP_INFO describes only the immediate connection. Per-socket
-[TCP_NOTSENT_LOWAT](https://docs.kernel.org/networking/ip-sysctl.html#tcp-notsent-lowat) is worth measuring as an
-unsent-queue bound, but it cannot replace end-to-end parsing feedback. Recovery analysis must also retain inner TCP RTO
-observations, because [RFC 6298](https://datatracker.ietf.org/doc/html/rfc6298#section-5) requires timeout backoff that
-can persist after carrier capacity returns.
-
-Two latency costs need separate budgets. The shared receiver clock mapping can accept up to five seconds of uncertainty.
-Conservative expiry at the latest mapped bound can therefore permit as much as ten additional seconds beyond the actual
-sender deadline, plus less than one millisecond of encoding rounding, while the true offset stays within the measured
-interval. Clock drift requires a separate allowance. The five-second default is a sender queue and migration lifetime,
-rather than a strict end-to-end age bound. A fresh low-delay interval combined with explicit aging is a better candidate
-than removing timestamps or keeping the historically best sample forever. The current-source feedback and freshness
-audit below provides the derivation.
-
-Discovery also consumes real carrier capacity. Each lane direction can send 2 MiB per discovery period, and sixteen
-distinct lanes in both directions have a theoretical 64 MiB simultaneous-period ceiling. These are bounds, not observed
-probe totals. Measure a shared session probe budget and confidence-based refresh against useful offered traffic, short
-transfers, and metered paths. Previous attempts to defer all probing until traffic or stop primary probing immediately
-regressed routed startup. A smaller budget must demonstrate convergence as well as lower padding overhead.
-
-#### Simplification candidates with concrete tradeoffs
-
-A stateless Data-envelope prototype used `uvarint(content_length << 1)`, reserving the low bit for a future control
-escape. It preserved current packet IDs, absolute deadlines, canonical integer checks, size bounds, and the payload
-copy. Both round-trip codecs reused their output buffers and then decoded every Data frame. The experiment covered five
-500-millisecond repetitions of each case on Linux arm64. Its control path, real carrier integration, and fault behavior
-were not implemented, so the results assess only the Data codec.
-
-| Payload bytes | Frames per operation | Current median ns/op | Prototype median ns/op | Header bytes per packet, current/prototype |
-| ---: | ---: | ---: | ---: | ---: |
-| 32 | 1 | 25.20 | 24.62 | 12 / 11 |
-| 32 | 16 | 389.20 | 384.70 | 12 / 11 |
-| 128 | 1 | 26.08 | 25.97 | 12 / 12 |
-| 128 | 16 | 406.60 | 406.10 | 12 / 12 |
-| 1452 | 1 | 41.54 | 41.19 | 13 / 12 |
-| 1452 | 16 | 673.20 | 669.90 | 13 / 12 |
-
-IDs and deadlines occupied five bytes each. Timed variants ran in consecutive groups, rather than alternating pairs, so
-small differences have limited attribution. Saving one byte improves the 1465-byte frame's theoretical payload-per-byte
-efficiency by about 0.068 percent. The observed scalar difference was 0.35 ns. A control escape would introduce another
-control layout and type-dependent sizing. This is a low-priority bulk-throughput change, even with no compatibility
-constraint.
-
-Batch bases and independent ID/deadline deltas can save much more metadata for dense small-packet traffic. Keep
-independent datagram boundaries and incremental delivery. A complete outer batch must not delay its first available
-packet. Priority scheduling, migration, and reconnect need negative deltas or absolute escapes. Compare ready scalar
-traffic and realistic batching frequency before accepting additional decoder state.
-
-The current arm64 retained-transmission descriptor occupies 136 bytes. A temporary layout probe occupied 104 bytes by
-retaining one integer microsecond deadline, using a bounded `uint32` encoded size and `uint16` original payload length,
-and keeping the existing packet ownership, budget pointer, migration flag, and delivery snapshot. Production local and
-wire deadlines already originate from the same protocol-clock value. Normalizing that representation would remove
-duplicate time state and `time.Time` storage without changing the wire format. At 262,144 simultaneously retained
-entries, the descriptor arithmetic is 34 MiB versus 26 MiB before deque spare capacity. Queued records could separately
-omit the 32-byte delivery snapshot until commitment. These are measured layout sizes and arithmetic bounds, not
-implemented memory savings or a measured throughput gain. Clock-range, migration, expiry, ownership, and partial-write
-tests must accompany an implementation.
-
-| Candidate | Expected benefit | Cost or required decision | Priority |
-| --- | --- | --- | --- |
-| Send-time sample provenance and explicit capacity-step handling | More meaningful rate changes and less coupling to new queued work | Preserve sparse-load behavior and validate the unchanged fault and routed-flow acceptance targets | High |
-| Transport-aware admission and recovery | Bound stale work before carrier queues dominate recovery | Preserve proxy-aware parsing evidence and validate slow links, delay steps, shared faults, and reconnect cost | High |
-| Clock interval aging and a shared discovery budget | Tighter freshness and lower idle or startup overhead | Preserve drift tolerance, asymmetric-path behavior, and routed startup convergence | Medium |
-| Integer deadlines and smaller retained records | Less descriptor copying, memory, and duplicate state | Preserve full clock range and ownership. Split queued and sent records only if the simpler layout is insufficient | Medium |
-| Coalesce a ready delivery report with ready Data in one carrier write | Fewer writes, TLS records, and WebSocket messages in bidirectional traffic | Preserve report sampling, control priority, timing barriers, bounded batches, and write callbacks | Medium |
-| One canonical binary WebSocket admission header | Remove duplicated decimal and hexadecimal field handling and repeated selectors | Authenticate the HTTP method and exact escaped path, retain signed pre-upgrade rejection, and remove the old format entirely | Medium for maintainability, low for steady throughput |
-| Zero-reserved WireGuard header coding | Save three bytes on common packets | Reconstruct exact packets, retain arbitrary reserved bytes, and measure any added copying or scatter/gather complexity | Workload-dependent |
-| Batch metadata bases | Reduce repeated ID and deadline bits | Additional state, signed deltas or escapes, incremental parsing, and realistic batch availability | Workload-dependent |
-| Implicit Data envelope | Save one byte for ordinary MTU-sized frames | Another control-header form for a very small bulk byte benefit | Low |
-| Remove relay packet IDs and deduplication | Remove ID bytes and up to 128 KiB of bitmap per receiving direction | Changes duplicate delivery and shifts repeated UDP and cryptographic work to WireGuard | Product variant only |
-| Replace everything with a length-only single TCP stream | Establish the cost of eliminating feedback, time mapping, migration, and scheduling | Changes freshness, multipath resilience, and recovery. Must beat the existing design on both healthy and faulty paths | Comparison prototype only |
-
-WireGuard's authenticated transport counter belongs to a receiving keypair. It does not provide one session-global relay
-identity for handshakes and transport packets. The
-[Linux receive path](https://git.zx2c4.com/wireguard-linux/tree/drivers/net/wireguard/receive.c) performs transport
-replay validation after cryptographic processing, so removing relay deduplication does not eliminate
-duplicate-processing cost. Its
-[effective replay window](https://git.zx2c4.com/wireguard-linux/tree/drivers/net/wireguard/messages.h) is 8128 counter
-positions on a 64-bit build. At 1 Gbit/s of 1452-byte packets under one key, that represents roughly 94 milliseconds of
-overtaking. A larger relay bitmap does not make later WireGuard replay rejection disappear. Actual aggregation needs
-arrival-skew and per-key replay measurements, and encrypted payloads do not expose inner flow identity for ordinary
-flow-based scheduling.
-
-The receiver's shared UDP slot is another candidate only if actual blocked writes are material. Moving delivery to a
-worker would uncouple parsing from UDP submission but requires bounded owned buffers and another expiry boundary.
-Keeping synchronous delivery preserves the current borrowed-buffer fast path. Similarly, changing the Linux receive
-batch size should follow packet-rate, syscall, and socket-drop measurements rather than assume that larger vectors
-always improve latency.
-
-Native WireGuard and direct UDP forwarding remain the first comparisons when UDP to the peer is usable.
-[QUIC DATAGRAM](https://datatracker.ietf.org/doc/html/rfc9221) can avoid reliable-stream payload retransmission when UDP
-to the relay works, but it cannot meet TCP-only reachability when that path is blocked.
-[MPTCP](https://datatracker.ietf.org/doc/html/rfc8684#section-3.3) preserves an ordered reliable stream, so adopting it
-does not preserve WireHop's independent deadline-bound datagram service automatically. A full rewrite is available, but
-no result in this audit establishes that either alternative would outperform the current product across its required
-workloads.
-
-The next implementation should address one high-priority mechanism at a time. Preserve the original recovery windows and
-per-flow routed bounds, and measure useful bytes, latency, retransmissions, unsent carrier bytes, parsing-feedback age,
-UDP drops, memory, and discovery traffic together. Keep scalar framing changes separate so a favorable microbenchmark
-cannot hide a recovery regression. Protocol version remains V1 for every candidate.
-
-### Optimization objective and current architecture
-
-The review treats incompatible changes as available within version 1. Compatibility is not a reason to retain a field,
-frame, carrier adapter, or scheduling policy. A replacement still has to improve a measured workload while preserving
-the desired packet freshness, resource bounds, authentication, and recovery behavior.
-
-There is no workload-independent best configuration. Bulk inner TCP goodput, interactive tail latency, independent-path
-aggregation, idle overhead, and recovery time can favor different decisions. The current policy favors stable inner TCP
-goodput and bounded retention. Its ordinary transport traffic uses one primary per direction, even when several lanes
-are healthy. Capacity discovery and control duplication use additional lanes. A full healthy primary waits for feedback
-instead of distributing unique packets across every available lane. Therefore, multiple lanes currently provide
-selection and resilience without a guarantee of simultaneous bandwidth aggregation.
-
-The main implementation boundaries are:
-
-| Layer | Current mechanism | Principal cost or constraint |
-| --- | --- | --- |
-| Admission | Raw authenticated hellos or HTTP WebSocket headers, then an initial clock sample | Connection, TLS, proxy, DNS, and target preparation latency |
-| Data framing | Packed type and length, packet ID, absolute millisecond deadline, complete datagram | Small integer decoding and payload copies |
-| Feedback | Cumulative parsed Data count, Ping progress, and construction delay for a lane generation | Reverse-path delay, report scheduling, and retained FIFO state |
-| Scheduling | Capacity-selected primary, bounded probes, deadline prediction, and one-time migration | Estimator convergence, primary changes, and actual path diversity |
-| UDP boundary | Structural filtering, deduplication, synchronous delivery, and opportunistic Linux batching | Syscalls, buffer ownership, socket limits, and the real UDP path MTU |
-| Carrier | Independent ordered TCP streams, optionally TLS and WebSocket | TCP loss recovery, ordered delivery, kernel buffering, and record or message overhead |
-
-Shrinking the frame header cannot remove a TCP lane's ordered-delivery constraint. TCP provides an ordered byte stream
-and can segment application writes independently of WireHop frames, as described in
-[RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7). Independent lanes and bounded migration provide an
-escape from a stalled stream. Larger batching or another WireHop retransmission loop cannot make bytes behind a missing
-TCP segment arrive sooner on that same stream.
-
-### Wire overhead and possible replacements
-
-The following examples use a five-byte packet ID and a five-byte deadline. They exclude TCP, IP, TLS, and WebSocket:
-
-| WireGuard datagram | WireHop header | Complete frame | Header divided by datagram |
-| ---: | ---: | ---: | ---: |
-| 32 bytes | 12 bytes | 44 bytes | 37.50% |
-| 128 bytes | 12 bytes | 140 bytes | 9.38% |
-| 1452 bytes | 13 bytes | 1465 bytes | 0.90% |
-| 65,535 bytes | 13 bytes | 65,548 bytes | 0.02% |
-
-For the 1452-byte example, eliminating every WireHop header byte would increase payload per carrier byte by only about
-0.90 percent before other overhead. Saving one byte saves about 0.07 percent of the datagram size. Small packets can
-benefit much more, but their total carrier cost must also include packet rate, writes, records, and feedback. These
-figures are arithmetic bounds, not measured throughput gains.
-
-| Candidate | Potential benefit | Assessment |
-| --- | --- | --- |
-| Fixed-width length and metadata | Fewer variable-integer branches | A two-byte content length cannot represent the current maximum. A three-byte length adds a byte to ordinary frames. Full-width IDs and deadlines increase typical overhead |
-| Packed type and length, implemented | Save one envelope byte for content lengths 0 to 7, 128 to 1023, and 16384 upward | Never increases envelope size. Ordinary 1452-byte datagrams retain a three-byte envelope |
-| Implicit Data type with a control escape | Reserve one tag bit for Data versus control, saving another byte on ordinary Data | Requires a second control-header layout or tighter control bounds and type-dependent frame sizing. Compare complete codecs and real forwarding before replacing the uniform envelope |
-| Batch base IDs and deadlines with per-packet deltas | Amortize repeated high bits | Promising for sustained small-packet traffic. Priority selection and migration can make IDs nonmonotonic within a lane. A signed delta or absolute escape is needed. Partial-batch parsing and exact cumulative accounting must remain possible |
-| Session-relative or truncated timestamps | Reduce deadline width in long-lived processes | Requires a shared epoch or unambiguous wrap handling across idle time, suspend, reconnect, and delayed old frames. A 32-bit millisecond clock wraps in about 49.7 days |
-| Relative TTL on receipt | Remove cross-peer deadline mapping | Starts a new lifetime after TCP transit and can admit stale traffic. It does not implement the current freshness contract |
-| Reuse WireGuard transport counters as relay IDs | Remove a second sequence number | Counters belong to WireGuard keypairs and do not cover handshake or cookie packets. Rekeying and multiple public receiver indexes need additional identity state |
-| Remove the frame length on WebSocket | Use the outer message length | Prevents the current multi-frame message format or requires another subframe format. One message per datagram can increase writes and WebSocket overhead |
-| Compress or add another payload cipher | Transform the datagram | WireGuard ciphertext offers no useful general compression. Another cipher does not address carrier ordering and duplicates established secure-carrier work |
-
-The WireGuard protocol defines the transport counter as a cryptographic nonce and replay value for its current keys,
-while handshakes have different layouts. Its authenticated replay window also does not replace relay-side deduplication
-before UDP submission. These constraints follow from the [WireGuard protocol](https://www.wireguard.com/protocol/).
-Increasing WireHop's bitmap cannot extend the receiving WireGuard peer's authenticated replay window. A slow copy can
-still become unusable after sufficiently many newer transport packets overtake it.
-
-WebSocket client frames carry a four-byte masking key in addition to their common header. An unfragmented binary message
-of 1465 bytes therefore adds eight WebSocket header bytes from client to server and four in the reverse direction.
-Coalescing sixteen WireHop frames into one unfragmented message would amortize those bytes to 0.5 and 0.25 bytes per
-datagram. Actual fragmentation can increase that cost. Fragment boundaries cannot serve as WireHop packet boundaries,
-and receivers must handle interleaved control frames, as specified by
-[RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.4). Existing opportunistic coalescing and incremental
-decoding already address this without a batch-collection timer.
-
-### State that remains useful
-
-Cumulative Data counts exploit each lane's ordered stream. The sender already has the exact sent FIFO, so it can
-reconstruct acknowledged bytes without transmitting byte totals, packet-ID lists, selective ranges, or per-frame lane
-sequence numbers. Counts include expired, duplicate, and probe frames that were successfully parsed. Removing an expired
-sent entry before its cumulative acknowledgment would destroy that correspondence. Packet storage is released only by
-validated progress or generation drain.
-
-Reports need an explicit lane ID and generation because they can return on another lane. Implicitly binding them to the
-carrying connection would remove the alternate feedback path. Generation checks also prevent delayed reports from
-releasing a replacement connection's packets. Ping progress tests that path even when no real datagram is outstanding.
-The report's construction delay distinguishes delayed reporting from network transit for deadline prediction.
-
-Ping and Pong provide a four-timestamp clock observation as well as liveness. The initial ClockSync orders the server's
-mapping before client data without another round trip. Removing clock synchronization requires a replacement freshness
-model. It does not follow from TCP reliability or from a fixed packet lifetime. Likewise, global delivery ordering would
-let a stalled lane delay fresh packets from another lane and change the current UDP semantics.
-
-The delivery-rate estimator uses the longer corresponding send and feedback intervals and avoids reducing capacity from
-an unconstrained application-limited sample. This follows the measurement principles described in the
-[BBR congestion-control draft, section 4.1](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/06/#section-4.1), an
-Internet-Draft rather than an RFC. WireHop's userspace observations include carrier buffering, parsing, and the feedback
-path. They are not the kernel TCP congestion controller's packet acknowledgments, and they should not be presented as an
-implementation of BBR. Cross-lane report timing and capacity changes still need workload-level validation.
-
-The default deduplication bitmap grows as successful UDP deliveries observe new ring positions, up to 128 KiB per
-inbound session direction. An unused receiver retains only the descriptor. A first observation at ID one allocates an
-eight-byte bitmap word. The logical 1,048,576-ID horizon is unchanged. At the server's 1024-session limit, fully grown
-bitmaps can still occupy 128 MiB, independently of the 256 MiB retained-packet budget. Socket buffers, scratch storage,
-and session metadata add separate costs. Memory optimization should measure full attached and detached sessions instead
-of treating the aggregate packet budget as a process-memory ceiling.
-
-Admission now uses mode-specific and result-specific suffixes. A create request saves 16 zero bytes, an ordinary
-lane-accepted response saves 35 bytes, and every rejection saves 65 bytes. Successful responses preserve authenticated
-clock bootstrap, and rejections preserve the authenticated Unix time used for admission-clock recovery. Ping and Pong
-retain their original four-timestamp format after the timing simplification experiment described below.
-
-### Current-source feedback and freshness audit
-
-A source review on 2026-10-08 identified several limits that are independent of frame-header compatibility. These are
-properties of the implementation at `4bf361d`, rather than proposed changes to the wire format.
-
-The configured five-second lifetime bounds local queue eligibility and transport migration. Receiver expiry uses the
-latest edge of the estimated clock-offset interval. If the true fixed offset is `theta`, the estimated center is `m`,
-and uncertainty is `u`, then:
-
-```text
-theta is in [m - u, m + u]
-actual_receiver_deadline = sender_deadline + theta
-accepted_receiver_deadline = sender_deadline + m + u
-additional_expiry_slack = m + u - theta, between 0 and 2 * u
-```
-
-This bound assumes that the offset remains within the measured interval. Drift between samples needs a separate bound.
-Millisecond wire rounding adds less than one further millisecond. At the currently accepted maximum uncertainty of five
-seconds, conservative receiver expiry can allow ten additional seconds beyond the actual sender deadline. A temporary
-test overlay reproduced this with synthetic timestamps representing ten seconds of forward delay and zero reverse delay.
-The mapping had a five-second center and five-second uncertainty. A sender deadline of fifteen seconds remained
-unexpired at receiver time 24.999999 seconds and expired at twenty-five seconds, although the actual clock offset was
-zero. No production clock or deadline policy changed for this audit.
-
-Therefore, five seconds is not a strict end-to-end freshness guarantee. Tightening the accepted uncertainty or aging and
-combining offset intervals would change the tradeoff between stale delivery and premature drops. Prefer fresh low-delay
-observations only with an explicit drift allowance and tests for asymmetric paths, idle periods, suspend, and reconnect.
-Keeping the historically best sample forever is still insufficient. Clock estimation and interval aging are distinct
-from the lane-local capacity estimator. The distinction also appears in the offset and dispersion mechanisms in
-[RFC 5905](https://www.rfc-editor.org/rfc/rfc5905.html#section-8).
-
-The sender's application feedback window includes queued and sent-but-unreported encoded bytes. It therefore depends on
-the complete parsing-feedback cycle, even when kernel TCP has already acknowledged those bytes. A hard window `W` and
-feedback cycle `T` impose an approximate sustained ceiling of `W / T`. The default 32 MiB lane cap would correspond to
-about 224 Mbit/s at a 1.2-second feedback cycle before framing and other costs. The adaptive window can be lower. The
-initial 16 KiB window corresponds to only about 0.44 Mbit/s at a 300-millisecond cycle until measurements allow growth.
-These are window arithmetic, not measured goodput or proof that one particular test reached this limit.
-
-Queue packet counts matter independently of byte caps. At 1452 bytes per datagram, the default 1024-packet ingress limit
-holds at most 1.42 MiB of payload, below its nominal 4 MiB cap. At 32 bytes it holds only 32 KiB. Changing the byte cap
-without observing packet occupancy can therefore leave the effective queue unchanged. On arm64, a retained transmission
-also occupies 136 bytes of descriptor storage, including a 32-byte delivery snapshot, before its payload buffer and
-slice spare capacity. Neither descriptor storage nor the receive deduplication bitmap, which can grow to 128 KiB, is
-covered by the encoded packet-byte budget.
-
-Sent expiry cannot remove an entry from the cumulative-count FIFO. The retained implementation now releases expired
-payloads while retaining the size, kind, delivery snapshot, and accounting descriptor needed for subsequent feedback.
-The writer keeps independent buffer ownership, and an original payload-length field preserves real-transport recovery
-proof after a late report. On arm64 that field occupies existing descriptor padding and keeps the descriptor at 136
-bytes. Smaller descriptors remain memory experiments. The allocation follow-up below implements growing bitmaps for
-quiet session directions without lowering deduplication capacity.
-
-All inbound lanes share one receiver UDP write slot. An endpoint write can hold it for up to the UDP write budget while
-other lane readers wait. Each reader acknowledges its validated batch before this wait, but cannot parse its following
-data or controls until delivery returns. A separate bounded UDP delivery worker could shorten this coupling, at the cost
-of copying borrowed carrier payloads, queue ownership, additional retention, and another expiry boundary. Measure actual
-UDP blocking and the extra copy before introducing that worker.
-
-Linux socket observations are useful for separating userspace retention, unsent TCP bytes, acknowledged carrier bytes,
-and receiver parsing progress. The per-socket `TCP_NOTSENT_LOWAT` option can limit admission of unsent write buffers, as
-documented by the [Linux networking documentation](https://docs.kernel.org/networking/ip-sysctl.html#tcp-notsent-lowat).
-It cannot remove bytes already transmitted, preempt an earlier TLS record, or prove parsing at the remote WireHop peer.
-Across a terminating reverse proxy, kernel TCP acknowledgments concern only that TCP leg. Neither `TCP_INFO` nor a
-smaller socket buffer directly replaces the current application delivery reports.
-
-### Current-source Linux profiling
-
-The unchanged `4bf361d` source was measured on 2026-10-08 with Go 1.27.1, Linux arm64, kernel `7.0.12-linuxkit`, and
-Docker on an Apple M4 Pro. The existing `BenchmarkRelayPipeline` ran each carrier sequentially for five two-second
-repetitions. Its 128-request window carries structurally valid 1452-byte datagrams through a client, server, and UDP
-echo target in one isolated container. A separate temporary overlay changed only the benchmark payload to 32 bytes.
-Values below are medians:
-
-| Carrier | 1452-byte ns/op | 1452-byte MB/s | 1452-byte B/op | 32-byte ns/op | 32-byte MB/s |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| TCP | 2979 | 487.38 | 16 | 2425 | 13.20 |
-| TLS | 3010 | 482.40 | 24 | 2435 | 13.14 |
-| WebSocket | 3867 | 375.45 | 18 | 2447 | 13.08 |
-| Secure WebSocket | 3672 | 395.41 | 21 | 2423 | 13.21 |
-
-The reported interval measures amortized throughput with concurrent requests, not datagram RTT. MB/s counts each payload
-once although it travels in both directions. The echo target and benchmark driver also contribute CPU and syscalls.
-These datagrams are not authenticated by a real WireGuard peer, and there is no inner TCP flow or impaired WAN path.
-Consequently, the table does not establish production goodput, tail latency, or a performance ranking valid on other
-hosts. The Go benchmark output rounds allocations per operation to an integer. A displayed zero does not imply that
-feedback, admission, or the complete pipeline performs no allocations.
-
-Separate ten-second CPU profiles placed 61.33 percent of TCP samples and 60.83 percent of WSS samples at the Linux
-syscall entry. Protocol package functions accounted for about 0.40 and 0.39 percent of flat samples respectively.
-Payload copying, standard integer helpers, and I/O are attributed separately. Filtering a profile to protocol call
-stacks can include the network read and TLS decryption beneath the frame reader. That cumulative time must not be
-attributed to integer decoding. The result supports investigating syscall and scheduling costs before another header
-rewrite, without proving which relay change will improve this synthetic pipeline.
-
-Allocation profiles identified a concrete avoidable cost. The session-close callback captured the whole 248-byte
-`schedulerEvent` by reference. Go therefore moved the parameter to a 256-byte heap allocation on every `applyEvent`
-call, including ordinary delivery reports and timing observations. In the TCP allocation profile, that function entry
-accounted for 33.01 MiB, or 44.79 percent of sampled allocation bytes. Capturing only the result channel removes this
-unconditional escape while preserving callback ordering, errors, and the wire protocol. The retained event benchmark
-measures timing updates and a complete enqueue, send, and cumulative-feedback cycle. Compiler escape analysis confirms
-that the callback now captures the eight-byte channel value and no longer moves the event itself to the heap.
-
-Five sequential one-second repetitions of each event benchmark produced these medians. Baseline and candidate binaries
-include the same benchmark. DeliveryReport includes store enqueue, carrier commitment, and cumulative acknowledgment,
-not just the event dispatch:
-
-| Event benchmark | Baseline ns/op | Candidate ns/op | Time change | Baseline/candidate B/op | Baseline/candidate allocs/op |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Timing | 40.550 | 7.311 | -81.97% | 256 / 0 | 1 / 0 |
-| DeliveryReport | 193.600 | 164.800 | -14.88% | 256 / 0 | 1 / 0 |
-
-The 1452-byte Linux pipeline then ran three alternating baseline/candidate pairs, with the middle pair reversing order.
-Each carrier used two seconds per run. These are separate measurements from the earlier five-repetition baseline:
-
-| Carrier | Baseline ns/op | Candidate ns/op | Time change | Baseline/candidate B/op |
-| --- | ---: | ---: | ---: | ---: |
-| TCP | 3169 | 3059 | -3.47% | 18 / 9 |
-| TLS | 3065 | 3079 | +0.46% | 24 / 11 |
-| WebSocket | 3828 | 3837 | +0.24% | 19 / 9 |
-| Secure WebSocket | 3741 | 3776 | +0.94% | 22 / 12 |
-
-All samples remain included. The first candidate WebSocket sample took 4465 ns/op versus its paired baseline's 3794
-ns/op. The candidate DeliveryReport samples included 205.8 ns/op before the other four samples between 163.7 and 164.8
-ns/op. The evidence establishes removal of the event allocation and lower pipeline allocation bytes. These short runs do
-not establish a consistent carrier-throughput improvement or statistical confidence. No wire layout, version, deadline,
-queue limit, discovery policy, or recovery threshold changed with this allocation fix.
-
-Reproduce the focused benchmark with:
-
-```sh
-go test ./internal/relay -run '^$' -bench '^BenchmarkSchedulerApplyEvent$' -benchmem -benchtime=1s -count=5
-```
-
-Fresh real-kernel capacity-collapse checks used the original twenty-second flows, impairment schedule, and 25 percent
-recovery requirement. The unchanged source ran first, followed later by the allocation candidate, once per scenario:
-
-| Scenario and direction | Unchanged recovery | Candidate recovery |
-| --- | ---: | ---: |
-| Forward-only | 104.09% | 97.86% |
-| Reverse-only | 105.06% | 76.13% |
-| Bidirectional forward | 0.00% | 98.52% |
-| Bidirectional reverse | 188.79% | 137.99% |
-
-The unchanged binary failed its bidirectional verifier, and the candidate passed all three targeted verifiers. These
-single runs do not establish that the allocation fix resolves recovery. The earlier failed historical samples and this
-new unchanged-source failure remain part of the evidence. The full 65-case matrix and routed comparison matrix were not
-rerun for this allocation change. Reliable capacity-collapse recovery remains a higher priority than another byte saved
-in the ordinary Data header.
-
-The candidate passed the complete shuffled race-enabled Go suite and `go vet` on Darwin arm64. Linux validation in this
-review consists of the benchmarks and targeted kernel scenarios above, rather than a fresh full Linux unit-test matrix.
-
-### Retained payload-expiry implementation and review
-
-The follow-up implementation releases expired sent payload references during scheduler maintenance. It retains ordered
-descriptors and all admission charges until cumulative acknowledgment or generation drain. Original payload lengths
-preserve the existing parsed-transport counter after late feedback. The independent writer reference remains valid
-through expiry, acknowledgment, and drain. No wire layout, protocol version, clock policy, queue limit, scheduling
-policy, or dependency changed.
-
-An initial implementation reused the generic deque append helper and increased Linux local and aggregate store-cycle
-medians by 16.96 and 17.51 percent. Compiler analysis showed that this helper was not inlined. The retained
-implementation initializes the sent expiry bound in the existing empty-prefix branch and keeps the direct sent append.
-Nonempty prefixes lower or rearm the bound as needed. The queued-deque implementation remains unchanged.
-
-Three fresh alternating pairs then compared the retained implementation with the earlier allocation-only implementation
-on the same Linux arm64 environment. The middle pair reversed execution order. Pipeline samples used two seconds per
-carrier and event/store samples used one second. No other tests, builds, or network benchmarks ran concurrently, and all
-samples remain included:
-
-| Benchmark | Allocation-only reference ns/op | Retained implementation ns/op | Change |
-| --- | ---: | ---: | ---: |
-| Pipeline TCP | 3389 | 2946 | -13.07% |
-| Pipeline TLS | 3532 | 3029 | -14.24% |
-| Pipeline WS | 4095 | 4270 | +4.27% |
-| Pipeline WSS | 3975 | 3807 | -4.23% |
-| Timing event | 5.362 | 5.332 | -0.56% |
-| Delivery-report event | 171.3 | 170.9 | -0.23% |
-| Local store cycle | 146.7 | 140.4 | -4.29% |
-| Aggregate store cycle | 148.8 | 145.8 | -2.02% |
-
-All four retained event/store microbenchmarks measured zero bytes and allocations per operation. Pipeline medians were
-9, 11, 13, and 12 bytes per operation. These short loopback samples do not establish a consistent carrier-throughput
-improvement or statistical significance. In particular, WS was slower. The demonstrated memory change is release of
-obsolete buffer ownership, not reduced steady-state allocation or guaranteed resident-memory reduction. Pooled buffers
-can remain cached, and an active writer can still own a released store payload.
-
-Six isolated runtime-policy experiments each ran the same six original kernel scenarios: forward, reverse, and
-bidirectional capacity collapse, fixed 600-millisecond delay, single-lane 32 kbit/s, and shared-path 32 kbit/s. The
-five-second fault start, seven-second impairment, twenty-second flow, carrier-stability checks, and 25 percent recovery
-requirement were unchanged:
-
-| Rejected experiment | Original acceptance failures |
-| --- | --- |
-| Set Linux `TCP_NOTSENT_LOWAT` to 16 KiB | Bidirectional forward recovery reached 14.0% |
-| Use the newest constrained rate directly without peak history or downward smoothing | Reverse recovery reached 19.4%, and bidirectional forward recovery reached 6.9% |
-| Reset a generation when its oldest unreported real frame expires, without a stall or alternative-path requirement | Forward recovery reached 0%. Single-lane 32 kbit/s opened eight TCP connections instead of three. Shared-path 32 kbit/s changed carrier identities |
-| Increase the default transport lifetime from five to fifteen seconds | The first six-case set passed. Three subsequent capacity-collapse repetitions each failed, with zero recovery in forward, reverse, or bidirectional directions |
-| Keep the five-second local lifetime but accept expired real frames at the receiver | Reverse recovery reached 0% |
-| Reset a measured generation after both the path-aware guard and two seconds without parsing progress, with 4 KiB of prior real-transport proof and fresh salvageable work | Single-lane 32 kbit/s opened four TCP connections instead of three |
-
-The socket, rate, unconditional-reset, and receiver-expiry experiments passed five, four, three, and five cases
-respectively, but those passes do not outweigh the failures. The longer-lifetime repetitions were intended to alternate
-with a reference, but the parent zsh did not split their order string. They executed candidate-only repetitions. These
-are valid standalone rejection evidence, not paired comparisons. Later order-dependent scripts explicitly use POSIX sh.
-No experiment is retained in production or in a selectable runtime mode. These observations do not prove a unique cause
-of recovery failure.
-
-The outbound-progress experiment passed its other five verifiers, including capacity recovery. Its extra low-rate
-reconnect rejects the policy. The experiment's initial launch failed during overlay generation and binary setup. It did
-not execute a valid candidate and is excluded from runtime results. The corrected executable ran all six original
-scenarios in a separate result directory with shell fail-fast behavior enabled.
-
-The implementation went through the following review rounds. The first ten preceded final performance and kernel
-validation:
-
-| Round | Review and resulting evidence |
-| --- | --- |
-| 1 | Re-read the protocol, timing, feedback, scheduling, and historical experiments against the current source |
-| 2 | Implemented payload release and corrected rearming when expired descriptors remain ahead of new payloads |
-| 3 | Reviewed independent writer ownership and expanded the state model to sixteen seeds per six configurations |
-| 4 | Verified four deliberately faulty temporary variants fail runtime assertions rather than compilation |
-| 5 | Checked cancellation, migration, control exclusion, late feedback, and aggregate charges with forty lifecycle race repetitions |
-| 6 | Added sent-payload deadline-bound assertions and corrected an overly strict assertion about conservative stale bounds |
-| 7 | Tested and rejected socket-buffer and immediate-rate policies against the original kernel fault checks |
-| 8 | Detected and removed the generic-append hot-path regression |
-| 9 | Re-read the retained diff and all call sites, and compiled relay, protocol, and clockmap tests for Linux 386 and Windows amd64 |
-| 10 | Added post-maintenance release assertions and passed fresh complete macOS shuffled race and Linux execution suites, `go vet`, and four regenerated mutation checks |
-| 11 | Completed three isolated alternating Linux benchmark pairs, retaining every sample and reporting the WS slowdown |
-| 12 | Executed all 65 original kernel scenarios on the exact retained binary, preserving its failed forward-capacity result |
-| 13 | Tested longer transport lifetime and receiver-expiry removal. Rejected receiver-expiry removal after reverse recovery failed |
-| 14 | Corrected the repetition driver's zsh order handling and classified three failed longer-lifetime sets as candidate-only evidence |
-| 15 | Re-read every retained production and test change, rechecked primary references, and rejected the final outbound-progress experiment after low-rate carrier churn |
-| 16 | Executed the complete original 18-flow routed matrix. Preserved a failed HighCapacity combined sample, then independently checked the original LowCapacity and historical-baseline conditions |
-| 17 | Ran nine unchanged-source HighCapacity control flows. All passed. Rechecked final ownership paths, documentation, formatting, artifact identity, and the two unresolved acceptance failures |
-| 18 | Re-audited every changed production path and identified missing combinations of expiry, active writers, compaction, late reports, and close callbacks |
-| 19 | Added pooled-buffer concurrency, expired active-write migration, large sent-prefix compaction, control fallback, deferred and synchronous callbacks, and close-cancellation coverage |
-| 20 | Passed fifty targeted race repetitions on each of one and four CPUs. Two new deliberately faulty variants failed the intended runtime assertions |
-| 21 | Passed fresh complete macOS race and Linux execution suites and `go vet`. Grouped related expiry scenarios and rechecked the final relay suites and file hygiene |
-| 22 | Rechecked clock, ownership, priority, and numeric boundaries. Added maximum-payload and full-width counter coverage for expiry followed by partial late reports |
-| 23 | Compared 320,000-operation observable traces with the original store twice per implementation. Verified trace sensitivity and two new runtime mutation failures |
-| 24 | Passed fresh complete macOS race and Linux execution suites, one hundred directed race executions, and `go vet`. Compiled the current relay tests for Linux 386 and Windows amd64 |
-| 25 | Re-read the final boundary fixture and evidence, checked documentation and file hygiene, and preserved both unresolved acceptance failures |
-
-Each state-model execution now performs 960,000 operations across 96 seed/configuration combinations. Three consecutive
-race-enabled model repetitions passed after correcting the conservative-bound assertion. Directed tests exercise expiry
-equality, nonmonotonic deadlines, partial late reports, mixed controls and padding, unchanged retention charges, rearmed
-sent-payload bounds, and writer references surviving store release. Temporary mutations remove transport proof, expiry
-rearming, retained accounting, or writer ownership, and all four are detected by runtime test failures.
-
-Follow-up directed coverage uses actual pooled UDP buffers while maintenance races with cumulative acknowledgment or
-generation drain and a writer repeatedly retains its independent reference. Expiry followed by late feedback preserves
-the original transport proof. An expired packet is excluded from migration while its active writer remains valid. A
-2048-entry sent prefix is compacted and shrunk, partially consumed, expired at nonmonotonic deadlines, rearmed, and
-finally acknowledged without losing accounting or saturated transport proof. The write-view fixture uses an injected
-clock to separate its expiry boundary from UDP setup time.
-
-Close lifecycle checks cover unavailable, rejecting, and abandoning lanes, fallback to another lane, reverse callback
-completion order, synchronous completion, caller cancellation before a delayed callback, and cancellation while the
-event queue is full. Two additional temporary faults clear the expiry bound during compaction or announce close success
-before the carrier callback. The targeted tests reject both with their intended runtime assertions. Related expiry cases
-share one top-level test. No further production change was needed, and none of these additional unit checks resolves or
-replaces the two recorded kernel and routed-performance acceptance failures.
-
-An additional expiry case combines a 65,535-byte payload, full-width packet IDs, the largest representable wire
-deadline, and cumulative packet and byte counters ending at `MaxUint64`. Control priority remains intact. Expiry keeps
-admission charges, duplicate and stale reports make no progress, and partial late reports preserve the original
-encoded-byte samples and delivery snapshots. Only transport payloads contribute to saturated transport proof. Temporary
-variants that truncate original payload lengths or erase delivery snapshots during expiry fail runtime assertions.
-
-A temporary differential harness compared 32 seeds of 10,000 randomized operations per implementation. Each seed also
-filled a 2048-entry sent prefix, acknowledged 1792 entries to exercise compaction, and expired the remaining alternating
-deadlines at equality. Subsequent operations covered writes, mixed controls and probes, maximum payloads, expiry,
-deadline assessment, valid and invalid reports, accounting, transport proof, and generation drain. The reference used
-the original `4bf361d` store with only an unused test-compilation field and a maintenance-method rename. Two runs per
-implementation produced identical normalized observable traces. Explicit deadline values avoid process-specific internal
-clock pointers. The comparison excludes intentionally released expired payload contents and expiry bookkeeping. A
-deliberately erased delivery snapshot changed the trace, confirming comparison sensitivity. These sampled traces do not
-establish equivalence for every execution or validate routed throughput.
-
-The complete Linux suite executed all 26 packages in isolated containers with route recovery and DNS fallback enabled.
-The macOS suite enabled the race detector. Linux 386 and Windows amd64 checks compiled tests without executing them.
-These reviews and tests establish concrete invariants and observed behavior, not absolute correctness across every
-possible execution or a resolution of the historical capacity-collapse failures.
-
-The retained binary subsequently completed all 65 original real-kernel scenarios. Sixty-four passed. Its SHA-256 was
-`66ffd7084db5e18e72755524e185d090eaa8ba43d1dc944612e4c09fcac5fcdb`. Original capacity-recovery results were:
-
-| Scenario and direction | Recovery relative to pre-fault throughput | Original verifier |
-| --- | ---: | --- |
-| Forward-only | 0.00% | Fail |
-| Reverse-only | 96.69% | Pass |
-| Bidirectional forward | 163.20% | Pass |
-| Bidirectional reverse | 132.66% | Pass |
-
-Every other original scenario passed, including rekey, route faults, controlled UDP traffic, IPv6, firewall marks,
-carrier stability, mixed carriers, slow links, outages, and roaming. The original twenty-second capacity-collapse flows,
-fault schedule, throughput windows, and 25 percent threshold were unchanged. This complete matrix therefore fails
-acceptance. Payload release and allocation improvements do not resolve recovery, and later passing samples cannot
-replace the failed forward result.
-
-The same retained binary also completed all 18 original routed performance flows, using three repetitions and rotating
-path order. No tests, builds, or competing network benchmarks ran concurrently. The original verifier failed because one
-HighCapacity combined flow reached 36.932 Mbit/s, only 77.89 percent of the best standalone median. The other two
-combined samples were 47.437 and 47.300 Mbit/s. Their median reached 99.76 percent of the best standalone median, which
-does not compensate for the failing individual sample.
-
-The original verifier stops at the first failed profile. Separate temporary diagnostic entry points therefore invoked
-its unchanged LowCapacity checks and its unchanged six-path baseline comparison. Both passed. These diagnostics do not
-make the complete matrix pass or replace its original exit status. Baseline values below use the preserved V1 baseline
-archive documented in the round-53 section, rather than a fresh paired `4bf361d` run:
-
-| Profile | Paths | Historical baseline Mbit/s | Retained implementation Mbit/s | Change |
-| --- | --- | ---: | ---: | ---: |
-| HighCapacity | Low | 8.167 | 8.161 | -0.06% |
-| HighCapacity | High | 47.383 | 47.416 | +0.07% |
-| HighCapacity | Both | 46.789 | 47.300 | +1.09% |
-| LowCapacity | Low | 87.157 | 86.585 | -0.66% |
-| LowCapacity | High | 6.732 | 6.466 | -3.95% |
-| LowCapacity | Both | 86.539 | 86.705 | +0.19% |
-
-LowCapacity combined median and lowest combined sample retained 100.14 and 99.85 percent of the better standalone
-median. Evidence checks across all 18 candidate flows confirmed complete flows, expected TCP connection counts, stable
-carrier socket identities, actual traffic through the configured router classes, and zero router-qdisc drops. These
-median bounds do not establish uniform throughput improvement, and the failed individual HighCapacity sample remains
-unresolved.
-
-A subsequent control used the exact unchanged `4bf361d` binary, with build metadata confirming `vcs.modified=false`. It
-ran the same nine HighCapacity flows with unchanged topology, durations, rotating order, evidence checks, and
-thresholds. All passed. Its standalone medians were 8.169 and 47.446 Mbit/s, and its combined median was 47.531 Mbit/s.
-The retained implementation's combined median was 0.49 percent lower. The control's lowest combined sample was 43.653
-Mbit/s, whereas the retained implementation's lowest was 36.932 Mbit/s. Candidate sender intervals show slower startup
-convergence before approaching the other samples' later rates. These sequential sets do not identify a unique cause or
-establish statistical confidence. The passing unchanged-source control does not justify dismissing the candidate's
-failed sample as environmental noise. Both full acceptance failures remain unresolved.
-
-### Current-source allocation follow-up
-
-The follow-up on 2026-10-08 and 2026-10-09 uses `141d2b2` as its unchanged reference and permits incompatible changes
-while retaining V1. A fresh Linux arm64 ten-second TCP pipeline profile placed 60.82 percent of CPU samples at the
-syscall entry and about 0.43 percent directly in protocol-package functions. The suspend-aware protocol clock accounted
-for 5.69 percent cumulatively, including its syscall. The benchmark's UDP driver and echo target contribute to these
-totals. These synthetic loopback results do not bound the benefit from removing scheduler state or entire I/O stages.
-
-The reference allocation profile placed 22.31 percent of sampled bytes in `ObserveDeliveryReport`, 12.75 percent in
-`queueDeliveryReport`, 10.62 percent in `SendDeliveryReport`, and 10.62 percent directly in `routeReport`. Three
-retained changes address concrete allocation costs:
-
-- Each serial carrier reader lazily creates one capacity-one report-result channel and reuses it for synchronous
-  scheduler validation. Cancellation or a protocol error ends that reader. A delayed scheduler completion can occupy the
-  retired channel without blocking the scheduler or reaching another generation. Client and server construct a new
-  `Lane` for every generation. The internal observer API documents this ownership contract
-- The report router applies `sync.Once` directly around successful carrier-write completion. If every queue rejects the
-  report, no writer owns a callback and the router invokes failure completion directly. Multiple accepted writers still
-  share one success callback. If no eligible lane exists, failure completes before callback state is allocated
-- The deduplication bitmap grows geometrically as ring positions are observed, up to its original maximum size.
-  Unallocated positions read as zero, clearing intersects only allocated storage, and growth preserves existing bits.
-  Classification and zero-ID rejection do not allocate. The receiver records observations only after successful UDP
-  submission. The logical capacity, sequence horizon, and duplicate classification remain unchanged
-
-An untouched default window saves exactly 131,072 bitmap bytes, or 128 MiB across 1024 such server sessions. The first
-observation at ID one allocates eight bitmap bytes and saves 131,064 bytes. A far first ring position can immediately
-require the full bitmap. These figures exclude other session storage. Storage does not shrink after traffic stops, lanes
-change, or a session detaches. Filling the first complete default window sequentially allocates 262,136 bitmap bytes
-cumulatively across 15 arrays, compared with one 131,072-byte array in the reference. The final retained bitmap still
-occupies 128 KiB. A reader similarly retains its one result channel until its generation is released.
-
-Focused measurements used identical benchmark source on Go 1.27.1, Darwin arm64, and an Apple M4 Pro. Three alternating
-pairs, with the middle pair reversed, supplied six half-second samples per variant. The reference overlay restores the
-original window and scheduler implementations. It adapts the report method signature to accept and ignore the new
-argument, while still creating the original per-request channel. Both sides use the updated Lane reader, including its
-one-time channel allocation. Report routing retains and invokes the actual writer callbacks. The handoff benchmark uses
-a minimal event responder and excludes full scheduler validation and carrier I/O:
-
-| Operation | Reference B/op | Final B/op | Reference allocs/op | Final allocs/op |
-| --- | ---: | ---: | ---: | ---: |
-| Empty 1,048,576-ID window | About 131,120 | 48 | 2 | 1 |
-| Window creation and first observation at ID one | About 131,120 | 56 | 2 | 2 |
-| Creation and sequential fill of 1,048,576 IDs | 131,120 | 262,184 | 2 | 16 |
-| Report validation handoff after first use | 128 | 0 | 2 | 0 |
-| Single or duplicate report routing | 56 | 40 | 3 | 2 |
-| Empty-lane report routing | 56 | 0 | 3 | 0 |
-| Steady sequential or duplicate window observation | 0 | 0 | 0 | 0 |
-
-The report handoff median changed from 234.55 to 198.30 ns, a 15.46 percent reduction in this focused benchmark. Before
-the later empty-lane guard, single, duplicate, and unroutable routing medians fell by 12.73, 10.09, and 33.92 percent.
-Steady sequential and sequential-plus-duplicate observations were 4.66 and 3.37 percent slower. Creating and filling a
-complete default window changed from 3.884 to 4.045 milliseconds, a 4.13 percent increase. This trades extra initial
-allocation and copying for much smaller untouched and sparsely observed sessions. These operation timings do not
-establish packet latency or forwarding throughput improvements.
-
-A later route audit found that the callback state was still allocated when no eligible lane existed. Moving that case
-before callback creation reduced empty-lane routing from 40 bytes and two allocations to zero. Three consecutive
-one-second samples per variant measured medians of 16.99 ns before the guard and 6.500 ns after it. Single and duplicate
-routes retained 40 bytes and two allocations. These samples were not interleaved and do not establish a timing change
-for the normal routes. The existing failure-completion regression now covers no lanes, two abandoning lanes, and two
-rejected queues, and verifies one failure completion and the expected write attempts. These cases and the existing
-duplicate-routing and control-order tests passed 100 race-enabled repetitions.
-
-The final-candidate Linux arm64 pipeline comparison used three alternating pairs, two seconds per carrier, the existing
-128-request window, 1452-byte structurally valid datagrams, and 1024-ID test windows. Every sample contributes to these
-medians:
-
-| Carrier | Reference ns/op | Final ns/op | Time change | Reference/final B/op |
-| --- | ---: | ---: | ---: | ---: |
-| TCP | 3101 | 3340 | +7.71% | 10 / 9 |
-| TLS | 2781 | 3505 | +26.03% | 13 / 10 |
-| WebSocket | 3977 | 4132 | +3.90% | 9 / 10 |
-| Secure WebSocket | 3700 | 4248 | +14.81% | 12 / 10 |
-
-The initial full-on-first-observation candidate also produced slower secure-WebSocket medians in separate short
-comparisons: +11.11 percent on Darwin and +9.00 percent on Linux. These negative results remain part of the evidence.
-The stronger isolated secure-WebSocket check rotated four variants through five six-second samples each:
-
-| Variant | ns/op samples | Median ns/op | Median B/op |
-| --- | --- | ---: | ---: |
-| Reference window and scheduler | 3797, 3797, 3646, 3945, 3869 | 3797 | 10 |
-| Full-on-first-observation bitmap, both report changes | 3781, 3758, 4213, 3856, 3654 | 3781 | 7 |
-| Growing bitmap and callback change, per-report result allocation | 3877, 3978, 3833, 3758, 3934 | 3877 | 10 |
-| Final growing bitmap and both report changes | 3831, 3782, 3881, 3868, 3791 | 3831 | 7 |
-
-The final isolated median is 0.90 percent slower than the reference. This does not reproduce the earlier double-digit
-secure-WebSocket difference and does not establish a throughput gain. A longer all-carrier check used the same three
-alternating pairs with two three-second samples per carrier in each run, giving six samples per variant:
-
-| Carrier | Reference ns/op samples | Final ns/op samples | Median time change | Reference/final median B/op |
-| --- | --- | --- | ---: | ---: |
-| TCP | 3396, 3337, 3035, 3419, 2886, 2912 | 3204, 3183, 3195, 3017, 2959, 3036 | -2.40% | 8 / 5 |
-| TLS | 3140, 3077, 3479, 3466, 3072, 3016 | 3033, 3015, 2853, 2811, 3387, 3262 | -2.72% | 11 / 7 |
-| WebSocket | 4019, 3974, 4303, 4222, 4197, 4006 | 3901, 3873, 3712, 3696, 3936, 3716 | -7.63% | 8 / 5.5 |
-| Secure WebSocket | 4352, 4130, 4253, 4281, 3668, 3741 | 3895, 3852, 3643, 3623, 3839, 3850 | -8.28% | 10.5 / 7 |
-
-The pooled longer medians favor the final candidate, while individual samples overlap and the separate secure-WebSocket
-check differs. Comparing within each alternating pair also reveals slower final samples in the third pair: +3.40 percent
-for TCP, +9.21 percent for TLS, and +3.78 percent for secure WebSocket. WebSocket favors the final candidate in all
-three paired runs. These are laboratory samples with substantial scheduling variation, not confidence intervals or a
-universal throughput guarantee. A displayed zero allocations per packet hides infrequent feedback allocations. Pipeline
-measurements describe amortized synthetic throughput rather than packet RTT, first-packet latency, real WireGuard
-authentication, or impaired-network inner TCP goodput.
-
-Reproduce the focused final benchmarks with:
-
-```sh
-go test ./internal/dedup ./internal/relay -run '^$' \
-  -bench 'Benchmark(NewWindow|WindowObserve|WindowFill|SchedulerObserveDeliveryReport|SchedulerRouteReport)$' \
-  -benchmem -benchtime=500ms -count=6
-```
-
-A recovery experiment allowed an established carrier to reconnect without a proven alternative after two path-aware
-progress guards, provided measured capacity, at least 4096 acknowledged real transport bytes, and useful unmigrated
-transport remained. The first six original kernel scenarios passed: capacity collapse in all three directions, single
-and shared-path 32 kbit/s, and fixed 600-millisecond one-way delay. Its first repeated bidirectional collapse then
-recovered only 0.2 percent in one direction against the unchanged 25 percent requirement. The untouched reference
-independently failed reverse recovery at 0.8 percent. The recovery change and its altered test invariants were removed.
-Passing first samples do not resolve the repeated failure. The earlier allocation candidate completed 46 original
-network cases before its run was stopped to test the refined bitmap. Its reverse-collapse result recovered only 10.4
-percent. That incomplete run is not a passing full matrix.
-
-Deterministic tests cover sparse ring positions, partial words, repeated wrapping, maximum-width sequence numbers,
-maximum-int capacity, repeated report-channel use, cancellation before and after event queueing, delayed completion, and
-generation replacement. An independent set-based oracle checks 1,300,000 operations across 260 capacities. The new
-window fuzz target completed 4,970,450 executions, and the receiver batch target completed 465,691 executions. Seven
-existing protocol fuzz targets also passed five seconds each. Existing tests cover concurrent duplicate writers, failed
-writes, full queues, retry suppression, late callbacks, partial UDP submission, and pooled packet ownership.
-
-The retained implementation passed the complete shuffled Darwin race suite, the complete shuffled Linux suite, Darwin
-and Windows static checks, Linux 32-bit static checks for deduplication and relay, and 100 race-enabled repetitions of
-report cancellation, replacement, and concurrent completion. The initial Linux fixture could not execute test binaries
-from a nonexecutable temporary filesystem. The corrected executable-tmpfs fixture passed without source or
-test-threshold changes. None of these changes alters wire encoding, cumulative report validation, report timing policy,
-clock mapping, queue limits, discovery, primary selection, or migration policy.
-
-Twenty full source-review passes covered the retained changes: ten for the initial candidate and ten after the final
-bitmap refinement. Each pass restarted from the production diff and traced the relevant callers, failure paths, tests,
-and documentation. The final ten examined construction and virtual bits, sparse clearing, integer limits, the
-independent oracle, UDP ownership, report cancellation, wire/control boundaries, benchmark attribution, recovery
-invariants, and the complete retained diff. Review fixes included benchmark metric arithmetic and resource/measurement
-descriptions.
-
-A subsequent audit on 2026-10-09 added a reader-to-scheduler regression test for serial feedback, validation errors,
-malformed reports, and cancellation within a prefetched frame batch. All four cases passed 100 race-enabled repetitions.
-Temporary source overlays confirmed that the test rejects continuing after validation failure and reallocating the
-result channel for each report. An external bitmap harness checked all 2,813 reachable logical states for capacities one
-through eight with IDs from zero through twice the capacity plus two, covering 48,889 transitions. A further translated
-word-boundary check covered 1,524,832 transitions and 505,256,320 classifications at different word and ring offsets,
-including IDs that reach the uint64 limit. Removing the bitmap history copy during growth made this independent model
-fail. A separate synthetic handoff stressor ran ten race-enabled repetitions with 32 serial owners and 32,000 report
-attempts per repetition. Tagged completions checked result ownership while cancellation and completion competed for the
-same request. This stressor excludes full scheduler validation and carrier I/O. These finite domains supplement the
-full-width sequence tests and fuzzing. The complete shuffled Darwin race suite and Darwin and Windows amd64 static
-checks passed again. Linux 32-bit static checks for deduplication and relay also passed. An intervening restricted
-relay-suite attempt could not bind its local TCP and UDP test listeners. Rerunning the full suite with local socket
-permission passed. Those audits changed tests and documentation only. The later empty-lane routing guard changes
-allocation on a detached or abandoning session. The two network acceptance failures below remain unresolved, and their
-original binaries predate that guard.
-
-A further receiver audit extended partial-UDP delivery coverage from one bitmap word to a 257-ID window. Its 56 cases
-combine scalar or vector delivery, probes, bitmap growth, sequence numbers reaching the uint64 limit, per-datagram
-drops, missing peers, endpoint failure, cancellation, and expiry. They verify the successful prefix, exact retry
-payloads, and cumulative parsing counts. Eight concurrent receiver callers additionally submit rotated batches around
-word and ring boundaries sixteen times each. All thirteen IDs remain within the logical horizon and must each reach the
-endpoint exactly once. Both checks passed 100 race-enabled repetitions on each of one and four CPUs. A temporary variant
-that discarded history during bitmap growth failed these tests through duplicate submissions, rather than a build error.
-These fixtures exercise the real receiver and lane batch logic with in-memory endpoints. They do not replace carrier
-network tests or resolve the performance failures below. After this extension, the complete shuffled Darwin race suite
-and executable Linux arm64 suite passed again. Darwin and Windows amd64 static checks passed for all packages, and Linux
-386 static checks passed for deduplication and relay. This extension changes tests and documentation only.
-
-A separate receiver set model checks scalar and vector delivery against successful writes without using the production
-bitmap or run-splitting logic. It varies deduplication capacities from 1 through 257, full-width sequence bases,
-unsorted batches, duplicate IDs, per-datagram drops, missing peers, endpoint failure, clock advancement, expiry, and
-retries. Each input contains up to 64 packets, submitted in batches of at most sixteen across three passes. The final
-pass reverses packet order and refreshes deadlines to check whether unsuccessful earlier submissions remain eligible
-under the current logical horizon. The model checks attempted writes, exact successful payload order, committed sequence
-state, and temporary-buffer cleanup. Its initial zero-offset version passed ten race-enabled repetitions on each of one
-and four CPUs for 144 seeds and completed 6,359,503 fuzz executions in 120 seconds. The current target also covers seven
-clock fixtures with positive and negative offsets, timestamps beyond the signed range, upper unsigned boundaries,
-maximum admitted uncertainty, and expiry exactly at the conservative deadline. During this extension, two timing
-mutations initially passed because the seed's short-deadline packet duplicated an earlier successfully delivered ID and
-was filtered before expiry mattered. Replacing that ID with a new one exposed both errors. All 1,008 final seeds passed
-100 race-enabled repetitions on each of one and four CPUs, and a fresh 120-second fuzz run completed 4,542,280
-executions without a mismatch. Temporary variants that ignored uncertainty, delayed expiry at equality, removed
-non-increasing run boundaries, or committed an unwritten suffix failed runtime assertions. A separate temporary
-arbitrary-precision oracle checked 202,592 deadline cases under the race detector, including translation overflow,
-saturated bounds, and the quantized lifetime limit. The full shuffled Darwin race suite and executable Linux arm64 suite
-passed all 26 packages with stronger pointer checks and `GOGC=20`. Darwin and Windows amd64 full static checks and Linux
-386 deduplication and relay static checks passed again. These checks changed tests and documentation only. The receiver
-model uses in-memory endpoints and fixed clock mappings. It does not exercise real carrier scheduling, kernel UDP
-vectors, or network performance acceptance.
-
-The final implementation completed all 65 original kernel WireGuard scenarios. The unchanged verifier passed 64 and
-rejected forward capacity-collapse recovery: the sender reported zero interval bytes in the final five seconds, or 0.0
-percent of the pre-fault rate, below the original 25 percent requirement. Reverse recovery reached 96.1 percent. The
-bidirectional case reached 64.0 and 111.4 percent in its two directions. All remaining carrier, low-rate, loss, delay,
-outage, roaming, IPv6, policy-routing, UDP-delivery, idle, and rekey checks passed. Both long-lived rekey cases observed
-a fresh kernel handshake 120 seconds after flow start.
-
-The untouched reference and initial allocation candidate also failed capacity-collapse checks in separate runs. This
-establishes an existing unstable acceptance target, but does not identify a unique cause or prove the retained changes
-free from timing regressions. The final failed sample remains unresolved.
-
-The independent three-repetition routed matrix completed all 18 original flows. Receiver goodput samples in Mbit/s were:
-
-| Capacity profile | Path | Three receiver-goodput samples | Median |
-| --- | --- | --- | ---: |
-| HighCapacity | Low | 8.164, 8.165, 8.160 | 8.164 |
-| HighCapacity | High | 46.841, 47.674, 47.442 | 47.442 |
-| HighCapacity | Both | 46.797, 47.946, 37.296 | 46.797 |
-| LowCapacity | Low | 87.236, 87.039, 87.242 | 87.236 |
-| LowCapacity | High | 6.730, 6.851, 6.617 | 6.730 |
-| LowCapacity | Both | 86.909, 86.330, 87.198 | 86.909 |
-
-The original verifier rejected the third HighCapacity combined flow. Its 37.296 Mbit/s retained only 78.61 percent of
-the 47.442 Mbit/s best standalone median, below the unchanged 85 percent requirement. The combined profile median
-retained 98.64 percent, which does not excuse that individual failure. The original verifier stops at this profile. A
-supplemental driver reused its unchanged flow and evidence functions to check all 18 flows and both capacity profiles.
-All connection-identity, routing, shaping, and no-drop evidence checks passed. LowCapacity retained 99.62 percent in its
-combined median and at least 98.96 percent in every combined flow. The supplemental driver preserves sample order before
-using the verifier's in-place median helper.
-
-The failed combined flow's existing interval records contain zero inner TCP retransmissions. Its reported inner RTT
-rises from approximately 304 milliseconds in interval zero to 933 milliseconds in interval three. Sender throughput then
-remains between 10.45 and 31.46 Mbit/s in intervals three through seven, before its final five intervals reach 41.95 to
-62.93 Mbit/s. The successful preceding combined flow reaches 62.93 Mbit/s in interval three. This narrows the observed
-deficit to slow early progress accompanied by increased inner RTT. It does not establish which queue, probe, feedback
-path, or scheduling transition produced that delay.
-
-This routed run compares combined and standalone paths within the final implementation. It does not establish a
-source-versus-reference throughput improvement. Capacity-collapse recovery and individual routed-flow stability remain
-failed acceptance targets. No fault schedule, verification threshold, compatibility path, or recovery heuristic was
-changed to turn these samples into passes. The retained benefits are lower report allocation and much smaller quiet
-session bitmaps, with the measured growth cost and throughput uncertainty described above.
-
-### Additional protocol candidates
-
-The following incompatible candidates remain available within V1. They address different costs and need separate
-acceptance targets:
-
-| Candidate | Benefit to test | Required semantic or implementation decision |
-| --- | --- | --- |
-| Stateless implicit Data envelope | Save one byte on ordinary MTU-sized frames | Compare scalar and batch codecs. Saving one byte from a 1465-byte frame changes carrier byte efficiency by only about 0.07 percent |
-| Batch bases with independent packet deltas | Amortize packet IDs and deadlines for dense small-packet traffic | Support priority-induced negative deltas, migrated IDs, immediate scalar writes, and incremental delivery without waiting for the complete batch |
-| Elide a zero WireGuard reserved field | Save three payload bytes in the common case | Preserve arbitrary nonzero bytes with an explicit escape. This is reversible header coding rather than ciphertext compression |
-| Combine timing replies with parsing progress | Reduce writes and control allocations on the same lane | Keep alternate-lane feedback and refresh report-construction delay at the actual writer. Waiting for the next Pong cannot delay normal feedback |
-| One binary admission header before WebSocket Upgrade | Reuse the raw hello field codec and remove repeated textual selectors without an extra application round trip | Preserve the WebSocket method and escaped-path MAC context, writer-sampled clock bootstrap, strict base64url canonicality, header bounds, duplicate-header rejection, and pre-upgrade signed errors |
-| One authenticated binary admission after WebSocket Upgrade | Remove duplicated raw and HTTP admission formats | Weigh a simpler state machine against unauthenticated upgraded connections, delayed HTTP rejection, and startup exchange timing |
-| One-stream length-only tunnel | Establish a lower-complexity forwarding comparison | Removing deadlines, deduplication, reports, and migration changes freshness and recovery. Compare fault behavior as well as CPU before selecting this product model |
-
-WireGuard replay limits are a separate constraint on aggregation. The inspected Linux implementation retains 8192
-counter bits with an architecture-dependent redundant region, as defined in
-[messages.h](https://git.zx2c4.com/wireguard-linux/tree/drivers/net/wireguard/messages.h). At roughly 86,000 packets per
-second for 1 Gbit/s of 1452-byte payloads under one key, about 95 milliseconds of overtaking can exhaust an
-approximately 8192-packet window. This is an illustration, not a universal threshold. Packet sizes, rates, keys, and
-implementation details matter. A much larger relay bitmap cannot make the WireGuard peer authenticate a counter that is
-already too old. Aggregation therefore needs explicit arrival-skew and replay-drop measurements, even if relay delivery
-remains unordered.
-
-### Additional codec boundary review
-
-Overlap tests cover 324 combinations of generic frames and Data encoders, ordinary and full-width metadata, empty and
-maximum payloads, both packed-header width transitions, destination prefixes, source offsets, and reuse versus forced
-allocation. Expected encodings preserve the original source bytes and use the standard integer encoder. Rejection-header
-regressions cover CR, LF, and CRLF at the beginning, middle, and end of a signed value. They fail against the previous
-parser and pass after the explicit check. Three shuffled race repetitions and one million fuzz executions validate
-canonical rejection-header round trips and the exact encoded size bound. This canonicality correction does not change
-HMAC verification or imply an authentication bypass in the previous implementation.
-
-### Measured admission encoding
-
-Admission signing and encoding were compared with commit `9764416` on 2026-10-07 using Go 1.27.1 on Darwin arm64 and an
-Apple M4 Pro. Each operation signs and then marshals one hello with the same short authentication key and field values.
-Each case used six one-second repetitions, with baseline and candidate runs performed sequentially. Values are medians.
-Client creation uses `127.0.0.1:51820` and single-byte selectors. Rejected responses have no diagnostic except for the
-maximum-diagnostic case, which contains 512 ASCII bytes:
-
-| Operation | Baseline ns/op | Current ns/op | Elapsed-time change | Baseline/current B/op | Baseline/current allocs/op |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Client create | 432.15 | 375.00 | -13.22% | 1072 / 832 | 19 / 17 |
-| Client join | 291.90 | 286.95 | -1.70% | 736 / 736 | 9 / 9 |
-| Server created | 301.50 | 293.15 | -2.77% | 880 / 832 | 9 / 9 |
-| Server accepted | 300.95 | 282.85 | -6.01% | 880 / 736 | 9 / 9 |
-| Server rejected | 301.45 | 257.05 | -14.73% | 880 / 640 | 9 / 9 |
-| Server maximum diagnostic | 919.55 | 822.60 | -10.54% | 2720 / 2240 | 11 / 9 |
-
-The client encoder reserves its complete mode-specific suffix before appending the three canonical selectors. This
-avoids an extra unsigned-buffer growth in both create and join. Server responses reserve only their actual result's
-fields. These are admission CPU and allocation measurements, not forwarding goodput or statistical confidence intervals.
-Reproduce them with:
-
-```sh
-go test ./internal/protocol -run '^$' -bench 'Benchmark(Client|Server)HelloEncoding$' \
-  -benchmem -benchtime=1s -count=6
-```
-
-### Measured packed-header implementation
-
-The implemented layout was compared with commit `9764416` on 2026-10-07 using Go 1.27.1, Darwin arm64, and an Apple M4
-Pro. Each case used six one-second repetitions. The table shows median elapsed times. Positive changes are slower, and
-these microbenchmarks do not establish WAN goodput or statistical confidence intervals:
-
-| Benchmark | Baseline | Packed header | Elapsed-time change |
-| --- | ---: | ---: | ---: |
-| Owned frame reader, 1420-byte content | 30.335 ns | 31.355 ns | +3.36% |
-| Validated 16-frame sequence | 138.00 ns | 110.90 ns | -19.64% |
-| Eight-frame Data encoding | 936.45 ns | 930.05 ns | -0.68% |
-| Buffered 16-frame Data batch, 32-byte payloads | 275.95 ns | 263.05 ns | -4.67% |
-| Buffered 16-frame Data batch, 1452-byte payloads | 557.15 ns | 582.45 ns | +4.54% |
-| WebSocket loopback 1-frame message, background context | 1813.00 ns | 1844.00 ns | +1.71% |
-| WebSocket loopback 1-frame message, cancelable context | 1719.50 ns | 1702.00 ns | -1.02% |
-| WebSocket loopback 16-frame message, background context | 3907.00 ns | 3796.00 ns | -2.84% |
-| WebSocket loopback 16-frame message, cancelable context | 3791.00 ns | 3538.00 ns | -6.67% |
-| WebSocket buffered 1-frame batch | 60.665 ns | 60.420 ns | -0.40% |
-| WebSocket buffered 16-frame batch | 555.85 ns | 546.30 ns | -1.72% |
-
-The packed ordinary header uses three LEB128 groups where the previous separate length used two, despite the same
-three-byte envelope. Its decoder specializes the bounded three-byte header to avoid the generic uint64 overflow loop.
-Scalar owned reads and the large-payload buffered microbenchmark still show a small cost. Sequence validation and
-small-packet buffered decoding improve, and batched WebSocket loopback medians do not show the rejected tail-borrow
-experiment's regression. The retained benefit is a smaller canonical layout with no envelope-size increase and smaller
-admission messages. It is not a claim that every workload becomes faster.
-
-Reproduce the protocol cases with:
-
-```sh
-go test ./internal/protocol -run '^$' \
-  -bench 'Benchmark(FrameReader|FrameSequence|BufferedDataBatch|DataBatchEncoding)$' \
-  -benchmem -benchtime=1s -count=6
-```
-
-### Round-53 routed validation
-
-The round-53 implementation, with original 4 MiB ingress and five-second packet lifetimes, completed a fresh 18-flow
-matrix on 2026-10-08 using Go 1.27.1, Linux arm64, and kernel `7.0.12-linuxkit`. A separate router applied 5-millisecond
-delay to one path and 150-millisecond delay to the other. HighCapacity assigned them 10 and 100 Mbit/s respectively.
-LowCapacity reversed those rates. Each standalone and combined configuration used three fresh twenty-second inner TCP
-flows, rotating case order between repetitions. Baseline and implementation ran sequentially with unchanged verifiers.
-The exact binary passed both standalone/combined checks and all six baseline median bounds. Values are receiver medians
-against the untouched `9764416` baseline:
-
-| Profile | Paths | Baseline Mbit/s | Final Mbit/s | Change |
-| --- | --- | ---: | ---: | ---: |
-| HighCapacity | Low alone | 8.167 | 8.158 | -0.10% |
-| HighCapacity | High alone | 47.383 | 47.544 | +0.34% |
-| HighCapacity | Both | 46.789 | 47.319 | +1.13% |
-| LowCapacity | Low alone | 87.157 | 86.618 | -0.62% |
-| LowCapacity | High alone | 6.732 | 6.474 | -3.83% |
-| LowCapacity | Both | 86.539 | 86.989 | +0.52% |
-
-Combined medians reached 99.5 and 100.4 percent of the better standalone path. The lowest HighCapacity combined flow
-retained 96.3 percent of its better standalone median. Original verification confirmed actual router traffic, zero
-router-qdisc drops, stable configured carrier identities, and the expected inner TCP connection opens. HighCapacity
-high-delay standalone samples were 47.588, 34.749, and 47.544 Mbit/s. The lower sample remains part of the evidence even
-though the original median requirement passed. LowCapacity high-delay standalone median declined 3.83 percent. These
-results establish the original regression bounds for this run, not identical startup convergence, universal optimality,
-or statistical confidence. That binary also includes the rejection-header canonicality and ingress deadline-bound fixes.
-Historical static-queue results below describe discarded runtime tuning and are not substituted for this matrix.
-
-Reproduce the routed matrix with an existing integration image and a Linux binary:
-
-```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/wirehop-linux ./cmd/wirehop
-sh test/performance/run.sh /tmp/wirehop-linux /tmp/wirehop-performance 3
-go run test/performance/verify.go /tmp/wirehop-performance 3 /tmp/wirehop-baseline-performance
-```
-
-Build the baseline from `9764416` with the same Go version, architecture, and flags, and run it separately. The optional
-baseline argument checks all six median regression bounds in addition to each matrix's standalone/combined checks.
-
-### Round-53 kernel validation and remaining failures
-
-The same exact round-53 binary completed all 65 original real-kernel scenarios once on 2026-10-08. Sixty-three passed
-their original verifiers. Two failed the original throughput recovery requirement:
-
-| Scenario | Original recovery requirement | Observed recovery | Result |
-| --- | ---: | ---: | --- |
-| Capacity collapse, forward | At least 25% | 99.62% | Pass |
-| Capacity collapse, reverse | At least 25% | 0.00% | Fail |
-| Capacity collapse, bidirectional | At least 25% in each direction | 28.80% forward, 0.00% reverse | Fail |
-
-Capacity dropped at five seconds, stayed at 32 kbit/s for seven seconds, and returned at twelve seconds. Recovery uses
-the original pre-fault intervals ending by 4.5 seconds and final intervals starting at 14.5 seconds. No failed flow was
-replaced by a passing rerun. The matrix therefore does not pass complete kernel acceptance, and the implementation
-cannot be described as defect-free or universally optimal. Earlier baseline and candidate variability, including the
-rejected runtime policies below, remains relevant evidence rather than a resolution of these failures.
-
-All basic carriers, asymmetric stalls, delay, loss, idle, routing, addressing, low-bandwidth completion, rekey, UDP,
-outage, roaming, and remaining carrier-stall verifiers passed. Both 140-second rekey tests recorded new handshakes on
-both peers at 120 seconds. Every controlled UDP flow received all offered bytes: 49,998,000 for native, TCP, and WSS,
-and 49,999,200 for the direct forwarder. The fixed 600-millisecond delay flow reached 10.036 Mbit/s.
-
-Completion and recovery checks do not establish uniform throughput. Compared with the historical 4 MiB protocol
-revision, asymmetric-stall reverse and ordinary bidirectional reverse receiver samples declined 36.58 and 36.02 percent.
-TLS outage declined 20.75 percent, and distinct-path 32 kbit/s declined 15.19 percent. Those are individual historical
-comparisons, not alternating repetitions or evidence of a causal frame field. Ten passing low-bandwidth flows also had
-zero bytes in their final five-second client-report window. Their original checks require completed transfers rather
-than continuous final-window progress. These observations remain limitations even though the corresponding original
-verifiers passed. No new queue policy, shorter lifetime, adaptive state, or altered verifier conceals them.
-
-### Follow-up admission audit and recovery comparisons
-
-A subsequent admission audit tightened WebSocket generation, Unix timestamp, and monotonic-send headers to the same
-unsigned decimal spelling already used by lane and path-group selectors, with Unix time retaining its signed 64-bit
-positive range. Creation and join now reject signs and leading zeroes. Only monotonic send time permits zero. This
-removes alternate text encodings of the same authenticated values. It does not fix an authentication bypass or change
-the canonical headers produced by clients. The correction adds no dependency, runtime policy, protocol version, or
-compatibility path.
-
-The numeric admission matrix covers 140 cases across both modes and all five numeric headers, including valid zero,
-full-width bounds, nonminimal text, signs, whitespace, line breaks, and overflow. Sixteen rejection cases failed against
-the previous implementation and pass after the correction. Six server-handler regression cases also fail with the
-previous parsers and pass with the corrected parsers. They verify HTTP 400 without a signed rejection, DNS resolution,
-session retention, admission-slot retention, or creation-nonce consumption. Independent fuzzing compares both parsers
-with ASCII decimal grammar and lexical magnitude bounds rather than the production parsing or formatting functions.
-
-Before this admission-only change, the preserved round-53 binary and untouched baseline completed three alternating
-repetitions of each previously failed capacity-collapse scenario. The middle repetition reversed execution order. All
-faults, twenty-second durations, throughput windows, and original 25 percent recovery checks remained unchanged:
-
-| Scenario and direction | Baseline recovery percentages | Round-53 recovery percentages |
-| --- | --- | --- |
-| Reverse-only | 51.26, 58.02, 0.00 | 97.01, 100.64, 61.60 |
-| Bidirectional forward | 101.09, 52.97, 93.52 | 126.46, 66.27, 113.25 |
-| Bidirectional reverse | 106.82, 122.30, 118.67 | 99.43, 125.94, 111.04 |
-
-The baseline passed five of six original verifiers and the round-53 implementation passed six of six. The baseline's
-zero-recovery sample confirms that recovery failure also occurs without the packed framing or compact admission changes.
-These diagnostic repetitions do not replace the two failed original matrix samples, isolate one causal mechanism, or
-establish reliable recovery across all workloads. The later numeric-header correction affects malformed WebSocket
-admission and cannot resolve these TCP recovery failures. Round-53 matrices above describe their recorded binary, not a
-fresh complete matrix after that correction.
-
-The corrected source passed two fresh full shuffled race repetitions, `go vet`, 1,000,027 grammar-fuzz executions, and
-test compilation of all seven relevant packages for Windows amd64 and Linux 386. Its new exact Linux arm64 binary then
-ran ten original kernel scenarios once each. WebSocket, WSS, mixed TCP/WSS lanes, both WebSocket stall variants, and
-both 32 kbit/s WebSocket variants passed. Capacity-collapse reverse recovery reached 66.24 percent, and bidirectional
-recovery reached 73.42 percent forward and 112.51 percent reverse. Forward-only recovery reached 10.41 percent and
-failed the original 25 percent requirement. This targeted run therefore passed nine scenarios and failed one. Neither
-the six successful earlier diagnostic repetitions nor the two successful later recovery directions resolve this failure.
-Complete kernel acceptance remains unestablished. The exact complete and targeted matrices, binary identities, and
-failures remain distinct in the recorded evidence.
-
-### Additional validation boundaries
-
-The unchanged production code passed a further race-enabled state-machine audit using 768 distinct seeds across 128
-groups and six queue configurations, with 10,000 operations per configuration. Its 7,680,000 operations exercised
-ordinary and control packets, capacity probes, local and shared budgets, expiration, partial and invalid cumulative
-acknowledgments, and generation drain. The temporary test overlay varied the existing model's seed without modifying
-production code or retaining an additional runtime path.
-
-A separate shuffled race audit ran 63 boundary tests twenty times each with one CPU and twenty times each with four
-CPUs. All 2520 top-level executions passed. Coverage included partial carrier reads and writes, borrowed and owned
-payload lifetimes, cancellation, valid prefixes before malformed tails, partial UDP delivery, deduplication retries,
-clock synchronization, packet expiry, and malformed WebSocket admission. These stress checks do not replace the failed
-kernel recovery checks or establish that every possible execution has been tested.
-
-Protocol validation also includes six frame, buffered-frame, admission, control, and carrier fuzz targets with one
-million executions each. Final hello and restored control layouts passed additional million-execution runs. Frame-header
-checks exercise all 2,097,152 canonical values representable by a three-byte packed header, including invalid types and
-oversized lengths, against the standard LEB128 encoder. Five independent literal hello/HMAC vectors cover one-byte reads
-and writes, every truncation, byte tampering, preservation of the following frame, failed write prefixes, and
-no-progress writes. Directed checks reject zero, nonminimal, overflowing, and overlong selectors at every client
-selector position and in both successful server results, with valid declared lengths and HMACs. Foreign test binaries in
-these earlier checks were compiled rather than executed.
-
-A subsequent full suite actually executed on Linux arm64 in isolated Docker namespaces with route faults and DNS
-fallback enabled. All 26 packages passed, including 554 top-level test executions. The unsupported-firewall-mark test
-was skipped because Linux supports that option. Linux UDP batching, interrupted system calls, GSO fallback, route
-recovery, and stack-growth clock reads also passed 400 top-level executions with strict pointer checking, `GOGC=20`, and
-one or four CPUs. These Linux runs did not enable the race detector or rerun the kernel throughput matrix.
-
-An independent arbitrary-precision clock model passed 716,093 cases under the race detector on macOS. It checked signed
-averaging, four-timestamp estimates, invalid samples, translation overflow, saturated deadline bounds, representable
-inverse mappings, and conservative bounds for physical exchanges with known offsets. This temporary test overlay made no
-production change and does not resolve the capacity-collapse recovery failures.
-
-A later audit found that the rejection-header fuzz fixture used a direct `http.Header` map key with noncanonical
-capitalization. Go's `Header.Values` could not find that key, so the earlier million-execution rejection fuzz run only
-exercised missing-header rejection. It does not count as decoder or canonicality coverage. The corrected target uses
-`Header.Set` and requires both known-valid seeds, including the maximum diagnostic, to be accepted. Adding that
-requirement to the previous fixture fails both seeds. The corrected target passed one million executions, and the
-retained source passed a fresh full shuffled race suite and `go vet`. This changes the test fixture without changing
-production header parsing. Other fuzz fixtures were reviewed for the same input-construction defect.
-
-A subsequent replay audit found that a delayed time sample or server wall-clock rollback could admit a previously
-expired nonce after another request purged it. Directed tests reproduced both cache cases and all four raw/WebSocket
-creation/join paths. The fix serializes cache time advancement, uses one nondecreasing server authentication time for
-validation and signed responses, and preserves retryable classification when a window expires during admission. It
-changes no packet deadline, queue policy, wire layout, protocol version, or dependency. Repeated race checks also cover
-concurrent authentication-time samples, signed clock correction, fresh corrected requests, and terminal nonce reuse. All
-throughput matrices above predate this authentication fix and do not establish exact-source performance acceptance of
-the final source. The previously recorded capacity-collapse failures remain unresolved.
-
-Independent replay-cache models subsequently passed 524,288 sequential operations and 2,000 concurrent six-call
-histories. Arbitrary-precision comparisons passed 200,441 timestamp and replay-expiry cases. Six deliberately faulty
-cache or timestamp variants failed these assertions. Live clients on TCP, TLS, WebSocket, and secure WebSocket passed
-100 reconnects across repeated server and client clock steps in 20 macOS/Linux scenarios, retaining their sessions and
-completing 120 UDP round trips. A server variant that permitted authentication time to retreat failed the live recovery
-check. macOS checks enabled the race detector. Linux checks executed without it. These temporary overlays changed no
-production source. An initial live-test fixture inherited a one-second session grace and a connection wait shorter than
-the maximum reconnect backoff. Its session replacements and timeouts remain recorded as failures. The subsequent fixture
-uses the unchanged production two-minute session grace and waits through the maximum backoff. Neither fixture changes
-the original throughput verifiers or resolves their recorded failures.
-
-### Capacity-collapse mechanism and limits
-
-Historical forty-second socket diagnostics sampled both the untouched baseline and a protocol revision during the same
-five-second start, seven-second impairment, and twelve-second restoration. Inner TCP smoothed RTT rose from tens of
-milliseconds to several seconds. Sampled retransmission timeouts reached 8.950 seconds in the baseline and 7.782 seconds
-in the protocol revision. The latter's cumulative inner TCP ACK counter did not advance between the sampled twelve- and
-seventeen-second observations, despite restored outer capacity. Both flows eventually resumed. These are TCP socket
-observations, not WireHop delivery reports or receiver application-throughput measurements.
-
-TCP derives retransmission timeouts from smoothed RTT and RTT variation and backs off the timer after expiry, as
-specified in [RFC 6298](https://www.rfc-editor.org/rfc/rfc6298.html#section-2). Delayed inner acknowledgments and
-timeout state are therefore a plausible contributor to slow recovery after outer capacity returns. The diagnostics do
-not identify a unique causal frame field or prove the mechanism of every failed sample. Their longer duration and older
-binaries also prevent treating eventual completion as passing the current twenty-second acceptance window.
-
-An isolated scheduler candidate allowed generation reset without a healthy alternative when the oldest sent real
-transport packet expired, the path-aware progress guard elapsed, capacity was measured, and at least 4096 real transport
-bytes had previously been acknowledged. Its first six original kernel cases passed: all three capacity-collapse
-directions, single and shared-path 32 kbit/s traffic, and fixed 600-millisecond delay. The next forward-collapse
-repetition recovered 0 percent against the unchanged 25 percent requirement, despite one new client connection beyond
-iperf's control and data connections. This counter alone does not identify which scheduler branch closed a generation or
-isolate the failed flow's cause. The candidate was rejected, its remaining conditional gates were not run, and no
-scheduler or transmission-store change was retained. The first passing samples do not establish reliable recovery or
-replace the failed repetition.
-
-Further diagnostics on 2026-10-09 used the retained allocation changes with temporary scheduler logging and socket
-sampling every 250 milliseconds. The three original twenty-second capacity-collapse directions passed the unchanged
-verifier, but the forward sender still recorded ten consecutive zero-byte one-second intervals before resuming in the
-interval starting at fifteen seconds. Its sampled inner TCP RTO reached 12.334 seconds. The inner ACK counter stayed at
-838,945,982 bytes from approximately eleven through fourteen seconds, across the recorded capacity restoration at twelve
-seconds. At approximately thirteen seconds, the scheduler had no queued frames and retained metadata for 622 sent,
-unreported frames totaling 907,291 bytes. Its last report counter had not advanced since approximately ten seconds. The
-inner socket still had about 2.8 MB awaiting acknowledgment. At the same time, the outer data socket retained 885,760
-send-queue bytes, including 718,884 unsent bytes, with a 4.471-second RTO. The peer outer socket had received
-895,386,144 bytes in both its approximately twelve- and thirteen-second snapshots. By approximately fifteen seconds,
-that counter had advanced to 896,292,961 and the sender outer queue was empty, while the inner ACK counter still had not
-advanced. Times are relative to the fixture's second-resolution start marker. This sample therefore includes stalled
-outer progress after capacity restoration, followed by a remaining inner recovery delay. It cannot be attributed solely
-to either the scheduler queue or the inner TCP timeout. Instrumentation changes timing, and these passing runs do not
-resolve the earlier failed sample. These three runs preceded the empty-lane guard.
-
-Three separately instrumented HighCapacity combined flows included the empty-lane guard and measured 47.495, 46.720, and
-46.733 Mbit/s with zero inner TCP retransmissions. The unchanged flow-completion and topology-evidence helpers accepted
-all three, including carrier identity, router traversal, and absence of qdisc drops. The high-capacity lane was primary
-from the first sampled transport assignment in each flow and did not change afterward. These runs did not reproduce the
-earlier 37.296 Mbit/s failure or establish its cause. Only the combined HighCapacity path was sampled, so this is
-neither a replacement 18-flow matrix nor a paired source-versus-reference comparison. No queue limit, lifetime, fault
-schedule, or acceptance threshold changed during these diagnostics.
-
-### Rejected queue and lifetime changes
-
-The current implementation retains the original 4 MiB ingress cap and five-second packet lifetimes. Smaller queues and
-shorter deadlines change burst retention, inner TCP loss, and latency. Their isolated recovery improvements did not
-establish acceptable behavior across the tested healthy paths and fault repetitions:
-
-| Discarded candidate | Favorable observation | Rejection evidence |
-| --- | --- | --- |
-| 256 KiB ingress, five-second lifetime | One complete 18-flow routed matrix and one 65-case kernel matrix passed | A later recovery control reached 0%. Paired asymmetric-stall forward and combined medians declined 43.35% and 14.38% |
-| 512 KiB ingress, five-second lifetime | Five capacity-collapse repetitions passed | Asymmetric-stall forward and combined medians were 24.825 and 94.904 Mbit/s, below 85% of the 45.769 and 112.517 Mbit/s reference medians |
-| One-second transport lifetime | Five original-window recovery repetitions passed | High-delay standalone median retained only 23.9% of baseline. The 600-millisecond delay flow reached 0.066 Mbit/s versus 9.934 Mbit/s before tuning |
-| Two-second transport lifetime | Recovery and some routed comparisons passed | Repeated combined startup failures remained. The 600-millisecond delay flow reached only 0.728 Mbit/s |
-| Adaptive transport lifetime | Five recovery repetitions and all directed scenario verifiers passed | A separate delay-step guard did not establish required final progress or the receiver-window comparison |
-
-The 256 KiB comparison also produced a 25.56 percent lower median for shared-path 128 kbit/s traffic. Instrumented
-queues in those low-bandwidth flows stayed below 90,024 bytes without a full-queue observation, so their variation
-cannot be attributed directly to the reduced byte cap. Passing repetitions and sample means do not erase lower medians,
-failed recovery, or uncertainty about causality.
-
-The adaptive candidate used the original 4 MiB ingress cap and limited transport lifetime to the lesser of its
-configured value and one second plus four times the slowest minimum observed RTT. Unknown paths and controls retained
-configured lifetimes. Paired asymmetric-stall median changes were +9.96 percent forward, -13.50 percent reverse, and
--5.11 percent combined. Fixed 600-millisecond delay goodput reached 9.393 Mbit/s versus 8.456 Mbit/s in its reference.
-However, when delay increased from 5 to 600 milliseconds five seconds into a separate forty-second flow, both variants
-had zero sender bytes in their final five-second windows. Buffered server logs did not establish receiver intervals. The
-candidate was removed. No adaptive arrival metadata, policy helper, or experimental fixture remains.
-
-### Rejected timing, discovery, and receive changes
-
-The original Ping/Pong fields, admission-time bounded discovery, and WebSocket buffered-tail copy remain. Their
-alternatives passed correctness checks but did not demonstrate the required workload benefit:
-
-| Discarded candidate | Observation and decision |
-| --- | --- |
-| Omit Ping's local send timestamp and its Pong echo | Routed high-delay standalone and combined samples fell to 23.610 and 20.797 Mbit/s. Restoring fields and original framing also produced startup outliers, so no unique field was isolated. No demonstrated workload benefit justified the change |
-| Delay discovery until real traffic | A combined flow reached 29.873 Mbit/s against a 47.383 Mbit/s standalone baseline, below the unchanged 85% requirement. Later passing samples did not replace that failure |
-| Stop primary padding after real assignment or feedback | Combined samples reached 39.206 and 39.284 Mbit/s and failed their original per-flow bounds. Both experiments were removed |
-| Borrow WebSocket buffered tails | A parser-only batch median improved 13.23%, but loopback batch medians regressed 4.10% and 4.71%. An alternating comparison regressed 4.61%. Correctness and six kernel cases passed without demonstrating a performance gain |
-
-Demand-triggered discovery can move sampling and primary changes into inner TCP startup. The failed flow showed slow
-congestion-window growth during its first twelve seconds with no router-qdisc drop. Delay-sensitive startup is a
-plausible contributor, not a proven cause. No demand-gating timestamp remains. Discovery still uses its original
-four-to-eight-second period, 2 MiB cap per lane direction, and thirty-second cooldown.
-
-Compare both carrier benchmark families when evaluating another receive change. The buffered benchmark measures
-decoding, while loopback includes a concurrent sender and network reader. Neither establishes WAN goodput:
-
-```sh
-go test ./internal/carrier -run '^$' -bench 'BenchmarkWebSocketConnRead(Frames|BufferedFrames)$' \
-  -benchmem -benchtime=1s -count=6
-```
-
-### Optimization priorities
-
-Further work should follow these priorities:
-
-1. Resolve unreliable capacity-collapse recovery with observations of local queue occupancy, TCP unsent bytes, parsing
-   progress, feedback timing, and inner TCP timeout state. Keep the existing fault schedule and recovery windows. A
-   passing rerun or allocation improvement cannot replace a failed acceptance sample
-2. Extend the loopback profiles above to actual WireGuard forwarding, including packet rate and total session memory.
-   Compare scalar traffic, ready batches, large fragmented frames, and detached sessions. A parser-only benchmark cannot
-   establish end-to-end goodput
-3. Measure capacity discovery against useful offered load, including admission without traffic, short flows, metered
-   paths, shared bottlenecks, and changing capacity. Each lane direction can send at most 2 MiB in one discovery period.
-   Sixteen lanes in both directions have a theoretical 64 MiB ceiling per simultaneous period. A lane that reaches its
-   cap every four-second period plus thirty-second cooldown averages about 493 kbit/s of padding. Slow paths normally
-   send less. Demand-triggered discovery was rejected after a routed startup failure. A tighter budget tied to useful
-   bytes still needs comparison against startup convergence
-4. Evaluate aggregation as an explicit scheduling change. Compare same-group and independent paths, symmetric and
-   heterogeneous RTTs, single and concurrent inner TCP flows, and UDP. Measure reordering and receiver replay drops as
-   well as goodput. The current primary policy does not become aggregating by adjusting its switching margin
-5. Prototype batch metadata only if small-packet profiles show a material framing cost. Preserve immediate scalar
-   forwarding, control preemption, incremental receive delivery, and generation-specific cumulative feedback
-6. Continue evaluating admission and low-frequency controls when their complexity or reconnect cost is measurable.
-   Unifying binary and WebSocket admission after Upgrade trades fewer formats against delayed rejection and another
-   application exchange
-
-Multipath TCP illustrates that actual aggregation involves scheduling, connection-wide identity, receive buffering,
-retransmission policy, and congestion-control interactions, rather than just more sockets. Its reliable-byte-stream
-service differs from WireHop's deadline-bound datagrams, as described in
-[RFC 8684](https://www.rfc-editor.org/rfc/rfc8684.html#section-3.3). Importing its global ordering or retransmission
-semantics would be a product change. Per-inner-flow scheduling would also require access to flow identity that encrypted
-WireGuard payloads do not reveal.
-
-[QUIC DATAGRAM](https://www.rfc-editor.org/rfc/rfc9221.html) provides congestion-controlled unreliable datagrams without
-retransmitting lost application payloads. It is a plausible alternative when UDP to the relay is usable. It does not
-solve the current TCP-only reachability requirement when that UDP path is blocked. Its datagrams must fit a QUIC packet
-and the path MTU, so carrying today's largest accepted payloads would require a smaller limit or application
-fragmentation. Such a comparison should include native WireGuard and direct forwarding before adding another encrypted
-transport layer.
-
-The routed performance harness currently checks that combined lanes retain at least 85 percent of the better standalone
-result. Passing that check establishes a regression bound, not aggregation or optimality. An aggregation experiment must
-add a positive gain target relative to the better path and the measured usable sum, with tail-latency, loss, probe-byte,
-and competing-flow limits. No codec change should be described as best-performance without those workload measurements.
 
 ## CLI model
 
@@ -3763,7 +2345,8 @@ below.
 - Packet drop rate
 - Reordering estimate
 - WireGuard handshake time
-- Time to recover after lane failure
+- Time to restore carrier parsing after lane failure
+- Time to restore inner-flow throughput after lane failure
 - Time spent disconnected
 - Reconnect attempt rate and peak concurrency after a shared outage
 - Session resume success within reconnect grace

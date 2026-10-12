@@ -103,6 +103,7 @@ func BenchmarkIngressExpiryReclaim(b *testing.B) {
 }
 
 func BenchmarkSchedulerMaintenance(b *testing.B) {
+	var rescuePreferred protocol.LaneID
 	for _, packets := range []int{64, 1024, 16384} {
 		b.Run(strconv.Itoa(packets), func(b *testing.B) {
 			for _, stalled := range []bool{false, true} {
@@ -145,9 +146,48 @@ func BenchmarkSchedulerMaintenance(b *testing.B) {
 					scheduler := new(Scheduler)
 					b.ReportAllocs()
 					for b.Loop() {
-						scheduler.checkAbandonment(lanes, now)
+						scheduler.checkAbandonment(lanes, &rescuePreferred, now)
 					}
 				})
+			}
+		})
+	}
+}
+
+func BenchmarkExpiredSentAssessment(b *testing.B) {
+	for _, packets := range []int{64, 1024, 16384, 65536} {
+		b.Run(strconv.Itoa(packets), func(b *testing.B) {
+			now := time.Unix(100, 0)
+			limits := packetqueue.Limits{Packets: packets + 1, Bytes: packets * 4096}
+			store, err := newTransmissionStore(limits, func() time.Time { return now })
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { releaseTransmissions(store.drain()) })
+			store.setDeliveryWindows(uint64(limits.Bytes), uint64(limits.Bytes))
+			for index := range packets {
+				if err := store.push(schedulerTransmission(uint64(index+1), wgpacket.TransportData, now.Add(time.Second))); err != nil {
+					b.Fatal(err)
+				}
+			}
+			var data [16]protocol.Data
+			var ownership [16]datagram.Packet
+			for sent := 0; sent < packets; {
+				count, err := store.takeBatch(data[:], ownership[:], limits.Bytes)
+				releaseBatchOwnership(ownership[:count])
+				if err != nil || count == 0 {
+					b.Fatalf("takeBatch() = %d, %v", count, err)
+				}
+				sent += count
+			}
+			now = now.Add(2 * time.Second)
+			store.expire(now)
+			if assessment := store.assessDeadlines(now, func(uint64) uint64 { return 0 }); !assessment.retained || !assessment.atRisk {
+				b.Fatalf("expired sent assessment = %+v", assessment)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				store.assessDeadlines(now, func(uint64) uint64 { return 0 })
 			}
 		})
 	}

@@ -560,11 +560,18 @@ func TestLaneReadClockSync(t *testing.T) {
 		name      string
 		sync      protocol.ClockSync
 		malformed bool
+		ignoreRTT bool
 		err       error
 	}{
 		{name: "AdmissionSample", sync: protocol.ClockSync{
 			ClientSendMicros: 1000, ServerReceiveMicros: 9000, ServerSendMicros: 11_000, ClientReceiveMicros: 7000,
 		}},
+		{name: "QuantizedZeroRTT", sync: protocol.ClockSync{
+			ClientSendMicros: 1000, ServerReceiveMicros: 2000, ServerSendMicros: 2000, ClientReceiveMicros: 1000,
+		}},
+		{name: "ClockRateDifference", sync: protocol.ClockSync{
+			ClientSendMicros: 100, ServerReceiveMicros: 200, ServerSendMicros: 5_000_201, ClientReceiveMicros: 5_000_100,
+		}, ignoreRTT: true},
 		{name: "MalformedSample", malformed: true, err: protocol.ErrInvalidControlFrame},
 		{name: "MaximumUncertainty", sync: protocol.ClockSync{
 			ClientReceiveMicros: 2 * uint64(maximumClockUncertainty/time.Microsecond),
@@ -601,8 +608,16 @@ func TestLaneReadClockSync(t *testing.T) {
 				LocalSendMicros: test.sync.ClientSendMicros, RemoteReceiveMicros: test.sync.ServerReceiveMicros,
 				RemoteSendMicros: test.sync.ServerSendMicros, LocalReceiveMicros: test.sync.ClientReceiveMicros,
 			}
-			if observer.samples != 1 || observer.sample != want {
+			if test.ignoreRTT {
+				if observer.samples != 0 || lane.reportRTTMicros.Load() != 0 {
+					t.Fatal("admission clock-rate difference initialized a false RTT estimate")
+				}
+			} else if observer.samples != 1 || observer.sample != want {
 				t.Fatalf("observed admission timing = %+v, want %+v", observer.sample, want)
+			}
+			mapping, err := clockmap.Estimate(want)
+			if err != nil || lane.receiver.mapping != mapping {
+				t.Fatalf("admission clock mapping = %+v, want %+v, error %v", lane.receiver.mapping, mapping, err)
 			}
 		})
 	}

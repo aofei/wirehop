@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aofei/wirehop/internal/clockmap"
@@ -38,8 +39,12 @@ const (
 	schedulerEventCapacity = 256
 	// abandonmentCheckInterval bounds reaction time to a stale retained packet.
 	abandonmentCheckInterval = 25 * time.Millisecond
-	// minimumRateSampleBytes avoids treating isolated packets as path-capacity measurements.
-	minimumRateSampleBytes = 4 * 1024
+	// minimumInitialRateSampleBytes qualifies the first capacity estimate independently of recovery proof.
+	minimumInitialRateSampleBytes = 4 * 1024
+	// minimumTransportProofBytes requires cumulative real transport before an alternative proves recovery.
+	minimumTransportProofBytes = 4 * 1024
+	// timingRefreshInterval coalesces lane requests. Session measurement policy bounds actual pause duty separately.
+	timingRefreshInterval = defaultPingInterval
 	// minimumProgressStall prevents ordinary report cadence and congestion from looking like a carrier black hole.
 	minimumProgressStall = 250 * time.Millisecond
 	// progressStallReportMargin allows two report intervals beyond the measured round trips.
@@ -56,6 +61,10 @@ type LaneRegistration struct {
 	SendControl          func(protocol.Frame, func()) bool
 	ValidatePingProgress func(uint64) bool
 	SendDeliveryReport   func(protocol.DeliveryReport, time.Time, func()) bool
+	RequestMeasurement   func()
+	// MeasurementInitiator identifies the client that owns session measurement IDs.
+	MeasurementInitiator bool
+	SendMeasurement      func(MeasurementWrite) bool
 	// InitialTiming seeds RTT from usable admission timing known before registration.
 	InitialTiming *clockmap.Sample
 }
@@ -66,6 +75,8 @@ type LaneObserver interface {
 	ObserveTiming(protocol.LaneID, uint64, clockmap.Sample)
 	ObserveLaneAbandon(context.Context, protocol.LaneGeneration) error
 	RouteDeliveryReport(protocol.DeliveryReport, time.Time, func(bool)) bool
+	RequestMeasurement(protocol.LaneGeneration)
+	ObserveMeasurement(protocol.LaneGeneration, protocol.Measurement, uint64) error
 }
 
 // schedulerEventKind identifies one serialized scheduler state transition.
@@ -80,27 +91,54 @@ const (
 	schedulerReport
 	// schedulerTiming applies one RTT sample.
 	schedulerTiming
+	// schedulerValidatedRTT applies a measurement while its transaction still owns a valid pause proof.
+	schedulerValidatedRTT
 	// schedulerRouteReport routes cumulative feedback over a connected outbound lane.
 	schedulerRouteReport
 	// schedulerPeerAbandon closes the exact generation abandoned by the peer.
 	schedulerPeerAbandon
 	// schedulerCloseSession writes one explicit graceful session close.
 	schedulerCloseSession
+	// schedulerDrainData acquires one session-wide data pause until its context ends.
+	schedulerDrainData
 )
 
 // schedulerEvent is one state transition consumed by the scheduler goroutine.
 type schedulerEvent struct {
-	kind           schedulerEventKind
-	registration   LaneRegistration
-	laneID         protocol.LaneID
-	generation     uint64
-	report         protocol.DeliveryReport
-	parsedAt       time.Time
-	timing         clockmap.Sample
-	receiveMicros  uint64
-	reportComplete func(bool)
-	frame          protocol.Frame
-	result         chan error
+	measurement         *measurementAttempt
+	measurementComplete func(bool)
+	kind                schedulerEventKind
+	registration        LaneRegistration
+	laneID              protocol.LaneID
+	generation          uint64
+	report              protocol.DeliveryReport
+	parsedAt            time.Time
+	timing              clockmap.Sample
+	rttMicros           uint64
+	drain               *measurementDrain
+	receiveMicros       uint64
+	reportComplete      func(bool)
+	frame               protocol.Frame
+	result              chan error
+}
+
+// measurementDrain holds the sole measurement operation's session-wide Data pause.
+type measurementDrain struct {
+	released func(time.Duration)
+	ctx      context.Context
+	ready    chan struct{}
+	valid    atomic.Bool
+	finished bool
+	deadline time.Time
+}
+
+// finish publishes or revokes proof that every paused generation's committed prefix was parsed.
+func (d *measurementDrain) finish(valid bool) {
+	d.valid.Store(valid)
+	if !d.finished {
+		d.finished = true
+		close(d.ready)
+	}
 }
 
 // rateObservation records one accepted delivery rate and its local sampling time.
@@ -111,24 +149,28 @@ type rateObservation struct {
 
 // scheduledLane contains direction-local predictive state for one generation.
 type scheduledLane struct {
-	registration        LaneRegistration
-	rttMicros           uint64
-	minimumRTTMicros    uint64
-	feedbackDelayMicros uint64
-	deliveryRate        uint64
-	lastDataPackets     uint64
-	lastPingID          uint64
-	rateHistory         [5]rateObservation
-	rateHistoryCount    int
-	rateHistoryNext     int
-	rateObserved        bool
-	probeUntil          time.Time
-	nextProbeAt         time.Time
-	probeBytes          uint64
-	lastProgressAt      time.Time
-	rttObserved         bool
-	degraded            bool
-	abandoning          bool
+	registration         LaneRegistration
+	rttMicros            uint64
+	minimumRTTMicros     uint64
+	timingReferenceRate  uint64
+	timingReferenceRTT   uint64
+	nextTimingRefresh    time.Time
+	ambiguousTimingSince time.Time
+	feedbackDelayMicros  uint64
+	deliveryRate         uint64
+	lastDataPackets      uint64
+	lastPingID           uint64
+	rateHistory          [5]rateObservation
+	rateHistoryCount     int
+	rateHistoryNext      int
+	rateObserved         bool
+	probeUntil           time.Time
+	nextProbeAt          time.Time
+	probeBytes           uint64
+	lastProgressAt       time.Time
+	rttObserved          bool
+	degraded             bool
+	abandoning           bool
 }
 
 // laneCandidates is a fixed-capacity ordered scheduler result.
@@ -154,13 +196,20 @@ func scoredLaneBetter(left, right scoredLane) bool {
 
 // Scheduler assigns session packets to dynamically registered lanes.
 type Scheduler struct {
-	ingress            *packetqueue.Queue[Packet]
-	events             chan schedulerEvent
-	controlOrder       []scoredLane
-	packetID           uint64
-	transportHoldUntil time.Time
-	lastTransportAt    time.Time
-	lastProbeLane      protocol.LaneID
+	measurements            *measurementCoordinator
+	ingress                 *packetqueue.Queue[Packet]
+	events                  chan schedulerEvent
+	controlOrder            []scoredLane
+	packetID                uint64
+	transportHoldUntil      time.Time
+	lastTransportAt         time.Time
+	lastProbeLane           protocol.LaneID
+	measurementDrain        *measurementDrain
+	pendingMeasurementDrain atomic.Bool
+	measurementChanged      chan struct{}
+	measurementStarted      time.Time
+	measurementDeadline     time.Time
+	measurementTimer        *time.Timer
 }
 
 // NewScheduler validates resources and returns an empty multipath scheduler.
@@ -168,14 +217,51 @@ func NewScheduler(ingress *packetqueue.Queue[Packet]) (*Scheduler, error) {
 	if ingress == nil {
 		return nil, ErrInvalidScheduler
 	}
-	return &Scheduler{ingress: ingress, events: make(chan schedulerEvent, schedulerEventCapacity)}, nil
+	s := &Scheduler{
+		ingress: ingress, events: make(chan schedulerEvent, schedulerEventCapacity), measurementChanged: make(chan struct{}, 1),
+	}
+	s.measurements = &measurementCoordinator{scheduler: s, peers: make(map[protocol.LaneID]LaneRegistration)}
+	return s, nil
+}
+
+// beginMeasurementDrain requests a session-wide data pause without blocking a carrier writer.
+// The context owns the operation. The proof publishes its fixed deadline, and released receives actual pause cost.
+// A saturated event queue returns nil and leaves timing unvalidated.
+func (s *Scheduler) beginMeasurementDrain(ctx context.Context, released func(time.Duration)) (<-chan struct{}, func() (time.Time, bool)) {
+	if ctx.Err() != nil || !s.pendingMeasurementDrain.CompareAndSwap(false, true) {
+		return nil, nil
+	}
+	drain := &measurementDrain{ctx: ctx, ready: make(chan struct{}), released: released}
+	stop := context.AfterFunc(ctx, s.notifyMeasurementChanged)
+	select {
+	case s.events <- schedulerEvent{kind: schedulerDrainData, drain: drain}:
+		return drain.ready, func() (time.Time, bool) {
+			if ctx.Err() == nil && drain.valid.Load() && time.Now().Before(drain.deadline) {
+				return drain.deadline, true
+			}
+			return time.Time{}, false
+		}
+	default:
+		s.pendingMeasurementDrain.Store(false)
+		stop()
+		s.notifyMeasurementChanged()
+		return nil, nil
+	}
+}
+
+// notifyMeasurementChanged wakes the scheduler when the operation ends or its fixed deadline expires.
+func (s *Scheduler) notifyMeasurementChanged() {
+	select {
+	case s.measurementChanged <- struct{}{}:
+	default:
+	}
 }
 
 // Register synchronously adds a lane or replaces it with a higher generation.
 func (s *Scheduler) Register(ctx context.Context, registration LaneRegistration) error {
 	if registration.LaneID.IsZero() || registration.Generation == 0 || registration.PathGroupID.IsZero() ||
 		registration.Store == nil || registration.Abandon == nil || registration.SendControl == nil ||
-		registration.ValidatePingProgress == nil || registration.SendDeliveryReport == nil {
+		registration.ValidatePingProgress == nil || registration.SendDeliveryReport == nil || registration.RequestMeasurement == nil || registration.SendMeasurement == nil {
 		return ErrInvalidRegistration
 	}
 	result := make(chan error, 1)
@@ -231,13 +317,23 @@ func (s *Scheduler) ObserveDeliveryReport(ctx context.Context, source protocol.L
 	}
 }
 
-// ObserveTiming applies one lane RTT observation without blocking a carrier reader.
+// ObserveTiming queues one ordinary RTT observation without blocking a carrier reader.
 func (s *Scheduler) ObserveTiming(laneID protocol.LaneID, generation uint64, sample clockmap.Sample) {
 	select {
+	case s.events <- schedulerEvent{kind: schedulerTiming, laneID: laneID, generation: generation, timing: sample}:
+	default:
+	}
+}
+
+// publishMeasurement queues evidence for validation and application in the scheduler's serialized state.
+func (s *Scheduler) publishMeasurement(attempt *measurementAttempt, target *measurementTarget, rttMicros uint64, complete func(bool)) {
+	select {
 	case s.events <- schedulerEvent{
-		kind: schedulerTiming, laneID: laneID, generation: generation, timing: sample,
+		kind: schedulerValidatedRTT, laneID: target.peer.LaneID, generation: target.peer.Generation, rttMicros: rttMicros,
+		measurement: attempt, measurementComplete: complete,
 	}:
 	default:
+		complete(false)
 	}
 }
 
@@ -297,7 +393,15 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 	defer cancel()
 	lanes := make(map[protocol.LaneID]*scheduledLane)
 	defer func() {
+		if s.measurements != nil {
+			s.measurements.close()
+		}
+		s.invalidateMeasurementDrain()
+		if s.measurementTimer != nil {
+			s.measurementTimer.Stop()
+		}
 		for _, lane := range lanes {
+			lane.registration.Store.endMeasurementPause()
 			releaseTransmissions(lane.registration.Store.drain())
 		}
 	}()
@@ -402,7 +506,9 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		if hasPending {
 			reserveBytes = uint64(len(pending.Value.Payload) + protocol.MaxEncodedFrameSize - protocol.MaxPacketSize)
 		}
-		progressed = s.fillTransportProbe(lanes, preferred, now, reserveBytes) || progressed
+		if hasPending || !hasPreempted && s.ingress.Len() == 0 {
+			progressed = s.fillTransportProbe(lanes, preferred, now, reserveBytes) || progressed
+		}
 		needsCheck := hasPending || hasPreempted
 		if !needsCheck {
 			for _, lane := range lanes {
@@ -436,8 +542,10 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 			select {
 			case event := <-s.events:
 				s.applyEvent(lanes, &preferred, event, s.ingress.Now())
+			case <-s.measurementChanged:
+				s.updateMeasurementDrain(lanes)
 			case <-check:
-				s.checkAbandonment(lanes, s.ingress.Now())
+				s.checkAbandonment(lanes, &preferred, s.ingress.Now())
 			case <-expiryReady:
 				s.ingress.Expire()
 				expiryAt = time.Time{}
@@ -450,9 +558,11 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		select {
 		case event := <-s.events:
 			s.applyEvent(lanes, &preferred, event, s.ingress.Now())
+		case <-s.measurementChanged:
+			s.updateMeasurementDrain(lanes)
 		case <-s.ingress.Ready():
 		case <-check:
-			s.checkAbandonment(lanes, s.ingress.Now())
+			s.checkAbandonment(lanes, &preferred, s.ingress.Now())
 		case <-expiryReady:
 			s.ingress.Expire()
 			expiryAt = time.Time{}
@@ -465,6 +575,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 // applyEvent mutates lane state for one serialized event.
 func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferred *protocol.LaneID,
 	event schedulerEvent, now time.Time) {
+	defer s.updateMeasurementDrain(lanes)
 	switch event.kind {
 	case schedulerRegister:
 		current := lanes[event.registration.LaneID]
@@ -477,9 +588,16 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			deliveryRate: defaultInitialRateBytesPerSecond, lastProgressAt: now,
 		}
 		if event.registration.InitialTiming != nil {
-			replacement.applyTiming(*event.registration.InitialTiming)
+			replacement.applyTiming(*event.registration.InitialTiming, false)
+		}
+		if !s.measurementStarted.IsZero() {
+			s.invalidateMeasurementDrain()
+			replacement.registration.Store.beginMeasurementPause()
 		}
 		lanes[event.registration.LaneID] = replacement
+		if s.measurements != nil {
+			s.measurements.register(event.registration)
+		}
 		if current != nil {
 			if *preferred == event.registration.LaneID {
 				*preferred = 0
@@ -491,6 +609,10 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 	case schedulerRemove:
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation {
+			if s.measurements != nil {
+				s.measurements.remove(event.laneID, event.generation)
+			}
+			s.invalidateMeasurementDrain()
 			delete(lanes, event.laneID)
 			s.migrateTransmissions(lanes, lane)
 			if *preferred == event.laneID {
@@ -504,31 +626,47 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			event.result <- nil
 			return
 		}
-		progressed, err := lane.applyReport(event.report, event.receiveMicros, now)
-		if err != nil {
-			event.result <- err
-			return
+		report := event.report
+		if source := lanes[event.laneID]; source != nil && source.registration.Generation == event.generation {
+			report.DelayMicros = saturatingAdd(report.DelayMicros, source.minimumRTTMicros/2)
 		}
-		if progressed {
-			lane.feedbackDelayMicros = event.report.DelayMicros
-			if source := lanes[event.laneID]; source != nil && source.registration.Generation == event.generation {
-				lane.feedbackDelayMicros = saturatingAdd(lane.feedbackDelayMicros, source.minimumRTTMicros/2)
-			}
-			lane.registration.Store.deliveryWindow.Store(lane.deliveryWindowBytes())
-		}
-		event.result <- nil
+		_, err := lane.applyReport(report, event.receiveMicros, now)
+		event.result <- err
 	case schedulerTiming:
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation {
-			lane.applyTiming(event.timing)
-			lane.registration.Store.deliveryWindow.Store(lane.deliveryWindowBytes())
+			roundTrip := lane.applyTiming(event.timing, false)
+			lane.registration.Store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+			if roundTrip != 0 {
+				lane.maybeRefreshTiming(now, roundTrip)
+			}
+		}
+	case schedulerValidatedRTT:
+		applied := false
+		if event.measurement != nil && s.measurements != nil {
+			m := s.measurements
+			m.mu.Lock()
+			lane := lanes[event.laneID]
+			if event.rttMicros != 0 && lane != nil && lane.registration.Generation == event.generation && m.usableLocked(event.measurement) {
+				lane.applyRoundTrip(event.rttMicros, true)
+				lane.registration.Store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+				applied = true
+			}
+			m.mu.Unlock()
+		}
+		if event.measurementComplete != nil {
+			event.measurementComplete(applied)
 		}
 	case schedulerRouteReport:
 		s.routeReport(lanes, event.report, event.parsedAt, event.reportComplete)
 	case schedulerPeerAbandon:
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation && !lane.abandoning {
+			s.invalidateMeasurementDrain()
 			lane.abandoning = true
+			if s.measurements != nil {
+				s.measurements.remove(lane.registration.LaneID, lane.registration.Generation)
+			}
 			lane.registration.Abandon()
 		}
 		event.result <- nil
@@ -537,6 +675,93 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		if !s.routeControl(lanes, event.frame, protocol.LaneID(0), func() { result <- nil }) {
 			event.result <- ErrNoActiveLane
 		}
+	case schedulerDrainData:
+		if event.drain.ctx.Err() != nil {
+			event.drain.finish(false)
+			s.pendingMeasurementDrain.Store(false)
+			if event.drain.released != nil {
+				event.drain.released(0)
+			}
+			return
+		}
+		s.measurementDrain = event.drain
+	}
+}
+
+// invalidateMeasurementDrain revokes proof when a generation changes without retracting an exposed pause promise.
+func (s *Scheduler) invalidateMeasurementDrain() {
+	if s.measurementDrain != nil {
+		s.measurementDrain.finish(false)
+	}
+}
+
+// updateMeasurementDrain admits the sole session pause after active discovery and expires its fixed deadline.
+func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledLane) {
+	drain := s.measurementDrain
+	if drain == nil {
+		return
+	}
+	now := time.Now()
+	active := !s.measurementStarted.IsZero()
+	if drain.ctx.Err() != nil || active && !now.Before(s.measurementDeadline) {
+		started := s.measurementStarted
+		drain.finish(false)
+		s.measurementDrain = nil
+		s.pendingMeasurementDrain.Store(false)
+		s.measurementStarted = time.Time{}
+		for _, lane := range lanes {
+			lane.registration.Store.endMeasurementPause()
+		}
+		if s.measurementTimer != nil {
+			s.measurementTimer.Stop()
+			s.measurementTimer = nil
+		}
+		if drain.released != nil {
+			var cost time.Duration
+			if !started.IsZero() {
+				cost = time.Since(started)
+			}
+			drain.released(cost)
+		}
+		return
+	}
+	if !active {
+		var wait time.Duration
+		for _, lane := range lanes {
+			if !lane.probeUntil.IsZero() {
+				// Discovery deadlines use the protocol clock. Pause promises use the runtime clock.
+				wait = max(wait, lane.probeUntil.Sub(lane.registration.Store.now()))
+			}
+		}
+		if wait > 0 {
+			if s.measurementTimer == nil {
+				s.measurementTimer = time.AfterFunc(wait, s.notifyMeasurementChanged)
+			} else {
+				s.measurementTimer.Reset(wait)
+			}
+			return
+		}
+		s.measurementStarted = now
+		s.measurementDeadline = now.Add(measurementPauseLimit)
+		if deadline, ok := drain.ctx.Deadline(); ok && deadline.Before(s.measurementDeadline) {
+			s.measurementDeadline = deadline
+		}
+		if s.measurementTimer != nil {
+			s.measurementTimer.Stop()
+		}
+		s.measurementTimer = time.AfterFunc(time.Until(s.measurementDeadline), s.notifyMeasurementChanged)
+		drain.deadline = s.measurementDeadline
+		for _, lane := range lanes {
+			lane.registration.Store.beginMeasurementPause()
+		}
+	}
+	for _, lane := range lanes {
+		if !lane.registration.Store.sentEmpty() {
+			return
+		}
+	}
+	if !drain.finished {
+		drain.finish(true)
 	}
 }
 
@@ -621,15 +846,25 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 	frameBytes := uint64(size)
 	control := item.Value.Kind.Control()
 	initialKeepalive := !control && preferred.IsZero() && len(item.Value.Payload) == wgpacket.TransportKeepaliveLength
+	paused := !s.measurementStarted.IsZero()
 	var candidates laneCandidates
 	if control {
+		if paused {
+			deadlineMicros = math.MaxUint64
+		}
 		candidates = selectControlCandidates(lanes, frameBytes, deadlineMicros)
 	} else if initialKeepalive {
+		if paused {
+			return false, nil
+		}
 		candidates = selectCandidates(lanes, 0, frameBytes, deadlineMicros)
 	} else {
 		candidates = s.selectTransportCandidates(lanes, *preferred, frameBytes, deadlineMicros, now)
 	}
 	if candidates.count == 0 {
+		if paused {
+			return false, nil
+		}
 		if candidates.available {
 			item.Release()
 		}
@@ -751,15 +986,9 @@ func selectControlCandidates(lanes map[protocol.LaneID]*scheduledLane,
 	return result
 }
 
-// canAccept reports whether current retained work can accept one more frame.
+// canAccept reports whether hard retained capacity can accept one more frame. The carrier writer enforces flight credit.
 func (l *scheduledLane) canAccept(frameBytes uint64) bool {
-	if !l.registration.Store.canAccept(frameBytes) {
-		return false
-	}
-
-	_, bytes := l.registration.Store.backlog()
-	window := l.deliveryWindowBytes()
-	return bytes == 0 || frameBytes <= window && bytes <= window-frameBytes
+	return l.registration.Store.canAccept(frameBytes)
 }
 
 // score returns predicted delivery delay in microseconds.
@@ -781,7 +1010,7 @@ func (l *scheduledLane) scoreBacklog(frameBytes, queuedBytes, backlogBytes uint6
 		return math.MaxUint64
 	}
 	// Unsent data still needs serialization and propagation. Already committed data can have reached the peer
-	// while its report returns over another lane. Discount the reported construction wait and the carrier's minimum observed return delay.
+	// while its report returns over another lane. Discount the reported construction wait and the carrier's recent minimum return delay.
 	if retainedMicros <= l.feedbackDelayMicros {
 		return base + queuedMicros
 	}
@@ -834,7 +1063,8 @@ func (l *scheduledLane) enqueueTransmission(transmission retainedTransmission) b
 	return l.registration.Store.push(transmission) == nil
 }
 
-// applyReport releases the reported carrier prefix and returns whether validated progress advanced.
+// applyReport releases the reported prefix and publishes its estimated flight credit in one store transaction.
+// report.DelayMicros includes the return-carrier estimate. The result indicates validated progress.
 func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicros uint64,
 	receiveTime time.Time) (bool, error) {
 	if !l.registration.ValidatePingProgress(report.PingID) {
@@ -851,7 +1081,10 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	if dataDirection == 0 && pingDirection == 0 {
 		return false, nil
 	}
-	sample, stale, err := l.registration.Store.acknowledge(report.DataPackets, receiveMicros)
+	store := l.registration.Store
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	sample, stale, err := store.acknowledgeLocked(report.DataPackets, receiveMicros)
 	if err != nil || stale {
 		return false, err
 	}
@@ -864,7 +1097,9 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 			quantum = max(uint64(1024), min(quantum, l.deliveryRate*interval/1_000_000))
 		}
 	}
-	l.registration.Store.writeBudget.Store(quantum)
+	store.writeBudget.Store(quantum)
+	l.feedbackDelayMicros = report.DelayMicros
+	store.setDeliveryWindowsLocked(l.deliveryWindowBytes(), l.probeWindowBytes(0))
 	l.lastDataPackets = report.DataPackets
 	l.lastPingID = report.PingID
 	l.lastProgressAt = receiveTime
@@ -875,7 +1110,8 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 // updateDeliveryRate keeps a time-bounded maximum of send-bounded samples. Application-limited observations can raise
 // capacity but cannot lower it or evict a useful peak. Reports may return over a different carrier.
 func (l *scheduledLane) updateDeliveryRate(sample deliverySample, receiveMicros uint64) {
-	if sample.bytes < minimumRateSampleBytes || sample.intervalMicros < uint64(time.Millisecond/time.Microsecond) ||
+	if !l.rateObserved && sample.bytes < minimumInitialRateSampleBytes ||
+		sample.intervalMicros < uint64(time.Millisecond/time.Microsecond) ||
 		sample.bytes > math.MaxUint64/1_000_000 {
 		return
 	}
@@ -901,22 +1137,93 @@ func (l *scheduledLane) updateDeliveryRate(sample deliverySample, receiveMicros 
 	}
 	l.deliveryRate = rate
 	l.rateObserved = true
+	if l.timingReferenceRate != 0 {
+		l.timingReferenceRate = max(l.timingReferenceRate, rate)
+	}
 }
 
-// applyTiming updates a bounded RTT exponential moving average.
-func (l *scheduledLane) applyTiming(sample clockmap.Sample) {
-	if sample.LocalReceiveMicros < sample.LocalSendMicros || sample.RemoteSendMicros < sample.RemoteReceiveMicros {
+// maybeRefreshTiming requests a drained exchange when fresh and smoothed feedback cycles exceed the flight horizon.
+// References follow improvements, while deterioration persists through the retry cooldown until a successful proof.
+func (l *scheduledLane) maybeRefreshTiming(now time.Time, roundTrip uint64) {
+	const margin = uint64(2 * defaultReportInterval / time.Microsecond)
+	horizon := l.deliveryWindowHorizonMicros()
+	if !l.rateObserved || l.minimumRTTMicros == 0 {
 		return
+	}
+	freshCycle := l.deliveryFeedbackCycleMicros(roundTrip)
+	operatingCycle := l.deliveryFeedbackCycleMicros(l.rttMicros)
+	if freshCycle <= horizon || operatingCycle <= horizon {
+		l.ambiguousTimingSince = time.Time{}
+		return
+	}
+	if now.Before(l.nextTimingRefresh) {
+		return
+	}
+	reference := l.timingReferenceRate
+	rttWorse := l.rttMicros > l.timingReferenceRTT &&
+		l.rttMicros-l.timingReferenceRTT >= max(margin, l.minimumRTTMicros/4)
+	if reference != 0 && l.deliveryRate >= reference-reference/4 && !rttWorse {
+		return
+	}
+	// A ping can follow a complete committed flight. Allow its serialization plus one unloaded
+	// feedback cycle, including the byte floor at every rate. Use the same recent capacity
+	// estimate as committed flight credit. An expired startup peak can misclassify a stable queue.
+	allowance := uint64(minimumDeliveryWindow) * 1_000_000 / l.deliveryRate
+	expected := saturatingAdd(saturatingAdd(horizon, allowance), l.deliveryFeedbackCycleMicros(l.minimumRTTMicros))
+	if freshCycle <= expected || operatingCycle <= expected {
+		if l.ambiguousTimingSince.IsZero() {
+			l.ambiguousTimingSince = now
+		}
+		// Ambiguous evidence still becomes eligible for independent calibration. Budget its
+		// estimated pause before the first attempt rather than permanently hiding delay behind
+		// the byte floor. Actual pauses also have the coordinator's recurring budget.
+		cost := time.Duration(min(expected, protocol.MaxMeasurementHoldMicros)) * time.Microsecond
+		if now.Sub(l.ambiguousTimingSince) < cost*measurementQuietRatio {
+			return
+		}
+	}
+	l.nextTimingRefresh = now.Add(timingRefreshInterval)
+	l.registration.RequestMeasurement()
+}
+
+// applyTiming updates a bounded RTT exponential moving average and a minimum that excludes transient queue growth.
+// It returns the validated adjusted RTT, or zero for rejected samples. The scheduler explicitly resets the minimum
+// only after a successful drained timing exchange.
+func (l *scheduledLane) applyTiming(sample clockmap.Sample, revalidated bool) uint64 {
+	if sample.LocalReceiveMicros < sample.LocalSendMicros || sample.RemoteSendMicros < sample.RemoteReceiveMicros {
+		return 0
 	}
 	roundTrip := sample.LocalReceiveMicros - sample.LocalSendMicros
 	processing := sample.RemoteSendMicros - sample.RemoteReceiveMicros
-	if processing < roundTrip {
-		roundTrip -= processing
-	} else {
-		roundTrip = 1
+	if processing > roundTrip {
+		return 0
 	}
-	if l.minimumRTTMicros == 0 || roundTrip < l.minimumRTTMicros {
+	roundTrip = max(1, roundTrip-processing)
+	l.applyRoundTrip(roundTrip, revalidated)
+	return roundTrip
+}
+
+// applyRoundTrip updates the operating RTT and its validated minimum without fabricating clock timestamps.
+func (l *scheduledLane) applyRoundTrip(roundTrip uint64, revalidated bool) {
+	if roundTrip == 0 {
+		return
+	}
+	if revalidated || l.minimumRTTMicros == 0 || roundTrip < l.minimumRTTMicros {
 		l.minimumRTTMicros = roundTrip
+	}
+	if revalidated {
+		l.ambiguousTimingSince = time.Time{}
+		// Removing queued work changes the sampling conditions. Keep the normal operating RTT so the
+		// resulting dip cannot trigger another refresh, while respecting the new propagation floor.
+		if l.rttObserved {
+			l.rttMicros = max(l.rttMicros, roundTrip)
+		} else {
+			l.rttMicros = roundTrip
+			l.rttObserved = true
+		}
+		l.timingReferenceRate = l.deliveryRate
+		l.timingReferenceRTT = l.rttMicros
+		return
 	}
 	if !l.rttObserved {
 		l.rttMicros = roundTrip
@@ -924,6 +1231,9 @@ func (l *scheduledLane) applyTiming(sample clockmap.Sample) {
 		return
 	}
 	l.rttMicros = weightedAverage7(l.rttMicros, roundTrip)
+	if l.timingReferenceRate != 0 {
+		l.timingReferenceRTT = min(l.timingReferenceRTT, l.rttMicros)
+	}
 }
 
 // weightedAverage7 returns a seven-to-one moving average without unsigned overflow.
@@ -932,12 +1242,16 @@ func weightedAverage7(previous, sample uint64) uint64 {
 }
 
 // checkAbandonment diverts deadline-risk work and migrates stalled generations while packets remain useful.
-func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, now time.Time) {
+func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, preferred *protocol.LaneID, now time.Time) {
 	for _, lane := range lanes {
 		if lane.abandoning {
 			continue
 		}
 		unreportedSince, firstBytes := lane.registration.Store.expire(now)
+		if lane.registration.Store.measurementDrain.Load() {
+			lane.degraded = false
+			continue
+		}
 		if !laneProgressStalled(lane, now, unreportedSince, firstBytes) {
 			lane.degraded = false
 			continue
@@ -963,9 +1277,39 @@ func (s *Scheduler) checkAbandonment(lanes map[protocol.LaneID]*scheduledLane, n
 		}
 		lane.degraded = assessment.atRisk || alternative
 		if proven {
+			s.invalidateMeasurementDrain()
+			if s.measurements != nil {
+				s.measurements.remove(lane.registration.LaneID, lane.registration.Generation)
+			}
 			lane.abandoning = true
 			s.announceAbandonment(lanes, lane)
 			lane.registration.Abandon()
+			continue
+		}
+		if !lane.degraded || assessment.queuedDeadline.IsZero() || !s.measurementStarted.IsZero() {
+			continue
+		}
+		var candidates []scoredLane
+		for _, alternate := range lanes {
+			if alternate == lane {
+				continue
+			}
+			candidate, eligible := recoveryCandidate(alternate, now, assessment.queuedBytes,
+				uint64(assessment.queuedDeadline.Sub(now)/time.Microsecond))
+			if eligible {
+				candidates = append(candidates, candidate)
+			}
+		}
+		sort.Slice(candidates, func(left, right int) bool { return scoredLaneBetter(candidates[left], candidates[right]) })
+		for _, candidate := range candidates {
+			if lane.registration.Store.transferQueuedTo(candidate.lane.registration.Store, now, candidate.lane.scoreBacklog) == 0 {
+				continue
+			}
+			if *preferred == lane.registration.LaneID {
+				s.recordTransportAssignment(lanes, *preferred, candidate.lane, now)
+				*preferred = candidate.lane.registration.LaneID
+			}
+			break
 		}
 	}
 }
@@ -1014,7 +1358,7 @@ func hasTimelyAlternative(lanes map[protocol.LaneID]*scheduledLane, current *sch
 		}
 		if _, eligible := recoveryCandidate(candidate, now, frameBytes, remainingMicros); eligible {
 			available = true
-			if candidate.registration.Store.transportReported.Load() >= minimumRateSampleBytes {
+			if candidate.registration.Store.transportReported.Load() >= minimumTransportProofBytes {
 				return true, true
 			}
 		}

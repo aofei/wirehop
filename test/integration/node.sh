@@ -72,6 +72,23 @@ fi
 case "$scenario" in
   tcp-latency) tc qdisc replace dev eth0 root netem delay 600ms ;;
   tcp-loss) tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 0.5% ;;
+  *-rtt-step*)
+    tc qdisc replace dev eth0 root handle 10: netem delay 5ms rate 20mbit limit 10000
+    tc -s qdisc show dev eth0 > "/results/$role-qdisc-initial.txt"
+    ip -brief address show > "/results/$role-addresses.txt"
+    ip route show table all > "/results/$role-routes.txt"
+    (
+      while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
+      sleep 10
+      tc qdisc change dev eth0 root handle 10: netem delay 600ms rate 20mbit limit 10000
+      date +%s > "/results/$role-delay-raised.txt"
+      tc -s qdisc show dev eth0 > "/results/$role-qdisc-raised.txt"
+      sleep 30
+      tc qdisc change dev eth0 root handle 10: netem delay 5ms rate 20mbit limit 10000
+      date +%s > "/results/$role-delay-restored.txt"
+      tc -s qdisc show dev eth0 > "/results/$role-qdisc-restored.txt"
+    ) &
+    ;;
   tcp-asymmetric|tcp-asymmetric-stall*)
     if [ "${WIREHOP_TEST_ROUTED:-false}" != true ]; then
       tc qdisc replace dev eth0 root handle 1: prio bands 3
@@ -91,7 +108,7 @@ case "$scenario" in
 esac
 
 case "$scenario" in
-  tcp-multipath-capacity-change*)
+  native-capacity-change*|tcp-multipath-capacity-change*)
     (
       while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
       sleep 5
@@ -108,7 +125,10 @@ esac
 if [ "$role" = server ]; then
   iperf3 --version > /results/iperf-version.txt
   uname -a > /results/kernel.txt
-  iperf3 -s > /results/iperf-server.log 2>&1 &
+  case "$scenario" in
+    *-rtt-step*) iperf3 -s -J > /results/iperf-server.log 2>&1 & ;;
+    *) iperf3 -s > /results/iperf-server.log 2>&1 & ;;
+  esac
   case "$scheme:$scenario" in
     native:*|forward:*)
       touch /results/ready
@@ -138,7 +158,8 @@ fi
 duration=20
 case "$scenario" in
   *-rekey) duration=140 ;;
-  *-outage|*-roam) duration=40 ;;
+  *-outage|*-roam|*-capacity-change*) duration=40 ;;
+  *-rtt-step*) duration=60 ;;
 esac
 local_endpoint=127.0.0.1:51821
 case "$scenario" in
@@ -165,7 +186,7 @@ case "$scheme" in
       *) set -- --allow-insecure ;;
     esac
     case "$scenario" in
-      tcp-multipath|tcp-multipath-slow32|tcp-multipath-slow64|tcp-multipath-slow128|tcp-multipath-capacity-change*)
+      tcp-multipath|tcp-multipath-slow32|tcp-multipath-slow64|tcp-multipath-slow128|tcp-multipath-capacity-change*|tcp-multipath-rtt-step*)
         set -- "$@" --lane "tcp://$WIREHOP_TEST_SERVER:51822"
         ;;
     esac
@@ -245,6 +266,7 @@ case "$scenario" in
 esac
 case "$scenario" in
   *-udp) set -- -u -b 20M -l 1200 ;;
+  *-rtt-step*) set -- "$@" --get-server-output ;;
 esac
 date +%s > /results/flow-start.txt
 nstat -az > /results/client-before.txt
@@ -256,4 +278,7 @@ timeout "$((duration + 60))" iperf3 -c "$remote_ip" -t "$duration" -J "$@" > /re
 nstat -az > /results/client-after.txt
 ss -tnH state established > /results/client-tcp-sockets-after.txt
 wg show wgtest latest-handshakes > /results/client-handshake.txt
+case "$scenario" in
+  *-rtt-step*) tc -s qdisc show dev eth0 > /results/client-qdisc-final.txt ;;
+esac
 exit "$status"

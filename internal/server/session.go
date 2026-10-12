@@ -212,6 +212,7 @@ func (s *serverSession) runLane(connection carrier.Conn, laneID protocol.LaneID,
 		LaneID: laneID, Generation: generation, PathGroupID: pathGroupID, Store: store,
 		Abandon: abandon, SendControl: lane.SendControl,
 		ValidatePingProgress: lane.ValidatePingProgress, SendDeliveryReport: lane.SendDeliveryReport,
+		RequestMeasurement: lane.RequestMeasurement, SendMeasurement: lane.SendMeasurement,
 	}); err != nil {
 		cancelLane(context.Canceled)
 		return err

@@ -112,22 +112,31 @@ func TestLaneObserveTiming(t *testing.T) {
 		name   string
 		sample clockmap.Sample
 		want   uint64
+		ignore bool
 	}{
 		{name: "ZeroSpan", want: 1},
 		{name: "EqualProcessing", sample: clockmap.Sample{LocalReceiveMicros: 20, RemoteSendMicros: 20}, want: 1},
-		{name: "LongerProcessing", sample: clockmap.Sample{LocalReceiveMicros: 20, RemoteSendMicros: 21}, want: 1},
+		{name: "LongerProcessing", sample: clockmap.Sample{LocalReceiveMicros: 20, RemoteSendMicros: 21}, want: 100_000, ignore: true},
 		{name: "PositiveRTT", sample: clockmap.Sample{LocalReceiveMicros: 20, RemoteSendMicros: 15}, want: 5},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
+			observer := &timingSampleObserver{testLaneObserver: &testLaneObserver{}}
+			lane.observer = observer
 			lane.reportInterval = defaultReportInterval
 			lane.reportRTTMicros.Store(100_000)
 			lane.observeTiming(tt.sample)
 			if got := lane.reportRTTMicros.Load(); got != tt.want {
 				t.Fatalf("feedback RTT = %d, want %d", got, tt.want)
 			}
-			if got := lane.effectiveReportInterval(); got != time.Millisecond {
-				t.Fatalf("feedback interval = %v, want %v", got, time.Millisecond)
+			wantInterval := time.Millisecond
+			wantSamples := 1
+			if tt.ignore {
+				wantInterval = defaultReportInterval
+				wantSamples = 0
+			}
+			if got := lane.effectiveReportInterval(); got != wantInterval || observer.samples != wantSamples {
+				t.Fatalf("feedback interval = %v, samples = %d, want %v and %d", got, observer.samples, wantInterval, wantSamples)
 			}
 		})
 	}
@@ -192,15 +201,12 @@ func TestScheduledLaneDeliveryWindow(t *testing.T) {
 	if got := lane.deliveryWindowBytes(); got != minimumDeliveryWindow {
 		t.Fatalf("small-packet floor = %d", got)
 	}
-	store := lane.registration.Store
-	store.backlogBytes.Store(minimumDeliveryWindow - 100)
-	if !lane.canAccept(100) || lane.canAccept(101) {
-		t.Fatal("estimated window admitted an oversized next frame")
+	if !lane.canAccept(minimumDeliveryWindow+1) || !lane.canAccept(32<<20) || lane.canAccept(32<<20+1) {
+		t.Fatal("memory admission did not preserve the hard cap independently of flight credit")
 	}
 	lane.rateObserved = false
-	store.backlogBytes.Store(initialDeliveryWindow - 100)
-	if !lane.canAccept(100) || lane.canAccept(101) {
-		t.Fatal("startup window is not bounded")
+	if lane.deliveryWindowBytes() != initialDeliveryWindow || !lane.canAccept(initialDeliveryWindow+1) {
+		t.Fatal("startup flight credit incorrectly limited buffered admission")
 	}
 }
 
@@ -220,14 +226,14 @@ func TestScheduledLaneFeedbackDelayIncludesReportWait(t *testing.T) {
 	if lane.feedbackDelayMicros != 75_000 {
 		t.Fatalf("feedback delay = %d", lane.feedbackDelayMicros)
 	}
-	if window := lane.registration.Store.deliveryWindow.Load(); window != lane.deliveryWindowBytes() {
+	if window := lane.registration.Store.deliveryWindow; window != lane.deliveryWindowBytes() {
 		t.Fatalf("sampling window = %d, want %d after feedback", window, lane.deliveryWindowBytes())
 	}
 	scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{1: lane}, &preferred, schedulerEvent{
 		kind: schedulerTiming, laneID: 1, generation: 1,
 		timing: clockmap.Sample{LocalSendMicros: 1000, RemoteReceiveMicros: 2000, RemoteSendMicros: 2000, LocalReceiveMicros: 11_000},
 	}, time.Now())
-	if window := lane.registration.Store.deliveryWindow.Load(); window != lane.deliveryWindowBytes() {
+	if window := lane.registration.Store.deliveryWindow; window != lane.deliveryWindowBytes() {
 		t.Fatalf("sampling window = %d, want %d after timing", window, lane.deliveryWindowBytes())
 	}
 	if saturatingAdd(math.MaxUint64, 1) != math.MaxUint64 {

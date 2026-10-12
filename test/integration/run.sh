@@ -16,7 +16,10 @@ if [ "$#" -eq 0 ]; then
     native-udp forward-udp tcp-udp wss-udp tcp-ipv6 wss-ipv6 forward-ipv6 tcp-inner-ipv6 tcp-fwmark forward-fwmark tcp-mixed \
     tcp-slow32 tcp-slow64 tcp-slow128 tcp-multipath-slow32 tcp-multipath-slow64 tcp-multipath-slow128 \
     tcp-multipath-distinct-slow32 tcp-multipath-distinct-slow64 tcp-multipath-distinct-slow128 \
+    native-capacity-change native-capacity-change-reverse native-capacity-change-bidir \
     tcp-multipath-capacity-change tcp-multipath-capacity-change-reverse tcp-multipath-capacity-change-bidir tcp-outage tcp-roam \
+    tcp-rtt-step tcp-rtt-step-reverse tcp-rtt-step-bidir \
+    tcp-multipath-rtt-step tcp-multipath-rtt-step-reverse tcp-multipath-rtt-step-bidir \
     tls-slow32 tls-slow64 tls-slow128 tls-outage tls-roam \
     ws-slow32 ws-slow64 ws-slow128 ws-outage ws-roam \
     wss-slow32 wss-slow64 wss-slow128 wss-outage wss-roam tls-stall ws-stall wss-stall
@@ -46,12 +49,15 @@ else
 fi
 for scenario in "$@"; do
   case "$scenario" in
-    native|forward|tcp|tls|ws|wss|tcp-multipath|tcp-asymmetric|tcp-asymmetric-stall|tcp-asymmetric-stall-reverse|tcp-asymmetric-stall-bidir|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
+    native|native-capacity-change|native-capacity-change-reverse|native-capacity-change-bidir|\
+    forward|tcp|tls|ws|wss|tcp-multipath|tcp-asymmetric|tcp-asymmetric-stall|tcp-asymmetric-stall-reverse|tcp-asymmetric-stall-bidir|tcp-latency|tcp-loss|tcp-stall|tcp-bidir|tcp-idle|tcp-rekey|forward-rekey|\
     forward-prohibit|forward-blackhole|tcp-prohibit|tcp-blackhole|native-udp|forward-udp|tcp-udp|wss-udp|\
     tcp-ipv6|wss-ipv6|forward-ipv6|tcp-inner-ipv6|tcp-fwmark|forward-fwmark|tcp-mixed|\
     tcp-slow32|tcp-slow64|tcp-slow128|tcp-multipath-slow32|tcp-multipath-slow64|tcp-multipath-slow128|\
     tcp-multipath-distinct-slow32|tcp-multipath-distinct-slow64|tcp-multipath-distinct-slow128|\
     tcp-multipath-capacity-change|tcp-multipath-capacity-change-reverse|tcp-multipath-capacity-change-bidir|tcp-outage|tcp-roam|\
+    tcp-rtt-step|tcp-rtt-step-reverse|tcp-rtt-step-bidir|\
+    tcp-multipath-rtt-step|tcp-multipath-rtt-step-reverse|tcp-multipath-rtt-step-bidir|\
     tls-slow32|tls-slow64|tls-slow128|tls-outage|tls-roam|\
     ws-slow32|ws-slow64|ws-slow128|ws-outage|ws-roam|\
     wss-slow32|wss-slow64|wss-slow128|wss-outage|wss-roam|tls-stall|ws-stall|wss-stall) ;;
@@ -96,6 +102,9 @@ for scenario in "$@"; do
   docker logs "$server" > "$results/$scenario/server-container.log" 2>&1
   docker exec "$server" nstat -az > "$results/$scenario/server-nstat.txt"
   docker exec "$server" wg show wgtest latest-handshakes > "$results/$scenario/server-handshake.txt"
+  case "$scenario" in
+    *-rtt-step*) docker exec "$server" tc -s qdisc show dev eth0 > "$results/$scenario/server-qdisc-final.txt" ;;
+  esac
   docker rm -f "$client" "$server" > /dev/null
   if [ "$status" != 0 ]; then
     echo "case failed: $scenario (container exit $status), inspect $results/$scenario" >&2

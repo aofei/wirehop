@@ -189,7 +189,7 @@ func TestLaneWriteControlBatch(t *testing.T) {
 		}
 	})
 	t.Run("Boundaries", func(t *testing.T) {
-		for _, boundary := range []protocol.FrameType{protocol.FramePing, protocol.FramePong, protocol.FrameClockSync,
+		for _, boundary := range []protocol.FrameType{protocol.FramePing, protocol.FramePong, protocol.FrameMeasurement, protocol.FrameClockSync,
 			protocol.FrameSessionClose, protocol.FrameLaneAbandon, protocol.FrameError} {
 			for _, preceding := range []bool{false, true} {
 				carrier := newTestCarrier()

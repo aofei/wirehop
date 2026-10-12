@@ -140,7 +140,7 @@ func TestHelloWireLayout(t *testing.T) {
 				t.Fatal(err)
 			}
 			key := []byte("test key")
-			stream := bytes.NewReader(append(bytes.Clone(want), 0x22, 1, 2))
+			stream := bytes.NewReader(append(bytes.Clone(want), 0x26, 1, 2))
 			var encoded []byte
 			if tt.client != nil {
 				if err := SignClientHello(tt.client, key); err != nil {

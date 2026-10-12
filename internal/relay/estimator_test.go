@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
@@ -98,12 +99,13 @@ func TestTransmissionStoreCapturesSupplyPressureAtSend(t *testing.T) {
 		{name: "HalfWindow", window: 8192, packetCap: 64},
 		{name: "OddHalfWindow", window: 8193, packetCap: 64, wantLimited: true},
 		{name: "PacketPressure", window: 32_768, packetCap: 1},
-		{name: "QueuedPressure", window: 32_768, packetCap: 64, queued: true},
+		{name: "QueuedBelowWindow", window: 32_768, packetCap: 64, queued: true, wantLimited: true},
+		{name: "QueuedHalfWindow", window: 16_384, packetCap: 64, queued: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.UnixMicro(1000)
 			store := newDeliverySampleStore(t, &now)
-			store.deliveryWindow.Store(test.window)
+			store.setDeliveryWindows(test.window, test.window)
 			store.limits.Packets = test.packetCap
 			for id := uint64(1); id <= 2; id++ {
 				if id == 2 && !test.queued {
@@ -122,11 +124,197 @@ func TestTransmissionStoreCapturesSupplyPressureAtSend(t *testing.T) {
 	}
 }
 
+func TestScheduledLanePartialBurstPreservesCapacity(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		window    uint64
+		packetCap int
+		wantLower bool
+	}{
+		{name: "BelowWindow", window: 262_144, packetCap: 64},
+		{name: "HalfWindow", window: 65_536, packetCap: 64, wantLower: true},
+		{name: "PacketPressure", window: 262_144, packetCap: 16, wantLower: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.UnixMicro(1000)
+			store := newDeliverySampleStore(t, &now)
+			store.setDeliveryWindows(test.window, test.window)
+			store.limits.Packets = test.packetCap
+			lane := &scheduledLane{
+				registration: schedulerRegistration(1, 1, store),
+				rttMicros:    400_000, minimumRTTMicros: 300_000,
+				timingReferenceRate: 1_000_000, timingReferenceRTT: 400_000,
+			}
+			lane.updateDeliveryRate(deliverySample{bytes: 100_000, intervalMicros: 100_000}, uint64(now.UnixMicro()))
+			refreshes := 0
+			lane.registration.RequestMeasurement = func() { refreshes++ }
+			// The old capacity sample has aged out before the application supplies a finite burst.
+			now = now.Add(2 * time.Second)
+			for id := uint64(1); id <= 8; id++ {
+				if err := store.push(deliverySampleTransmission(t, store, id)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Each carrier batch leaves queued work until the last batch. Feedback can report any prefix.
+			var data [2]protocol.Data
+			var ownership [2]datagram.Packet
+			for range 4 {
+				count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+				releaseBatchOwnership(ownership[:count])
+				if err != nil || count != len(data) {
+					t.Fatalf("takeBatch() = %d, %v", count, err)
+				}
+				now = now.Add(time.Microsecond)
+			}
+			now = now.Add(300 * time.Millisecond)
+			for packets := uint64(2); packets <= 8; packets += 2 {
+				progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: packets}, uint64(now.UnixMicro()), now)
+				if err != nil || !progressed {
+					t.Fatalf("report %d = %t, %v", packets, progressed, err)
+				}
+				lane.maybeRefreshTiming(now, lane.rttMicros)
+				if !test.wantLower && lane.deliveryRate != 1_000_000 {
+					t.Errorf("finite burst prefix %d lowered known capacity to %d B/s", packets, lane.deliveryRate)
+				}
+				now = now.Add(time.Millisecond)
+			}
+			if test.wantLower {
+				if lane.deliveryRate >= 1_000_000 || refreshes != 0 {
+					t.Fatalf("saturated burst did not expose capacity loss without a within-horizon refresh: rate %d B/s, refreshes %d", lane.deliveryRate, refreshes)
+				}
+			} else if refreshes != 0 {
+				t.Fatalf("finite burst requested %d unnecessary timing refreshes", refreshes)
+			}
+		})
+	}
+}
+
+func TestScheduledLaneTimingResumePreservesCapacity(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		latePrefix    bool
+		emptyResumes  int
+		sparseFirst   bool
+		repeatedPause bool
+	}{
+		{name: "CompletedPrefix"},
+		{name: "LatePrefixReport", latePrefix: true},
+		{name: "RepeatedEmptyResume", emptyResumes: 3},
+		{name: "MixedSupply", sparseFirst: true},
+		{name: "RepeatedPauseBeforeReport", repeatedPause: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.UnixMicro(1000)
+			store, err := newTransmissionStore(packetqueue.Limits{Packets: 64, Bytes: 65_536}, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { releaseTransmissions(store.drain()) })
+			store.setDeliveryWindows(65_536, 65_536)
+			lane := &scheduledLane{
+				registration: schedulerRegistration(1, 1, store),
+				rttMicros:    400_000, minimumRTTMicros: 300_000,
+				timingReferenceRate: 1_000_000, timingReferenceRTT: 400_000,
+			}
+			lane.updateDeliveryRate(deliverySample{bytes: 100_000, intervalMicros: 100_000}, uint64(now.UnixMicro()))
+			refreshes := 0
+			lane.registration.RequestMeasurement = func() { refreshes++ }
+			queue := func(first, count uint64) {
+				t.Helper()
+				for id := first; id < first+count; id++ {
+					if err := store.push(deliverySampleTransmission(t, store, id)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			commit := func() {
+				t.Helper()
+				var data [2]protocol.Data
+				var ownership [2]datagram.Packet
+				count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+				releaseBatchOwnership(ownership[:count])
+				if err != nil || count != len(data) {
+					t.Fatalf("takeBatch() = %d, %v", count, err)
+				}
+				now = now.Add(time.Microsecond)
+			}
+			report := func(packets uint64) {
+				t.Helper()
+				now = now.Add(time.Millisecond)
+				progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: packets}, uint64(now.UnixMicro()), now)
+				if err != nil || !progressed {
+					t.Fatalf("report %d = %t, %v", packets, progressed, err)
+				}
+				lane.maybeRefreshTiming(now, lane.rttMicros)
+			}
+			// An aged peak must survive the intentional pause, without relying on recent rate history.
+			now = now.Add(2 * time.Second)
+			queue(1, 2)
+			commit()
+			now = now.Add(20 * time.Millisecond)
+			store.beginMeasurementPause()
+			if !test.latePrefix {
+				report(2)
+			}
+			store.endMeasurementPause()
+			for range test.emptyResumes {
+				store.beginMeasurementPause()
+				store.endMeasurementPause()
+			}
+			if test.sparseFirst {
+				queue(3, 2)
+			} else {
+				queue(3, 12)
+			}
+			commit()
+			if test.sparseFirst {
+				queue(5, 10)
+			}
+			if test.latePrefix {
+				// A canceled or expired drain can receive this old prefix after resuming Data.
+				report(2)
+			}
+			firstReport := uint64(4)
+			if test.repeatedPause {
+				store.beginMeasurementPause()
+				store.endMeasurementPause()
+				now = now.Add(20 * time.Millisecond)
+				report(4)
+				firstReport = 6
+			}
+			for range 5 {
+				commit()
+			}
+			now = now.Add(300 * time.Millisecond)
+			report(firstReport)
+			// Cleanup can end an already ended pause and must not arm another recovery interval.
+			store.endMeasurementPause()
+			// Six new frames fit the remaining flight credit and preserve half-window pressure.
+			// These commits must regain normal rate-loss detection after the first resumed ACK.
+			queue(15, 6)
+			for range 3 {
+				commit()
+			}
+			for packets := firstReport + 2; packets <= 14; packets += 2 {
+				report(packets)
+			}
+			if lane.deliveryRate != 1_000_000 || refreshes != 0 {
+				t.Errorf("resumed flight changed capacity to %d B/s and requested %d refreshes", lane.deliveryRate, refreshes)
+			}
+			now = now.Add(300 * time.Millisecond)
+			report(16)
+			if lane.deliveryRate >= 1_000_000 || refreshes != 0 {
+				t.Fatalf("self-clocked constrained flight hid capacity loss or refreshed within the horizon: rate %d B/s, refreshes %d", lane.deliveryRate, refreshes)
+			}
+		})
+	}
+}
+
 func TestTransmissionStorePreservesApplicationLimitedFlight(t *testing.T) {
 	now := time.UnixMicro(1000)
 	store := newDeliverySampleStore(t, &now)
 	sendDeliverySamplePacket(t, store, 1)
-	store.deliveryWindow.Store(initialDeliveryWindow)
+	store.setDeliveryWindows(32_768, 32_768)
 	var data [8]protocol.Data
 	var ownership [8]datagram.Packet
 	for flight := uint64(0); flight < 2; flight++ {

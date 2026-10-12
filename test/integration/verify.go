@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -15,7 +16,13 @@ import (
 type flowResult struct {
 	Error     string
 	Intervals []flowIntervalResult
-	End       struct {
+	Start     struct {
+		Timestamp struct {
+			Seconds int64 `json:"timesecs"`
+		}
+	}
+	ServerOutput *flowResult `json:"server_output_json"`
+	End          struct {
 		Received struct {
 			Bytes         uint64
 			BitsPerSecond float64 `json:"bits_per_second"`
@@ -38,10 +45,14 @@ type flowIntervalResult struct {
 
 // flowInterval describes one direction's completed iperf3 reporting interval.
 type flowInterval struct {
-	Bytes uint64
-	Start float64
-	End   float64
+	Bytes  uint64
+	Start  float64
+	End    float64
+	Sender *bool
 }
+
+// rttStepQdiscPattern extracts the configured root netem and its cumulative traffic and drop counters.
+var rttStepQdiscPattern = regexp.MustCompile(`(?m)^qdisc netem 10: root ([^\n]*)\n Sent ([0-9]+) bytes [0-9]+ pkt \(dropped ([0-9]+),`)
 
 // main validates every requested scenario and exits unsuccessfully if any transfer failed or made no progress.
 func main() {
@@ -82,7 +93,8 @@ func main() {
 				err = fmt.Errorf("TCP flow made no progress in the final interval after path recovery")
 			}
 		}
-		capacityChange := strings.HasPrefix(scenario, "tcp-multipath-capacity-change")
+		capacityChange := strings.HasPrefix(scenario, "native-capacity-change") ||
+			strings.HasPrefix(scenario, "tcp-multipath-capacity-change")
 		if err == nil && capacityChange {
 			for _, name := range []string{"client-rate-dropped.txt", "client-rate-restored.txt",
 				"server-rate-dropped.txt", "server-rate-restored.txt"} {
@@ -92,7 +104,14 @@ func main() {
 			}
 		}
 		if err == nil && (strings.HasPrefix(scenario, "tcp-asymmetric-stall") || capacityChange) {
-			err = verifyThroughputRecovery(flow, strings.HasSuffix(scenario, "-bidir"))
+			duration := 20.0
+			if capacityChange {
+				duration = 40
+			}
+			err = verifyThroughputRecovery(flow, strings.HasSuffix(scenario, "-bidir"), duration)
+		}
+		if err == nil && strings.Contains(scenario, "-rtt-step") {
+			err = verifyRTTStep(directory, scenario, flow)
 		}
 		if err == nil {
 			err = verifyCarrier(directory, scenario)
@@ -118,9 +137,144 @@ func main() {
 	}
 }
 
-// verifyThroughputRecovery requires substantial throughput in each exercised direction during the final five seconds
-// of a twenty-second flow, relative to its own throughput before fault injection at five seconds.
-func verifyThroughputRecovery(flow flowResult, bidirectional bool) error {
+// verifyRTTStep checks each exercised direction using intervals measured at its receiving endpoint.
+func verifyRTTStep(directory, scenario string, flow flowResult) error {
+	if !strings.HasSuffix(scenario, "-reverse") {
+		if err := verifyRTTStepDirection(directory, flow.ServerOutput, false); err != nil {
+			return fmt.Errorf("forward direction: %w", err)
+		}
+	}
+	bidirectional := strings.HasSuffix(scenario, "-bidir")
+	if bidirectional || strings.HasSuffix(scenario, "-reverse") {
+		if err := verifyRTTStepDirection(directory, &flow, bidirectional); err != nil {
+			return fmt.Errorf("reverse direction: %w", err)
+		}
+	}
+	return nil
+}
+
+// verifyRTTStepDirection checks receiver throughput after a persistent RTT increase and its reversal at fixed capacity.
+// Reverse intervals are selected only from the client's bidirectional result. Reverse-only flows use their ordinary sum.
+func verifyRTTStepDirection(directory string, receiver *flowResult, reverseIntervals bool) error {
+	if receiver == nil || receiver.Error != "" || receiver.Start.Timestamp.Seconds == 0 {
+		return fmt.Errorf("missing completed receiver interval evidence")
+	}
+	var raised, restored [2]float64
+	for index, role := range []string{"client", "server"} {
+		for _, change := range []struct {
+			name string
+			at   *float64
+			want float64
+		}{
+			{name: "raised", at: &raised[index], want: 10},
+			{name: "restored", at: &restored[index], want: 40},
+		} {
+			name := role + "-delay-" + change.name + ".txt"
+			data, err := os.ReadFile(filepath.Join(directory, name))
+			if err != nil {
+				return err
+			}
+			at, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			*change.at = float64(at - receiver.Start.Timestamp.Seconds)
+			if *change.at < change.want-1 || *change.at > change.want+2 {
+				return fmt.Errorf("%s changed at %.0f seconds, expected approximately %.0f", name, *change.at, change.want)
+			}
+		}
+		if err := verifyRTTStepQdiscs(directory, role); err != nil {
+			return err
+		}
+	}
+	previousEnd := 0.0
+	for _, interval := range receiver.Intervals {
+		sample := interval.Sum
+		if reverseIntervals {
+			sample = interval.Reverse
+		}
+		if sample.Sender == nil || *sample.Sender || sample.Start < previousEnd || sample.End <= sample.Start {
+			return fmt.Errorf("invalid receiver interval evidence")
+		}
+		previousEnd = sample.End
+	}
+	var rates [3]float64
+	for index, window := range []struct {
+		name       string
+		start, end float64
+	}{
+		{name: "baseline", start: 2, end: min(raised[0], raised[1]) - 2},
+		{name: "raised RTT", start: max(raised[0], raised[1]) + 18, end: min(restored[0], restored[1]) - 2},
+		{name: "restored RTT", start: max(restored[0], restored[1]) + 10, end: 58},
+	} {
+		var bytes uint64
+		var seconds float64
+		for _, interval := range receiver.Intervals {
+			sample := interval.Sum
+			if reverseIntervals {
+				sample = interval.Reverse
+			}
+			if sample.Start >= window.start && sample.End <= window.end {
+				bytes += sample.Bytes
+				seconds += sample.End - sample.Start
+			}
+		}
+		// Whole intervals can omit at most one second at either edge of a window.
+		if seconds < window.end-window.start-2.1 || bytes == 0 {
+			return fmt.Errorf("%s lacks complete useful receiver intervals", window.name)
+		}
+		rates[index] = float64(bytes) / seconds
+		if index == 0 && rates[0]*8 < 5e6 {
+			return fmt.Errorf("baseline receiver throughput is %.3f Mbit/s, require at least 5 Mbit/s on the 20 Mbit/s link",
+				rates[0]*8/1e6)
+		}
+		if index > 0 && rates[index] < rates[0]/4 {
+			return fmt.Errorf("%s receiver throughput is %.1f percent of baseline, require at least 25 percent",
+				window.name, rates[index]/rates[0]*100)
+		}
+	}
+	return nil
+}
+
+// verifyRTTStepQdiscs verifies successful impairment changes without queue replacement, packet drops, or bypass.
+func verifyRTTStepQdiscs(directory, role string) error {
+	var previousBytes uint64
+	for _, phase := range []struct{ name, delay string }{
+		{name: "initial", delay: "5ms"},
+		{name: "raised", delay: "600ms"},
+		{name: "restored", delay: "5ms"},
+		{name: "final", delay: "5ms"},
+	} {
+		name := role + "-qdisc-" + phase.name + ".txt"
+		data, err := os.ReadFile(filepath.Join(directory, name))
+		if err != nil {
+			return err
+		}
+		match := rttStepQdiscPattern.FindStringSubmatch(string(data))
+		if match == nil {
+			return fmt.Errorf("%s lacks root netem evidence", name)
+		}
+		configuration := " " + match[1] + " "
+		for _, setting := range []string{"limit 10000", "delay " + phase.delay, "rate 20Mbit"} {
+			if !strings.Contains(configuration, " "+setting+" ") {
+				return fmt.Errorf("%s lacks expected %s", name, setting)
+			}
+		}
+		bytes, err := strconv.ParseUint(match[2], 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if match[3] != "0" || phase.name != "initial" && bytes <= previousBytes {
+			return fmt.Errorf("%s records packet drops or no additional shaped traffic", name)
+		}
+		previousBytes = bytes
+	}
+	return nil
+}
+
+// verifyThroughputRecovery requires a complete flow and substantial final-five-second throughput in each direction,
+// relative to its own throughput before fault injection at five seconds. duration is the prescribed flow time in seconds.
+func verifyThroughputRecovery(flow flowResult, bidirectional bool, duration float64) error {
 	directions := 1
 	if bidirectional {
 		directions = 2
@@ -128,25 +282,27 @@ func verifyThroughputRecovery(flow flowResult, bidirectional bool) error {
 	for direction := range directions {
 		var baselineBytes, recoveredBytes uint64
 		var baselineSeconds, recoveredSeconds float64
+		var finalEnd float64
 		for _, interval := range flow.Intervals {
 			sample := interval.Sum
 			if direction == 1 {
 				sample = interval.Reverse
 			}
-			duration := sample.End - sample.Start
-			if duration <= 0 {
+			seconds := sample.End - sample.Start
+			if seconds <= 0 {
 				continue
 			}
+			finalEnd = max(finalEnd, sample.End)
 			if sample.End <= 4.5 {
 				baselineBytes += sample.Bytes
-				baselineSeconds += duration
+				baselineSeconds += seconds
 			}
-			if sample.Start >= 14.5 {
+			if sample.Start >= duration-5.5 {
 				recoveredBytes += sample.Bytes
-				recoveredSeconds += duration
+				recoveredSeconds += seconds
 			}
 		}
-		if baselineSeconds < 2 || recoveredSeconds < 4 || baselineBytes == 0 {
+		if finalEnd < duration-0.5 || baselineSeconds < 2 || recoveredSeconds < 4 || baselineBytes == 0 {
 			return fmt.Errorf("direction %d lacks complete pre-fault or post-fault throughput intervals", direction)
 		}
 		baseline := float64(baselineBytes) / baselineSeconds
@@ -174,8 +330,9 @@ func verifyCarrier(directory, scenario string) error {
 	expected := 3
 	if strings.HasPrefix(scenario, "native") || strings.HasPrefix(scenario, "forward") {
 		expected = 2
-	} else if scenario == "tcp-bidir" {
-		expected = 4
+	}
+	if strings.HasSuffix(scenario, "-bidir") {
+		expected++
 	} else if scenario == "tcp-idle" {
 		expected = 5
 	}
@@ -234,8 +391,12 @@ func verifyParallelCarriers(directory, scenario string) error {
 	if err != nil {
 		return err
 	}
-	if after-before != 2 {
-		return fmt.Errorf("initiated %d TCP connections during the flow, expected only iperf3 control and data", after-before)
+	expected := 2
+	if strings.HasSuffix(scenario, "-bidir") {
+		expected = 3
+	}
+	if after-before != expected {
+		return fmt.Errorf("initiated %d TCP connections during the flow, expected %d for iperf3 control and data", after-before, expected)
 	}
 	return nil
 }

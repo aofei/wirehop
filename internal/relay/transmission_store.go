@@ -70,6 +70,9 @@ type deliverySample struct {
 type deadlineAssessment struct {
 	usefulDeadline time.Time
 	usefulBytes    uint64
+	// queuedDeadline and queuedBytes are independent optimistic bounds, not one packet's identity.
+	queuedDeadline time.Time
+	queuedBytes    uint64
 	retained       bool
 	atRisk         bool
 }
@@ -272,8 +275,10 @@ type TransmissionStore struct {
 	firstSentMicros         uint64
 	deliveredMicros         uint64
 	applicationLimitedUntil uint64
-	deliveryWindow          atomic.Uint64
-	// transportReported saturates at minimumRateSampleBytes and excludes capacity padding.
+	deliveryWindow          uint64
+	probeWindow             uint64
+	measurementDrain        atomic.Bool
+	// transportReported saturates at minimumTransportProofBytes and excludes capacity padding.
 	transportReported atomic.Uint64
 	writeBudget       atomic.Uint64
 	backlogPackets    atomic.Int64
@@ -315,8 +320,25 @@ func newTransmissionStoreWithBudget(limits packetqueue.Limits, now func() time.T
 		notify: make(chan struct{}, 1),
 		done:   make(chan struct{}),
 	}
-	store.deliveryWindow.Store(min(uint64(limits.Bytes), initialDeliveryWindow))
+	store.deliveryWindow = min(uint64(limits.Bytes), initialDeliveryWindow)
+	store.probeWindow = store.deliveryWindow
 	return store, nil
+}
+
+// setDeliveryWindows publishes normal and padding send credit under the committed-prefix lock.
+func (s *TransmissionStore) setDeliveryWindows(normal, probe uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setDeliveryWindowsLocked(normal, probe)
+}
+
+// setDeliveryWindowsLocked publishes both windows while the caller holds s.mu.
+func (s *TransmissionStore) setDeliveryWindowsLocked(normal, probe uint64) {
+	s.deliveryWindow = normal
+	s.probeWindow = probe
+	if s.control.len()+s.normal.len() > 0 {
+		s.notifyLocked()
+	}
 }
 
 // push retains one transmission when all limits and invariants permit it.
@@ -390,6 +412,9 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 	if s.closed {
 		return 0, packetqueue.ErrClosed
 	}
+	if s.measurementDrain.Load() {
+		return 0, packetqueue.ErrEmpty
+	}
 	if s.control.len()+s.normal.len() == 0 {
 		return 0, packetqueue.ErrEmpty
 	}
@@ -406,6 +431,14 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 			if count == 0 {
 				return 0, ErrCounterExhausted
 			}
+			break
+		}
+		window := s.deliveryWindow
+		if transmission.packetID == 0 {
+			window = s.probeWindow
+		}
+		committed := s.sentBytes - s.reportedBytes
+		if committed != 0 && (committed >= window || uint64(transmission.size) > window-committed) {
 			break
 		}
 		transmission = source.pop()
@@ -433,8 +466,8 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 		return 0, packetqueue.ErrEmpty
 	}
 	// Preserve supply state with the committed batch. Later queue arrivals cannot reclassify its samples.
-	window := s.deliveryWindow.Load()
-	constrained := s.control.len()+s.normal.len() > 0 || s.packets >= s.limits.Packets/2+s.limits.Packets%2 ||
+	window := s.deliveryWindow
+	constrained := s.packets >= s.limits.Packets/2+s.limits.Packets%2 ||
 		uint64(s.bytes) >= window/2+window%2
 	if !constrained {
 		s.applicationLimitedUntil = s.sentPackets
@@ -470,10 +503,8 @@ func (s *TransmissionStore) nextQueuedLocked(nowMicros uint64) (*transmissionDeq
 	}
 }
 
-// acknowledge releases the exact cumulative sent prefix and samples its delivery in the store's deadline clock.
-func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (deliverySample, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// acknowledgeLocked releases and samples the exact cumulative sent prefix while the caller holds s.mu.
+func (s *TransmissionStore) acknowledgeLocked(packets, receiveMicros uint64) (deliverySample, bool, error) {
 	if s.closed || packets < s.reportedPackets {
 		return deliverySample{}, true, nil
 	}
@@ -489,7 +520,7 @@ func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (delivery
 	delivery := last.delivery
 	var releasedBytes uint64
 	var transportBytes uint64
-	needTransportProof := s.transportReported.Load() < minimumRateSampleBytes
+	needTransportProof := s.transportReported.Load() < minimumTransportProofBytes
 	for index := range acknowledged {
 		releasedBytes += uint64(acknowledged[index].size)
 		if needTransportProof && acknowledged[index].packet.Kind == wgpacket.TransportData {
@@ -498,7 +529,7 @@ func (s *TransmissionStore) acknowledge(packets, receiveMicros uint64) (delivery
 		acknowledged[index].releasePacket()
 	}
 	if needTransportProof {
-		s.transportReported.Store(min(minimumRateSampleBytes, s.transportReported.Load()+transportBytes))
+		s.transportReported.Store(min(minimumTransportProofBytes, s.transportReported.Load()+transportBytes))
 	}
 	bytes := s.reportedBytes + releasedBytes
 	var sample deliverySample
@@ -577,7 +608,7 @@ func (s *TransmissionStore) expire(now time.Time) (time.Time, uint64) {
 	return s.unreportedSince, uint64(first.size)
 }
 
-// assessDeadlines reclaims queued expiry and evaluates retained work in one locked traversal.
+// assessDeadlines reclaims expiry and evaluates retained work in carrier order while holding the store lock.
 func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) uint64) deadlineAssessment {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -589,12 +620,21 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 	var assessment deadlineAssessment
 	prefixBytes := uint64(0)
 	nowMicros := uint64(now.UnixMicro())
+	queued := false
 	visit := func(transmission retainedTransmission) bool {
 		prefixBytes += uint64(transmission.size)
 		if transmission.packetID == 0 {
 			return true
 		}
 		assessment.retained = true
+		if queued && transmission.packet.Kind == wgpacket.TransportData && !transmission.migrated {
+			if assessment.queuedDeadline.IsZero() || transmission.deadlineMicros > uint64(assessment.queuedDeadline.UnixMicro()) {
+				assessment.queuedDeadline = monotime.Time(transmission.deadlineMicros)
+			}
+			if assessment.queuedBytes == 0 || uint64(transmission.size) < assessment.queuedBytes {
+				assessment.queuedBytes = uint64(transmission.size)
+			}
+		}
 		if transmission.packet.Kind == wgpacket.TransportData && !transmission.migrated && nowMicros < transmission.deadlineMicros &&
 			(assessment.usefulDeadline.IsZero() || transmission.deadlineMicros < uint64(assessment.usefulDeadline.UnixMicro())) {
 			assessment.usefulDeadline = monotime.Time(transmission.deadlineMicros)
@@ -608,10 +648,80 @@ func (s *TransmissionStore) assessDeadlines(now time.Time, delay func(uint64) ui
 		}
 		return true
 	}
-	s.sent.each(visit)
+	if s.sent.earliestDeadline != 0 {
+		s.sent.each(visit)
+	} else {
+		// Expired payloads leave a charged prefix but no useful deadline to search for.
+		prefixBytes = s.sentBytes - s.reportedBytes
+		s.sent.each(func(transmission retainedTransmission) bool {
+			if transmission.packetID == 0 {
+				return true
+			}
+			assessment.retained = true
+			assessment.atRisk = true
+			return false
+		})
+	}
 	s.control.each(visit)
+	queued = true
 	s.normal.each(visit)
 	return assessment
+}
+
+// transferQueuedTo moves useful unsent transport once without changing either committed prefix or aggregate ownership.
+// The caller supplies distinct stores and serializes transfers through their scheduler, preventing reversed lock order.
+// The delay callback must use the supplied locked destination backlog without taking either store's mutex.
+func (s *TransmissionStore) transferQueuedTo(destination *TransmissionStore, now time.Time,
+	delay func(frameBytes, queuedBytes, backlogBytes uint64) uint64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	destination.mu.Lock()
+	defer destination.mu.Unlock()
+	if s.closed || destination.closed || s.measurementDrain.Load() || destination.measurementDrain.Load() || s.budget != destination.budget {
+		return 0
+	}
+	s.removeExpiredQueuedLocked(now)
+	destination.removeExpiredQueuedLocked(now)
+	nowMicros := uint64(now.UnixMicro())
+	write, moved := 0, 0
+	s.normal.earliestDeadline = 0
+	for read := s.normal.head; read < len(s.normal.items); read++ {
+		transmission := s.normal.items[read]
+		if transmission.packet.Kind == wgpacket.TransportData && !transmission.migrated {
+			size := uint64(transmission.size)
+			backlog := uint64(destination.bytes)
+			queuedBytes := backlog - (destination.sentBytes - destination.reportedBytes)
+			if destination.packets < destination.limits.Packets && size <= uint64(destination.limits.Bytes-destination.bytes) &&
+				delay(size, queuedBytes, backlog) < transmission.deadlineMicros-nowMicros {
+				transmission.migrated = true
+				destination.normal.push(transmission)
+				s.addBacklogLocked(-1, -int(size))
+				destination.addBacklogLocked(1, int(size))
+				moved++
+				continue
+			}
+		}
+		if write == 0 || transmission.deadlineMicros < s.normal.earliestDeadline {
+			s.normal.earliestDeadline = transmission.deadlineMicros
+		}
+		s.normal.items[write] = transmission
+		write++
+	}
+	clear(s.normal.items[write:])
+	s.normal.items = s.normal.items[:write]
+	s.normal.head = 0
+	if write == 0 {
+		s.normal.resetEmpty()
+	} else {
+		s.normal.shrink()
+	}
+	if moved > 0 {
+		destination.notifyLocked()
+		if s.control.len()+s.normal.len() > 0 {
+			s.notifyLocked()
+		}
+	}
+	return moved
 }
 
 // drain closes the generation and returns every queued or sent-unreported transmission.
@@ -638,7 +748,7 @@ func (s *TransmissionStore) drain() []retainedTransmission {
 	return retained
 }
 
-// Ready returns a coalesced notification for available queued work.
+// Ready returns a coalesced notification to retry queued work.
 func (s *TransmissionStore) Ready() <-chan struct{} {
 	return s.notify
 }
@@ -656,6 +766,9 @@ func (s *TransmissionStore) removeExpiredQueuedLocked(now time.Time) {
 	removedBytes += normalBytes
 	if removedPackets > 0 {
 		s.releaseBacklogLocked(removedPackets, removedBytes)
+		if s.control.len()+s.normal.len() > 0 {
+			s.notifyLocked()
+		}
 	}
 }
 
@@ -675,10 +788,36 @@ func (s *TransmissionStore) addBacklogLocked(packets, bytes int) {
 	s.backlogBytes.Store(uint64(s.bytes))
 }
 
-// notifyLocked publishes available queued work without blocking the caller.
+// notifyLocked publishes a queued-work retry notification without blocking the caller.
 func (s *TransmissionStore) notifyLocked() {
 	select {
 	case s.notify <- struct{}{}:
 	default:
 	}
+}
+
+// beginMeasurementPause closes the Data gate while committed prefixes are reported.
+func (s *TransmissionStore) beginMeasurementPause() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.measurementDrain.Store(true)
+}
+
+// endMeasurementPause resumes Data while preserving pause provenance until the first post-resume packet is reported.
+func (s *TransmissionStore) endMeasurementPause() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.measurementDrain.Swap(false) {
+		s.applicationLimitedUntil = saturatingAdd(s.sentPackets, 1)
+	}
+	if s.control.len()+s.normal.len() > 0 {
+		s.notifyLocked()
+	}
+}
+
+// sentEmpty reports whether every data frame committed before the timing pause has been parsed by the peer.
+func (s *TransmissionStore) sentEmpty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sent.len() == 0
 }

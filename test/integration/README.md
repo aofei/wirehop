@@ -19,16 +19,20 @@ sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-results
 Use `GOARCH=amd64` for an x86-64 engine. Each run requires a fresh results directory. To reuse an equivalent tool image,
 set `WIREHOP_TEST_IMAGE`. It must provide `sh`, `ip`, `wg`, `tc`, `nstat`, `iperf3`, `openssl`, and `timeout`.
 
-The default matrix contains 65 cases. It includes native WireGuard, forward, all four carrier schemes, two TCP lanes,
-1.2-second RTT, 0.5% loss with delay and jitter, four-second and twelve-second one-way outages, client address
-replacement, 32, 64, and 128 kbit/s carrier links, bidirectional TCP, an idle interval followed by a new burst, and
-140-second TCP flows spanning an actual kernel WireGuard rekey. Each scenario uses fresh endpoints. Ordinary cases run
-for 20 seconds. Twelve-second outage and address-replacement cases run for 40 seconds and require transfer progress
-after recovery. Address replacement changes the container's carrier-facing address, forcing recovery from an obsolete
-TCP connection. The rate-limited cases add 100 ms one-way delay, 20 ms jitter, and 0.2% loss with an eight-packet netem
-queue. They test continued connectivity at low capacity, not comparative mobile throughput or battery consumption. The
-`tcp-asymmetric` case uses distinct TCP path groups with 5 ms one-way delay at 100 Mbit/s and 150 ms one-way delay at 20
-Mbit/s. `tcp-asymmetric-stall` additionally interrupts only the faster path for four seconds. Its `-reverse` and
+The default matrix includes native WireGuard, forward, all four carrier schemes, two TCP lanes, 1.2-second RTT, 0.5%
+loss with delay and jitter, four-second and twelve-second one-way outages, client address replacement, 32, 64, and 128
+kbit/s carrier links, bidirectional TCP, an idle interval followed by a new burst, and 140-second TCP flows spanning an
+actual kernel WireGuard rekey. Each scenario uses fresh endpoints.
+
+Ordinary cases run for 20 seconds. Capacity-change, twelve-second outage, and address-replacement cases run for 40
+seconds and require transfer progress after recovery. Address replacement changes the container's carrier-facing
+address, forcing recovery from an obsolete TCP connection.
+
+The rate-limited cases add 100 ms one-way delay, 20 ms jitter, and 0.2% loss with an eight-packet netem queue. They test
+continued connectivity at low capacity, not comparative mobile throughput or battery consumption.
+
+The `tcp-asymmetric` case uses distinct TCP path groups with 5 ms one-way delay at 100 Mbit/s and 150 ms one-way delay
+at 20 Mbit/s. `tcp-asymmetric-stall` additionally interrupts only the faster path for four seconds. Its `-reverse` and
 `-bidir` variants exercise the opposite direction and simultaneous bidirectional traffic. Each exercised direction must
 recover at least 25 percent of its measured pre-fault throughput during the final five seconds. These cases check
 completed delivery and substantial recovery with unequal paths. They do not guarantee uninterrupted inner TCP progress
@@ -52,6 +56,20 @@ because previously measured capacity and accumulated TCP backlog can make the ol
 startup cases retain their stricter no-reconnection check. The capacity-change case's `-reverse` and `-bidir` variants
 apply the same fault to opposite-direction and simultaneous bidirectional traffic. Each exercised direction must meet
 the recovery threshold using its own pre-fault rate.
+
+The `native-capacity-change`, `native-capacity-change-reverse`, and `native-capacity-change-bidir` cases apply the same
+fault and recovery threshold directly to native WireGuard. Severe delay or loss can leave inner TCP waiting in
+retransmission backoff after capacity returns. Forty-second flows leave room to observe sustained recovery after that
+wait, and all intervals remain available for inspecting earlier behavior. The native controls help distinguish inner TCP
+recovery limits from relay-specific regressions.
+
+The `tcp-rtt-step` and `tcp-multipath-rtt-step` cases keep a 20 Mbit/s bottleneck throughout a 60-second transfer. Both
+endpoint delays rise from 5 to 600 milliseconds after ten seconds and return to 5 milliseconds thirty seconds later. The
+multipath case uses two lanes in one path group. Their `-reverse` and `-bidir` variants exercise the reverse direction
+and simultaneous bidirectional traffic. Receiver interval data in each direction must show at least 5 Mbit/s before the
+change and retain at least 25 percent of its own baseline during the settled high-delay and restored phases. Both
+endpoints record the actual change times. Every phase must exercise the configured queue without drops, and the carrier
+connections must remain unchanged. Sender-side buffered bytes do not satisfy the delivery checks.
 
 Select a subset by passing case names:
 
@@ -105,6 +123,7 @@ docker run --rm --network none --read-only --cap-add NET_ADMIN \
 ```
 
 The route test is skipped during ordinary `go test` runs. CI runs the socket recovery tests in isolation and selects
-twenty-four representative kernel flow cases, including directional multipath recovery, low-rate TCP/WSS and multipath,
-shared-capacity changes with simultaneous bidirectional traffic, a twelve-second interruption, and address replacement.
-The complete matrix remains available through `run.sh` without case arguments.
+representative kernel flow cases, including directional multipath recovery, low-rate TCP/WSS and multipath,
+shared-capacity changes with simultaneous bidirectional traffic, changing RTT, a twelve-second interruption, and address
+replacement. The selected cases are listed in [the test workflow](../../.github/workflows/test.yaml). The complete
+matrix remains available through `run.sh` without case arguments.

@@ -634,6 +634,8 @@ func TestTransmissionStoreAcknowledgeMixedProbePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
+	// This prefix-accounting fixture needs its entire mixed batch committed before feedback.
+	store.setDeliveryWindows(128*1024, 128*1024)
 	first := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))
 	first.packet.Payload = make([]byte, 2048)
 	first.packet.Payload[0] = 4
@@ -685,9 +687,9 @@ func TestTransmissionStoreAcknowledgeMixedProbePrefix(t *testing.T) {
 		{name: "BeyondSentPrefix", packets: 6, proof: 2048, remaining: 3, malformed: true},
 		{name: "PaddingOnly", packets: 3, proof: 2048, remaining: 2},
 		{name: "StalePrefix", packets: 2, proof: 2048, remaining: 2, stale: true},
-		{name: "MigratedReal", packets: 4, proof: minimumRateSampleBytes, remaining: 1},
-		{name: "OversizedRealSaturates", packets: 5, proof: minimumRateSampleBytes},
-		{name: "RepeatedPrefix", packets: 5, proof: minimumRateSampleBytes},
+		{name: "MigratedReal", packets: 4, proof: minimumTransportProofBytes, remaining: 1},
+		{name: "OversizedRealSaturates", packets: 5, proof: minimumTransportProofBytes},
+		{name: "RepeatedPrefix", packets: 5, proof: minimumTransportProofBytes},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, stale, err := store.acknowledge(tt.packets, uint64(now.UnixMicro()))
@@ -751,15 +753,15 @@ func TestScheduledLaneRateFilterStartupAndCapacityDrop(t *testing.T) {
 
 func TestSchedulerTransportSelectionBoundaries(t *testing.T) {
 	for _, tt := range []struct {
-		name                                    string
-		holding, failed, full, deadlineFallback bool
-		want                                    protocol.LaneID
+		name                                 string
+		holding, failed, full, shortDeadline bool
+		want                                 protocol.LaneID
 	}{
 		{name: "MeasuredPromotion", want: 2},
 		{name: "InitialHold", holding: true, want: 1},
 		{name: "FailedPrimaryBypassesHold", holding: true, failed: true, want: 2},
 		{name: "FullPrimaryWaits", holding: true, full: true},
-		{name: "FullLatePrimaryPermitsFallback", holding: true, full: true, deadlineFallback: true, want: 2},
+		{name: "FullLatePrimaryWaits", holding: true, full: true, shortDeadline: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			now := time.Unix(100, 0)
@@ -780,7 +782,7 @@ func TestSchedulerTransportSelectionBoundaries(t *testing.T) {
 				scheduler.transportHoldUntil = now.Add(time.Second)
 			}
 			maximumScore := uint64(math.MaxUint64)
-			if tt.deadlineFallback {
+			if tt.shortDeadline {
 				maximumScore = 20_000
 			}
 			got := scheduler.selectTransportCandidates(map[protocol.LaneID]*scheduledLane{1: first, 2: second},
@@ -950,7 +952,7 @@ func TestScheduledLaneDeliveryRateSamplingInterval(t *testing.T) {
 		{name: "CompressedHighDelay", rtt: 200_000, interval: 999, bytes: 4096},
 		{name: "CrossCarrierFeedback", rtt: 400_000, interval: 150_000, bytes: 4096, observed: true},
 		{name: "AsymmetricCrossCarrierFeedback", rtt: 200_000, interval: 1000, bytes: 4096, observed: true},
-		{name: "SmallSample", rtt: 200, interval: 1000, bytes: 4095},
+		{name: "SmallInitialSample", rtt: 200, interval: 1000, bytes: 4095},
 		{name: "Overflow", interval: 1000, bytes: math.MaxUint64},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -989,6 +991,7 @@ func TestScheduledLaneDeliveryRateAcceptsFasterFeedbackCarrier(t *testing.T) {
 }
 
 func TestSchedulerStalledProbePermitsInitialFailover(t *testing.T) {
+	var rescuePreferred protocol.LaneID
 	now := time.Unix(100, 0)
 	first := schedulerLane(t, 1, 1, 10_000, defaultInitialRateBytesPerSecond)
 	second := schedulerLane(t, 2, 2, 100_000, 100_000)
@@ -1007,7 +1010,7 @@ func TestSchedulerStalledProbePermitsInitialFailover(t *testing.T) {
 	lanes := map[protocol.LaneID]*scheduledLane{1: first, 2: second}
 	var scheduler Scheduler
 	now = now.Add(time.Second)
-	scheduler.checkAbandonment(lanes, now)
+	scheduler.checkAbandonment(lanes, &rescuePreferred, now)
 	if !first.degraded || first.abandoning || abandoned {
 		t.Fatal("stalled padding did not divert initial traffic without generation abandonment")
 	}
@@ -1035,6 +1038,7 @@ func TestLaneWriteDataBatchBudget(t *testing.T) {
 			connection := newTestCarrier()
 			lane := newTestLane(t, connection, newTestEndpoint())
 			lane.store = schedulerStore(t, packetqueue.Limits{Packets: 32, Bytes: 128 * 1024})
+			lane.store.setDeliveryWindows(128*1024, 128*1024)
 			lane.store.writeBudget.Store(tt.budget)
 			t.Cleanup(func() { releaseTransmissions(lane.store.drain()) })
 			for id := uint64(1); id <= maximumDataBatchFrames; id++ {
@@ -1165,7 +1169,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	old := &scheduledLane{registration: schedulerRegistration(1, 1, oldStore), rttMicros: 10_000,
 		deliveryRate: defaultInitialRateBytesPerSecond, lastProgressAt: now}
 	transmission := schedulerTransmission(7, wgpacket.TransportData, now.Add(time.Second))
-	transmission.packet.Payload = make([]byte, minimumRateSampleBytes)
+	transmission.packet.Payload = make([]byte, minimumTransportProofBytes)
 	transmission.packet.Payload[0] = 4
 	if err := oldStore.push(transmission); err != nil {
 		t.Fatal(err)
@@ -1183,7 +1187,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	if progressed, err := old.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 		t.Fatalf("old generation's real feedback = %t, %v", progressed, err)
 	}
-	if !old.rateObserved || oldStore.transportReported.Load() != minimumRateSampleBytes {
+	if !old.rateObserved || oldStore.transportReported.Load() != minimumTransportProofBytes {
 		t.Fatal("old generation did not establish capacity and real-transport proof")
 	}
 	abandonments := 0
@@ -1262,7 +1266,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	if err := <-result; err != nil {
 		t.Fatalf("fresh generation's real feedback = %v", err)
 	}
-	if got := budget.Usage(); got != (retention.Usage{}) || !fresh.rateObserved || freshStore.transportReported.Load() != minimumRateSampleBytes {
+	if got := budget.Usage(); got != (retention.Usage{}) || !fresh.rateObserved || freshStore.transportReported.Load() != minimumTransportProofBytes {
 		t.Fatal("fresh real feedback did not independently establish capacity, proof, and exact release")
 	}
 }
@@ -1297,5 +1301,77 @@ func TestSchedulerPromotionPreservesActiveProbe(t *testing.T) {
 	now = until
 	if scheduler.fillTransportProbe(lanes, 2, now, 0) {
 		t.Fatal("primary discovery continued after its existing period")
+	}
+}
+
+func TestSchedulerSmallRateIdleProbe(t *testing.T) {
+	probeSize, err := protocol.DataFrameSize(protocol.Data{Payload: probePadding[:]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		hardBytes int
+		reserve   uint64
+		wantProbe bool
+	}{
+		{name: "Recovery", hardBytes: 65536, wantProbe: true},
+		{name: "HardCapBelowFrame", hardBytes: probeSize - 1},
+		{name: "ExactHardCap", hardBytes: probeSize, wantProbe: true},
+		{name: "PendingUsefulByte", hardBytes: 65536, reserve: 1},
+		{name: "PendingMTU", hardBytes: 65536, reserve: 1458},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			store := newRateRecoveryStore(t, &now, 64, test.hardBytes)
+			// This recovery fixture starts with an already measured low-rate path.
+			lane := &scheduledLane{registration: schedulerRegistration(2, 2, store), rateObserved: true, deliveryRate: 30}
+			lane.applyTiming(clockmap.Sample{LocalReceiveMicros: 10_000}, false)
+			seed := schedulerTransmission(1, wgpacket.TransportData, now.Add(2*time.Second))
+			if err := store.push(seed); err != nil {
+				t.Fatal(err)
+			}
+			assertFlightCreditTake(t, store, 1)
+			now = now.Add(1250 * time.Millisecond)
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+				t.Fatalf("seed report = %t, %v", progressed, err)
+			}
+			if !lane.rateObserved || lane.deliveryRate != 30 || lane.deliveryWindowBytes() != 4100 || probeSize != 4101 {
+				t.Fatalf("seed rate/window/probe frame = %d/%d/%d, want 30/4100/4101", lane.deliveryRate, lane.deliveryWindowBytes(), probeSize)
+			}
+			primaryStore := newRateRecoveryStore(t, &now, 8, 65536)
+			primary := &scheduledLane{registration: schedulerRegistration(1, 1, primaryStore), rateObserved: true, deliveryRate: 1_000_000, rttMicros: 10_000, minimumRTTMicros: 10_000}
+			lanes := map[protocol.LaneID]*scheduledLane{1: primary, 2: lane}
+			scheduler := Scheduler{lastTransportAt: now}
+			progressed := scheduler.fillTransportProbe(lanes, 1, now, test.reserve)
+			if progressed != test.wantProbe {
+				t.Fatalf("idle probe admission=%t, want %t: normal=%d, probe=%d, frame=%d, hard=%d, reserve=%d", progressed, test.wantProbe, lane.deliveryWindowBytes(), lane.probeWindowBytes(test.reserve), probeSize, test.hardBytes, test.reserve)
+			}
+			if !test.wantProbe {
+				if packets, bytes := store.backlog(); packets != 0 || bytes != 0 {
+					t.Fatal("failed probe admission retained padding")
+				}
+				return
+			}
+			if store.deliveryWindow != 4100 || store.probeWindow != uint64(probeSize) {
+				t.Fatalf("padding allowance changed normal flight credit: normal=%d probe=%d", store.deliveryWindow, store.probeWindow)
+			}
+			if scheduler.fillTransportProbe(lanes, 1, now, 0) {
+				t.Fatal("low-rate discovery admitted a second unreported probe")
+			}
+			assertFlightCreditTake(t, store, 0)
+			now = now.Add(time.Duration(uint64(probeSize)+35_000) * time.Microsecond)
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 2}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+				t.Fatalf("probe report = %t, %v", progressed, err)
+			}
+			if lane.deliveryRate <= 100_000 || store.transportReported.Load() != wgpacket.TransportKeepaliveLength {
+				t.Fatalf("probe did not recover capacity independently of real transport proof: rate=%d proof=%d", lane.deliveryRate, store.transportReported.Load())
+			}
+			if !scheduler.fillTransportProbe(lanes, 1, now, 0) {
+				t.Fatal("discovery did not continue after its first probe report")
+			}
+			assertTransmissionStoreInvariants(t, store)
+			t.Logf("recovered_rate=%d normal=%d probe=%d real_transport_proof=%d", lane.deliveryRate, store.deliveryWindow, store.probeWindow, store.transportReported.Load())
+		})
 	}
 }
