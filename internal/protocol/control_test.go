@@ -33,9 +33,9 @@ func TestControlFrameWireLayout(t *testing.T) {
 		{name: "ClockSync", value: ClockSync{
 			ClientSendMicros: 127, ServerReceiveMicros: 128, ServerSendMicros: 16383, ClientReceiveMicros: 16384,
 		}, encoded: "85017f8001ff7f808001"},
-		{name: "Ping", value: TimingPing{ID: 128, SendMicros: 16384}, encoded: "568001808001"},
-		{name: "Pong", value: TimingPong{ID: 1, PingSendMicros: 127, ReceiveMicros: 128, SendMicros: 16384},
-			encoded: "77017f8001808001"},
+		{name: "Ping", value: TimingPing{ID: 128}, encoded: "268001"},
+		{name: "Pong", value: TimingPong{ID: 1, ReceiveMicros: 128, SendMicros: 16384},
+			encoded: "67018001808001"},
 		{name: "LaneAbandon", value: LaneGeneration{LaneID: testLaneID(1), Generation: 128},
 			encoded: "39018001"},
 		{name: "SessionClose", value: CloseClientShutdown, encoded: "1a01"},
@@ -105,7 +105,7 @@ func TestControlFrameWireLayout(t *testing.T) {
 }
 
 func TestTimingFrames(t *testing.T) {
-	ping := TimingPing{ID: 1, SendMicros: 100}
+	ping := TimingPing{ID: 1}
 	pingFrame, err := MarshalTimingPing(ping)
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestTimingFrames(t *testing.T) {
 		t.Fatalf("ParseTimingPing() = %#v, %v", got, err)
 	}
 
-	pong := TimingPong{ID: 1, PingSendMicros: 100, ReceiveMicros: 150, SendMicros: 160}
+	pong := TimingPong{ID: 1, ReceiveMicros: 150, SendMicros: 160}
 	pongFrame, err := MarshalTimingPong(pong)
 	if err != nil {
 		t.Fatal(err)
@@ -220,10 +220,10 @@ func TestControlFrameErrors(t *testing.T) {
 	if _, err := MarshalTimingPong(TimingPong{}); err == nil {
 		t.Fatal("MarshalTimingPong() succeeded with zero ID")
 	}
-	if _, err := ParseTimingPing(Frame{Type: FramePing, Payload: []byte{0, 1}}); err == nil {
+	if _, err := ParseTimingPing(Frame{Type: FramePing, Payload: []byte{0}}); err == nil {
 		t.Fatal("ParseTimingPing() accepted zero ID")
 	}
-	if _, err := ParseTimingPong(Frame{Type: FramePong, Payload: []byte{0, 1, 2, 3}}); err == nil {
+	if _, err := ParseTimingPong(Frame{Type: FramePong, Payload: []byte{0, 1, 2}}); err == nil {
 		t.Fatal("ParseTimingPong() accepted zero ID")
 	}
 	if _, err := MarshalDeliveryReport(DeliveryReport{}); err == nil {
@@ -287,8 +287,8 @@ func FuzzParseControlFrame(f *testing.F) {
 		}
 		f.Add(uint8(frame.Type), frame.Payload)
 	}
-	add(MarshalTimingPing(TimingPing{ID: 1, SendMicros: 2}))
-	add(MarshalTimingPong(TimingPong{ID: 1, PingSendMicros: 2, ReceiveMicros: 3, SendMicros: 4}))
+	add(MarshalTimingPing(TimingPing{ID: 1}))
+	add(MarshalTimingPong(TimingPong{ID: 1, ReceiveMicros: 3, SendMicros: 4}))
 	add(MarshalClockSync(ClockSync{
 		ClientSendMicros: 1, ServerReceiveMicros: 2, ServerSendMicros: 3, ClientReceiveMicros: 4,
 	}))
@@ -381,12 +381,12 @@ func TestControlIntegerBoundaries(t *testing.T) {
 		size    int
 		prefix  int
 	}{
-		{name: "Ping", marshal: func() (Frame, error) { return MarshalTimingPing(TimingPing{ID: maximum, SendMicros: maximum}) },
-			parse: func(f Frame) error { _, err := ParseTimingPing(f); return err }, size: 20},
+		{name: "Ping", marshal: func() (Frame, error) { return MarshalTimingPing(TimingPing{ID: maximum}) },
+			parse: func(f Frame) error { _, err := ParseTimingPing(f); return err }, size: 10},
 		{name: "Pong", marshal: func() (Frame, error) {
-			return MarshalTimingPong(TimingPong{ID: maximum, PingSendMicros: maximum, ReceiveMicros: maximum, SendMicros: maximum})
+			return MarshalTimingPong(TimingPong{ID: maximum, ReceiveMicros: maximum, SendMicros: maximum})
 		},
-			parse: func(f Frame) error { _, err := ParseTimingPong(f); return err }, size: 40},
+			parse: func(f Frame) error { _, err := ParseTimingPong(f); return err }, size: 30},
 		{name: "ClockSync", marshal: func() (Frame, error) {
 			return MarshalClockSync(ClockSync{ClientSendMicros: maximum, ServerReceiveMicros: maximum, ServerSendMicros: maximum, ClientReceiveMicros: maximum})
 		},

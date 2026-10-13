@@ -39,7 +39,7 @@ func TestLaneWriteControlBatch(t *testing.T) {
 				}
 				for range tt.timingFrames {
 					if tt.reservedPong {
-						ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 500})
+						ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1})
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -100,7 +100,7 @@ func TestLaneWriteControlBatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 1000})
+		ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1})
 		if err != nil {
 			t.Fatal(err)
 		}

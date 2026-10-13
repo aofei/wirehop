@@ -512,7 +512,7 @@ func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 				}
 				dataBytes += uint64(len(encoded))
 				if test.ping && index == 6 {
-					ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 1000})
+					ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1})
 					if err != nil {
 						t.Fatal(err)
 					}

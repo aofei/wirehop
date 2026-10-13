@@ -325,7 +325,7 @@ func (l *Lane) ping(ctx context.Context) error {
 			build: func(sendMicros uint64) (protocol.Frame, error) {
 				l.recordPingSend(id, sendMicros)
 				l.exposedPingID.Store(id)
-				return protocol.MarshalTimingPing(protocol.TimingPing{ID: id, SendMicros: sendMicros})
+				return protocol.MarshalTimingPing(protocol.TimingPing{ID: id})
 			},
 			sent: func() { l.recordPingWritten(id, time.Now()) },
 		}
@@ -418,20 +418,21 @@ func (l *Lane) cancelPing(identifier uint64) {
 	l.pingMu.Unlock()
 }
 
-// completePing accepts only a matching response for a request built by the carrier writer.
-func (l *Lane) completePing(identifier, sendMicros uint64) bool {
+// completePing returns the local send timestamp only for a matching request built by the carrier writer.
+func (l *Lane) completePing(identifier uint64) (uint64, bool) {
 	l.pingMu.Lock()
-	if !l.pendingPingBuilt || l.pendingPingID != identifier || l.pendingPingMicros != sendMicros {
+	if !l.pendingPingBuilt || l.pendingPingID != identifier {
 		l.pingMu.Unlock()
-		return false
+		return 0, false
 	}
+	sendMicros := l.pendingPingMicros
 	l.pendingPingID = 0
 	l.pendingPingAt = time.Time{}
 	l.pendingPingMicros = 0
 	l.pendingPingBuilt = false
 	l.pingMu.Unlock()
 	l.signalPingChanged()
-	return true
+	return sendMicros, true
 }
 
 // signalPingChanged wakes the ping state machine after timing-state or real-data progress.
@@ -753,11 +754,12 @@ func (l *Lane) readControl(ctx context.Context, frame protocol.Frame, clockSyncP
 			return err
 		}
 		receiveMicros := l.clock.NowMicros()
-		if !l.completePing(pong.ID, pong.PingSendMicros) {
+		sendMicros, matched := l.completePing(pong.ID)
+		if !matched {
 			return ErrUnexpectedPong
 		}
 		sample := clockmap.Sample{
-			LocalSendMicros: pong.PingSendMicros, RemoteReceiveMicros: pong.ReceiveMicros,
+			LocalSendMicros: sendMicros, RemoteReceiveMicros: pong.ReceiveMicros,
 			RemoteSendMicros: pong.SendMicros, LocalReceiveMicros: receiveMicros,
 		}
 		mapping, err := clockmap.Estimate(sample)
@@ -866,7 +868,7 @@ func (l *Lane) readPing(frame protocol.Frame) error {
 	}
 	request := controlWrite{build: func(sendMicros uint64) (protocol.Frame, error) {
 		return protocol.MarshalTimingPong(protocol.TimingPong{
-			ID: ping.ID, PingSendMicros: ping.SendMicros, ReceiveMicros: receiveMicros, SendMicros: sendMicros,
+			ID: ping.ID, ReceiveMicros: receiveMicros, SendMicros: sendMicros,
 		})
 	}}
 	// The sole reader owns admission, and the writer can only free this reserved slot.

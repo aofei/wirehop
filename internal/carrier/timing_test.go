@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -17,6 +18,30 @@ import (
 )
 
 func TestWebSocketConnReadFrames(t *testing.T) {
+	t.Run("CanceledBufferedRead", func(t *testing.T) {
+		payload := []byte{42}
+		encoded, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameDeliveryReport, Payload: payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := bufio.NewReader(bytes.NewReader(encoded))
+		if _, err := reader.Peek(len(encoded)); err != nil {
+			t.Fatal(err)
+		}
+		stream := WebSocketConn{messageReader: reader, messageOpen: true}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		var frames [1]protocol.Frame
+		count, err := stream.ReadFrames(ctx, frames[:])
+		if count != 0 || !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled buffered read = %d frames, %v", count, err)
+		}
+		count, err = stream.ReadFrames(t.Context(), frames[:])
+		if count != 1 || err != nil || !bytes.Equal(frames[0].Payload, payload) {
+			t.Fatalf("buffered read after cancellation = %d frames, %v, payload %v", count, err, frames[0].Payload)
+		}
+	})
+
 	t.Run("ProgressAndChangingCallContext", func(t *testing.T) {
 		release := make(chan struct{})
 		written := make(chan error, 1)

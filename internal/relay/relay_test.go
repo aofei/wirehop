@@ -1129,7 +1129,7 @@ func TestLanePingState(t *testing.T) {
 		t.Fatalf("empty ping state = %t, %v", pending, remaining)
 	}
 	lane.startPing(1)
-	if matched := lane.completePing(1, 0); matched {
+	if _, matched := lane.completePing(1); matched {
 		t.Fatal("queued ping accepted a response before the writer generated its timestamp")
 	}
 	if pending, remaining := lane.pingState(now); !pending || remaining != time.Second {
@@ -1143,7 +1143,7 @@ func TestLanePingState(t *testing.T) {
 	if pending, remaining := lane.pingState(now.Add(3 * time.Second)); !pending || remaining != 0 {
 		t.Fatalf("expired ping state = %t, %v", pending, remaining)
 	}
-	if matched := lane.completePing(1, 0); !matched {
+	if sendMicros, matched := lane.completePing(1); !matched || sendMicros != 0 {
 		t.Fatal("matching ping did not complete")
 	}
 	if pending, remaining := lane.pingState(now); pending || remaining != 0 {
@@ -1159,9 +1159,25 @@ func TestLanePingState(t *testing.T) {
 	if pending, remaining := lane.pingState(now); pending || remaining != 0 {
 		t.Fatalf("canceled ping state = %t, %v", pending, remaining)
 	}
-	if matched := lane.completePing(2, 42); matched {
+	if _, matched := lane.completePing(2); matched {
 		t.Fatal("canceled ping accepted a later response")
 	}
+	t.Run("StalePongPreservesNewRequest", func(t *testing.T) {
+		lane := &Lane{pingChanged: make(chan struct{}, 1)}
+		lane.startPing(1)
+		lane.recordPingSend(1, 42)
+		if sendMicros, matched := lane.completePing(1); !matched || sendMicros != 42 {
+			t.Fatal("matching ping did not return its local send timestamp")
+		}
+		lane.startPing(2)
+		lane.recordPingSend(2, 128)
+		if _, matched := lane.completePing(1); matched {
+			t.Fatal("stale pong completed a newer request")
+		}
+		if sendMicros, matched := lane.completePing(2); !matched || sendMicros != 128 {
+			t.Fatal("stale pong changed the newer request's local send timestamp")
+		}
+	})
 	t.Run("PongValidation", func(t *testing.T) {
 		for _, tt := range []struct {
 			name  string
@@ -1179,7 +1195,7 @@ func TestLanePingState(t *testing.T) {
 					want = nil
 				}
 				frame, err := protocol.MarshalTimingPong(protocol.TimingPong{
-					ID: 1, PingSendMicros: 0, ReceiveMicros: 1000, SendMicros: 1000,
+					ID: 1, ReceiveMicros: 1000, SendMicros: 1000,
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -1197,13 +1213,33 @@ func TestLanePingState(t *testing.T) {
 			})
 		}
 	})
+	t.Run("LocalSendTimestamp", func(t *testing.T) {
+		lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
+		lane.clock = &testClock{now: 220}
+		lane.startPing(1)
+		lane.recordPingSend(1, 100)
+		frame, err := protocol.MarshalTimingPong(protocol.TimingPong{
+			ID: 1, ReceiveMicros: 150, SendMicros: 160,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := false
+		if err := lane.readControl(t.Context(), frame, &pending); err != nil {
+			t.Fatal(err)
+		}
+		want := clockmap.Mapping{OffsetMicros: 5, UncertaintyMicros: 55}
+		if lane.receiver.mapping != want {
+			t.Fatalf("receiver mapping = %+v, want %+v", lane.receiver.mapping, want)
+		}
+	})
 	t.Run("ReplyBeforeWriteCompletion", func(t *testing.T) {
 		for _, sendMicros := range []uint64{0, 128} {
 			lane := &Lane{pingInterval: time.Second, pingTimeout: 3 * time.Second,
 				pingChanged: make(chan struct{}, 1)}
 			lane.startPing(1)
 			lane.recordPingSend(1, sendMicros)
-			if matched := lane.completePing(1, sendMicros); !matched {
+			if got, matched := lane.completePing(1); !matched || got != sendMicros {
 				t.Fatal("writer-built ping rejected a response before write completion")
 			}
 			lane.startPing(2)
@@ -1211,12 +1247,12 @@ func TestLanePingState(t *testing.T) {
 			if lane.pendingPingID != 2 || !lane.pendingPingAt.IsZero() || lane.pendingPingBuilt {
 				t.Fatal("late write completion changed the newer queued request")
 			}
-			if matched := lane.completePing(2, 0); matched {
+			if _, matched := lane.completePing(2); matched {
 				t.Fatal("new queued request inherited the previous request's exposure")
 			}
 			lane.cancelPing(2)
 			lane.recordPingSend(2, sendMicros)
-			if matched := lane.completePing(2, sendMicros); lane.pendingPingBuilt || matched {
+			if _, matched := lane.completePing(2); lane.pendingPingBuilt || matched {
 				t.Fatal("canceled request was restored by a late builder")
 			}
 		}
@@ -1248,7 +1284,7 @@ func TestLanePingResumesActiveInterval(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if matched := lane.completePing(ping.ID, ping.SendMicros); !matched {
+		if _, matched := lane.completePing(ping.ID); !matched {
 			t.Fatal("matching ping did not complete")
 		}
 	}
@@ -1731,7 +1767,7 @@ func TestLane(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 7, SendMicros: 800})
+	ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2077,7 +2113,7 @@ func TestLanePingTimeoutPreemptsIdleBackoff(t *testing.T) {
 	for range 4 {
 		ping := awaitLanePing(t, carrier)
 		pong, err := protocol.MarshalTimingPong(protocol.TimingPong{
-			ID: ping.ID, PingSendMicros: ping.SendMicros, ReceiveMicros: clock.now, SendMicros: clock.now,
+			ID: ping.ID, ReceiveMicros: clock.now, SendMicros: clock.now,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -2325,7 +2361,7 @@ func TestLaneRejectsMismatchedPong(t *testing.T) {
 		}
 	}
 	pong, err := protocol.MarshalTimingPong(protocol.TimingPong{
-		ID: ping.ID, PingSendMicros: ping.SendMicros + 1, ReceiveMicros: 1000, SendMicros: 1000,
+		ID: ping.ID + 1, ReceiveMicros: 1000, SendMicros: 1000,
 	})
 	if err != nil {
 		t.Fatal(err)

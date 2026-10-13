@@ -12,8 +12,7 @@ var (
 
 // TimingPing requests one lane-local timing observation.
 type TimingPing struct {
-	ID         uint64
-	SendMicros uint64
+	ID uint64
 }
 
 // MarshalTimingPing returns a timing ping frame.
@@ -21,7 +20,7 @@ func MarshalTimingPing(ping TimingPing) (Frame, error) {
 	if ping.ID == 0 {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := integerPayload(0, ping.ID, ping.SendMicros)
+	payload := integerPayload(0, ping.ID)
 	return Frame{Type: FramePing, Payload: payload}, nil
 }
 
@@ -31,7 +30,7 @@ func ParseTimingPing(frame Frame) (TimingPing, error) {
 		return TimingPing{}, ErrInvalidControlFrame
 	}
 	var ping TimingPing
-	remaining, err := parseIntegers(frame.Payload, &ping.ID, &ping.SendMicros)
+	remaining, err := parseIntegers(frame.Payload, &ping.ID)
 	if err != nil || len(remaining) != 0 {
 		return TimingPing{}, ErrInvalidControlFrame
 	}
@@ -43,10 +42,9 @@ func ParseTimingPing(frame Frame) (TimingPing, error) {
 
 // TimingPong responds with receiver timing for a prior ping.
 type TimingPong struct {
-	ID             uint64
-	PingSendMicros uint64
-	ReceiveMicros  uint64
-	SendMicros     uint64
+	ID            uint64
+	ReceiveMicros uint64
+	SendMicros    uint64
 }
 
 // MarshalTimingPong returns a timing pong frame.
@@ -54,7 +52,7 @@ func MarshalTimingPong(pong TimingPong) (Frame, error) {
 	if pong.ID == 0 || pong.ReceiveMicros > pong.SendMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	payload := integerPayload(0, pong.ID, pong.PingSendMicros, pong.ReceiveMicros, pong.SendMicros)
+	payload := integerPayload(0, pong.ID, pong.ReceiveMicros, pong.SendMicros)
 	return Frame{Type: FramePong, Payload: payload}, nil
 }
 
@@ -64,7 +62,7 @@ func ParseTimingPong(frame Frame) (TimingPong, error) {
 		return TimingPong{}, ErrInvalidControlFrame
 	}
 	var pong TimingPong
-	remaining, err := parseIntegers(frame.Payload, &pong.ID, &pong.PingSendMicros, &pong.ReceiveMicros, &pong.SendMicros)
+	remaining, err := parseIntegers(frame.Payload, &pong.ID, &pong.ReceiveMicros, &pong.SendMicros)
 	if err != nil || len(remaining) != 0 {
 		return TimingPong{}, ErrInvalidControlFrame
 	}

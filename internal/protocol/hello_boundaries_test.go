@@ -140,7 +140,7 @@ func TestHelloWireLayout(t *testing.T) {
 				t.Fatal(err)
 			}
 			key := []byte("test key")
-			stream := bytes.NewReader(append(bytes.Clone(want), 0x26, 1, 2))
+			stream := bytes.NewReader(append(bytes.Clone(want), 0x16, 1))
 			var encoded []byte
 			if tt.client != nil {
 				if err := SignClientHello(tt.client, key); err != nil {
@@ -169,7 +169,7 @@ func TestHelloWireLayout(t *testing.T) {
 				t.Fatalf("frame following hello: %v", err)
 			}
 			ping, err := ParseTimingPing(frame)
-			if err != nil || ping != (TimingPing{ID: 1, SendMicros: 2}) || stream.Len() != 0 {
+			if err != nil || ping != (TimingPing{ID: 1}) || stream.Len() != 0 {
 				t.Fatalf("frame following hello: %+v, error %v, remaining %d", ping, err, stream.Len())
 			}
 			for end := range len(want) {

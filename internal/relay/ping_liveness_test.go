@@ -44,7 +44,7 @@ func TestLaneDelayedPongWithReceiveProgress(t *testing.T) {
 							Payload: relayWireGuardPacket(wgpacket.TransportData),
 						})
 					case "Ping":
-						frame, err = protocol.MarshalTimingPing(protocol.TimingPing{ID: uint64(index + 1), SendMicros: 1000})
+						frame, err = protocol.MarshalTimingPing(protocol.TimingPing{ID: uint64(index + 1)})
 					case "Probe":
 						frame, err = protocol.MarshalData(protocol.Data{Payload: probePadding[:]})
 					}
@@ -60,7 +60,7 @@ func TestLaneDelayedPongWithReceiveProgress(t *testing.T) {
 					}
 				}
 				pong, err := protocol.MarshalTimingPong(protocol.TimingPong{
-					ID: ping.ID, PingSendMicros: ping.SendMicros, ReceiveMicros: 1000, SendMicros: 1000,
+					ID: ping.ID, ReceiveMicros: 1000, SendMicros: 1000,
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -90,7 +90,7 @@ func TestLaneReadPing(t *testing.T) {
 					t.Fatal("failed to fill the control queue")
 				}
 			}
-			ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 500})
+			ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -109,7 +109,7 @@ func TestLaneReadPing(t *testing.T) {
 						continue
 					}
 					pong, err := protocol.ParseTimingPong(frame)
-					if err != nil || pong.ID != 1 || pong.PingSendMicros != 500 || pong.ReceiveMicros != 1000 {
+					if err != nil || pong.ID != 1 || pong.ReceiveMicros != 1000 {
 						t.Fatalf("pong = %+v, error %v", pong, err)
 					}
 					found = true
@@ -135,14 +135,14 @@ func TestLaneReadPing(t *testing.T) {
 		} {
 			t.Run(tt.name, func(t *testing.T) {
 				lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
-				first, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 500})
+				first, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1})
 				if err != nil {
 					t.Fatal(err)
 				}
 				if err := lane.readPing(first); err != nil {
 					t.Fatal(err)
 				}
-				invalid, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: tt.id, SendMicros: 600})
+				invalid, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: tt.id})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -160,7 +160,7 @@ func TestLaneReadPing(t *testing.T) {
 					t.Fatal(err)
 				}
 				pong, err := protocol.ParseTimingPong(frame)
-				if err != nil || pong.ID != 1 || pong.PingSendMicros != 500 {
+				if err != nil || pong.ID != 1 {
 					t.Fatalf("queued response = %+v, error %v", pong, err)
 				}
 			})
@@ -176,7 +176,7 @@ func TestLaneReadPing(t *testing.T) {
 			result := make(chan error, 1)
 			go func() { result <- lane.write(ctx) }()
 			for id := uint64(1); id <= 2; id++ {
-				ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: id, SendMicros: 500})
+				ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: id})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -232,7 +232,7 @@ func TestLaneWriteControlProgressDuringContinuousPings(t *testing.T) {
 			t.Fatal(err)
 		}
 		lane.SendControl(report, nil)
-		ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 500})
+		ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -282,7 +282,7 @@ func (c *sequentialPingCarrier) WriteFrames(ctx context.Context, frames []protoc
 			return err
 		}
 		if pong.ID <= maximumConsecutiveControlFrames {
-			ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: pong.ID + 1, SendMicros: 500})
+			ping, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: pong.ID + 1})
 			if err != nil {
 				return err
 			}

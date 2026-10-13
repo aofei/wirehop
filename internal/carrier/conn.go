@@ -195,6 +195,15 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 		return 0, err
 	}
 	c.frameReader.Reset()
+	if c.messageOpen {
+		frame, available, err := protocol.ReadBufferedFrame(c.messageReader)
+		if err != nil {
+			return 0, c.readFrameError(err)
+		}
+		if available {
+			return c.readBufferedFrames(frame, frames)
+		}
+	}
 	if ctx.Done() != nil {
 		stop := context.AfterFunc(ctx, func() { c.Close() })
 		defer stop()
@@ -224,22 +233,27 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 			}
 			return 0, c.readFrameError(err)
 		}
-		c.messageHasFrames = true
-		frames[0] = frame
-		count := 1
-		for count < min(len(frames), maximumStreamReadBatchFrames) {
-			frame, available, err := protocol.ReadBufferedFrame(c.messageReader)
-			if err != nil {
-				return count, c.readFrameError(err)
-			}
-			if !available {
-				break
-			}
-			frames[count] = frame
-			count++
-		}
-		return count, nil
+		return c.readBufferedFrames(frame, frames)
 	}
+}
+
+// readBufferedFrames returns first and any complete message frames available without another read.
+func (c *WebSocketConn) readBufferedFrames(first protocol.Frame, frames []protocol.Frame) (int, error) {
+	c.messageHasFrames = true
+	frames[0] = first
+	count := 1
+	for count < min(len(frames), maximumStreamReadBatchFrames) {
+		frame, available, err := protocol.ReadBufferedFrame(c.messageReader)
+		if err != nil {
+			return count, c.readFrameError(err)
+		}
+		if !available {
+			break
+		}
+		frames[count] = frame
+		count++
+	}
+	return count, nil
 }
 
 // readMessage starts the next binary message without consuming its complete payload.

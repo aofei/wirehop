@@ -870,7 +870,7 @@ func TestWebSocketUpgradeClearsHTTPDeadline(t *testing.T) {
 		}
 		defer connection.Close()
 		time.Sleep(50 * time.Millisecond)
-		frame, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1, SendMicros: 1})
+		frame, err := protocol.MarshalTimingPing(protocol.TimingPing{ID: 1})
 		if err == nil {
 			err = connection.WriteFrames(request.Context(), []protocol.Frame{frame})
 		}
