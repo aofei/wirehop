@@ -29,6 +29,7 @@ import (
 	"github.com/aofei/wirehop/internal/server"
 	targetpkg "github.com/aofei/wirehop/internal/target"
 	"github.com/aofei/wirehop/internal/wgpacket"
+	"github.com/aofei/wirehop/internal/wsheader"
 )
 
 func TestRawTCPRelay(t *testing.T) {
@@ -99,6 +100,97 @@ func TestSecureWebSocketRelay(t *testing.T) {
 	laneURL, clientTLS, stopServer := startWebSocketServer(t, token, []netip.AddrPort{target}, true)
 	defer stopServer()
 	testRelay(t, laneURL, target, token, clientTLS)
+}
+
+func TestWebSocketHMACReconnect(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		name := "WS"
+		if secure {
+			name = "WSS"
+		}
+		t.Run(name, func(t *testing.T) {
+			target, stopTarget := startEchoTarget(t)
+			defer stopTarget()
+			token := []byte("binary\x00\xff HMAC key")
+			serverConfig := serverConfig(t, token, []netip.AddrPort{target})
+			serverConfig.ReconnectGrace = time.Minute
+			serverInstance, err := server.New(serverConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			requests := make(chan protocol.ClientHello, 4)
+			connections := make(chan net.Conn, 4)
+			handler := serverInstance.WebSocketHandler(ctx)
+			httpServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hello, err := wsheader.Parse(r)
+				if err != nil {
+					t.Errorf("parse client admission: %v", err)
+				} else {
+					requests <- hello
+				}
+				handler.ServeHTTP(w, r)
+			}))
+			httpServer.Config.ConnState = func(connection net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections <- connection
+				}
+			}
+			var tlsConfig *tls.Config
+			if secure {
+				httpServer.StartTLS()
+				roots := x509.NewCertPool()
+				roots.AddCert(httpServer.Certificate())
+				tlsConfig = &tls.Config{RootCAs: roots}
+			} else {
+				httpServer.Start()
+			}
+			defer func() {
+				cancel()
+				httpServer.Close()
+			}()
+			laneURL := strings.Replace(httpServer.URL, "http", "ws", 1) + "/_wirehop"
+			instance, err := client.Start(ctx, clientConfig(t, laneURL, target, token, tlsConfig))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer instance.Close()
+			waitForServer(t, func(s server.Snapshot) bool { return s.AttachedLanes == 1 }, serverInstance)
+			peer, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			assertRelayExchange(t, peer, instance.LocalAddr())
+			creation := <-requests
+			if creation.Mode != protocol.HelloCreate || creation.Generation != 1 {
+				t.Fatalf("creation = %+v", creation)
+			}
+			sessionID := instance.SessionID()
+			connection := <-connections
+			if err := connection.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var join protocol.ClientHello
+			select {
+			case <-t.Context().Done():
+				t.Fatal(context.Cause(t.Context()))
+			case join = <-requests:
+			case <-time.After(3 * time.Second):
+				t.Fatal("reconnect admission did not arrive")
+			}
+			if join.Mode != protocol.HelloJoin || join.SessionID != sessionID ||
+				join.Generation != 2 || join.Nonce == creation.Nonce || join.LaneID != creation.LaneID ||
+				join.PathGroupID != creation.PathGroupID {
+				t.Fatalf("reconnect = %+v, creation = %+v", join, creation)
+			}
+			waitForServer(t, func(s server.Snapshot) bool { return s.Sessions == 1 && s.AttachedLanes == 1 }, serverInstance)
+			assertRelayExchange(t, peer, instance.LocalAddr())
+			if instance.SessionID() != sessionID {
+				t.Fatal("reconnect replaced the retained session")
+			}
+		})
+	}
 }
 
 func TestAuthenticationClockSkewRecovery(t *testing.T) {

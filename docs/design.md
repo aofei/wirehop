@@ -1168,16 +1168,18 @@ errors are normalized before applying this policy. A target-side network error a
 
 ## Authentication model
 
-WireHop authenticates every lane. A long-term token authorizes session creation. The server then issues a 128-bit random
-session identifier and a 256-bit random ephemeral session secret, which authorizes additional and reconnecting lanes
-through a session-bound HMAC.
+WireHop authenticates every lane with HMAC-SHA256, regardless of carrier. A long-term token signs session creation. The
+server then issues a 128-bit random session identifier and a 256-bit random ephemeral session secret, which signs
+additional and reconnecting lane requests. Every request authenticates the protocol version, operation, target or
+session identifier, lane, generation, path group, nonce, Unix timestamp, and monotonic send timestamp. WebSocket
+admission also binds the HTTP method and exact escaped path.
 
 The server keeps both session values valid while the session is attached or detached within its reconnect grace period.
 It invalidates them when the session closes and never writes the secret to logs.
 
-The long-term token uses the RFC 6750 `b64token` character set and is limited to 4096 bytes so the same value is valid
-in raw-stream HMACs and WebSocket authorization headers. Deployments should generate a high-entropy random value rather
-than a human password.
+The long-term token is a nonempty HMAC key of at most 4096 bytes. It has no wire character grammar because admission
+requests transmit only the authentication tag. Both endpoints must use exactly the same key bytes. Deployments should
+generate a high-entropy random value rather than a human password.
 
 Each configured lane maintains an authentication-only estimate of its server's Unix time. Before receiving an
 authenticated sample, it uses the local wall clock. A signed response supplies the server time and echoes the request
@@ -1232,9 +1234,8 @@ uses the long-term token because the server has no retained session secret. The 
 `session_not_found` code with session-gone class and session scope. Every response echoes the request nonce and supplies
 the server Unix time under the same HMAC.
 
-This avoids sending the long-term token directly over insecure raw TCP. It does not provide the same protection as TLS,
-but it is better than a plaintext token. The returned session secret and all later control frames remain visible and
-modifiable on `tcp://`, so raw HMAC admission does not turn the carrier into a secure channel.
+The long-term token is never sent directly. The returned session secret and all later control frames remain visible and
+modifiable on `tcp://`, so HMAC admission does not turn the carrier into a secure channel.
 
 The server accepts timestamps only within a bounded clock-skew window and keeps the nonce in a replay cache for that
 window. A timestamp outside the window returns a retryable `clock_skew` response before the nonce enters the cache. A
@@ -1247,7 +1248,7 @@ For `ws://` and `wss://`, authentication occurs in HTTP headers during the WebSo
 The lane that creates a session uses:
 
 ```text
-Authorization: Bearer <token>
+Authorization: WireHop-HMAC <auth-tag>
 WireHop-Target: <host:port>
 WireHop-Lane-ID: <lane-id>
 WireHop-Lane-Generation: <generation>
@@ -1260,6 +1261,7 @@ WireHop-Monotonic-Send: <monotonic-microseconds>
 Each lane that joins an existing session uses:
 
 ```text
+Authorization: WireHop-HMAC <auth-tag>
 WireHop-Session-ID: <session-id>
 WireHop-Lane-ID: <lane-id>
 WireHop-Lane-Generation: <generation>
@@ -1267,17 +1269,25 @@ WireHop-Path-Group-ID: <path-group-id>
 WireHop-Nonce: <nonce>
 WireHop-Timestamp: <unix-seconds>
 WireHop-Monotonic-Send: <monotonic-microseconds>
-Authorization: WireHop-HMAC <auth-tag>
 ```
 
-Each nonce is a 96-bit random value. For a lane join, the HMAC covers the HTTP method, request path, session identifier,
-lane identifier, connection generation, proposed path group identifier, nonce, Unix timestamp, and monotonic send
-timestamp. A creation request relies on its bearer token and the carrier's security. Production creation requests
-therefore require `wss://` rather than `ws://`.
+Creation and join use the same authentication scheme. Creation uses the long-term token as its HMAC key. Join uses the
+retained session secret. `WireHop-Target` selects creation and `WireHop-Session-ID` selects join. Exactly one of these
+headers must be present. A request containing both, neither, or a duplicated admission header is malformed. Each nonce
+is a 96-bit random value.
 
-The join HMAC input concatenates a one-byte method length, method bytes, a two-byte path length, escaped path bytes,
-session ID (16 bytes), lane ID (`uvarint`), generation (`uvarint`), path group ID (`uvarint`), nonce (12 bytes), Unix
-timestamp (`u64`), and monotonic send time (`u64`). Fixed-width lengths and timestamps use network byte order.
+The HMAC input concatenates the four ASCII bytes `WHOW`, a one-byte method length, method bytes, a two-byte path length,
+escaped path bytes, and the canonical binary client hello without its final 32-byte authentication tag. The embedded
+hello uses the raw-stream `WHOP` magic, V1 version, body length including the omitted tag, and the corresponding
+creation or join mode. All admission fields use exactly the binary hello layout specified below. Fixed-width lengths use
+network byte order. The WebSocket prefix prevents a raw-stream authentication tag from being reused on WebSocket, and
+vice versa. Binding the mode prevents creation and join tags from being interchangeable even if their keys happen to
+match.
+
+This encoding reuses the binary hello's version, field validation, and operation semantics while retaining
+authentication before HTTP Upgrade. It adds no round trip or per-Data-frame overhead. HMAC admission does not encrypt
+the session secret returned after the upgrade or any later control frames. Production traffic over untrusted networks
+requires `wss://`.
 
 Clients encode session IDs, nonces, and HMAC tags as fixed-width lowercase hexadecimal. Receivers accept either
 hexadecimal case. Lane and path group IDs are positive unsigned 64-bit selectors encoded in canonical decimal without
@@ -1290,8 +1300,9 @@ parsers enforce these rules before authentication or session reservation. The cr
 
 WebSocket admission uses HTTP `GET`. Lane URLs and admission requests use an exact path with no query component,
 including an empty trailing query marker. The canonical escaped path is limited to 8 KiB so it fits the direct server's
-16 KiB request-header budget together with the bounded token and admission fields. It also fits the authenticated join
-encoding. These rules keep the endpoint identity identical to the path covered by join authentication.
+16 KiB request-header budget together with the fixed-size authentication tag and bounded admission fields. These rules
+keep the endpoint identity identical to the path covered by authentication. Reverse proxies must preserve that escaped
+path when forwarding the request.
 
 The server validates the WireHop authentication, target, lane, generation, path-group, nonce, and timestamp fields
 before accepting the WebSocket upgrade. It applies a bounded clock-skew window to creation and join requests and caches
@@ -1319,10 +1330,10 @@ and nonce replay remain terminal. Missing, malformed, incorrectly signed, or req
 the authentication clock.
 
 The client does not follow HTTP redirects during WebSocket admission. A lane URL is an exact admission endpoint, and
-forwarding bearer or join headers to a redirected URL would weaken that boundary. For an unsigned intermediary response,
-HTTP 408, 429, and 5xx are retryable. Every other unsigned non-upgrade HTTP response permanently rejects only that lane
-candidate. In particular, HTTP 410 triggers session replacement only when its rejection metadata authenticates a
-`session_gone` result.
+forwarding signed admission headers to a redirected URL would weaken that boundary. For an unsigned intermediary
+response, HTTP 408, 429, and 5xx are retryable. Every other unsigned non-upgrade HTTP response permanently rejects only
+that lane candidate. In particular, HTTP 410 triggers session replacement only when its rejection metadata authenticates
+a `session_gone` result.
 
 ## TLS policy
 
@@ -1331,9 +1342,8 @@ controls, or scheduling feedback. TLS provides confidentiality and integrity for
 
 Plaintext carriers require the explicit `--allow-insecure` CLI flag and a trusted network path.
 
-Neither `tcp://` nor `ws://` provides carrier confidentiality or integrity. In particular, `ws://` exposes the bearer
-token directly in the HTTP request, while `tcp://` exposes the returned session secret after its HMAC-authenticated
-creation hello.
+Neither `tcp://` nor `ws://` provides carrier confidentiality or integrity. Both expose the returned session secret and
+later control frames after HMAC-authenticated admission. Neither transmits the long-term token in the creation request.
 
 Clients using `tls://` or `wss://` validate the server certificate chain and hostname. A fixed lane resolution changes
 only the socket destination, so the URL hostname still supplies the TLS SNI and certificate identity.

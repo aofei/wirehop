@@ -438,10 +438,10 @@ func TestWebSocketCreationReplayCapacityIsRetryable(t *testing.T) {
 	if err := instance.replay.CheckAndStore(protocol.Nonce{1}, now, now+60); err != nil {
 		t.Fatal(err)
 	}
-	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+	headers, err := wsheader.Headers("/_wirehop", protocol.ClientHello{
+		Mode: protocol.HelloCreate, Target: target, LaneID: protocol.LaneID(1), Generation: 1,
 		PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{2}, UnixSeconds: now,
-	})
+	}, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,10 +476,10 @@ func TestWebSocketCreationReplayIsTerminal(t *testing.T) {
 	if err := instance.replay.CheckAndStore(nonce, now, now+60); err != nil {
 		t.Fatal(err)
 	}
-	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+	headers, err := wsheader.Headers("/_wirehop", protocol.ClientHello{
+		Mode: protocol.HelloCreate, Target: target, LaneID: protocol.LaneID(1), Generation: 1,
 		PathGroupID: protocol.PathGroupID(1), Nonce: nonce, UnixSeconds: now,
-	})
+	}, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,10 +510,10 @@ func TestWebSocketClockSkewIsRetryable(t *testing.T) {
 	token := []byte("test-token")
 	instance := newSessionTestServer(t, token, target, time.Second)
 	instance.config.WallClock = func() time.Time { return time.Unix(2_000, 0) }
-	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+	headers, err := wsheader.Headers("/_wirehop", protocol.ClientHello{
+		Mode: protocol.HelloCreate, Target: target, LaneID: protocol.LaneID(1), Generation: 1,
 		PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{2}, UnixSeconds: 3_000,
-	})
+	}, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -558,10 +558,10 @@ func TestWebSocketRejectionSurvivesReverseProxy(t *testing.T) {
 	}
 	proxy := httptest.NewServer(httputil.NewSingleHostReverseProxy(upstreamURL))
 	defer proxy.Close()
-	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(token), Target: target, LaneID: protocol.LaneID(1), Generation: 1,
+	headers, err := wsheader.Headers("/_wirehop", protocol.ClientHello{
+		Mode: protocol.HelloCreate, Target: target, LaneID: protocol.LaneID(1), Generation: 1,
 		PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{2}, UnixSeconds: 1_000,
-	})
+	}, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,14 +606,11 @@ func TestWebSocketLaneLimitIsTerminal(t *testing.T) {
 	if err := session.reserveLane(protocol.LaneID(1), 1, protocol.PathGroupID(1)); err != nil {
 		t.Fatal(err)
 	}
-	join := wsheader.Join{
-		Method: "GET", Path: "/_wirehop", SessionID: session.id, LaneID: protocol.LaneID(2), Generation: 1,
+	join := protocol.ClientHello{
+		Mode: protocol.HelloJoin, SessionID: session.id, LaneID: protocol.LaneID(2), Generation: 1,
 		PathGroupID: protocol.PathGroupID(2), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
 	}
-	if err := wsheader.SignJoin(&join, session.secret); err != nil {
-		t.Fatal(err)
-	}
-	headers, err := wsheader.JoinHeaders(join)
+	headers, err := wsheader.Headers("/_wirehop", join, session.secret[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,16 +1034,13 @@ func TestAdmissionReplayAfterClockRollback(t *testing.T) {
 					var headers http.Header
 					var err error
 					if tt.join {
-						join := wsheader.Join{Method: http.MethodGet, Path: "/_wirehop", SessionID: sessionID,
+						join := protocol.ClientHello{Mode: protocol.HelloJoin, SessionID: sessionID,
 							LaneID: 1, Generation: 1, PathGroupID: 1, Nonce: nonce, UnixSeconds: timestamp}
-						if err := wsheader.SignJoin(&join, secret); err != nil {
-							t.Fatal(err)
-						}
-						headers, err = wsheader.JoinHeaders(join)
+						headers, err = wsheader.Headers("/_wirehop", join, secret[:])
 					} else {
-						headers, err = wsheader.Headers(wsheader.Create{Token: string(token),
+						headers, err = wsheader.Headers("/_wirehop", protocol.ClientHello{Mode: protocol.HelloCreate,
 							Target: targetpkg.MustParse("127.0.0.1:51821"), LaneID: 1, Generation: 1,
-							PathGroupID: 1, Nonce: nonce, UnixSeconds: timestamp})
+							PathGroupID: 1, Nonce: nonce, UnixSeconds: timestamp}, token)
 					}
 					if err != nil {
 						t.Fatal(err)

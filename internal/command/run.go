@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aofei/wirehop/internal/auth"
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/client"
 	"github.com/aofei/wirehop/internal/forward"
@@ -33,7 +34,6 @@ import (
 	"github.com/aofei/wirehop/internal/socketopts"
 	"github.com/aofei/wirehop/internal/target"
 	"github.com/aofei/wirehop/internal/wgpacket"
-	"github.com/aofei/wirehop/internal/wsheader"
 )
 
 var (
@@ -417,7 +417,7 @@ func runClient(ctx context.Context, args []string, getenv func(string) string, s
 		return err
 	}
 	token := getenv("WIREHOP_TOKEN")
-	if err := wsheader.ValidateBearerToken(token); err != nil {
+	if err := auth.ValidateToken([]byte(token)); err != nil {
 		message := "WIREHOP_TOKEN is invalid"
 		if token == "" {
 			message = "WIREHOP_TOKEN is required"
@@ -556,7 +556,7 @@ func runServer(ctx context.Context, args []string, getenv func(string) string, s
 		return err
 	}
 	token := getenv("WIREHOP_TOKEN")
-	if err := wsheader.ValidateBearerToken(token); err != nil {
+	if err := auth.ValidateToken([]byte(token)); err != nil {
 		message := "WIREHOP_TOKEN is invalid"
 		if token == "" {
 			message = "WIREHOP_TOKEN is required"

@@ -23,6 +23,143 @@ import (
 	"github.com/coder/websocket"
 )
 
+func TestServerWebSocketAuthenticationHasNoAdmissionSideEffects(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		mode protocol.HelloMode
+	}{
+		{name: "Create", mode: protocol.HelloCreate},
+		{name: "Join", mode: protocol.HelloJoin},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name   string
+				mutate func(*http.Request)
+			}{
+				{name: "Path", mutate: func(r *http.Request) { r.URL.Path = "/changed" }},
+				{name: "EscapedPath", mutate: func(r *http.Request) {
+					r.URL.Path, r.URL.RawPath = "/_wirehop", "/%5fwirehop"
+				}},
+				{name: "Generation", mutate: func(r *http.Request) { r.Header.Set("WireHop-Lane-Generation", "2") }},
+				{name: "Timestamp", mutate: func(r *http.Request) { r.Header.Set("WireHop-Timestamp", "1") }},
+				{name: "Nonce", mutate: func(r *http.Request) { r.Header.Set("WireHop-Nonce", protocol.Nonce{2}.String()) }},
+				{name: "Tag", mutate: func(r *http.Request) {
+					value := []byte(r.Header.Get("Authorization"))
+					if value[len(value)-1] == '0' {
+						value[len(value)-1] = '1'
+					} else {
+						value[len(value)-1] = '0'
+					}
+					r.Header.Set("Authorization", string(value))
+				}},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					endpoint := target.MustParse("127.0.0.1:51820")
+					token := []byte("test-token")
+					instance := newSessionTestServer(t, token, endpoint, time.Minute)
+					now := time.Now().Unix()
+					hello := protocol.ClientHello{
+						Mode: mode.mode, LaneID: 1, Generation: 1, PathGroupID: 1,
+						Nonce: protocol.Nonce{1}, UnixSeconds: now,
+					}
+					key := token
+					class, scope := protocol.ErrorSessionRejected, protocol.ErrorScopeSession
+					var retained *serverSession
+					if mode.mode == protocol.HelloCreate {
+						hello.Target = endpoint
+					} else {
+						var err error
+						retained, err = instance.createSession(t.Context(), t.Context(), endpoint)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer retained.close()
+						hello.SessionID, key = retained.id, retained.secret[:]
+						class, scope = protocol.ErrorLaneRejected, protocol.ErrorScopeLane
+					}
+					before := instance.Snapshot()
+					headers, err := wsheader.Headers("/_wirehop", hello, key)
+					if err != nil {
+						t.Fatal(err)
+					}
+					request := httptest.NewRequest(http.MethodGet, "http://relay.example/_wirehop", nil)
+					request.Header = headers
+					tt.mutate(request)
+					writer := httptest.NewRecorder()
+					instance.WebSocketHandler(t.Context()).ServeHTTP(writer, request)
+					if writer.Code != http.StatusUnauthorized {
+						t.Fatalf("HTTP status = %d, want 401", writer.Code)
+					}
+					rejection, err := wsheader.ParseRejection(writer.Header())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := protocol.VerifyServerHello(rejection, key); err != nil {
+						t.Fatal(err)
+					}
+					if rejection.ErrorCode != protocol.ErrorAuthentication || rejection.ErrorClass != class || rejection.ErrorScope != scope {
+						t.Fatalf("rejection = %+v", rejection)
+					}
+					if after := instance.Snapshot(); after != before {
+						t.Fatalf("failed authentication changed resources: before %+v, after %+v", before, after)
+					}
+					for _, nonce := range []protocol.Nonce{{1}, {2}} {
+						if retained != nil {
+							err = retained.acceptJoinNonce(nonce, now, now)
+						} else {
+							err = instance.replay.CheckAndStore(nonce, now, now+60)
+						}
+						if err != nil {
+							t.Fatalf("failed authentication retained nonce: %v", err)
+						}
+					}
+					if retained != nil {
+						if err := retained.reserveLane(hello.LaneID, 1, hello.PathGroupID); err != nil {
+							t.Fatalf("failed authentication reserved lane: %v", err)
+						}
+						retained.rejectReservedLane()
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestServerWebSocketRejectsBearerAndAmbiguousOperations(t *testing.T) {
+	endpoint := target.MustParse("127.0.0.1:51820")
+	instance := newSessionTestServer(t, []byte("test-token"), endpoint, time.Minute)
+	hello := protocol.ClientHello{
+		Mode: protocol.HelloCreate, Target: endpoint, LaneID: 1, Generation: 1,
+		PathGroupID: 1, Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
+	}
+	for _, tt := range []struct {
+		name   string
+		mutate func(http.Header)
+	}{
+		{name: "Bearer", mutate: func(h http.Header) { h.Set("Authorization", "Bearer test-token") }},
+		{name: "BothOperations", mutate: func(h http.Header) { h.Set("WireHop-Session-ID", protocol.SessionID{1}.String()) }},
+		{name: "NeitherOperation", mutate: func(h http.Header) { h.Del("WireHop-Target") }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			headers, err := wsheader.Headers("/_wirehop", hello, []byte("test-token"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(headers)
+			request := httptest.NewRequest(http.MethodGet, "http://relay.example/_wirehop", nil)
+			request.Header = headers
+			writer := httptest.NewRecorder()
+			instance.WebSocketHandler(t.Context()).ServeHTTP(writer, request)
+			if writer.Code != http.StatusBadRequest {
+				t.Fatalf("HTTP status = %d, want 400", writer.Code)
+			}
+		})
+	}
+	if err := instance.replay.CheckAndStore(hello.Nonce, hello.UnixSeconds, hello.UnixSeconds+60); err != nil {
+		t.Fatalf("malformed admission retained nonce: %v", err)
+	}
+}
+
 func TestServerCandidateRetention(t *testing.T) {
 	for _, transport := range []string{"Raw", "WebSocket"} {
 		t.Run(transport, func(t *testing.T) {
@@ -73,14 +210,14 @@ func TestServerCandidateRetention(t *testing.T) {
 						httpServer := httptest.NewServer(instance.WebSocketHandler(parent))
 						defer httpServer.Close()
 						defer cancel()
-						headers, err := wsheader.Headers(wsheader.Create{
-							Token: "test-token", Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
+						headers, err := wsheader.Headers("/_wirehop", protocol.ClientHello{
+							Mode: protocol.HelloCreate, Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
 							PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
-						})
+						}, []byte("test-token"))
 						if err != nil {
 							t.Fatal(err)
 						}
-						stream, _, err := websocket.Dial(parent, httpServer.URL, &websocket.DialOptions{
+						stream, _, err := websocket.Dial(parent, httpServer.URL+"/_wirehop", &websocket.DialOptions{
 							HTTPHeader: headers, Subprotocols: []string{wsheader.Subprotocol},
 						})
 						if err != nil {
@@ -216,10 +353,10 @@ func TestServerPreparationCancellation(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				request.Header, err = wsheader.Headers(wsheader.Create{
-					Token: "test-token", Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
+				request.Header, err = wsheader.Headers("/_wirehop", protocol.ClientHello{
+					Mode: protocol.HelloCreate, Target: endpoint, LaneID: protocol.LaneID(1), Generation: 1,
 					PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
-				})
+				}, []byte("test-token"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -303,10 +440,10 @@ func TestCreationDeadlineRequiresAuthorization(t *testing.T) {
 						instance.serveRawCreate(t.Context(), connection, hello, 0, func() { t.Error("unexpected admission") })
 						deadline = connection.deadline
 					} else {
-						headers, err := wsheader.Headers(wsheader.Create{
-							Token: test.token, Target: target.MustParse(test.target), LaneID: protocol.LaneID(1),
+						headers, err := wsheader.Headers("/_wirehop", protocol.ClientHello{
+							Mode: protocol.HelloCreate, Target: target.MustParse(test.target), LaneID: protocol.LaneID(1),
 							Generation: 1, PathGroupID: protocol.PathGroupID(1), Nonce: protocol.Nonce{1}, UnixSeconds: time.Now().Unix(),
-						})
+						}, []byte(test.token))
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -335,21 +472,18 @@ func TestCreationDeadlineRequiresAuthorization(t *testing.T) {
 func TestServerWebSocketAdmissionRejectsNoncanonicalNumbers(t *testing.T) {
 	now := time.Now().Unix()
 	endpoint := target.MustParse("wg.example.com:51820")
-	creation, err := wsheader.Headers(wsheader.Create{
-		Token: "test-token", Target: endpoint, LaneID: 1, Generation: 1, PathGroupID: 1,
+	creation, err := wsheader.Headers("/_wirehop", protocol.ClientHello{
+		Mode: protocol.HelloCreate, Target: endpoint, LaneID: 1, Generation: 1, PathGroupID: 1,
 		Nonce: protocol.Nonce{1}, UnixSeconds: now, MonotonicMicros: 1,
-	})
+	}, []byte("test-token"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	join := wsheader.Join{
-		Method: http.MethodGet, Path: "/_wirehop", SessionID: protocol.SessionID{1}, LaneID: 1,
+	join := protocol.ClientHello{
+		Mode: protocol.HelloJoin, SessionID: protocol.SessionID{1}, LaneID: 1,
 		Generation: 1, PathGroupID: 1, Nonce: protocol.Nonce{1}, UnixSeconds: now, MonotonicMicros: 1,
 	}
-	if err := wsheader.SignJoin(&join, protocol.SessionSecret{1}); err != nil {
-		t.Fatal(err)
-	}
-	joining, err := wsheader.JoinHeaders(join)
+	joining, err := wsheader.Headers("/_wirehop", join, []byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aofei/backoff"
+	"github.com/aofei/wirehop/internal/auth"
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
@@ -1078,12 +1079,12 @@ func (c *Client) joinRawSession(ctx context.Context, connection net.Conn, attemp
 func (c *Client) createWebSocketSession(ctx context.Context,
 	url laneurl.URL, attempt creationAttempt,
 	prepared net.Conn) (carrier.Conn, creationResult, clockmap.Mapping, protocol.Frame, error) {
-	headers, err := wsheader.Headers(wsheader.Create{
-		Token: string(c.config.Token), Target: c.config.Target, LaneID: attempt.laneID,
+	headers, err := wsheader.Headers(url.EscapedPath(), protocol.ClientHello{
+		Mode: protocol.HelloCreate, Target: c.config.Target, LaneID: attempt.laneID,
 		Generation:  attempt.generation,
 		PathGroupID: attempt.pathGroupID, Nonce: attempt.nonce, UnixSeconds: attempt.unixSeconds,
 		MonotonicMicros: attempt.monotonicMicros,
-	})
+	}, c.config.Token)
 	if err != nil {
 		return nil, creationResult{}, clockmap.Mapping{}, protocol.Frame{}, err
 	}
@@ -1133,15 +1134,12 @@ func (c *Client) createWebSocketSession(ctx context.Context,
 // joinWebSocketSession performs one signed WebSocket lane join.
 func (c *Client) joinWebSocketSession(ctx context.Context, url laneurl.URL, attempt creationAttempt,
 	session creationResult, prepared net.Conn) (acceptedLane, error) {
-	join := wsheader.Join{
-		Method: "GET", Path: url.EscapedPath(), SessionID: session.sessionID, LaneID: attempt.laneID,
+	join := protocol.ClientHello{
+		Mode: protocol.HelloJoin, SessionID: session.sessionID, LaneID: attempt.laneID,
 		Generation: attempt.generation, PathGroupID: attempt.pathGroupID, Nonce: attempt.nonce,
 		UnixSeconds: attempt.unixSeconds, MonotonicMicros: attempt.monotonicMicros,
 	}
-	if err := wsheader.SignJoin(&join, session.sessionSecret); err != nil {
-		return acceptedLane{}, err
-	}
-	headers, err := wsheader.JoinHeaders(join)
+	headers, err := wsheader.Headers(url.EscapedPath(), join, session.sessionSecret[:])
 	if err != nil {
 		return acceptedLane{}, err
 	}
@@ -1610,7 +1608,7 @@ func buildLanes(specs []lanespec.Spec, wallClock func() time.Time) []clientLane 
 
 // validateConfig verifies client startup and resource limits before binding UDP.
 func validateConfig(config Config) ([]lanespec.Spec, error) {
-	if err := wsheader.ValidateBearerToken(string(config.Token)); err != nil {
+	if err := auth.ValidateToken(config.Token); err != nil {
 		return nil, fmt.Errorf("%w: invalid WIREHOP_TOKEN", ErrInvalidConfig)
 	}
 	if config.TLSConfig != nil {

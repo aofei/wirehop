@@ -74,8 +74,8 @@ Set the same high-entropy token on the client and server:
 export WIREHOP_TOKEN="$(openssl rand -hex 32)"
 ```
 
-The token must use the RFC 6750 Bearer token character set and may contain at most 4096 bytes. The hexadecimal command
-above produces a compatible 256-bit random token.
+The token must be nonempty and may contain at most 4096 bytes. It is an HMAC key and is never sent in admission
+requests. The hexadecimal command above produces a 256-bit random token.
 
 Start a secure WebSocket server and allow one exact logical WireGuard UDP target:
 
@@ -351,7 +351,7 @@ reserved field is public header metadata rather than authentication material.
 The server permits only exact canonical `--allow-target` host and port entries. Authorizing a DNS target delegates its
 address selection to the server's configured name service, so the operator must trust that hostname's DNS authority and
 all returned records. Session creation uses the long-term token. The server returns a random ephemeral session secret
-for subsequent lane joins. Raw stream handshakes and joins use HMAC-SHA256, fresh nonces, bounded timestamp skew, replay
+for subsequent lane joins. Every carrier uses HMAC-SHA256 admission, fresh nonces, bounded timestamp skew, replay
 caches, stable lane identifiers, and strictly increasing connection generations. Authenticated responses bind the
 request nonce and server time. If an otherwise authenticated request falls outside the timestamp window, the client
 learns the server time and retries without changing the system clock.
@@ -364,5 +364,5 @@ admission protocol.
 
 WireGuard packets are already encrypted, but TLS still protects authorization material, target metadata, session
 secrets, lifecycle controls, timing information, and the carrier against observable manipulation. TLS carriers require
-TLS 1.2 or later. Raw HMAC admission does not encrypt the returned session secret or later control frames, and `ws://`
-sends the bearer token in its HTTP request. Use `tls://` or `wss://` on untrusted networks.
+TLS 1.2 or later. HMAC admission does not encrypt the returned session secret or later control frames on `tcp://` or
+`ws://`. Use `tls://` or `wss://` on untrusted networks.

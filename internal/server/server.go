@@ -4,14 +4,12 @@ package server
 import (
 	"bufio"
 	"context"
-	"crypto/hmac"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -189,7 +187,7 @@ type Snapshot struct {
 
 // New validates config and returns a server.
 func New(config Config) (*Server, error) {
-	if err := wsheader.ValidateBearerToken(string(config.Token)); err != nil {
+	if err := auth.ValidateToken(config.Token); err != nil {
 		return nil, fmt.Errorf("%w: invalid WIREHOP_TOKEN", ErrInvalidConfig)
 	}
 	if config.Targets.Len() == 0 || config.AuthenticationSkew < time.Second ||
@@ -825,25 +823,25 @@ func shouldReportLaneError(err error) bool {
 // serveWebSocket dispatches creation and join authentication before upgrading.
 func (s *Server) serveWebSocket(ctx context.Context, writer http.ResponseWriter, request *http.Request,
 	releaseAdmission func()) error {
-	if strings.HasPrefix(request.Header.Get("Authorization"), "WireHop-HMAC ") {
-		return s.serveWebSocketJoin(ctx, writer, request, releaseAdmission)
-	}
-	return s.serveWebSocketCreate(ctx, writer, request, releaseAdmission)
-}
-
-// serveWebSocketCreate authenticates headers before upgrading and running one creator lane.
-func (s *Server) serveWebSocketCreate(ctx context.Context, writer http.ResponseWriter, request *http.Request,
-	releaseAdmission func()) error {
-	creation, err := wsheader.ParseCreate(request)
+	hello, err := wsheader.Parse(request)
 	receiveMicros := s.config.Clock.NowMicros()
 	if err != nil {
 		http.Error(writer, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return err
 	}
-	if !hmac.Equal([]byte(creation.Token), s.config.Token) {
+	if hello.Mode == protocol.HelloJoin {
+		return s.serveWebSocketJoin(ctx, writer, request, hello, receiveMicros, releaseAdmission)
+	}
+	return s.serveWebSocketCreate(ctx, writer, request, hello, receiveMicros, releaseAdmission)
+}
+
+// serveWebSocketCreate authenticates headers before upgrading and running one creator lane.
+func (s *Server) serveWebSocketCreate(ctx context.Context, writer http.ResponseWriter, request *http.Request,
+	creation protocol.ClientHello, receiveMicros uint64, releaseAdmission func()) error {
+	if err := wsheader.Verify(request, creation, s.config.Token); err != nil {
 		return s.rejectWebSocket(writer, creation.Nonce, protocol.ErrorAuthentication,
 			protocol.ErrorSessionRejected, protocol.ErrorScopeSession, "authentication failed", s.config.Token,
-			protocol.ErrAuthenticationFailed)
+			err)
 	}
 	now := s.authenticationTime()
 	if err := auth.ValidateTimestamp(creation.UnixSeconds, now, s.config.AuthenticationSkew); err != nil {
@@ -921,13 +919,7 @@ func (s *Server) serveWebSocketCreate(ctx context.Context, writer http.ResponseW
 
 // serveWebSocketJoin authenticates a session-bound join before upgrading.
 func (s *Server) serveWebSocketJoin(ctx context.Context, writer http.ResponseWriter, request *http.Request,
-	releaseAdmission func()) error {
-	join, err := wsheader.ParseJoin(request)
-	receiveMicros := s.config.Clock.NowMicros()
-	if err != nil {
-		http.Error(writer, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return err
-	}
+	join protocol.ClientHello, receiveMicros uint64, releaseAdmission func()) error {
 	session := s.findSession(join.SessionID)
 	if session == nil {
 		return s.rejectWebSocket(writer, join.Nonce, protocol.ErrorSessionNotFound,
@@ -940,7 +932,7 @@ func (s *Server) serveWebSocketJoin(ctx context.Context, writer http.ResponseWri
 			protocol.ErrorSessionGone, protocol.ErrorScopeSession, "session is not available", s.config.Token,
 			ErrSessionClosed)
 	}
-	if err := wsheader.VerifyJoin(join, secret); err != nil {
+	if err := wsheader.Verify(request, join, secret[:]); err != nil {
 		return s.rejectWebSocket(writer, join.Nonce, protocol.ErrorAuthentication,
 			protocol.ErrorLaneRejected, protocol.ErrorScopeLane, "authentication failed", secret[:], err)
 	}

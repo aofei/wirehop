@@ -248,7 +248,7 @@ func TestExecuteNilStandardError(t *testing.T) {
 }
 
 func TestExecuteDoesNotExposeInvalidToken(t *testing.T) {
-	const token = "private token"
+	token := strings.Repeat("private", 586)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := Execute(context.Background(), []string{
