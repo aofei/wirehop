@@ -132,6 +132,47 @@ func TestCompareBaseline(t *testing.T) {
 	}
 }
 
+func TestVerifyLatency(t *testing.T) {
+	for _, tt := range []struct {
+		name, replacement string
+		wantError         string
+	}{
+		{name: "Healthy"},
+		{name: "LossIsReported", replacement: `"received":90,"lost":10`},
+		{name: "MissingReplies", replacement: `"received":0,"lost":100`, wantError: "incomplete latency"},
+		{name: "InconsistentLoss", replacement: `"received":90,"lost":0`, wantError: "incomplete latency"},
+		{name: "TooManyReplies", replacement: `"received":101,"lost":0`, wantError: "incomplete latency"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := t.TempDir()
+			encoded := `{"sent":100,"received":100,"lost":0,"p50_rtt_ms":10,"p95_rtt_ms":20,` +
+				`"p99_rtt_ms":30,"max_rtt_ms":40,"requested_duration_seconds":20,"actual_duration_seconds":20,` +
+				`"actual_interval_seconds":0.01,"actual_size_bytes":64}`
+			if tt.replacement != "" {
+				encoded = strings.Replace(encoded, `"received":100,"lost":0`, tt.replacement, 1)
+			}
+			writeFixture(t, directory, "latency.json", encoded+"\n")
+			err := verifyLatency(directory)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("verification = %v, want %q", err, tt.wantError)
+			}
+		})
+	}
+	t.Run("ReorderedQuantiles", func(t *testing.T) {
+		directory := t.TempDir()
+		writeFixture(t, directory, "latency.json", `{"sent":100,"received":100,"lost":0,"p50_rtt_ms":20,`+
+			`"p95_rtt_ms":10,"p99_rtt_ms":30,"max_rtt_ms":40,"requested_duration_seconds":20,`+
+			`"actual_duration_seconds":20,"actual_interval_seconds":0.01,"actual_size_bytes":64}`+"\n")
+		if err := verifyLatency(directory); err == nil || !strings.Contains(err.Error(), "invalid latency quantiles") {
+			t.Fatalf("verification = %v, want invalid quantiles", err)
+		}
+	})
+}
+
 // writeEvidence creates complete healthy carrier and router evidence for a comparison case.
 func writeEvidence(t *testing.T, directory, path string) {
 	t.Helper()

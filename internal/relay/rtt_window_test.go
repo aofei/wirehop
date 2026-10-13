@@ -228,10 +228,11 @@ func TestScheduledLaneRefreshTimingAfterCapacityAndDelayIncrease(t *testing.T) {
 func TestSchedulerApplyMeasurementUpdatesRoutedFeedback(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newMeasurementFixture(t, true, 2)
+		f.target.LaneID = 2
 		f.scheduler.RequestMeasurement(f.target)
 		f.apply(t)
 		attempt := f.scheduler.measurements.active
-		f.scheduler.publishMeasurement(attempt, attempt.targets[2], 600_000, func(bool) {})
+		f.scheduler.publishMeasurement(attempt, 600_000, func(bool) {})
 		event := <-f.scheduler.events
 		event.generation = 2
 		var preferred protocol.LaneID

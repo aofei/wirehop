@@ -17,7 +17,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-func TestWebSocketConnReadFramesOwnsBufferedTail(t *testing.T) {
+func TestWebSocketConnReadFramesBorrowsBufferedPrefix(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		size    int
@@ -58,18 +58,14 @@ func TestWebSocketConnReadFramesOwnsBufferedTail(t *testing.T) {
 			if err != nil || count != len(want) || !reflect.DeepEqual(frames[:count], want) {
 				t.Fatalf("read batch = %d frames, %v", count, err)
 			}
-			if cap(stream.readBuffer) > streamReadBufferSize {
-				t.Fatalf("tail capacity = %d bytes, exceeds the buffered prefix", cap(stream.readBuffer))
-			}
-			for index, offset := 1, 0; index < count; index++ {
-				if &frames[index].Payload[0] != &stream.readBuffer[offset] {
-					t.Fatal("buffered tail retains an additional backing allocation")
+			// Conn permits borrowing until the next read. Buffered parsing must preserve that prefix without copying.
+			for index, offset := 0, 0; index < count; index++ {
+				size := protocol.FrameSize(len(frames[index].Payload))
+				headerSize := size - len(frames[index].Payload)
+				if &frames[index].Payload[0] != &borrowed[offset+headerSize] {
+					t.Fatal("buffered frame does not borrow the message read buffer")
 				}
-				offset += len(frames[index].Payload)
-			}
-			clear(borrowed)
-			if !reflect.DeepEqual(frames[:count], want) {
-				t.Fatal("read-buffer reuse changed an owned payload")
+				offset += size
 			}
 		})
 	}
@@ -79,13 +75,45 @@ type fragmentedReadConn struct {
 	net.Conn
 	input *bytes.Reader
 	limit int
+	reads int
 }
 
 func (c *fragmentedReadConn) Read(buffer []byte) (int, error) {
+	c.reads++
 	return c.input.Read(buffer[:min(len(buffer), c.limit)])
 }
 
 func (*fragmentedReadConn) SetReadDeadline(time.Time) error { return nil }
+
+func TestWebSocketConnBorrowedBatchStopsBeforeRefill(t *testing.T) {
+	want := []protocol.Frame{
+		{Type: protocol.FrameData, Payload: bytes.Repeat([]byte{0xa5}, 1452)},
+		{Type: protocol.FramePing, Payload: bytes.Repeat([]byte{0x5a}, 16)},
+		{Type: protocol.FrameData, Payload: bytes.Repeat([]byte{0x96}, 128)},
+	}
+	var encoded []byte
+	for _, frame := range want {
+		var err error
+		encoded, err = protocol.AppendFrame(encoded, frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	input := &fragmentedReadConn{input: bytes.NewReader(encoded), limit: len(encoded) - 64}
+	stream := WebSocketConn{messageReader: bufio.NewReaderSize(input, streamReadBufferSize), messageOpen: true}
+	var frames [maximumStreamReadBatchFrames]protocol.Frame
+	count, err := stream.ReadFrames(context.Background(), frames[:])
+	if err != nil || count != 2 || !reflect.DeepEqual(frames[:count], want[:2]) {
+		t.Fatalf("complete prefix = %d frames, %v", count, err)
+	}
+	if input.reads != 1 {
+		t.Fatalf("complete prefix used %d underlying reads, want 1", input.reads)
+	}
+	count, err = stream.ReadFrames(context.Background(), frames[:])
+	if err != nil || count != 1 || !reflect.DeepEqual(frames[0], want[2]) {
+		t.Fatalf("fragmented tail = %d frames, %v", count, err)
+	}
+}
 
 func FuzzCarrierReadFrames(f *testing.F) {
 	for _, encoded := range [][]byte{
@@ -134,9 +162,6 @@ func FuzzCarrierReadFrames(f *testing.F) {
 			var frames [maximumStreamReadBatchFrames]protocol.Frame
 			for {
 				count, err := stream.ReadFrames(context.Background(), frames[:1+int(batchSize)%len(frames)])
-				if connection, ok := stream.(*WebSocketConn); ok && cap(connection.readBuffer) > streamReadBufferSize {
-					t.Fatalf("WebSocket tail capacity = %d, exceeds the read buffer", cap(connection.readBuffer))
-				}
 				if count == 0 && err == nil {
 					t.Fatalf("%T returned without a frame or an error", stream)
 				}

@@ -4,7 +4,10 @@ package datagram
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -72,17 +75,17 @@ func TestLinuxUDPBatchReadInterrupted(t *testing.T) {
 	t.Cleanup(func() { linuxReadBatches = previous })
 	batch := newLinuxReadBatch()
 	calls := 0
-	batch.receive = func(descriptor uintptr) bool {
+	batch.receive = func(descriptor uintptr) {
 		calls++
 		if calls == 1 {
 			batch.count = 0
 			batch.err = syscall.EINTR
-			return true
+			return
 		}
-		return batch.receiveFrom(descriptor)
+		batch.receiveFrom(descriptor)
 	}
 	linuxReadBatches.idle <- batch
-	result, err := newUDPBatchConn(receiver).readAvailable(1)
+	result, err := newUDPBatchConn(receiver).read(2)
 	if result != nil {
 		defer result.release()
 	}
@@ -91,5 +94,87 @@ func TestLinuxUDPBatchReadInterrupted(t *testing.T) {
 	}
 	if messages := result.messages(); len(messages) != 1 || string(messages[0].payload) != "pending" {
 		t.Fatalf("received %v, want pending datagram", messages)
+	}
+}
+
+func TestLinuxUDPBatchReadInterruptedRechecksCancellation(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		limit    int
+		deadline bool
+	}{
+		{name: "VectorContext", limit: MaximumBatchSize},
+		{name: "ScalarContext", limit: 1},
+		{name: "VectorDeadline", limit: MaximumBatchSize, deadline: true},
+		{name: "ScalarDeadline", limit: 1, deadline: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			previous := linuxReadBatches
+			linuxReadBatches = newLinuxReadBatchPool()
+			t.Cleanup(func() { linuxReadBatches = previous })
+			local := NewLocal(listenUDP(t))
+			t.Cleanup(func() { local.Close() })
+			connection := local.batch.(*linuxUDPBatchConn)
+			observed := &observedUDPRead{RawConn: connection.raw}
+			connection.raw = observed
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			calls := 0
+			interrupt := func() {
+				calls++
+				if !tt.deadline {
+					cancel()
+				}
+				if err := local.conn.SetReadDeadline(time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.limit == 1 {
+				connection.scalar.receive = func(descriptor uintptr) {
+					if calls != 0 {
+						calls++
+						connection.scalar.receiveFrom(descriptor)
+						return
+					}
+					connection.scalar.err = syscall.EINTR
+					interrupt()
+				}
+			} else {
+				batch := newLinuxReadBatch()
+				batch.receive = func(descriptor uintptr) {
+					if calls != 0 {
+						calls++
+						batch.receiveFrom(descriptor)
+						return
+					}
+					batch.err = syscall.EINTR
+					interrupt()
+				}
+				linuxReadBatches.idle <- batch
+			}
+			var err error
+			if tt.deadline {
+				if err := local.conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				_, err = connection.read(tt.limit)
+				if !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("interrupted read returned %v, want expired deadline", err)
+				}
+			} else {
+				var packets [MaximumBatchSize]Packet
+				_, err = local.ReadBatch(ctx, packets[:tt.limit])
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("interrupted read returned %v, want context cancellation", err)
+				}
+			}
+			if calls != 1 || observed.operations != 2 {
+				t.Fatalf("interruption used %d receive attempts and %d poll operations, want 1 and 2",
+					calls, observed.operations)
+			}
+			if len(linuxReadBatches.permits) != 0 || connection.scalar.storage != nil || connection.scalar.vector.Base != nil {
+				t.Fatal("interrupted read retained vector or scalar staging")
+			}
+		})
 	}
 }

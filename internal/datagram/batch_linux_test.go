@@ -4,8 +4,10 @@ package datagram
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -35,8 +37,14 @@ func TestLinuxUDPBatch(t *testing.T) {
 			t.Cleanup(func() { sender.Close() })
 
 			receiverBatch := newUDPBatchConn(receiver)
-			if batch, err := receiverBatch.readAvailable(3); err != nil || batch != nil {
-				t.Fatalf("empty readAvailable() = %v, %v", batch, err)
+			if err := receiver.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			if batch, err := receiverBatch.read(3); !errors.Is(err, os.ErrDeadlineExceeded) || batch != nil {
+				t.Fatalf("empty read() = %v, %v", batch, err)
+			}
+			if err := receiver.SetReadDeadline(time.Time{}); err != nil {
+				t.Fatal(err)
 			}
 			payloads := [3][]byte{{1, 0, 0}, {2, 0, 0}, {3, 0, 0}}
 			messages := [3]udpMessage{
@@ -48,17 +56,17 @@ func TestLinuxUDPBatch(t *testing.T) {
 			if err != nil || written != len(messages) {
 				t.Fatalf("write() = %d, %v, want %d, nil", written, err, len(messages))
 			}
-			batch, err := receiverBatch.readAvailable(len(messages))
+			batch, err := receiverBatch.read(len(messages))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if batch == nil {
-				t.Fatal("readAvailable() returned no queued datagrams")
+				t.Fatal("read() returned no queued datagrams")
 			}
 			defer batch.release()
 			values := batch.messages()
 			if len(values) != len(messages) {
-				t.Fatalf("readAvailable() = %d datagrams, want %d", len(values), len(messages))
+				t.Fatalf("read() = %d datagrams, want %d", len(values), len(messages))
 			}
 			wantPeer := sender.LocalAddr().(*net.UDPAddr).AddrPort()
 			for index, value := range values {
@@ -104,17 +112,17 @@ func TestLinuxUDPBatchEqualTailWorkaround(t *testing.T) {
 		t.Skip("UDP_SEGMENT failed and fell back to scalar writes")
 	}
 
-	received, err := newUDPBatchConn(receiver).readAvailable(len(messages) + 1)
+	received, err := newUDPBatchConn(receiver).read(len(messages) + 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if received == nil {
-		t.Fatal("readAvailable() returned no queued datagrams")
+		t.Fatal("read() returned no queued datagrams")
 	}
 	defer received.release()
 	values := received.messages()
 	if len(values) != len(messages)+1 {
-		t.Fatalf("readAvailable() = %d datagrams, want %d", len(values), len(messages)+1)
+		t.Fatalf("read() = %d datagrams, want %d", len(values), len(messages)+1)
 	}
 	for index, value := range values[:len(messages)] {
 		if len(value.payload) != len(payloads[index]) || value.payload[0] != byte(index+1) {

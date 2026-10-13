@@ -103,18 +103,15 @@ func TestServerWebSocketAuthenticationHasNoAdmissionSideEffects(t *testing.T) {
 					if after := instance.Snapshot(); after != before {
 						t.Fatalf("failed authentication changed resources: before %+v, after %+v", before, after)
 					}
-					for _, nonce := range []protocol.Nonce{{1}, {2}} {
-						if retained != nil {
-							err = retained.acceptJoinNonce(nonce, now, now)
-						} else {
-							err = instance.replay.CheckAndStore(nonce, now, now+60)
-						}
-						if err != nil {
-							t.Fatalf("failed authentication retained nonce: %v", err)
+					if retained == nil {
+						for _, nonce := range []protocol.Nonce{{1}, {2}} {
+							if err := instance.replay.CheckAndStore(nonce, now, now+60); err != nil {
+								t.Fatalf("failed authentication retained nonce: %v", err)
+							}
 						}
 					}
 					if retained != nil {
-						if err := retained.reserveLane(hello.LaneID, 1, hello.PathGroupID); err != nil {
+						if err := retained.reserveJoinLane(hello); err != nil {
 							t.Fatalf("failed authentication reserved lane: %v", err)
 						}
 						retained.rejectReservedLane()

@@ -1106,8 +1106,12 @@ func TestAdmissionReplayAfterClockRollback(t *testing.T) {
 			if response := exchange(protocol.Nonce{3}, advancedUnix); response.ErrorCode != admittedCode {
 				t.Fatalf("corrected request code = %d, want %d", response.ErrorCode, admittedCode)
 			}
-			if response := exchange(protocol.Nonce{3}, advancedUnix); response.ErrorCode != protocol.ErrorReplay {
-				t.Fatalf("corrected request replay code = %d, want %d", response.ErrorCode, protocol.ErrorReplay)
+			wantReplayCode := protocol.ErrorReplay
+			if tt.join {
+				wantReplayCode = protocol.ErrorStaleGeneration
+			}
+			if response := exchange(protocol.Nonce{3}, advancedUnix); response.ErrorCode != wantReplayCode {
+				t.Fatalf("corrected request replay code = %d, want %d", response.ErrorCode, wantReplayCode)
 			}
 		})
 	}
@@ -1166,35 +1170,25 @@ func TestServerAuthenticationTime(t *testing.T) {
 }
 
 func TestReplayRejection(t *testing.T) {
-	for _, terminal := range []struct {
+	for _, tt := range []struct {
 		name  string
+		err   error
+		code  protocol.ErrorCode
 		class protocol.ErrorClass
 		scope protocol.ErrorScope
 	}{
-		{name: "Create", class: protocol.ErrorSessionRejected, scope: protocol.ErrorScopeSession},
-		{name: "Join", class: protocol.ErrorLaneRejected, scope: protocol.ErrorScopeLane},
+		{name: "Replay", err: auth.ErrReplay, code: protocol.ErrorReplay,
+			class: protocol.ErrorSessionRejected, scope: protocol.ErrorScopeSession},
+		{name: "Capacity", err: auth.ErrReplayCacheFull, code: protocol.ErrorRateLimited,
+			class: protocol.ErrorRetryable, scope: protocol.ErrorScopeSession},
+		{name: "ExpiredConcurrentSample", err: auth.ErrTimestampOutsideWindow, code: protocol.ErrorClockSkew,
+			class: protocol.ErrorRetryable, scope: protocol.ErrorScopeLane},
 	} {
-		t.Run(terminal.name, func(t *testing.T) {
-			for _, tt := range []struct {
-				name  string
-				err   error
-				code  protocol.ErrorCode
-				class protocol.ErrorClass
-				scope protocol.ErrorScope
-			}{
-				{name: "Replay", err: auth.ErrReplay, code: protocol.ErrorReplay, class: terminal.class, scope: terminal.scope},
-				{name: "Capacity", err: auth.ErrReplayCacheFull, code: protocol.ErrorRateLimited,
-					class: protocol.ErrorRetryable, scope: terminal.scope},
-				{name: "ExpiredConcurrentSample", err: auth.ErrTimestampOutsideWindow, code: protocol.ErrorClockSkew,
-					class: protocol.ErrorRetryable, scope: protocol.ErrorScopeLane},
-			} {
-				t.Run(tt.name, func(t *testing.T) {
-					code, class, scope := replayRejection(tt.err, terminal.class, terminal.scope)
-					if code != tt.code || class != tt.class || scope != tt.scope {
-						t.Fatalf("replayRejection(%v) = %d, %d, %d, want %d, %d, %d",
-							tt.err, code, class, scope, tt.code, tt.class, tt.scope)
-					}
-				})
+		t.Run(tt.name, func(t *testing.T) {
+			code, class, scope := replayRejection(tt.err)
+			if code != tt.code || class != tt.class || scope != tt.scope {
+				t.Fatalf("replayRejection(%v) = %d, %d, %d, want %d, %d, %d",
+					tt.err, code, class, scope, tt.code, tt.class, tt.scope)
 			}
 		})
 	}
@@ -1207,6 +1201,8 @@ func TestReservationRejection(t *testing.T) {
 		class protocol.ErrorClass
 		scope protocol.ErrorScope
 	}{
+		{err: auth.ErrTimestampOutsideWindow, code: protocol.ErrorClockSkew,
+			class: protocol.ErrorRetryable, scope: protocol.ErrorScopeLane},
 		{err: relay.ErrStaleLane, code: protocol.ErrorStaleGeneration,
 			class: protocol.ErrorLaneRejected, scope: protocol.ErrorScopeLane},
 		{err: ErrLaneLimit, code: protocol.ErrorLaneLimit,
@@ -1384,7 +1380,7 @@ func newSessionTestConfig(t *testing.T, token []byte, target targetpkg.Endpoint,
 	}
 	return Config{
 		Token: token, Targets: targets, AuthenticationSkew: time.Minute, HandshakeTimeout: time.Second,
-		ReplayEntries: 1024, JoinNonceEntries: 1024, MaxSessions: 16, MaxLanesPerSession: 8, MaxPendingAdmissions: 1,
+		ReplayEntries: 1024, MaxSessions: 16, MaxLanesPerSession: 8, MaxPendingAdmissions: 1,
 		ReconnectGrace: grace, IngressLimits: packetqueue.Limits{Packets: 64, Bytes: 256 * 1024},
 		LaneLimits:      packetqueue.Limits{Packets: 64, Bytes: 256 * 1024},
 		RetentionLimits: retention.Limits{Packets: 1024, Bytes: 4 * 1024 * 1024},

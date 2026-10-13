@@ -1425,7 +1425,7 @@ func newCommandTestServerForTokenAndTarget(t *testing.T, token string, target ne
 	}
 	instance, err := server.New(server.Config{
 		Token: []byte(token), Targets: targets, AuthenticationSkew: time.Minute,
-		HandshakeTimeout: time.Second, ReplayEntries: 16, JoinNonceEntries: 16, MaxSessions: 4,
+		HandshakeTimeout: time.Second, ReplayEntries: 16, MaxSessions: 4,
 		MaxLanesPerSession: 4, MaxPendingAdmissions: 1, ReconnectGrace: reconnectGrace,
 		IngressLimits:       packetqueue.Limits{Packets: 4, Bytes: 8192},
 		LaneLimits:          packetqueue.Limits{Packets: 4, Bytes: 8192},

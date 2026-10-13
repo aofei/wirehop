@@ -28,6 +28,21 @@ type flowResult struct {
 	}
 }
 
+// latencyResult contains the optional independent UDP probe's accounting and RTT summary.
+type latencyResult struct {
+	Sent             uint64  `json:"sent"`
+	Received         uint64  `json:"received"`
+	Lost             uint64  `json:"lost"`
+	P50              float64 `json:"p50_rtt_ms"`
+	P95              float64 `json:"p95_rtt_ms"`
+	P99              float64 `json:"p99_rtt_ms"`
+	Maximum          float64 `json:"max_rtt_ms"`
+	RequestedSeconds float64 `json:"requested_duration_seconds"`
+	ActualSeconds    float64 `json:"actual_duration_seconds"`
+	ActualInterval   float64 `json:"actual_interval_seconds"`
+	Size             int     `json:"actual_size_bytes"`
+}
+
 // droppedPattern extracts each qdisc's recorded packet drops.
 var droppedPattern = regexp.MustCompile(`dropped ([0-9]+)`)
 
@@ -171,6 +186,36 @@ func verifyEvidence(directory, path string, minimumBytes uint64, allowDrops bool
 	if after < before || after-before != 2 {
 		return fmt.Errorf("unexpected TCP active opens during flow: before %d, after %d", before, after)
 	}
+	return verifyLatency(directory)
+}
+
+// verifyLatency checks optional probe accounting without treating packet loss as malformed evidence.
+func verifyLatency(directory string) error {
+	encoded, err := os.ReadFile(filepath.Join(directory, "latency.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var measured latencyResult
+	if err := json.Unmarshal(encoded, &measured); err != nil {
+		return fmt.Errorf("invalid latency result: %w", err)
+	}
+	if measured.Sent == 0 || measured.Received == 0 || measured.Received > measured.Sent ||
+		measured.Lost != measured.Sent-measured.Received || measured.RequestedSeconds < 19 ||
+		measured.ActualSeconds <= 0 || measured.ActualInterval <= 0 || measured.Size < 16 || measured.Size > 65507 {
+		return fmt.Errorf("incomplete latency accounting")
+	}
+	previous := 0.0
+	for _, value := range []float64{measured.P50, measured.P95, measured.P99, measured.Maximum} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < previous {
+			return fmt.Errorf("invalid latency quantiles")
+		}
+		previous = value
+	}
+	fmt.Printf("%s latency sent=%d received=%d lost=%d p50=%.3f p95=%.3f p99=%.3f max=%.3f ms\n",
+		directory, measured.Sent, measured.Received, measured.Lost, measured.P50, measured.P95, measured.P99, measured.Maximum)
 	return nil
 }
 

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
 
@@ -18,6 +17,7 @@ import (
 type Local struct {
 	conn          *net.UDPConn
 	batch         udpBatchConn
+	scalarRead    udpReadBuffer
 	readInterrupt readInterrupt
 	writeMu       sync.Mutex
 	writeMessages [MaximumBatchSize]udpMessage
@@ -45,12 +45,12 @@ func NewLocal(conn *net.UDPConn) *Local {
 
 // Read returns the next structurally valid local WireGuard datagram and remembers its source.
 func (e *Local) Read(ctx context.Context) (Packet, error) {
-	packet, peer, err := e.readOne(ctx)
+	var packets [1]Packet
+	_, err := e.ReadBatch(ctx, packets[:])
 	if err != nil {
 		return Packet{}, err
 	}
-	e.rememberPeer(peer)
-	return packet, nil
+	return packets[0], nil
 }
 
 // ReadBatch returns one blocking packet plus currently queued valid local WireGuard datagrams.
@@ -58,60 +58,39 @@ func (e *Local) ReadBatch(ctx context.Context, packets []Packet) (int, error) {
 	if len(packets) == 0 {
 		return 0, nil
 	}
-	packet, latestPeer, err := e.readOne(ctx)
-	if err != nil {
+	if err := e.readInterrupt.prepare(ctx, e.conn); err != nil {
 		return 0, err
 	}
-	packets[0] = packet
-	count := 1
-	var drainErr error
-	if e.batch != nil && len(packets) > 1 {
-		var batch udpReadBatch
-		batch, drainErr = e.batch.readAvailable(len(packets) - 1)
-		if batch != nil {
-			for _, message := range batch.messages() {
-				kind := wgpacket.Classify(message.payload)
-				if !kind.Accepted() {
-					continue
-				}
-				packets[count] = ownPacket(kind, message.payload)
-				count++
-				latestPeer = message.peer
-			}
-			batch.release()
-		}
-	}
-	if isSoftNetworkError(drainErr) {
-		e.notice.report("read local", drainErr)
-		drainErr = nil
-	}
-	e.rememberPeer(latestPeer)
-	return count, drainErr
-}
-
-// readOne returns one blocking accepted packet and its source.
-func (e *Local) readOne(ctx context.Context) (Packet, netip.AddrPort, error) {
-	if err := e.readInterrupt.prepare(ctx, e.conn); err != nil {
-		return Packet{}, netip.AddrPort{}, err
-	}
-	pooled := readBufferPool.Get().(*[protocol.MaxPacketSize + 1]byte)
-	defer readBufferPool.Put(pooled)
-	buffer := pooled[:]
 	for {
-		length, peer, err := e.conn.ReadFromUDPAddrPort(buffer)
+		batch, err := readUDPBatch(e.conn, e.batch, &e.scalarRead, len(packets))
 		if err != nil {
 			if ctx.Err() != nil {
-				return Packet{}, netip.AddrPort{}, ctx.Err()
+				return 0, ctx.Err()
 			}
 			if isSoftNetworkError(err) {
 				e.notice.report("read local", err)
 				continue
 			}
-			return Packet{}, netip.AddrPort{}, fmt.Errorf("read local UDP datagram: %w", err)
+			return 0, fmt.Errorf("read local UDP datagram: %w", err)
 		}
-		packet, ok := copyAcceptedPacket(buffer, length)
-		if ok {
-			return packet, peer, nil
+		if batch == nil {
+			continue
+		}
+		count := 0
+		var latestPeer netip.AddrPort
+		for _, message := range batch.messages() {
+			kind := wgpacket.Classify(message.payload)
+			if !kind.Accepted() {
+				continue
+			}
+			packets[count] = ownPacket(kind, message.payload)
+			count++
+			latestPeer = message.peer
+		}
+		batch.release()
+		if count > 0 {
+			e.rememberPeer(latestPeer)
+			return count, nil
 		}
 	}
 }

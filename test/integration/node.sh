@@ -58,6 +58,11 @@ wg set wgtest private-key /tmp/private.key listen-port 51820 peer "$peer" allowe
 ip addr add "$local_ip/$prefix" dev wgtest
 ip link set wgtest mtu 1420 up
 ip route add "$remote_ip/$prefix" dev wgtest
+observer=
+if [ "${WIREHOP_TEST_OBSERVE:-false}" = true ]; then
+  sh /test/observe.sh "$role" /results &
+  observer=$!
+fi
 if [ "$role" = client ]; then
   case "$scenario" in
     tcp-fwmark|forward-fwmark)
@@ -129,6 +134,11 @@ if [ "$role" = server ]; then
     *-rtt-step*) iperf3 -s -J > /results/iperf-server.log 2>&1 & ;;
     *) iperf3 -s > /results/iperf-server.log 2>&1 & ;;
   esac
+  if [ "${WIREHOP_TEST_LATENCY:-false}" = true ]; then
+    latency_address=$local_ip:5202
+    case "$local_ip" in *:*) latency_address="[$local_ip]:5202" ;; esac
+    /latency -listen "$latency_address" > /results/latency-server.log 2>&1 &
+  fi
   case "$scheme:$scenario" in
     native:*|forward:*)
       touch /results/ready
@@ -161,6 +171,7 @@ case "$scenario" in
   *-outage|*-roam|*-capacity-change*) duration=40 ;;
   *-rtt-step*) duration=60 ;;
 esac
+duration=${WIREHOP_TEST_DURATION:-$duration}
 local_endpoint=127.0.0.1:51821
 case "$scenario" in
   tcp-ipv6|wss-ipv6|forward-ipv6) local_endpoint='[::1]:51821' ;;
@@ -273,8 +284,19 @@ nstat -az > /results/client-before.txt
 ss -u -a -m > /results/client-sockets.txt
 ss -tnH state established > /results/client-tcp-sockets.txt
 cat /proc/sys/net/core/rmem_max > /results/receive-buffer-limit.txt
+latency_process=
+if [ "${WIREHOP_TEST_LATENCY:-false}" = true ]; then
+  latency_address=$remote_ip:5202
+  case "$remote_ip" in *:*) latency_address="[$remote_ip]:5202" ;; esac
+  timeout "$((duration + 5))" /latency -target "$latency_address" -duration "${duration}s" -interval 10ms \
+    > /results/latency.json 2> /results/latency-client.log &
+  latency_process=$!
+fi
 status=0
 timeout "$((duration + 60))" iperf3 -c "$remote_ip" -t "$duration" -J "$@" > /results/flow.json || status=$?
+if [ -n "$latency_process" ]; then wait "$latency_process" || status=$?; fi
+touch /results/flow-done.txt
+if [ -n "$observer" ]; then wait "$observer"; fi
 nstat -az > /results/client-after.txt
 ss -tnH state established > /results/client-tcp-sockets-after.txt
 wg show wgtest latest-handshakes > /results/client-handshake.txt

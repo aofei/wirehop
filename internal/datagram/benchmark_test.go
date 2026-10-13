@@ -16,16 +16,12 @@ import (
 var benchmarkPacketSink Packet
 var benchmarkAddressSink netip.AddrPort
 
-func BenchmarkCopyAcceptedPacket(b *testing.B) {
+func BenchmarkOwnPacket(b *testing.B) {
 	buffer := wireGuardPacket(4, 1420)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(buffer)))
 	for b.Loop() {
-		packet, ok := copyAcceptedPacket(buffer, len(buffer))
-		if !ok {
-			b.Fatal("copyAcceptedPacket() rejected a transport packet")
-		}
-		benchmarkPacketSink = packet
+		benchmarkPacketSink = ownPacket(wgpacket.TransportData, buffer)
 		benchmarkPacketSink.Release()
 	}
 }
@@ -62,6 +58,14 @@ func BenchmarkLocalRead(b *testing.B) {
 }
 
 func BenchmarkLocalReadBatch(b *testing.B) {
+	benchmarkLocalReadBatch(b, MaximumBatchSize)
+}
+
+func BenchmarkLocalReadBatchSingle(b *testing.B) {
+	benchmarkLocalReadBatch(b, 1)
+}
+
+func benchmarkLocalReadBatch(b *testing.B, burstSize int) {
 	if runtime.GOOS != "linux" {
 		b.Skip("Linux recvmmsg benchmark")
 	}
@@ -82,9 +86,9 @@ func BenchmarkLocalReadBatch(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Cleanup(cancel)
 	b.ReportAllocs()
-	b.SetBytes(int64(len(payload) * len(packets)))
+	b.SetBytes(int64(len(payload) * burstSize))
 	for b.Loop() {
-		for range packets {
+		for range burstSize {
 			if _, err := peer.WriteToUDPAddrPort(payload, target); err != nil {
 				b.Fatal(err)
 			}
@@ -93,8 +97,8 @@ func BenchmarkLocalReadBatch(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if count != len(packets) {
-			b.Fatalf("ReadBatch() = %d packets, want %d", count, len(packets))
+		if count != burstSize {
+			b.Fatalf("ReadBatch() = %d packets, want %d", count, burstSize)
 		}
 		for index := range count {
 			packets[index].Release()

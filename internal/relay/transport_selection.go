@@ -90,7 +90,7 @@ var probePadding [protocol.ProbePayloadSize]byte
 // fillTransportProbe samples one eligible path without consuming packet IDs or producing UDP traffic.
 func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane, preferred protocol.LaneID,
 	now time.Time, reserveBytes uint64) bool {
-	if !s.measurementStarted.IsZero() {
+	if !s.measurementStarted.IsZero() || len(lanes) < 2 {
 		return false
 	}
 	waitingDrain := s.measurementDrain != nil || s.pendingMeasurementDrain.Load()
@@ -111,6 +111,7 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 		return false
 	}
 	size, _ := protocol.DataFrameSize(protocol.Data{Payload: probePadding[:]})
+	var groups map[protocol.PathGroupID]*scheduledLane
 	var first, next *scheduledLane
 	for _, candidate := range lanes {
 		active := now.Before(candidate.probeUntil)
@@ -139,6 +140,14 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 			candidate.registration.Store.hasProbe() {
 			continue
 		}
+		if !active {
+			if groups == nil {
+				groups = s.probeRepresentatives(lanes, preferred, now)
+			}
+			if groups[candidate.registration.PathGroupID] != candidate {
+				continue
+			}
+		}
 		id := candidate.registration.LaneID
 		if first == nil || id < first.registration.LaneID {
 			first = candidate
@@ -147,6 +156,7 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 			next = candidate
 		}
 	}
+	clear(groups)
 	probe := next
 	if probe == nil {
 		probe = first
@@ -196,6 +206,45 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 		}
 	}
 	return progressed
+}
+
+// probeRepresentatives selects one healthy lane per group in reusable scratch storage.
+// The caller must clear the returned map after use.
+func (s *Scheduler) probeRepresentatives(lanes map[protocol.LaneID]*scheduledLane, preferred protocol.LaneID,
+	now time.Time) map[protocol.PathGroupID]*scheduledLane {
+	if s.probeGroups == nil {
+		s.probeGroups = make(map[protocol.PathGroupID]*scheduledLane)
+	}
+	groups := s.probeGroups
+	for _, lane := range lanes {
+		if lane.degraded || lane.abandoning {
+			continue
+		}
+		group := lane.registration.PathGroupID
+		if probeRepresentativeBetter(lane, groups[group], preferred, now) {
+			groups[group] = lane
+		}
+	}
+	return groups
+}
+
+// probeRepresentativeBetter prefers the primary, an active discovery period, and then the lowest RTT and lane ID.
+func probeRepresentativeBetter(candidate, current *scheduledLane, preferred protocol.LaneID, now time.Time) bool {
+	if current == nil {
+		return true
+	}
+	if current.registration.LaneID == preferred {
+		return false
+	}
+	if candidate.registration.LaneID == preferred {
+		return true
+	}
+	active := now.Before(candidate.probeUntil)
+	if active != now.Before(current.probeUntil) {
+		return active
+	}
+	return candidate.rttMicros < current.rttMicros || candidate.rttMicros == current.rttMicros &&
+		candidate.registration.LaneID < current.registration.LaneID
 }
 
 // recordTransportAssignment commits discovery state only after a successful store transfer.

@@ -3,8 +3,8 @@ package protocol
 // MaxMeasurementHoldMicros bounds a measurement's remaining Data pause independently of liveness timeouts.
 const MaxMeasurementHoldMicros = 4_000_000
 
-// MaxMeasurementTargets guarantees that even full-width identities fit the existing absolute frame limit.
-const MaxMeasurementTargets = (MaxFrameContentSize - 14) / 20
+// MaxMeasurementContentSize bounds a Reply with full-width IDs and timestamps and a four-byte pause hold.
+const MaxMeasurementContentSize = 45
 
 // MeasurementKind identifies a phase of the client-coordinated measurement transaction.
 type MeasurementKind uint8
@@ -28,7 +28,6 @@ const (
 // ProbeMicros, ReceiveMicros, and ReplyMicros are t1, t2, and t3 in a Reply. ReceiveMicros is t4 in a Result.
 type Measurement struct {
 	Kind          MeasurementKind
-	Targets       []LaneGeneration
 	ID            uint64
 	ProbeMicros   uint64
 	ReceiveMicros uint64
@@ -41,7 +40,7 @@ type Measurement struct {
 func MarshalMeasurement(value Measurement) (Frame, error) {
 	if value.Kind < MeasurementRequest || value.Kind > MeasurementResult ||
 		(value.Kind == MeasurementRequest) != (value.ID == 0) ||
-		value.HoldMicros > MaxMeasurementHoldMicros || value.Kind != MeasurementBegin && len(value.Targets) != 0 {
+		value.HoldMicros > MaxMeasurementHoldMicros {
 		return Frame{}, ErrInvalidControlFrame
 	}
 	var payload []byte
@@ -53,20 +52,7 @@ func MarshalMeasurement(value Measurement) (Frame, error) {
 		if value.Kind == MeasurementRequest {
 			payload = integerPayload(0, uint64(value.Kind))
 		} else {
-			if len(value.Targets) == 0 || len(value.Targets) > MaxMeasurementTargets {
-				return Frame{}, ErrInvalidControlFrame
-			}
-			values := make([]uint64, 0, 3+2*len(value.Targets))
-			values = append(values, uint64(value.Kind), value.ID, uint64(len(value.Targets)))
-			var previous LaneID
-			for _, target := range value.Targets {
-				if target.LaneID <= previous || target.Generation == 0 {
-					return Frame{}, ErrInvalidControlFrame
-				}
-				previous = target.LaneID
-				values = append(values, uint64(target.LaneID), target.Generation)
-			}
-			payload = integerPayload(0, values...)
+			payload = integerPayload(0, uint64(value.Kind), value.ID)
 		}
 	case MeasurementReady:
 		if value.ProbeMicros != 0 || value.ReceiveMicros != 0 || value.ReplyMicros != 0 || value.HoldMicros != 0 {
@@ -103,7 +89,7 @@ func MarshalMeasurement(value Measurement) (Frame, error) {
 
 // ParseMeasurement parses exactly the fields of one phase and rejects noncanonical or unbounded values.
 func ParseMeasurement(frame Frame) (Measurement, error) {
-	if frame.Type != FrameMeasurement {
+	if frame.Type != FrameMeasurement || len(frame.Payload) > MaxMeasurementContentSize {
 		return Measurement{}, ErrInvalidControlFrame
 	}
 	var kind uint64
@@ -116,21 +102,7 @@ func ParseMeasurement(frame Frame) (Measurement, error) {
 	switch value.Kind {
 	case MeasurementRequest:
 	case MeasurementBegin:
-		var count uint64
-		remaining, err = parseIntegers(remaining, &value.ID, &count)
-		if err != nil || count == 0 || count > MaxMeasurementTargets || count > uint64(len(remaining)/2) {
-			return Measurement{}, ErrInvalidControlFrame
-		}
-		value.Targets = make([]LaneGeneration, count)
-		var previous LaneID
-		for index := range value.Targets {
-			target := &value.Targets[index]
-			remaining, err = parseIntegers(remaining, (*uint64)(&target.LaneID), &target.Generation)
-			if err != nil || target.LaneID <= previous || target.Generation == 0 {
-				return Measurement{}, ErrInvalidControlFrame
-			}
-			previous = target.LaneID
-		}
+		remaining, err = parseIntegers(remaining, &value.ID)
 	case MeasurementReady:
 		remaining, err = parseIntegers(remaining, &value.ID, &valid)
 		value.Valid = valid == 1

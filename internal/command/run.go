@@ -72,8 +72,6 @@ const (
 	defaultRetainedBytes = 256 * 1024 * 1024
 	// defaultReplayEntries bounds global creation nonces.
 	defaultReplayEntries = 65_536
-	// defaultJoinNonceEntries bounds join nonces retained by one session.
-	defaultJoinNonceEntries = 4096
 	// defaultMaxSessions bounds concurrent attached and detached sessions.
 	defaultMaxSessions = 1024
 	// defaultMaxLanesPerSession bounds stable lane identifiers per session.
@@ -567,8 +565,8 @@ func runServer(ctx context.Context, args []string, getenv func(string) string, s
 	instance, err := server.New(server.Config{
 		Token: []byte(token), Targets: allowlist, Logger: logger,
 		AuthenticationSkew: defaultAuthenticationSkew, HandshakeTimeout: defaultHandshakeTimeout,
-		ReplayEntries: defaultReplayEntries, JoinNonceEntries: defaultJoinNonceEntries,
-		MaxSessions: defaultMaxSessions, MaxLanesPerSession: defaultMaxLanesPerSession,
+		ReplayEntries: defaultReplayEntries,
+		MaxSessions:   defaultMaxSessions, MaxLanesPerSession: defaultMaxLanesPerSession,
 		MaxPendingAdmissions: defaultMaxPendingAdmissions,
 		ReconnectGrace:       defaultReconnectGrace,
 		IngressLimits:        packetqueue.Limits{Packets: defaultIngressPackets, Bytes: defaultIngressBytes},

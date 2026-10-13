@@ -1125,7 +1125,7 @@ func serverConfig(t testing.TB, token []byte, targets []netip.AddrPort) server.C
 	}
 	return server.Config{
 		Token: token, Targets: allowlist, AuthenticationSkew: time.Minute, HandshakeTimeout: time.Second,
-		ReplayEntries: 1024, JoinNonceEntries: 1024, MaxSessions: 64, MaxLanesPerSession: 8, MaxPendingAdmissions: 1,
+		ReplayEntries: 1024, MaxSessions: 64, MaxLanesPerSession: 8, MaxPendingAdmissions: 1,
 		ReconnectGrace: time.Second, IngressLimits: packetqueue.Limits{Packets: 64, Bytes: 256 * 1024},
 		LaneLimits:          packetqueue.Limits{Packets: 64, Bytes: 256 * 1024},
 		RetentionLimits:     retention.Limits{Packets: 1024, Bytes: 4 * 1024 * 1024},

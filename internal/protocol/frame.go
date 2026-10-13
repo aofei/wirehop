@@ -98,7 +98,7 @@ func AppendFrame(destination []byte, frame Frame) ([]byte, error) {
 	if !frame.Type.Valid() {
 		return destination, ErrInvalidFrameType
 	}
-	if len(frame.Payload) > MaxFrameContentSize {
+	if len(frame.Payload) > MaxFrameContentSize || frame.Type == FrameMeasurement && len(frame.Payload) > MaxMeasurementContentSize {
 		return destination, ErrFrameTooLarge
 	}
 
@@ -281,7 +281,7 @@ func frameHeader(message []byte) (int, int, error) {
 		return 0, 0, ErrInvalidFrameType
 	}
 	contentLength := header >> 4
-	if contentLength > MaxFrameContentSize {
+	if contentLength > MaxFrameContentSize || FrameType(header&0x0f) == FrameMeasurement && contentLength > MaxMeasurementContentSize {
 		return 0, 0, ErrFrameTooLarge
 	}
 	return int(contentLength), width, nil

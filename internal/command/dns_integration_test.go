@@ -141,7 +141,7 @@ func startDNSFallbackRelay(t *testing.T, ctx context.Context, scheme string, end
 	}
 	instance, err := server.New(server.Config{
 		Token: []byte("test-token"), Targets: targets, AuthenticationSkew: time.Minute,
-		HandshakeTimeout: defaultHandshakeTimeout, ReplayEntries: 16, JoinNonceEntries: 16, MaxSessions: 4,
+		HandshakeTimeout: defaultHandshakeTimeout, ReplayEntries: 16, MaxSessions: 4,
 		MaxLanesPerSession: 4, MaxPendingAdmissions: 4, ReconnectGrace: time.Second,
 		IngressLimits: packetqueue.Limits{Packets: 4, Bytes: 8192}, LaneLimits: packetqueue.Limits{Packets: 4, Bytes: 8192},
 		RetentionLimits: retention.Limits{Packets: 16, Bytes: 32 * 1024},

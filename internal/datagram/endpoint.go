@@ -132,10 +132,43 @@ type udpReadBatch interface {
 	release()
 }
 
-// udpBatchConn provides platform-specific nonblocking receive draining and vector writes.
+// udpBatchConn provides platform-specific blocking vector reads and vector writes.
 type udpBatchConn interface {
-	readAvailable(int) (udpReadBatch, error)
+	read(int) (udpReadBatch, error)
 	write([]udpMessage) (int, error)
+}
+
+// udpReadBuffer owns one borrowed scalar receive buffer until release.
+type udpReadBuffer struct {
+	storage *[protocol.MaxPacketSize + 1]byte
+	values  [1]udpMessage
+}
+
+// messages returns the received scalar message while b remains borrowed.
+func (b *udpReadBuffer) messages() []udpMessage {
+	return b.values[:]
+}
+
+// release returns scalar receive storage without retaining payload pointers.
+func (b *udpReadBuffer) release() {
+	clear(b.values[:])
+	readBufferPool.Put(b.storage)
+	b.storage = nil
+}
+
+// readUDPBatch receives an immediately available vector or one blocking scalar datagram on other platforms.
+func readUDPBatch(connection *net.UDPConn, batch udpBatchConn, scalar *udpReadBuffer, limit int) (udpReadBatch, error) {
+	if batch != nil {
+		return batch.read(limit)
+	}
+	scalar.storage = readBufferPool.Get().(*[protocol.MaxPacketSize + 1]byte)
+	length, peer, err := connection.ReadFromUDPAddrPort(scalar.storage[:])
+	if err != nil || length > protocol.MaxPacketSize {
+		scalar.release()
+		return nil, err
+	}
+	scalar.values[0] = udpMessage{payload: scalar.storage[:length], peer: peer}
+	return scalar, nil
 }
 
 // ReadBatch reads one or more packets while falling back to scalar endpoint I/O. It transfers ownership of the returned
@@ -170,18 +203,6 @@ func WriteBatch(ctx context.Context, endpoint Endpoint, payloads [][]byte, deadl
 		}
 	}
 	return len(payloads), nil
-}
-
-// copyAcceptedPacket validates one complete read and returns an owned WireGuard packet.
-func copyAcceptedPacket(buffer []byte, length int) (Packet, bool) {
-	if length > protocol.MaxPacketSize {
-		return Packet{}, false
-	}
-	kind := wgpacket.Classify(buffer[:length])
-	if !kind.Accepted() {
-		return Packet{}, false
-	}
-	return ownPacket(kind, buffer[:length]), true
 }
 
 // ownPacket copies payload into an owned size-classed packet buffer.

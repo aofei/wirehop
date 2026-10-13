@@ -143,7 +143,6 @@ type WebSocketConn struct {
 	messageHasFrames  bool
 	message           webSocketMessageReader
 	frameReader       protocol.FrameReader
-	readBuffer        []byte
 	writeBuffer       []byte
 	writeMu           sync.Mutex
 	closeOnce         sync.Once
@@ -195,7 +194,7 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	c.readBuffer = c.readBuffer[:0]
+	c.frameReader.Reset()
 	if ctx.Done() != nil {
 		stop := context.AfterFunc(ctx, func() { c.Close() })
 		defer stop()
@@ -209,7 +208,7 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 				return 0, err
 			}
 		}
-		frame, err := c.frameReader.Read(c.messageReader)
+		frame, err := readCarrierFrame(c.messageReader, &c.frameReader)
 		if err == io.EOF && c.message.ended {
 			c.messageOpen = false
 			c.messageReader.Reset(nil)
@@ -236,13 +235,6 @@ func (c *WebSocketConn) ReadFrames(ctx context.Context, frames []protocol.Frame)
 			if !available {
 				break
 			}
-			// Reserve the buffered prefix so every tail uses the same bounded allocation.
-			if count == 1 && cap(c.readBuffer) < len(frame.Payload)+c.messageReader.Buffered() {
-				c.readBuffer = make([]byte, 0, len(frame.Payload)+c.messageReader.Buffered())
-			}
-			offset := len(c.readBuffer)
-			c.readBuffer = append(c.readBuffer, frame.Payload...)
-			frame.Payload = c.readBuffer[offset:]
 			frames[count] = frame
 			count++
 		}

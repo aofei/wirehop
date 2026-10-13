@@ -536,6 +536,7 @@ func TestFrameCanonicalLength(t *testing.T) {
 		{name: "NonminimalThirdByte", header: []byte{0x81, 0x80, 0}, want: ErrInvalidInteger},
 		{name: "TooLarge", header: []byte{0xa1, 0x82, 0x40}, want: ErrFrameTooLarge},
 		{name: "TooLong", header: []byte{0x81, 0x80, 0x80, 0}, want: ErrFrameTooLarge},
+		{name: "OversizedMeasurement", header: binary.AppendUvarint(nil, uint64(MaxMeasurementContentSize+1)<<4|uint64(FrameMeasurement)), want: ErrFrameTooLarge},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var decoder FrameReader
@@ -570,7 +571,7 @@ func TestFrameHeaderValues(t *testing.T) {
 				}
 				continue
 			}
-			if length > MaxFrameContentSize {
+			if length > MaxFrameContentSize || frameType == FrameMeasurement && length > MaxMeasurementContentSize {
 				if !errors.Is(err, ErrFrameTooLarge) {
 					t.Fatalf("type %d, length %d: error %v, want %v", frameType, length, err, ErrFrameTooLarge)
 				}

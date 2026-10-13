@@ -62,7 +62,6 @@ type serverSession struct {
 	lanes        map[protocol.LaneID]sessionLane
 	reservations int
 	confirmed    bool
-	joinNonces   *auth.ReplayCache
 	detach       *detachState
 }
 
@@ -89,17 +88,12 @@ func newServerSession(parent context.Context, owner *Server, id protocol.Session
 	if err != nil {
 		return nil, err
 	}
-	joinNonces, err := auth.NewReplayCache(owner.config.JoinNonceEntries)
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithCancel(parent)
 	session := &serverSession{
 		owner: owner, id: id, secret: secret, endpoint: endpoint, ingressQueue: ingressQueue, ingress: ingress,
 		receiver: receiver, scheduler: scheduler, ctx: ctx, cancel: cancel,
-		history:    make(map[protocol.LaneID]laneHistory),
-		lanes:      make(map[protocol.LaneID]sessionLane),
-		joinNonces: joinNonces,
+		history: make(map[protocol.LaneID]laneHistory),
+		lanes:   make(map[protocol.LaneID]sessionLane),
 	}
 	session.group = lifecycle.NewGroup(ctx)
 	return session, nil
@@ -123,6 +117,23 @@ func (s *serverSession) reserveLane(laneID protocol.LaneID, generation uint64,
 	pathGroupID protocol.PathGroupID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.reserveLaneLocked(laneID, generation, pathGroupID)
+}
+
+// reserveJoinLane checks the current authentication time and consumes a strictly increasing generation under one lock.
+// Generation history survives failed responses, so an authenticated join can reserve its generation at most once.
+func (s *serverSession) reserveJoinLane(hello protocol.ClientHello) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := auth.ValidateTimestamp(hello.UnixSeconds, s.owner.authenticationTime(), s.owner.config.AuthenticationSkew); err != nil {
+		return err
+	}
+	return s.reserveLaneLocked(hello.LaneID, hello.Generation, hello.PathGroupID)
+}
+
+// reserveLaneLocked validates and consumes one generation while the session mutex is held.
+func (s *serverSession) reserveLaneLocked(laneID protocol.LaneID, generation uint64,
+	pathGroupID protocol.PathGroupID) error {
 	if s.ctx.Err() != nil {
 		return ErrSessionClosed
 	}
@@ -156,15 +167,6 @@ func (s *serverSession) rejectReservedLane() {
 	defer s.mu.Unlock()
 	s.reservations--
 	s.startDetachTimerLocked()
-}
-
-// acceptJoinNonce retains one nonce for the bounded authentication replay window.
-func (s *serverSession) acceptJoinNonce(nonce protocol.Nonce, timestamp, now int64) error {
-	expires, err := auth.ReplayExpiry(timestamp, s.owner.config.AuthenticationSkew)
-	if err != nil {
-		return err
-	}
-	return s.joinNonces.CheckAndStore(nonce, now, expires)
 }
 
 // joinSecret returns a copy of the ephemeral secret while the session remains available.

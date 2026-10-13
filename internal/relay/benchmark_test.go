@@ -20,9 +20,19 @@ var benchmarkCandidateSink uint64
 
 func BenchmarkSchedulerRouteReport(b *testing.B) {
 	for _, tt := range []struct {
-		name  string
-		lanes int
-	}{{name: "Unroutable"}, {name: "Single", lanes: 1}, {name: "Duplicate", lanes: 2}} {
+		name       string
+		lanes      int
+		rejectBest bool
+		rejectAll  bool
+	}{
+		{name: "Unroutable"},
+		{name: "Single", lanes: 1},
+		{name: "Duplicate", lanes: 2},
+		{name: "SixteenLanes", lanes: 16},
+		{name: "SixtyFourLanes", lanes: 64},
+		{name: "BestAlternateFull", lanes: 16, rejectBest: true},
+		{name: "AllQueuesFull", lanes: 16, rejectAll: true},
+	} {
 		b.Run(tt.name, func(b *testing.B) {
 			var callbacks [2]func()
 			callbackCount := 0
@@ -36,18 +46,21 @@ func BenchmarkSchedulerRouteReport(b *testing.B) {
 				lanes[laneID] = &scheduledLane{registration: LaneRegistration{
 					LaneID: laneID, Generation: 1, Store: store,
 					SendDeliveryReport: func(_ protocol.DeliveryReport, _ time.Time, onSent func()) bool {
+						if tt.rejectAll || tt.rejectBest && int(laneID) == tt.lanes {
+							return false
+						}
 						callbacks[callbackCount] = onSent
 						callbackCount++
 						return true
 					},
-				}, deliveryRate: defaultInitialRateBytesPerSecond}
+				}, rttMicros: uint64(tt.lanes-index) * 2000, deliveryRate: defaultInitialRateBytesPerSecond}
 			}
 			scheduler := new(Scheduler)
 			report := protocol.DeliveryReport{LaneID: 1, Generation: 1}
 			parsedAt := time.Now()
 			completed := 0
 			complete := func(sent bool) {
-				if sent != (tt.lanes > 0) {
+				if sent != (tt.lanes > 0 && !tt.rejectAll) {
 					b.Fatalf("completion sent = %t, lanes = %d", sent, tt.lanes)
 				}
 				completed++
@@ -64,6 +77,76 @@ func BenchmarkSchedulerRouteReport(b *testing.B) {
 				if completed != 1 {
 					b.Fatalf("completion calls = %d, want 1", completed)
 				}
+			}
+		})
+	}
+}
+
+func BenchmarkSchedulerFillTransportProbe(b *testing.B) {
+	for _, tt := range []struct {
+		name   string
+		lanes  int
+		groups int
+		fresh  bool
+	}{
+		{name: "TwoDistinct", lanes: 2, groups: 2},
+		{name: "SixteenMixed", lanes: 16, groups: 2},
+		{name: "SixteenDistinct", lanes: 16, groups: 16},
+		{name: "FreshTwoDistinct", lanes: 2, groups: 2, fresh: true},
+		{name: "FreshSixteenMixed", lanes: 16, groups: 2, fresh: true},
+		{name: "FreshSixteenDistinct", lanes: 16, groups: 16, fresh: true},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			now := time.Unix(100, 0)
+			lanes := make(map[protocol.LaneID]*scheduledLane, tt.lanes)
+			for index := range tt.lanes {
+				store, err := newTransmissionStore(packetqueue.Limits{Packets: 64, Bytes: 128 * 1024},
+					func() time.Time { return now })
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Cleanup(func() { releaseTransmissions(store.drain()) })
+				if !tt.fresh {
+					if err := store.pushAt(retainedTransmission{
+						deadlineMicros: uint64(now.Add(time.Hour).UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]},
+					}, now); err != nil {
+						b.Fatal(err)
+					}
+				}
+				laneID := protocol.LaneID(index + 1)
+				lanes[laneID] = &scheduledLane{
+					registration: LaneRegistration{
+						LaneID: laneID, Generation: 1, PathGroupID: protocol.PathGroupID(index%tt.groups + 1), Store: store,
+					},
+					rttMicros: uint64(10_000 + index*1000), deliveryRate: defaultInitialRateBytesPerSecond,
+				}
+			}
+			var scheduler Scheduler
+			var data [1]protocol.Data
+			var ownership [1]datagram.Packet
+			b.ReportAllocs()
+			for b.Loop() {
+				admitted := scheduler.fillTransportProbe(lanes, 1, now, 0)
+				if admitted != tt.fresh {
+					b.Fatalf("probe admitted = %t, want %t", admitted, tt.fresh)
+				}
+				if !tt.fresh {
+					continue
+				}
+				lane := lanes[scheduler.lastProbeLane]
+				store := lane.registration.Store
+				count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+				releaseBatchOwnership(ownership[:count])
+				if err != nil || count != 1 {
+					b.Fatalf("takeBatch() = %d, %v", count, err)
+				}
+				now = now.Add(time.Microsecond)
+				if _, stale, err := store.acknowledge(store.sentPackets, uint64(now.UnixMicro())); err != nil || stale {
+					b.Fatalf("acknowledge() = stale %t, %v", stale, err)
+				}
+				lane.probeUntil = time.Time{}
+				lane.nextProbeAt = time.Time{}
+				lane.probeBytes = 0
 			}
 		})
 	}

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/aofei/wirehop/internal/netsetup"
-	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/target"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
@@ -446,11 +445,9 @@ func (e *Remote) ensureSockets(ctx context.Context, addresses []netip.AddrPort) 
 // readSocket receives and filters one address family's target traffic.
 func (e *Remote) readSocket(connection *net.UDPConn, batchConnection udpBatchConn) {
 	defer e.workers.Done()
-	pooled := readBufferPool.Get().(*[protocol.MaxPacketSize + 1]byte)
-	defer readBufferPool.Put(pooled)
-	buffer := pooled[:]
+	var scalar udpReadBuffer
 	for {
-		length, peer, err := connection.ReadFromUDPAddrPort(buffer)
+		batch, err := readUDPBatch(connection, batchConnection, &scalar, MaximumBatchSize)
 		if err != nil {
 			if e.ctx.Err() != nil {
 				return
@@ -468,48 +465,23 @@ func (e *Remote) readSocket(connection *net.UDPConn, batchConnection udpBatchCon
 			}
 			return
 		}
-		if length > protocol.MaxPacketSize {
+		if batch == nil {
 			continue
 		}
 		now := time.Now()
-		header := wgpacket.Inspect(buffer[:length])
-		if !header.Kind.Accepted() || !e.observeSource(peer, header, now) {
-			continue
-		}
-		result := remoteRead{count: 1}
-		result.packets[0] = ownPacket(header.Kind, buffer[:length])
-		var drainErr error
-		if batchConnection != nil {
-			var batch udpReadBatch
-			batch, drainErr = batchConnection.readAvailable(MaximumBatchSize - 1)
-			if batch != nil {
-				for _, message := range batch.messages() {
-					header := wgpacket.Inspect(message.payload)
-					if !header.Kind.Accepted() || !e.observeSource(message.peer, header, now) {
-						continue
-					}
-					result.packets[result.count] = ownPacket(header.Kind, message.payload)
-					result.count++
-				}
-				batch.release()
+		var result remoteRead
+		for _, message := range batch.messages() {
+			header := wgpacket.Inspect(message.payload)
+			if !header.Kind.Accepted() || !e.observeSource(message.peer, header, now) {
+				continue
 			}
+			result.packets[result.count] = ownPacket(header.Kind, message.payload)
+			result.count++
 		}
-		e.offerRead(result)
-		if drainErr == nil {
-			continue
+		batch.release()
+		if result.count > 0 {
+			e.offerRead(result)
 		}
-		if isSoftNetworkError(drainErr) {
-			e.notice.report("read target", drainErr)
-			e.triggerRefresh()
-			continue
-		}
-		available := e.retireSocket(connection)
-		connection.Close()
-		e.triggerRefresh()
-		if !available {
-			e.offerRead(remoteRead{err: fmt.Errorf("read target UDP datagram batch: %w", drainErr)})
-		}
-		return
 	}
 }
 

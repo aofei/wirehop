@@ -1,9 +1,7 @@
 package relay
 
 import (
-	"cmp"
 	"context"
-	"slices"
 	"sync"
 	"time"
 
@@ -27,30 +25,19 @@ type MeasurementWrite struct {
 	Sent  func()
 }
 
-// measurementTarget holds one actual carrier's timing evidence within a session operation.
-type measurementTarget struct {
+// measurementAttempt owns one actual carrier, one session pause, and a non-extendable deadline.
+type measurementAttempt struct {
+	id          uint64
 	peer        LaneRegistration
-	stage       protocol.MeasurementKind
 	sample      clockmap.Sample
 	probeBudget uint64
 	replyBudget uint64
-	done        bool
-}
-
-// measurementAttempt owns one fixed cohort, one session pause, and a non-extendable deadline.
-type measurementAttempt struct {
-	id         uint64
-	peer       LaneRegistration
-	identities []protocol.LaneGeneration
-	targets    map[protocol.LaneID]*measurementTarget
-	ctx        context.Context
-	cancel     context.CancelFunc
-	ready      <-chan struct{}
-	proof      func() (time.Time, bool)
-	stage      protocol.MeasurementKind
-	prepared   bool
-	peerReady  bool
-	completed  int
+	ctx         context.Context
+	cancel      context.CancelFunc
+	ready       <-chan struct{}
+	proof       func() (time.Time, bool)
+	stage       protocol.MeasurementKind
+	prepared    bool
 }
 
 // measurementCoordinator owns the sole operation across all session carrier readers and writers.
@@ -121,33 +108,19 @@ func (s *Scheduler) RequestMeasurement(target protocol.LaneGeneration) {
 	m.startClientLocked(peer)
 }
 
-// startClientLocked snapshots all eligible generations so one pause refreshes the entire fixed cohort.
+// startClientLocked allocates an operation for the requesting carrier generation.
 func (m *measurementCoordinator) startClientLocked(peer LaneRegistration) {
 	if m.nextID == ^uint64(0) {
 		return
 	}
-	identities := make([]protocol.LaneGeneration, 0, len(m.peers))
-	for _, target := range m.peers {
-		if target.SendMeasurement != nil {
-			identities = append(identities, protocol.LaneGeneration{LaneID: target.LaneID, Generation: target.Generation})
-		}
-	}
-	if len(identities) == 0 || len(identities) > protocol.MaxMeasurementTargets {
-		return
-	}
-	slices.SortFunc(identities, func(left, right protocol.LaneGeneration) int { return cmp.Compare(left.LaneID, right.LaneID) })
 	m.nextID++
-	m.startLocked(peer, m.nextID, identities)
+	m.startLocked(peer, m.nextID)
 }
 
 // startLocked reserves session ownership before asynchronously preparing both endpoints.
-func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64, identities []protocol.LaneGeneration) {
+func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), measurementPauseLimit)
-	a := &measurementAttempt{id: id, peer: peer, identities: identities,
-		targets: make(map[protocol.LaneID]*measurementTarget, len(identities)), ctx: ctx, cancel: cancel}
-	for _, target := range identities {
-		a.targets[target.LaneID] = &measurementTarget{peer: m.peers[target.LaneID]}
-	}
+	a := &measurementAttempt{id: id, peer: peer, ctx: ctx, cancel: cancel}
 	m.active = a
 	a.ready, a.proof = m.scheduler.beginMeasurementDrain(ctx, func(cost time.Duration) { m.released(a, cost) })
 	if a.ready == nil {
@@ -163,7 +136,7 @@ func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64, i
 			return protocol.Measurement{}, false
 		}
 		a.stage = protocol.MeasurementBegin
-		return protocol.Measurement{Kind: protocol.MeasurementBegin, ID: a.id, Targets: a.identities}, true
+		return protocol.Measurement{Kind: protocol.MeasurementBegin, ID: a.id}, true
 	}}) {
 		m.finishLocked(a)
 	}
@@ -178,7 +151,7 @@ func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64, i
 	}()
 }
 
-// prepared announces server readiness or starts probes after both preparations have completed.
+// prepared announces server readiness or starts the probe after both preparations have completed.
 func (m *measurementCoordinator) prepared(a *measurementAttempt) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -188,8 +161,8 @@ func (m *measurementCoordinator) prepared(a *measurementAttempt) {
 	}
 	a.prepared = true
 	if a.peer.MeasurementInitiator {
-		if a.peerReady {
-			m.queueProbesLocked(a)
+		if a.stage == protocol.MeasurementReady {
+			m.queueProbeLocked(a)
 		}
 		return
 	}
@@ -206,41 +179,34 @@ func (m *measurementCoordinator) prepared(a *measurementAttempt) {
 	}
 }
 
-// queueProbesLocked measures the fixed cohort on its actual carriers without serializing their round trips.
-func (m *measurementCoordinator) queueProbesLocked(a *measurementAttempt) {
-	for _, identity := range a.identities {
-		target := a.targets[identity.LaneID]
-		if !target.peer.SendMeasurement(MeasurementWrite{Build: func(now uint64) (protocol.Measurement, bool) {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			if !m.usableLocked(a) {
-				return protocol.Measurement{}, false
-			}
-			budget := m.budgetLocked(a)
-			if budget == 0 {
-				return protocol.Measurement{}, false
-			}
-			target.sample.LocalSendMicros = now
-			target.probeBudget = budget
-			target.stage = protocol.MeasurementProbe
-			return protocol.Measurement{Kind: protocol.MeasurementProbe, ID: a.id, ProbeMicros: now, HoldMicros: budget}, true
-		}}) {
-			// Build cannot run under this mutex, so no queued probe has been exposed yet.
-			m.finishLocked(a)
-			return
+// queueProbeLocked samples the requesting carrier while the session remains quiet.
+func (m *measurementCoordinator) queueProbeLocked(a *measurementAttempt) {
+	if !a.peer.SendMeasurement(MeasurementWrite{Build: func(now uint64) (protocol.Measurement, bool) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.usableLocked(a) {
+			return protocol.Measurement{}, false
 		}
+		budget := m.budgetLocked(a)
+		if budget == 0 {
+			return protocol.Measurement{}, false
+		}
+		a.sample.LocalSendMicros = now
+		a.probeBudget = budget
+		a.stage = protocol.MeasurementProbe
+		return protocol.Measurement{Kind: protocol.MeasurementProbe, ID: a.id, ProbeMicros: now, HoldMicros: budget}, true
+	}}) {
+		m.finishLocked(a)
 	}
 }
 
-// usableLocked checks operation ownership, the fixed cohort, and the scheduler's unchanged prefix proof.
+// usableLocked checks operation ownership, the actual generation, and the scheduler's unchanged session prefix proof.
 func (m *measurementCoordinator) usableLocked(a *measurementAttempt) bool {
 	if m.active != a || a.ctx.Err() != nil || a.proof == nil {
 		return false
 	}
-	for _, identity := range a.identities {
-		if m.peers[identity.LaneID].Generation != identity.Generation {
-			return false
-		}
+	if m.peers[a.peer.LaneID].Generation != a.peer.Generation {
+		return false
 	}
 	_, valid := a.proof()
 	return valid
@@ -286,28 +252,21 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 			return nil
 		}
 		m.lastPeerID = value.ID
-		valid := m.active == nil && !time.Now().Before(m.nextAt)
-		included := false
-		for _, identity := range value.Targets {
-			target := m.peers[identity.LaneID]
-			valid = valid && target.Generation == identity.Generation && target.SendMeasurement != nil
-			included = included || identity == source
-		}
-		if !valid || !included {
+		if m.active != nil || time.Now().Before(m.nextAt) {
 			m.rejectBeginLocked(peer, value.ID)
 			return nil
 		}
-		m.startLocked(peer, value.ID, value.Targets)
+		m.startLocked(peer, value.ID)
 		return nil
 	}
 	a := m.active
 	if a == nil || a.id != value.ID {
 		return nil
 	}
+	if source.LaneID != a.peer.LaneID || source.Generation != a.peer.Generation {
+		return nil
+	}
 	if value.Kind == protocol.MeasurementReady {
-		if source.LaneID != a.peer.LaneID || source.Generation != a.peer.Generation {
-			return nil
-		}
 		if a.stage != protocol.MeasurementBegin {
 			return ErrUnexpectedFrame
 		}
@@ -315,67 +274,62 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 			m.finishLocked(a)
 			return nil
 		}
-		a.peerReady = true
 		a.stage = protocol.MeasurementReady
 		if a.prepared {
-			m.queueProbesLocked(a)
+			m.queueProbeLocked(a)
 		}
-		return nil
-	}
-	target := a.targets[source.LaneID]
-	if target == nil || target.peer.Generation != source.Generation {
 		return nil
 	}
 	switch value.Kind {
 	case protocol.MeasurementProbe:
-		if a.stage != protocol.MeasurementReady || target.stage != 0 {
+		if a.stage != protocol.MeasurementReady {
 			return ErrUnexpectedFrame
 		}
-		target.sample.LocalSendMicros = value.ProbeMicros
-		target.sample.RemoteReceiveMicros = now
-		target.probeBudget = value.HoldMicros
-		target.stage = protocol.MeasurementProbe
+		a.sample.LocalSendMicros = value.ProbeMicros
+		a.sample.RemoteReceiveMicros = now
+		a.probeBudget = value.HoldMicros
+		a.stage = protocol.MeasurementProbe
 		peer.SendMeasurement(MeasurementWrite{Build: func(send uint64) (protocol.Measurement, bool) {
 			m.mu.Lock()
 			defer m.mu.Unlock()
 			if m.active != a || a.ctx.Err() != nil {
 				return protocol.Measurement{}, false
 			}
-			target.sample.RemoteSendMicros = send
+			a.sample.RemoteSendMicros = send
 			if m.usableLocked(a) {
-				target.replyBudget = m.budgetLocked(a)
+				a.replyBudget = m.budgetLocked(a)
 			}
-			target.stage = protocol.MeasurementReply
+			a.stage = protocol.MeasurementReply
 			return protocol.Measurement{Kind: protocol.MeasurementReply, ID: a.id,
-				ProbeMicros: target.sample.LocalSendMicros, ReceiveMicros: target.sample.RemoteReceiveMicros,
-				ReplyMicros: send, HoldMicros: target.replyBudget}, true
+				ProbeMicros: a.sample.LocalSendMicros, ReceiveMicros: a.sample.RemoteReceiveMicros,
+				ReplyMicros: send, HoldMicros: a.replyBudget}, true
 		}})
 	case protocol.MeasurementReply:
-		if target.stage != protocol.MeasurementProbe || value.ProbeMicros != target.sample.LocalSendMicros {
+		if a.stage != protocol.MeasurementProbe || value.ProbeMicros != a.sample.LocalSendMicros {
 			return ErrUnexpectedFrame
 		}
-		target.sample.RemoteReceiveMicros = value.ReceiveMicros
-		target.sample.RemoteSendMicros = value.ReplyMicros
-		target.sample.LocalReceiveMicros = now
-		target.replyBudget = value.HoldMicros
-		target.stage = protocol.MeasurementReply
-		rtt, valid := m.resultLocked(a, target)
+		a.sample.RemoteReceiveMicros = value.ReceiveMicros
+		a.sample.RemoteSendMicros = value.ReplyMicros
+		a.sample.LocalReceiveMicros = now
+		a.replyBudget = value.HoldMicros
+		a.stage = protocol.MeasurementReply
+		rtt, valid := m.resultLocked(a)
 		if valid {
-			go s.publishMeasurement(a, target, rtt, func(applied bool) { m.sendResult(a, target, applied) })
+			go s.publishMeasurement(a, rtt, func(applied bool) { m.sendResult(a, applied) })
 		} else {
-			go m.sendResult(a, target, false)
+			go m.sendResult(a, false)
 		}
 	case protocol.MeasurementResult:
-		if target.stage != protocol.MeasurementReply || target.done {
+		if a.stage != protocol.MeasurementReply {
 			return ErrUnexpectedFrame
 		}
-		target.sample.LocalReceiveMicros = value.ReceiveMicros
-		target.stage = protocol.MeasurementResult
-		rtt, valid := m.resultLocked(a, target)
+		a.sample.LocalReceiveMicros = value.ReceiveMicros
+		a.stage = protocol.MeasurementResult
+		rtt, valid := m.resultLocked(a)
 		if value.Valid && valid {
-			go s.publishMeasurement(a, target, rtt, func(bool) { m.finishTarget(a, target) })
+			go s.publishMeasurement(a, rtt, func(bool) { m.finish(a) })
 		} else {
-			m.finishTargetLocked(a, target)
+			m.finishLocked(a)
 		}
 	}
 	return nil
@@ -391,11 +345,11 @@ func (m *measurementCoordinator) rejectBeginLocked(peer LaneRegistration, id uin
 }
 
 // resultLocked validates timestamps and both fixed quiet budgets for the actual measured carrier.
-func (m *measurementCoordinator) resultLocked(a *measurementAttempt, target *measurementTarget) (uint64, bool) {
+func (m *measurementCoordinator) resultLocked(a *measurementAttempt) (uint64, bool) {
 	if !m.usableLocked(a) {
 		return 0, false
 	}
-	sample := target.sample
+	sample := a.sample
 	mapping, err := clockmap.Estimate(sample)
 	if err != nil || !ClockMappingUsable(mapping) {
 		return 0, false
@@ -406,17 +360,17 @@ func (m *measurementCoordinator) resultLocked(a *measurementAttempt, target *mea
 		return 0, false
 	}
 	rtt := max(1, span-processing)
-	return rtt, rtt < target.replyBudget && span < target.probeBudget
+	return rtt, rtt < a.replyBudget && span < a.probeBudget
 }
 
 // sendResult retains client quiet until the result completes the measured carrier write.
-func (m *measurementCoordinator) sendResult(a *measurementAttempt, target *measurementTarget, valid bool) {
+func (m *measurementCoordinator) sendResult(a *measurementAttempt, valid bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.active != a || a.ctx.Err() != nil {
 		return
 	}
-	target.peer.SendMeasurement(MeasurementWrite{Build: func(uint64) (protocol.Measurement, bool) {
+	a.peer.SendMeasurement(MeasurementWrite{Build: func(uint64) (protocol.Measurement, bool) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		if m.active != a || a.ctx.Err() != nil {
@@ -424,30 +378,11 @@ func (m *measurementCoordinator) sendResult(a *measurementAttempt, target *measu
 		}
 		value := protocol.Measurement{Kind: protocol.MeasurementResult, ID: a.id, Valid: valid && m.usableLocked(a)}
 		if value.Valid {
-			value.ReceiveMicros = target.sample.LocalReceiveMicros
+			value.ReceiveMicros = a.sample.LocalReceiveMicros
 		}
-		target.stage = protocol.MeasurementResult
+		a.stage = protocol.MeasurementResult
 		return value, true
-	}, Sent: func() { m.finishTarget(a, target) }})
-}
-
-// finishTarget retires a completed carrier without releasing other measurements in the same cohort.
-func (m *measurementCoordinator) finishTarget(a *measurementAttempt, target *measurementTarget) {
-	m.mu.Lock()
-	m.finishTargetLocked(a, target)
-	m.mu.Unlock()
-}
-
-// finishTargetLocked resumes Data only after every target has completed or the common deadline expires.
-func (m *measurementCoordinator) finishTargetLocked(a *measurementAttempt, target *measurementTarget) {
-	if m.active != a || target.done {
-		return
-	}
-	target.done = true
-	a.completed++
-	if a.completed == len(a.targets) {
-		m.finishLocked(a)
-	}
+	}, Sent: func() { m.finish(a) }})
 }
 
 // finish retires only the matching operation.

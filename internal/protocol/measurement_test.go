@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
-	"reflect"
 	"testing"
 )
 
@@ -16,7 +15,7 @@ func TestMeasurementWireLayout(t *testing.T) {
 		encoded string
 	}{
 		{name: "Request", value: Measurement{Kind: MeasurementRequest}, encoded: "1801"},
-		{name: "Begin", value: Measurement{Kind: MeasurementBegin, ID: 128, Targets: []LaneGeneration{{LaneID: 1, Generation: 1}}}, encoded: "68028001010101"},
+		{name: "Begin", value: Measurement{Kind: MeasurementBegin, ID: 128}, encoded: "38028001"},
 		{name: "Ready", value: Measurement{Kind: MeasurementReady, ID: 1, Valid: true}, encoded: "38030101"},
 		{name: "Probe", value: Measurement{Kind: MeasurementProbe, ID: 1, ProbeMicros: 127, HoldMicros: 128}, encoded: "5804017f8001"},
 		{name: "Reply", value: Measurement{Kind: MeasurementReply, ID: 1, ProbeMicros: 127, ReceiveMicros: 128,
@@ -34,7 +33,7 @@ func TestMeasurementWireLayout(t *testing.T) {
 				t.Fatalf("literal framing: %v, %v", frames, err)
 			}
 			value, err := ParseMeasurement(frames[0])
-			if err != nil || !reflect.DeepEqual(value, test.value) {
+			if err != nil || value != test.value {
 				t.Fatalf("literal measurement = %+v, %v", value, err)
 			}
 			frame, err := MarshalMeasurement(test.value)
@@ -75,7 +74,7 @@ func TestMeasurementValidation(t *testing.T) {
 	}
 	for _, payload := range [][]byte{
 		{0}, {7}, {2, 0}, {2, 0x81, 0}, {2, 0x80}, {6, 1, 2, 0}, {6, 1, 0, 1},
-		{4, 1, 0, 0}, {5, 1, 0, 2, 1, 1}, {0x81, 0},
+		{4, 1, 0, 0}, {5, 1, 0, 2, 1, 1}, {0x81, 0}, {2, 1, 1, 1, 1},
 	} {
 		if _, err := ParseMeasurement(Frame{Type: FrameMeasurement, Payload: payload}); !errors.Is(err, ErrInvalidControlFrame) {
 			t.Fatalf("accepted invalid measurement %x: %v", payload, err)
@@ -86,44 +85,31 @@ func TestMeasurementValidation(t *testing.T) {
 	}
 }
 
-func TestMeasurementTargets(t *testing.T) {
-	for _, targets := range [][]LaneGeneration{
-		nil, {{LaneID: 0, Generation: 1}}, {{LaneID: 1}},
-		{{LaneID: 1, Generation: 1}, {LaneID: 1, Generation: 2}},
-		{{LaneID: 2, Generation: 1}, {LaneID: 1, Generation: 1}},
-		make([]LaneGeneration, MaxMeasurementTargets+1),
-	} {
-		if _, err := MarshalMeasurement(Measurement{Kind: MeasurementBegin, ID: 1, Targets: targets}); err == nil {
-			t.Fatal("accepted an empty, unordered, duplicate, or unbounded target set")
-		}
-	}
-	targets := make([]LaneGeneration, MaxMeasurementTargets)
-	for index := range targets {
-		targets[index] = LaneGeneration{LaneID: LaneID(uint64(math.MaxUint64-MaxMeasurementTargets) + uint64(index)), Generation: math.MaxUint64}
-	}
-	frame, err := MarshalMeasurement(Measurement{Kind: MeasurementBegin, ID: math.MaxUint64, Targets: targets})
+func TestMeasurementContentBounds(t *testing.T) {
+	value := Measurement{Kind: MeasurementReply, ID: math.MaxUint64, ProbeMicros: math.MaxUint64,
+		ReceiveMicros: math.MaxUint64, ReplyMicros: math.MaxUint64, HoldMicros: MaxMeasurementHoldMicros}
+	frame, err := MarshalMeasurement(value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MarshalFrame(frame); err != nil || len(frame.Payload) > MaxFrameContentSize {
-		t.Fatalf("maximum target set exceeds frame bound: %d, %v", len(frame.Payload), err)
+	if _, err := MarshalFrame(frame); err != nil || len(frame.Payload) != MaxMeasurementContentSize {
+		t.Fatalf("maximum measurement content = %d, %v, want %d", len(frame.Payload), err, MaxMeasurementContentSize)
 	}
 	parsed, err := ParseMeasurement(frame)
-	if err != nil || !reflect.DeepEqual(parsed.Targets, targets) {
-		t.Fatal("maximum full-width target set failed to round trip")
+	if err != nil || parsed != value {
+		t.Fatal("maximum full-width measurement failed to round trip")
 	}
-	for _, fields := range [][]uint64{
-		{2, 1, math.MaxUint64}, {2, 1, MaxMeasurementTargets + 1}, {2, 1, 0},
-		{2, 1, 2, 1, 1, 1, 2}, {2, 1, 2, 2, 1, 1, 1}, {2, 1, 1, 1, 0},
-	} {
-		if _, err := ParseMeasurement(Frame{Type: FrameMeasurement, Payload: integerPayload(0, fields...)}); err == nil {
-			t.Fatal("accepted an invalid wire target set")
-		}
+	frame.Payload = append(frame.Payload, 0)
+	if _, err := ParseMeasurement(frame); !errors.Is(err, ErrInvalidControlFrame) {
+		t.Fatalf("oversized measurement parse error = %v", err)
+	}
+	if _, err := MarshalFrame(frame); !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("oversized measurement encoding error = %v", err)
 	}
 }
 
 func FuzzParseMeasurement(f *testing.F) {
-	for _, payload := range [][]byte{{1}, {2, 1, 1, 1, 1}, {3, 1, 1}, {4, 1, 0, 1}, {5, 1, 0, 0, 0, 1}, {6, 1, 1, 0}, {6, 1, 0, 0}} {
+	for _, payload := range [][]byte{{1}, {2, 1}, {3, 1, 1}, {4, 1, 0, 1}, {5, 1, 0, 0, 0, 1}, {6, 1, 1, 0}, {6, 1, 0, 0}} {
 		f.Add(payload)
 	}
 	f.Fuzz(func(t *testing.T, payload []byte) {

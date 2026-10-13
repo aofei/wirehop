@@ -200,6 +200,7 @@ type Scheduler struct {
 	ingress                 *packetqueue.Queue[Packet]
 	events                  chan schedulerEvent
 	controlOrder            []scoredLane
+	probeGroups             map[protocol.PathGroupID]*scheduledLane
 	packetID                uint64
 	transportHoldUntil      time.Time
 	lastTransportAt         time.Time
@@ -326,10 +327,10 @@ func (s *Scheduler) ObserveTiming(laneID protocol.LaneID, generation uint64, sam
 }
 
 // publishMeasurement queues evidence for validation and application in the scheduler's serialized state.
-func (s *Scheduler) publishMeasurement(attempt *measurementAttempt, target *measurementTarget, rttMicros uint64, complete func(bool)) {
+func (s *Scheduler) publishMeasurement(attempt *measurementAttempt, rttMicros uint64, complete func(bool)) {
 	select {
 	case s.events <- schedulerEvent{
-		kind: schedulerValidatedRTT, laneID: target.peer.LaneID, generation: target.peer.Generation, rttMicros: rttMicros,
+		kind: schedulerValidatedRTT, laneID: attempt.peer.LaneID, generation: attempt.peer.Generation, rttMicros: rttMicros,
 		measurement: attempt, measurementComplete: complete,
 	}:
 	default:
@@ -768,27 +769,49 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 // routeReport duplicates feedback over its own connected lane and one best alternate lane.
 func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report protocol.DeliveryReport,
 	parsedAt time.Time, complete func(bool)) {
-	candidates := s.orderedControlLanes(lanes)
-	if len(candidates) == 0 {
+	own := lanes[report.LaneID]
+	if own != nil && own.abandoning {
+		own = nil
+	}
+	clear(s.controlOrder)
+	candidates := s.controlOrder[:0]
+	var alternate scoredLane
+	for _, candidate := range lanes {
+		if candidate.abandoning || candidate.registration.LaneID == report.LaneID {
+			continue
+		}
+		scored := scoredLane{lane: candidate, score: candidate.score(0)}
+		candidates = append(candidates, scored)
+		if scoredLaneBetter(scored, alternate) {
+			alternate = scored
+		}
+	}
+	s.controlOrder = candidates
+	if own == nil && alternate.lane == nil {
 		complete(false)
 		return
 	}
 	var completeOnce sync.Once
 	onSent := func() { completeOnce.Do(func() { complete(true) }) }
 	accepted := false
-	for _, scored := range candidates {
-		candidate := scored.lane
-		if candidate.registration.LaneID == report.LaneID {
-			accepted = candidate.registration.SendDeliveryReport(report, parsedAt, onSent)
-			break
-		}
+	if own != nil {
+		accepted = own.registration.SendDeliveryReport(report, parsedAt, onSent)
 	}
-	for _, scored := range candidates {
-		candidate := scored.lane
-		if candidate.registration.LaneID != report.LaneID &&
-			candidate.registration.SendDeliveryReport(report, parsedAt, onSent) {
+	if alternate.lane != nil {
+		if alternate.lane.registration.SendDeliveryReport(report, parsedAt, onSent) {
 			accepted = true
-			break
+		} else {
+			sortControlLanes(candidates)
+			for _, scored := range candidates {
+				candidate := scored.lane
+				if candidate == alternate.lane {
+					continue
+				}
+				if candidate.registration.SendDeliveryReport(report, parsedAt, onSent) {
+					accepted = true
+					break
+				}
+			}
 		}
 	}
 	if !accepted {
@@ -797,7 +820,7 @@ func (s *Scheduler) routeReport(lanes map[protocol.LaneID]*scheduledLane, report
 }
 
 // orderedControlLanes returns every non-abandoning lane in deterministic predicted-delivery order.
-// The result remains valid until this method is called again.
+// The result shares scheduler scratch storage.
 func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane) []scoredLane {
 	clear(s.controlOrder)
 	scores := s.controlOrder[:0]
@@ -806,6 +829,13 @@ func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane
 			scores = append(scores, scoredLane{lane, lane.score(0)})
 		}
 	}
+	sortControlLanes(scores)
+	s.controlOrder = scores
+	return scores
+}
+
+// sortControlLanes orders score snapshots by predicted delivery and stable lane identity.
+func sortControlLanes(scores []scoredLane) {
 	for index := 1; index < len(scores); index++ {
 		candidate := scores[index]
 		position := index
@@ -815,8 +845,6 @@ func (s *Scheduler) orderedControlLanes(lanes map[protocol.LaneID]*scheduledLane
 		}
 		scores[position] = candidate
 	}
-	s.controlOrder = scores
-	return scores
 }
 
 // schedule assigns one PacketID to one or two eligible lanes.

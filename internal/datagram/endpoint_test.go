@@ -51,10 +51,10 @@ func TestLocal(t *testing.T) {
 	readUDP(t, second, 64)
 }
 
-func TestLocalReadBatchIgnoresSoftDrainError(t *testing.T) {
+func TestLocalReadBatchRecoversFromSoftError(t *testing.T) {
 	listener := listenUDP(t)
 	local := NewLocal(listener)
-	local.batch = stubUDPBatchConn{readErr: syscall.ENOBUFS}
+	local.batch = &stubUDPBatchConn{connection: listener, readErr: syscall.ENOBUFS}
 	t.Cleanup(func() { local.Close() })
 	peer := listenUDP(t)
 	writeUDP(t, peer, local.LocalAddr(), wireGuardPacket(4, 32))
@@ -63,6 +63,12 @@ func TestLocalReadBatchIgnoresSoftDrainError(t *testing.T) {
 	count, err := local.ReadBatch(context.Background(), packets[:])
 	if err != nil || count != 1 {
 		t.Fatalf("ReadBatch() = %d, %v, want 1, nil", count, err)
+	}
+	packets[0].Release()
+	writeUDP(t, peer, local.LocalAddr(), wireGuardPacket(4, 32))
+	count, err = local.ReadBatch(context.Background(), packets[:])
+	if err != nil || count != 1 {
+		t.Fatalf("ReadBatch() after soft error = %d, %v, want 1, nil", count, err)
 	}
 	packets[0].Release()
 }
@@ -397,7 +403,7 @@ func TestRemoteInitiationTriggersRefresh(t *testing.T) {
 	}
 }
 
-func TestRemoteBatchDrainErrorTriggersRefresh(t *testing.T) {
+func TestRemoteBatchReadErrorTriggersRefresh(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		err  error
@@ -422,7 +428,7 @@ func TestRemoteBatchDrainErrorTriggersRefresh(t *testing.T) {
 			remote.sockets[0] = connection
 			remote.sockets[1] = fallback
 			remote.workers.Add(1)
-			go remote.readSocket(connection, stubUDPBatchConn{readErr: tt.err})
+			go remote.readSocket(connection, &stubUDPBatchConn{connection: connection, readErr: tt.err})
 			t.Cleanup(func() { remote.Close() })
 
 			writeUDP(t, peer, connection.LocalAddr().(*net.UDPAddr).AddrPort(), indexedWireGuardPacket(1, 148, 11, 0))
@@ -435,7 +441,7 @@ func TestRemoteBatchDrainErrorTriggersRefresh(t *testing.T) {
 			deadline := time.Now().Add(time.Second)
 			for resolver.callCount() == 0 {
 				if time.Now().After(deadline) {
-					t.Fatal("batch drain error did not trigger target refresh")
+					t.Fatal("batch read error did not trigger target refresh")
 				}
 				time.Sleep(time.Millisecond)
 			}
@@ -799,22 +805,17 @@ func TestEarlierDeadline(t *testing.T) {
 	}
 }
 
-func TestCopyAcceptedPacket(t *testing.T) {
+func TestOwnPacket(t *testing.T) {
 	valid := wireGuardPacket(4, 32)
-	packet, ok := copyAcceptedPacket(valid, len(valid))
-	if !ok || len(packet.Payload) != len(valid) {
-		t.Fatalf("copyAcceptedPacket() = %#v, %t", packet, ok)
+	packet := ownPacket(wgpacket.TransportData, valid)
+	if packet.Kind != wgpacket.TransportData || len(packet.Payload) != len(valid) {
+		t.Fatalf("ownPacket() = %#v", packet)
 	}
 	packet.Payload[4] = 1
 	if valid[4] != 0 {
 		t.Fatal("accepted packet did not own its payload")
 	}
 	packet.Release()
-
-	oversized := wireGuardPacket(4, protocol.MaxPacketSize+1)
-	if packet, ok := copyAcceptedPacket(oversized, len(oversized)); ok {
-		t.Fatalf("oversized copyAcceptedPacket() = %#v, true", packet)
-	}
 }
 
 func TestPacketOwnership(t *testing.T) {
@@ -1004,14 +1005,21 @@ type blockingRefreshResolver struct {
 }
 
 type stubUDPBatchConn struct {
-	readErr error
+	connection *net.UDPConn
+	scalar     udpReadBuffer
+	readErr    error
+	reads      int
 }
 
-func (c stubUDPBatchConn) readAvailable(int) (udpReadBatch, error) {
-	return nil, c.readErr
+func (c *stubUDPBatchConn) read(limit int) (udpReadBatch, error) {
+	c.reads++
+	if c.reads == 2 {
+		return nil, c.readErr
+	}
+	return readUDPBatch(c.connection, nil, &c.scalar, limit)
 }
 
-func (stubUDPBatchConn) write(messages []udpMessage) (int, error) {
+func (*stubUDPBatchConn) write(messages []udpMessage) (int, error) {
 	return len(messages), nil
 }
 

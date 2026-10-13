@@ -11,8 +11,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/wirehop-linux ./cmd/wireh
 sh test/performance/run.sh /tmp/wirehop-linux /tmp/wirehop-performance-results 3
 ```
 
-The final argument defaults to three repetitions. Use a fresh results directory. `WIREHOP_TEST_IMAGE` selects an already
-available equivalent image. The harness never changes host routes or sysctls.
+The final argument defaults to three repetitions. Numeric arguments use decimal notation without leading zeros. Use a
+fresh results directory. `WIREHOP_TEST_IMAGE` selects an already available equivalent image. The harness never changes
+host routes or sysctls.
 
 Both profiles use 5 ms one-way delay on port 51822 and 150 ms on port 51823:
 
@@ -41,3 +42,34 @@ The check detects a healthy-path combination that severely underperforms an avai
 bandwidth aggregation, production WAN optimality, or packet latency. Short flows include startup, and the router's
 priority classes, bridge offloads, kernel TCP algorithm, and shared processing affect results. Run candidate binaries
 sequentially without competing network or CPU benchmarks.
+
+For longer runs with outer TCP, queue, CPU, and inner UDP latency observations:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/wirehop-latency ./test/performance/latency
+WIREHOP_TEST_DURATION=60 WIREHOP_TEST_OBSERVE=true \
+  WIREHOP_TEST_LATENCY_BINARY=/tmp/wirehop-latency \
+  sh test/performance/run.sh /tmp/wirehop-linux /tmp/wirehop-observed-results 3
+```
+
+`WIREHOP_TEST_DURATION` accepts an integer of at least 20 seconds. `WIREHOP_TEST_OBSERVE=true` records established
+socket details, socket memory, interface counters, and container CPU counters every 250 milliseconds on both endpoints
+and the router. Environment files preserve kernel TCP buffer limits, congestion control, interface details, and qdisc
+settings. These observations consume CPU and must be enabled for both candidates in a comparison.
+
+`WIREHOP_TEST_LATENCY_BINARY` enables a separate 64-byte UDP echo flow inside WireGuard. Its sender runs independently
+of replies at a requested 10-millisecond cadence, so missing or delayed replies do not reduce the offered probe rate.
+`latency.json` preserves sent, unique received, lost, duplicate, and unexpected counts, RTT p50/p95/p99/maximum,
+requested and actual cadence and duration, datagram size, and the two-second reply drain timeout. The verifier requires
+at least one reply and checks accounting and ordered quantiles. It reports loss and latency without imposing a latency
+threshold. Compare repeated results with the same offered load, and account for timer scheduling and the extra probe
+traffic.
+
+The latency tool also supports standalone `-listen ADDRESS` and `-target ADDRESS` modes, including IPv6 addresses in
+brackets. `-size`, `-interval`, `-duration`, and `-drain` select the probe parameters. It uses local monotonic send and
+receive times and does not require synchronized host clocks.
+
+`WIREHOP_TEST_TRACE` passes a file prefix to both endpoints with separate client/server suffixes. Standard binaries
+ignore it. Experimental Go source overlays can use it to export scheduler state without adding production tracing hooks.
+Such overlays need bounded, asynchronous export, recorded source and binary fingerprints, and identical sampling for
+both candidates. Include observation overhead when interpreting those experiments.

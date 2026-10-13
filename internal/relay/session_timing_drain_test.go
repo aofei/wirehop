@@ -2,7 +2,6 @@ package relay
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -121,32 +120,4 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 func measurementDrainValid(proof func() (time.Time, bool)) bool {
 	_, valid := proof()
 	return valid
-}
-
-func runMeasurementScheduler(t *testing.T, lanes ...*Lane) *Scheduler {
-	t.Helper()
-	ingress, scheduler := feedbackScheduler(t)
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- scheduler.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		if err := <-done; !errors.Is(err, context.Canceled) {
-			t.Error(err)
-		}
-		ingress.Close()
-	})
-	for _, lane := range lanes {
-		lane.observer = scheduler
-		registration := schedulerRegistration(byte(lane.laneID), 1, lane.store)
-		registration.SendControl = lane.SendControl
-		registration.SendDeliveryReport = lane.SendDeliveryReport
-		registration.ValidatePingProgress = lane.ValidatePingProgress
-		registration.RequestMeasurement = lane.RequestMeasurement
-		registration.SendMeasurement = lane.SendMeasurement
-		if err := scheduler.Register(ctx, registration); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return scheduler
 }

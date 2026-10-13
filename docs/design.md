@@ -557,11 +557,15 @@ seconds and four estimated RTTs, capped at eight seconds. The first assignment d
 improvement. This hold does not suppress failure recovery. A healthy transport primary retains ownership until actual
 packet expiry instead of discarding or redirecting a live packet solely because its current delivery prediction exceeds
 the remaining lifetime. Startup and recovery from a missing, degraded, or abandoning primary can still use unmeasured
-lanes. Same-group idle siblings do not receive discovery padding and can remain unmeasured until real traffic or
-failover uses them. Previously measured capacity can become stale, and capacity promotion can reorder in-flight packets.
-A primary at its hard memory limit retains the pending ingress item until feedback, expiry, or a lifecycle transition
-permits another decision. WireGuard controls can still preempt that pending transport item. An initial empty 32-byte
-WireGuard keepalive uses predicted delivery without fixing the bulk-data primary or restarting idle capacity discovery.
+lanes. Sessions whose healthy lanes all share one path group send no discovery padding, so idle siblings can remain
+unmeasured until real traffic or failover uses them. Mixed-group sessions elect one healthy representative per group
+before starting fresh discovery. The healthy transport primary takes precedence, followed by an active discovery period,
+then lower RTT and stable lane ID. Active periods finish before an idle sibling can start another period. A
+credit-blocked representative does not spill padding onto its idle siblings. Previously measured capacity can become
+stale, and capacity promotion can reorder in-flight packets. A primary at its hard memory limit retains the pending
+ingress item until feedback, expiry, or a lifecycle transition permits another decision. WireGuard controls can still
+preempt that pending transport item. An initial empty 32-byte WireGuard keepalive uses predicted delivery without fixing
+the bulk-data primary or restarting idle capacity discovery.
 
 Each committed transmission records its send time, send-interval anchor, and the preceding cumulative delivered byte
 count and time. Valid feedback samples the bytes since that anchor over the longer corresponding send and feedback
@@ -817,7 +821,6 @@ The command uses these packet and resource limits:
 | Retained plus in-progress server sessions | 1024 |
 | Pending unauthenticated admissions across all listeners | 512 |
 | Creation replay nonces | 65,536 |
-| Join replay nonces per session | 4096 |
 | Session ingress queue per direction | 1024 packets and 4 MiB |
 | Combined transmission store per lane direction | 65,536 packets and 32 MiB |
 | Aggregate retained relay work per client process | 131,072 packets and 256 MiB |
@@ -1192,10 +1195,24 @@ not used for TLS certificate validation, packet deadlines, RTT, logging, or the 
 Each server instance also keeps an authentication-only high-water mark for Unix seconds. Timestamp validation and signed
 admission responses use that same nondecreasing value. A backward server wall-clock adjustment freezes it until the wall
 clock catches up. Clients can refresh their estimate through signed `clock_skew` responses, including further
-corrections during a prolonged freeze. The acceptance window is not widened. Replay caches serialize expiration against
-their latest observed admission time, so an earlier concurrent sample cannot reopen an expired window after its nonce
-was removed. A request whose window expires while waiting for the cache receives retryable, lane-scoped `clock_skew`.
-Nonce state and the high-water marks belong to the server instance and are not persisted across restart.
+corrections during a prolonged freeze. The acceptance window is not widened. The creation replay cache serializes
+expiration against its latest observed admission time, so an earlier concurrent sample cannot reopen an expired window
+after its nonce was removed. A creation request whose window expires while waiting for the cache receives retryable,
+lane-scoped `clock_skew`. Join timestamp validation occurs under the same session lock as generation reservation and
+samples the authentication clock there. Creation nonce state and the high-water marks belong to the server instance and
+are not persisted across restart.
+
+Creation and join use different replay proofs. Creation retains each authenticated nonce through its inclusive
+timestamp-validity window because the request has no existing session generation to consume. Join atomically validates
+the timestamp and reserves a strictly greater generation for its stable lane. Accepted generation history remains for
+the session's entire lifetime, including after an acceptance write fails or a carrier disconnects. An identical signed
+join can therefore reserve its generation at most once, without a separate per-session nonce cache or expiry heap.
+Concurrent joins serialize at that reservation. A still-timely replay of a consumed generation returns
+`stale_generation`, while a newer generation still requires the correct session HMAC and immutable path group.
+
+Clients generate a fresh random nonce for every creation and join attempt. A nonce also binds a signed response to the
+pending request. Removing the join cache does not remove that response-binding requirement or permit clients to reuse
+nonces deliberately. Timestamp rejection remains retryable `clock_skew` before a join generation is consumed.
 
 ### Authentication for TCP and TLS lanes
 
@@ -1237,9 +1254,11 @@ the server Unix time under the same HMAC.
 The long-term token is never sent directly. The returned session secret and all later control frames remain visible and
 modifiable on `tcp://`, so HMAC admission does not turn the carrier into a secure channel.
 
-The server accepts timestamps only within a bounded clock-skew window and keeps the nonce in a replay cache for that
-window. A timestamp outside the window returns a retryable `clock_skew` response before the nonce enters the cache. A
-nonce already retained by the cache returns terminal `replay`. Clock correction never weakens replay protection.
+The server accepts timestamps only within a bounded clock-skew window. Creation additionally retains the nonce in its
+replay cache for that window. A timestamp outside the window returns retryable `clock_skew` before creation retains the
+nonce or join reserves a generation. A creation nonce already retained by the cache returns terminal `replay`. Join
+replay protection uses the atomic generation reservation described above. Clock correction never weakens either replay
+proof.
 
 ### Authentication for WebSocket lanes
 
@@ -1305,9 +1324,10 @@ keep the endpoint identity identical to the path covered by authentication. Reve
 path when forwarding the request.
 
 The server validates the WireHop authentication, target, lane, generation, path-group, nonce, and timestamp fields
-before accepting the WebSocket upgrade. It applies a bounded clock-skew window to creation and join requests and caches
-each nonce until the complete inclusive timestamp-validity window has elapsed. A nonce present in the cache is rejected
-as a replay.
+before accepting the WebSocket upgrade. It applies the same creation nonce cache and atomic join timestamp and
+generation reservation as raw-stream admission. A creation nonce remains cached until the complete inclusive
+timestamp-validity window has elapsed. A repeated creation nonce returns `replay`, and a consumed join generation
+returns `stale_generation`.
 
 The direct server uses a 16 KiB request-header budget, and the client limits relay or proxy response headers to 16 KiB
 during the WebSocket handshake.
@@ -1363,7 +1383,7 @@ WireGuard protects its payload, not the WireHop control plane or exposed relay r
 | Threat | Mitigation |
 | --- | --- |
 | Unauthorized relay or lane access | Long-term token, per-lane authentication, and session-bound join HMAC |
-| Replay of admission requests | Random nonces, bounded timestamp skew, and replay caches |
+| Replay of admission requests | Fresh nonces, bounded timestamp skew, creation replay cache, and atomic join generations |
 | Forged authentication time correction | HMAC-authenticated server time bound to the exact request nonce |
 | Stale or forged lifecycle feedback | Admission-bound controls, TLS in production, and identity and generation checks |
 | Unauthorized target selection | Canonical logical target allowlist checked before server-side resolution |
@@ -1406,10 +1426,10 @@ as permission to release retained backlog and packet state.
 
 ### UDP batching and buffer ownership
 
-Each UDP reader waits for one datagram, then opportunistically drains up to 15 additional ready datagrams on Linux with
-`recvmmsg`. Writers submit ready datagrams with `sendmmsg` and combine compatible same-destination runs with
-`UDP_SEGMENT` when supported. Other platforms and sockets without batch access use scalar UDP I/O. Neither path waits
-for a batch to fill.
+Each Linux UDP reader uses one poll-integrated `recvmmsg` operation to receive the first datagram and up to 15
+additional already-ready datagrams. Writers submit ready datagrams with `sendmmsg` and combine compatible
+same-destination runs with `UDP_SEGMENT` when supported. Other platforms and sockets without batch access use scalar UDP
+I/O. Neither path waits for a batch to fill.
 
 A GSO size rejection retries only the unsent datagrams without segmentation, preserving ordinary UDP fragmentation
 behavior. It does not disable GSO for later batches. An offload capability failure disables GSO on that socket and
@@ -1427,16 +1447,18 @@ Accepted UDP payloads are copied into reference-counted buffers. Queue admission
 and migration transfer or retain explicit ownership. A buffer returns to its pool only after the final owner releases
 it. Size classes retain buffers up to 32 KiB, and larger payload allocations are not pooled.
 
-Linux receive staging uses a process-wide pool of 15-datagram vectors. Its capacity is chosen from `GOMAXPROCS` at
-initialization, with a minimum of two vectors and a maximum of 16. At the maximum, payload storage occupies 15 MiB plus
-vector metadata. A reader that cannot borrow a vector continues with scalar reads. TCP and TLS carriers borrow complete
-frames from a fixed 32 KiB buffered reader and use one reusable owned frame buffer for fragmented or larger frames.
-WebSocket carriers own the first frame and copy already-buffered batch tails into one contiguous allocation bounded by
-32 KiB. Only the first frame can refill the read buffer. Payloads remain valid until the next carrier read, and UDP
-submission consumes them synchronously. A nonempty read that passes its initial cancellation check discards exceptional
-owned first-frame capacity above 32 KiB. Larger encoding buffers are discarded after writing. WebSocket decoding remains
-incremental within a message without retaining a complete message allocation. These scratch buffers, size-class
-overhead, and kernel socket buffers are separate from the retained relay-work budget.
+Linux receive staging uses a process-wide pool of 16-datagram vectors. Its capacity is chosen from `GOMAXPROCS` at
+initialization, with a minimum of two vectors and a maximum of 16. At the maximum, payload storage occupies 16 MiB plus
+vector metadata. A reader that cannot borrow a vector continues with one pooled scalar buffer. Both vector and scalar
+staging are released before the socket poller waits, so idle Linux readers retain neither a vector nor a payload buffer.
+Successful receive staging remains owned until accepted datagrams are copied. All carriers borrow complete frames from a
+fixed 32 KiB buffered reader and use one reusable owned frame buffer for fragmented or larger frames. WebSocket
+borrowing stays within the current binary message. Only the first frame can refill the read buffer. Already-buffered
+tails require neither payload copying nor a separate allocation. Payloads remain valid until the next carrier read, and
+UDP submission consumes them synchronously. A nonempty read that passes its initial cancellation check discards
+exceptional owned first-frame capacity above 32 KiB. Larger encoding buffers are discarded after writing. WebSocket
+decoding remains incremental within a message without retaining a complete message allocation. These scratch buffers,
+size-class overhead, and kernel socket buffers are separate from the retained relay-work budget.
 
 ### WebSocket transport
 
@@ -1607,7 +1629,7 @@ same order:
 | 5 | Clock sync | 4 to 40 bytes | Client to server, first post-admission frame |
 | 6 | Ping | 2 to 20 bytes | Both directions after admission |
 | 7 | Pong | 4 to 40 bytes | Both directions after admission |
-| 8 | Measurement | 1 to 65,533 bytes | Direction and phase depend on the measurement operation |
+| 8 | Measurement | 1 to 45 bytes | Direction and phase depend on the measurement operation |
 | 9 | Lane abandon | 2 to 20 bytes | Both directions after admission |
 | 10 | Session close | 1 byte | Client to server after admission |
 | 11 | Error | 5 to 535 bytes | Both directions after admission |
@@ -1642,8 +1664,7 @@ Payload descriptions follow frame-type order. Fields within each payload appear 
 - `Ping`: ping ID and send time (two `uvarint` values)
 - `Pong`: ping ID, echoed ping send time, receive time, and send time (four `uvarint` values)
 - `Measurement Request`: kind `1`
-- `Measurement Begin`: kind `2`, operation ID, target count, and that many lane ID and generation pairs. Targets are
-  nonempty and strictly ordered by lane ID. Every generation is nonzero
+- `Measurement Begin`: kind `2` and operation ID. The carrying lane generation is the measurement target
 - `Measurement Ready`: kind `3`, operation ID, and acceptance flag (`0` or `1`)
 - `Measurement Probe`: kind `4`, operation ID, probe send time `t1`, and remaining hold in microseconds
 - `Measurement Reply`: kind `5`, operation ID, echoed `t1`, receive time `t2`, reply send time `t3`, and remaining hold
@@ -1676,11 +1697,12 @@ WireGuard packet structure. The sender keeps migration state locally, while copi
 Ping and Pong IDs are nonzero. Ping counters start at 1 for each connection generation and never wrap. Exhausting the
 counter ends that generation. Measurement operation IDs are nonzero session counters, independent of Ping counters.
 Request has no operation ID. Exhausting the operation counter disables further measurements without disrupting Data.
-Measurement holds cannot exceed 4,000,000 microseconds. The target limit is derived from the existing frame bound and
-permits 3276 full-width identities. The default client lane limit remains 16. Ready rejection acquires no pause. Probe
-requires a positive hold. A zero Reply hold rejects the measurement. Delivery reports and lane-abandon frames require a
-nonzero lane ID and generation. Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted
-requires nonzero session and path group IDs. Encoded receive and send timestamp pairs must not run backward.
+Measurement holds cannot exceed 4,000,000 microseconds. The maximum Measurement content is a 45-byte Reply with
+full-width operation ID and timestamps and a four-byte hold. Readers reject a larger Measurement from its frame header
+before allocating payload storage. Ready rejection acquires no pause. Probe requires a positive hold. A zero Reply hold
+rejects the measurement. Delivery reports and lane-abandon frames require a nonzero lane ID and generation.
+Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted requires nonzero session and path
+group IDs. Encoded receive and send timestamp pairs must not run backward.
 
 Version 1 control enums are:
 
@@ -1810,33 +1832,32 @@ rule and fails the generation instead of silently discarding a response.
 #### Coordinated RTT measurement
 
 Coordinated RTT measurement uses an independent, client-owned session transaction. At most one operation can prepare,
-measure, or publish at a time across all lanes. Repeated requests coalesce. Each operation snapshots a fixed cohort of
-eligible lane IDs and generations. Every cohort member is measured on its actual carrier, so one pause can refresh all
-lanes without serializing their round trips. Preparation messages use the requesting carrier. Timing and result messages
-never switch to a faster feedback carrier. An unmatched generation declines preparation rather than silently changing
-the cohort.
+measure, or publish at a time across all lanes. Repeated requests coalesce. Each operation measures only its requesting
+carrier generation. All preparation, timing, and result messages travel on that same carrier. Begin identifies the
+operation without repeating its lane identity or carrying a target list. A phase on another carrier or generation cannot
+modify the active operation. An empty slow standby does not participate in the timed exchange. Every session lane's
+committed Data prefix must still drain to remove the session's own load from shared bottlenecks.
 
 The measurement exchange proceeds as follows:
 
-1. The client reserves the session operation, requests its local Data pause, and sends Measurement Begin with the fixed
-   cohort immediately. Begin requests preparation and does not assert that the client's prefix has already drained
+1. The client reserves the session operation, requests its local Data pause, and sends Measurement Begin immediately on
+   the requesting carrier. Begin requests preparation and does not assert that the client's prefix has already drained
 2. The server closes its session Data gates, waits until cumulative DeliveryReports cover every committed prefix, and
    sends Measurement Ready. Client preparation proceeds concurrently
-3. Only after both its local prefix proof and the server's Ready arrive does the client queue probes on every cohort
-   carrier. Each writer samples that carrier's `t1` and sends Measurement Probe
-4. The server samples `t2` when parsing each Probe and `t3` when its writer builds the corresponding Reply. A positive
-   Reply hold promises continued session Data quiescence from `t3` until that fixed remaining budget expires
+3. Only after both its local prefix proof and the server's Ready arrive does the client queue its Probe. The requesting
+   carrier's writer samples `t1` and sends Measurement Probe
+4. The server samples `t2` when parsing Probe and `t3` when its writer builds the corresponding Reply. A positive Reply
+   hold promises continued session Data quiescence from `t3` until that fixed remaining budget expires
 5. The client samples `t4`, validates `RTT = (t4 - t1) - (t3 - t2)`, applies the result, and sends Measurement Result on
    that same carrier. The server reconstructs and independently checks the sample before applying it. Client Data
-   resumes after every cohort result completes its carrier write. Server Data resumes after every cohort result is
-   applied or rejected
+   resumes after Result completes its carrier write. Server Data resumes after Result is applied or rejected
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as Server
     C->>C: Reserve operation and request Data pause
-    C->>S: Begin(id, fixed cohort)
+    C->>S: Begin(id) on the requesting carrier
     par Client preparation
         C->>C: Close Data gates and await parsed prefixes
     and Server preparation
@@ -1844,14 +1865,14 @@ sequenceDiagram
         S->>C: Ready(id)
     end
     Note over C,S: Require local proof and peer readiness before any Probe
-    Note over C,S: Each carrier runs the following exchange in parallel
+    Note over C,S: Continue on that same carrier
     C->>S: Probe(id, t1, remaining hold)
     S->>C: Reply(id, t1, t2, t3, remaining hold)
     C->>C: Validate and apply or reject the actual carrier's RTT
     C->>S: Result(id, valid, t4)
     S->>S: Independently validate and apply or reject RTT
-    C->>C: Resume after all Results finish writing
-    S->>S: Resume after all Results finish processing
+    C->>C: Resume after Result finishes writing
+    S->>S: Resume after Result finishes processing
     Note over C,S: A fixed local deadline also reopens Data gates
 ```
 
@@ -1870,11 +1891,11 @@ budgets, revoked prefix proof, and changed target generation reject the evidence
 one-microsecond quantization floor. The scheduler checks transaction ownership and prefix proof again when applying a
 queued result. A full event queue rejects publication rather than claiming that the controller applied the sample.
 
-One target's completion cannot release another target's hold. Both endpoints retain session ownership until all cohort
-members complete or the common deadline expires. An exposed Probe or positive Reply must honor its fixed promise after
-ambiguous write failure or lane cancellation. Missing phases cannot extend a pause. Deadline expiry resumes Data, and
-session shutdown releases the operation immediately. Old completions cannot release a newer operation. Failure to
-measure is not a connection-liveness failure. Ordinary carrier errors still follow normal lane teardown.
+Both endpoints retain session ownership until their target completes or the common deadline expires. An exposed Probe or
+positive Reply must honor its fixed promise after ambiguous write failure or lane cancellation. Missing phases cannot
+extend a pause. Deadline expiry resumes Data, and session shutdown releases the operation immediately. Old completions
+cannot release a newer operation. Failure to measure is not a connection-liveness failure. Ordinary carrier errors still
+follow normal lane teardown.
 
 A server that wants a refresh sends a throttled Measurement Request without pausing Data. The client decides when to
 start. Every local attempt is followed by at least five seconds without another attempt and a quiet interval of at least
@@ -1883,6 +1904,11 @@ discovery does not incur pause cost. This bounds recurring pause cost to at most
 is a local controller policy, not a wire requirement. Natural low RTT observations can still lower the minimum without
 any measurement transaction. Whether an active measurement's benefit exceeds its cost must be checked against a
 controller-identical no-active-measurement variant.
+
+Requests arriving during an active operation or cooldown coalesce without a pending-target queue. Other lanes no longer
+receive incidental calibration from a shared cohort. Fresh eligible timing observations can request their own operation
+later. This policy does not guarantee measurement fairness between lanes, so directional RTT changes and different
+forward and reverse primaries need separate performance comparisons.
 
 During preparation, new transport may remain on the existing healthy primary within hard memory limits. Queued unsent
 Data does not participate in the committed-prefix proof. Every retained packet keeps its original deadline. An active
@@ -2248,6 +2274,153 @@ category, without packet contents, peer addresses, or wrapped diagnostic text.
 
 WireHop exposes no network metrics endpoint or stable telemetry schema. Any telemetry interface must exclude tokens,
 session secrets, packet payloads, and identifying target metadata by default.
+
+## Protocol performance decisions
+
+Protocol changes may break compatibility while retaining V1. Existing fields and algorithms remain only when they serve
+the current forwarding, recovery, or resource requirements. A smaller encoding or shorter implementation alone does not
+establish higher useful throughput or lower tail latency.
+
+### Framing and control responsibilities
+
+The current Data encoding adds 13 bytes to a 1452-byte datagram when its ID and deadline each use five bytes, about 0.90
+percent of the datagram length. Even eliminating all of those bytes would save less than one percent of that frame's
+carrier payload. Small packets have a larger proportional cost and require a separate packet-rate comparison. The fields
+have independent responsibilities:
+
+- The packed type and length delimit frames on every carrier, including multiple frames in one WebSocket message
+- The direction-local ID identifies duplicates and migrations across lanes and remains independent of WireGuard keys
+- The sender's absolute deadline includes startup, ingress, writer, and carrier delay without restarting packet lifetime
+
+Implicit per-lane sequencing would still need explicit identity for duplicates and migrations. Replacing relay IDs with
+WireGuard receiver indices and counters would couple deduplication to unauthenticated peer metadata and key lifetimes,
+and would still need an identity for handshake and cookie packets. Delta encoding can save metadata bytes but requires
+per-generation decoder state and special handling for old migrated IDs. These are possible redesigns, with acceptance
+dependent on measured small-packet gains and unchanged recovery behavior.
+
+A relative lifetime sampled at the writer can remove local queue age but cannot account for time subsequently trapped in
+TCP. Starting that lifetime at receive would allow old buffered packets another full lifetime. Cross-clock deadline
+mapping therefore remains necessary for the current end-to-end expiry contract. A design that removes it must explicitly
+replace that contract rather than silently reset packet age.
+
+DeliveryReports acknowledge peer parsing, not UDP delivery. They release exact retained prefixes, advance application
+flight credit, support rate sampling, and prove measurement drain completion. Local TCP write completion and even a
+kernel TCP acknowledgment do not establish those application-level facts. Removing reports without replacing these
+responsibilities would undermine memory bounds and recovery. A separate cumulative byte count is already omitted because
+retained descriptors reconstruct it exactly.
+
+The adaptive report timer is a policy rather than a wire requirement. A fixed 10 or 25 millisecond timer can reduce
+reverse-path work at low RTT while delaying startup and credit recovery. At high RTT, 10 milliseconds can instead
+increase report traffic. Bulk traffic can also trigger the 256 KiB or 256-frame threshold before the timer. At 1 Gbit/s,
+256 KiB takes about 2.10 milliseconds to arrive. Compare report cadence with those triggers and eager feedback after
+idle intact, rather than attributing every report to the timer.
+
+### Main performance tradeoffs
+
+Transport scheduling selects one primary per direction. Its intended benefit is stable selection of the better lane and
+bounded recovery. It does not stripe useful transport across independent links, so it does not promise their sum
+capacity. WireGuard ciphertext hides inner flow identity. Packet-level striping across unequal paths can reorder a
+single inner TCP flow and reduce its goodput. Aggregation requires a separate scheduling experiment with equal and
+unequal paths, shared bottlenecks, multiple inner flows, and latency measurements.
+
+Primary promotion compares recent delivery-capacity estimates. It does not require direction-local offered demand or an
+improvement over the current primary's delivery score. Sparse traffic can therefore move to a higher-delay path despite
+spare capacity on the lower-delay path. Replacing this rule with a counterfactual score that charges the candidate for
+all retained primary work can delay a useful promotion until a large old-path tail has accumulated. Such late changes
+can reorder inner traffic. Neither a smaller score margin nor a larger discovery budget is an established solution.
+Evaluate startup, sparse reverse traffic, sustained load and remaining old-path work together.
+
+Short-flow goodput can also vary while the primary remains stable and carrier loss counters stay at zero. Record the
+inner TCP congestion window, slow-start threshold, receive window and minimum RTT alongside carrier estimates before
+attributing every startup outlier to path selection. A passing median does not excuse an individual combined-path
+failure. Preserve failed runs and their evidence when repeating the performance gate.
+
+The application flight window covers four feedback cycles, each with a fixed 25 millisecond reporting allowance even
+when the adaptive report timer is shorter. A 10 millisecond minimum RTT therefore yields a horizon of at least 140
+milliseconds before converting the delivery estimate to bytes. This is not the kernel TCP congestion window: it also
+covers peer parsing and feedback. Reducing the multiplier or allowance could reduce queued work, but can also starve the
+writer while valid feedback is returning. Compare goodput and interactive latency together before changing either
+constant. Large outstanding credit alone does not prove the cause of an observed throughput or latency limit.
+
+Capacity discovery spends real carrier bandwidth on padding. The per-period limit is 2 MiB per lane direction, with 4 to
+8 seconds of activity and a 30-second cooldown. This is a bound rather than a promised traffic volume. With the default
+limit of 16 lanes, initial discovery could collectively admit up to 32 MiB in one direction if their groups and
+available capacity permit it. Opposite directions have independent budgets. Payload ownership is shared, but bandwidth
+and flight credit are still consumed. The no-padding guard applies when all healthy lanes share one group. In a mixed
+configuration such as groups `A, A, B`, fresh discovery elects one `A` representative and one `B` representative.
+Election uses current state only after an inactive candidate passes its admission checks, avoiding recurring group-map
+work when no fresh period can start. An aggregate session probe budget or early stopping after sufficient evidence could
+reduce cost further. Their effect on discovering a genuinely faster path needs measurement.
+
+Coordinated RTT calibration can pause all session Data for up to four seconds. Its two-percent recurring duty bound does
+not bound the latency of an individual packet or the impact on a short flow. An empty delayed standby no longer prolongs
+the target exchange, but any committed standby prefix still participates in the drain proof. Compare the current
+controller with an otherwise identical controller that disables active calibration, then vary pause scope. Measure RTT
+increases and decreases, idle bursts, capacity collapse, and a stalled standby. A lane-local pause permits other session
+lanes to keep loading a shared bottleneck, so it provides a weaker quiet-path measurement. Merely aging the minimum RTT
+can instead mistake the session's own backlog for increased propagation and enlarge the application window.
+
+The [BBR congestion-control draft](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/) describes delivery-rate
+sampling, application-limited provenance, and active propagation-delay measurement. It is work in progress and supplies
+useful reasoning, not proof that WireHop's application-over-TCP window or timing constants are optimal.
+
+The stable scheduling path still performs lane scans, repeated Data sizing, and transmission-store locking. Promotion
+estimates change with feedback and lifecycle events rather than every packet. Caching candidates and carrying validated
+encoded sizes could reduce this work. Live backlog, packet deadlines, and capacity eligibility still need checks at
+assignment because writers and feedback change them independently. Report routing finds its own lane directly and
+selects an alternate in a linear scan. It sorts the captured alternate scores only after the best alternate rejects
+queue admission. These changes need benchmarks of the actual scheduler, including full alternate control queues, before
+introducing cached state or removing validation at an ownership boundary.
+
+Linux receive batching combines the first datagram and ready tail in one poll-integrated `recvmmsg` operation. Bounded
+staging is released before an idle socket waits. Existing `sendmmsg` and UDP segmentation already batch outgoing
+datagrams. The
+[Linux segmentation documentation](https://www.kernel.org/doc/html/latest/networking/segmentation-offloads.html)
+explains the offload boundary. Measure syscalls per datagram and CPU per byte before replacing this I/O path.
+
+TCP head-of-line blocking remains within each lane because TCP delivers an ordered byte stream, as specified in
+[RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html). Separate carriers provide independent streams for failover but
+cannot make one stream skip lost bytes. An unreliable transport such as
+[QUIC DATAGRAM](https://www.rfc-editor.org/rfc/rfc9221.html) changes that constraint only where UDP is usable, and does
+not satisfy TCP-only reachability by itself. FEC inside the same TCP stream also remains blocked behind missing stream
+bytes. WebSocket client masking remains required even over TLS by
+[RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.3). Disabling compression and batching already-ready
+frames avoids unnecessary work while retaining those carrier requirements.
+
+### Evidence required for further changes
+
+The routed harness compares 10 and 100 Mbit/s paths with 10 and 300 millisecond nominal RTTs. Its checks establish
+healthy-path throughput retention and carrier stability. They do not establish bandwidth aggregation, Gbit-scale CPU
+efficiency, optimal feedback constants, or interactive tail latency. Microbenchmarks isolate codec and buffer costs,
+while loopback pipeline tests include userspace coordination and socket costs. Neither substitutes for routed inner
+WireGuard workloads.
+
+Attributing a throughput limit also requires outer TCP RTT, congestion window, receive window, and socket-memory
+observations during the transfer, together with application delivery rate, committed bytes, and flight credit. The
+optional routed observations sample TCP state, socket memory, container CPU counters, and qdisc state during each flow.
+Experiment-only Go source overlays can additionally sample scheduler rate, window, and pause state without adding a
+production telemetry interface. The optional inner UDP probe records latency and loss alongside bulk TCP. A
+combined-to-best-path ratio near one can pass while both paths underuse available capacity. Record standalone
+utilization and inner TCP state as well as that regression ratio.
+
+Linux automatic send-buffer limits can constrain a high-bandwidth, high-RTT carrier even when application flight credit
+is available. Increasing those limits can also increase queueing, drops, and inner TCP retransmissions. WireHop leaves
+TCP buffer autotuning to the kernel rather than imposing a larger fixed per-socket buffer. The
+[Linux TCP sysctl documentation](https://docs.kernel.org/networking/ip-sysctl.html) distinguishes `tcp_wmem` autotuning
+limits from `SO_SNDBUF`, which disables send-buffer autotuning for that socket.
+
+Shorter reporting allowances and fewer flight-window cycles also need separate controls. A smaller committed window can
+move backlog into the ingress or kernel UDP queue instead of improving packet latency. Measure all queue layers, actual
+offered probe cadence, receiver goodput, and successful-probe quantiles with their loss counts before accepting a
+parameter change.
+
+Further comparisons should include 32, 64, 148, 1452, 9000, and path-valid maximum UDP payload sizes, one and 16 lanes,
+startup and reconnect bursts, long idle periods, and concurrent interactive UDP and bulk TCP inside WireGuard. Exercise
+the 65,535-byte protocol ceiling separately in codec and carrier tests rather than assuming UDP can deliver that size.
+Record receiver goodput, carrier bytes including padding and feedback, p50/p95/p99 latency, drops, retransmissions,
+syscalls per datagram, CPU per byte, and retained memory. Compare changes sequentially against the same baseline, with
+loss, jitter, RTT steps, shared bottlenecks, and independent path capacities. Parameter changes should improve the
+intended workload without concealing failures in a median or relying only on bytes accepted by a sender socket.
 
 ## Performance validation matrix
 

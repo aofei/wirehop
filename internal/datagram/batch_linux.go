@@ -19,10 +19,8 @@ import (
 )
 
 const (
-	// maximumConcurrentReadBatches bounds process-wide opportunistic staging memory.
+	// maximumConcurrentReadBatches bounds process-wide vector staging memory.
 	maximumConcurrentReadBatches = 16
-	// readBatchDrainSize leaves the first blocking read outside the opportunistic drain.
-	readBatchDrainSize = MaximumBatchSize - 1
 	// udpSegmentSizeBytes is the UDP_SEGMENT ancillary value size.
 	udpSegmentSizeBytes = 2
 	// udpSegmentControlCapacity holds one aligned UDP_SEGMENT control message on supported Linux architectures.
@@ -57,21 +55,36 @@ type linuxMMsgHdr struct {
 // linuxUDPBatchConn applies Linux mmsg operations to one UDP socket.
 type linuxUDPBatchConn struct {
 	raw                    syscall.RawConn
+	readLimit              int
+	readBatch              udpReadBatch
+	readErr                syscall.Errno
+	receive                func(uintptr) bool
+	scalar                 linuxScalarReadBatch
 	gso                    bool
 	equalGSOTailWorkaround bool
 }
 
 // linuxReadBatch contains one bounded nonblocking receive vector.
 type linuxReadBatch struct {
-	headers   [readBatchDrainSize]linuxMMsgHdr
-	vectors   [readBatchDrainSize]unix.Iovec
-	addresses [readBatchDrainSize]unix.RawSockaddrAny
-	buffers   [readBatchDrainSize][protocol.MaxPacketSize + 1]byte
-	values    [readBatchDrainSize]udpMessage
+	headers   [MaximumBatchSize]linuxMMsgHdr
+	vectors   [MaximumBatchSize]unix.Iovec
+	addresses [MaximumBatchSize]unix.RawSockaddrAny
+	buffers   [MaximumBatchSize][protocol.MaxPacketSize + 1]byte
+	values    [MaximumBatchSize]udpMessage
 	limit     int
 	count     int
 	err       syscall.Errno
-	receive   func(uintptr) bool
+	receive   func(uintptr)
+}
+
+// linuxScalarReadBatch receives one message when the vector pool is busy or only one message was requested.
+type linuxScalarReadBatch struct {
+	udpReadBuffer
+	header  linuxMMsgHdr
+	vector  unix.Iovec
+	address unix.RawSockaddrAny
+	err     syscall.Errno
+	receive func(uintptr)
 }
 
 // linuxReadBatchPool limits concurrent large receive vectors process-wide.
@@ -107,9 +120,15 @@ func newUDPBatchConn(conn *net.UDPConn) udpBatchConn {
 		_, optionErr := unix.GetsockoptInt(int(descriptor), unix.IPPROTO_UDP, unix.UDP_SEGMENT)
 		gso = optionErr == nil
 	})
-	return &linuxUDPBatchConn{
+	connection := &linuxUDPBatchConn{
 		raw: raw, gso: gso, equalGSOTailWorkaround: linuxEqualGSOTailWorkaround,
 	}
+	connection.receive = connection.receiveFrom
+	connection.scalar.header.header.Iov = &connection.scalar.vector
+	connection.scalar.header.header.SetIovlen(1)
+	connection.scalar.header.header.Name = (*byte)(unsafe.Pointer(&connection.scalar.address))
+	connection.scalar.receive = connection.scalar.receiveFrom
+	return connection
 }
 
 // currentKernelHasEqualGSOTailBug reports whether the running kernel needs the Linux UDP GSO workaround.
@@ -200,7 +219,7 @@ func newLinuxWriteBatch() *linuxWriteBatch {
 	return batch
 }
 
-// acquire borrows a vector without blocking an active UDP reader.
+// acquire borrows a vector without waiting for another socket's receive processing.
 func (p *linuxReadBatchPool) acquire() *linuxReadBatch {
 	select {
 	case p.permits <- struct{}{}:
@@ -236,7 +255,7 @@ func (b *linuxReadBatch) release() {
 }
 
 // receiveFrom executes one nonblocking recvmmsg call.
-func (b *linuxReadBatch) receiveFrom(descriptor uintptr) bool {
+func (b *linuxReadBatch) receiveFrom(descriptor uintptr) {
 	count, _, err := unix.Syscall6(unix.SYS_RECVMMSG, descriptor, uintptr(unsafe.Pointer(&b.headers[0])),
 		uintptr(b.limit), unix.MSG_DONTWAIT, 0, 0)
 	b.count = 0
@@ -244,16 +263,38 @@ func (b *linuxReadBatch) receiveFrom(descriptor uintptr) bool {
 		b.count = int(count)
 	}
 	b.err = err
-	return true
 }
 
-// readAvailable drains currently queued datagrams without waiting for another arrival.
-func (c *linuxUDPBatchConn) readAvailable(limit int) (udpReadBatch, error) {
-	batch := linuxReadBatches.acquire()
-	if batch == nil {
-		return nil, nil
+// read receives one or more immediately queued datagrams after socket readiness.
+func (c *linuxUDPBatchConn) read(limit int) (udpReadBatch, error) {
+	c.readLimit = min(limit, MaximumBatchSize)
+	for {
+		c.readErr = 0
+		if err := c.raw.Read(c.receive); err != nil {
+			return nil, err
+		}
+		if c.readErr != syscall.EINTR {
+			break
+		}
 	}
-	batch.limit = min(limit, len(batch.headers))
+	batch := c.readBatch
+	c.readBatch = nil
+	if c.readErr != 0 {
+		return nil, c.readErr
+	}
+	return batch, nil
+}
+
+// receiveFrom borrows staging only for the immediate receive attempt, releasing it before the poller waits.
+func (c *linuxUDPBatchConn) receiveFrom(descriptor uintptr) bool {
+	var batch *linuxReadBatch
+	if c.readLimit > 1 {
+		batch = linuxReadBatches.acquire()
+	}
+	if batch == nil {
+		return c.receiveScalar(descriptor)
+	}
+	batch.limit = c.readLimit
 	for index := range batch.limit {
 		header := &batch.headers[index]
 		header.header.Namelen = uint32(unsafe.Sizeof(batch.addresses[index]))
@@ -261,24 +302,16 @@ func (c *linuxUDPBatchConn) readAvailable(limit int) (udpReadBatch, error) {
 		header.length = 0
 		batch.vectors[index].SetLen(len(batch.buffers[index]))
 	}
-	for {
-		if err := c.raw.Read(batch.receive); err != nil {
-			batch.release()
-			return nil, err
-		}
-		if batch.err != syscall.EINTR {
-			break
-		}
-	}
+	batch.receive(descriptor)
 	runtime.KeepAlive(batch)
-	if errors.Is(batch.err, syscall.EAGAIN) || errors.Is(batch.err, syscall.EWOULDBLOCK) {
+	if batch.err == syscall.EAGAIN || batch.err == syscall.EWOULDBLOCK {
 		batch.release()
-		return nil, nil
+		return false
 	}
 	if batch.err != 0 {
-		err := batch.err
+		c.readErr = batch.err
 		batch.release()
-		return nil, err
+		return true
 	}
 	accepted := 0
 	for index := range batch.count {
@@ -296,9 +329,53 @@ func (c *linuxUDPBatchConn) readAvailable(limit int) (udpReadBatch, error) {
 	batch.count = accepted
 	if accepted == 0 {
 		batch.release()
-		return nil, nil
+		return true
 	}
-	return batch, nil
+	c.readBatch = batch
+	return true
+}
+
+// receiveScalar uses one pooled packet buffer without holding vector capacity while the socket is idle.
+func (c *linuxUDPBatchConn) receiveScalar(descriptor uintptr) bool {
+	batch := &c.scalar
+	batch.storage = readBufferPool.Get().(*[protocol.MaxPacketSize + 1]byte)
+	batch.vector.Base = &batch.storage[0]
+	batch.vector.SetLen(len(batch.storage))
+	batch.header.header.Namelen = uint32(unsafe.Sizeof(batch.address))
+	batch.header.header.Flags = 0
+	batch.header.length = 0
+	batch.receive(descriptor)
+	runtime.KeepAlive(batch)
+	errno := batch.err
+	if errno != 0 {
+		batch.release()
+		if errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK {
+			return false
+		}
+		c.readErr = errno
+		return true
+	}
+	peer, ok := rawSockaddrAddrPort(&batch.address)
+	if !ok || batch.header.length > protocol.MaxPacketSize || batch.header.header.Flags&unix.MSG_TRUNC != 0 {
+		batch.release()
+		return true
+	}
+	batch.values[0] = udpMessage{payload: batch.storage[:batch.header.length], peer: peer}
+	c.readBatch = batch
+	return true
+}
+
+// receiveFrom executes one nonblocking single-message recvmmsg call.
+func (b *linuxScalarReadBatch) receiveFrom(descriptor uintptr) {
+	_, _, b.err = unix.Syscall6(unix.SYS_RECVMMSG, descriptor, uintptr(unsafe.Pointer(&b.header)),
+		1, unix.MSG_DONTWAIT, 0, 0)
+}
+
+// release clears the kernel payload pointer before returning the scalar packet buffer.
+func (b *linuxScalarReadBatch) release() {
+	b.vector.Base = nil
+	b.err = 0
+	b.udpReadBuffer.release()
 }
 
 // sendTo executes one sendmmsg call and lets RawConn wait for socket writability when necessary.

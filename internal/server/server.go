@@ -50,7 +50,6 @@ type Config struct {
 	AuthenticationSkew   time.Duration
 	HandshakeTimeout     time.Duration
 	ReplayEntries        int
-	JoinNonceEntries     int
 	MaxSessions          int
 	MaxLanesPerSession   int
 	MaxPendingAdmissions int
@@ -191,7 +190,7 @@ func New(config Config) (*Server, error) {
 		return nil, fmt.Errorf("%w: invalid WIREHOP_TOKEN", ErrInvalidConfig)
 	}
 	if config.Targets.Len() == 0 || config.AuthenticationSkew < time.Second ||
-		config.HandshakeTimeout <= 0 || config.ReplayEntries <= 0 || config.JoinNonceEntries <= 0 ||
+		config.HandshakeTimeout <= 0 || config.ReplayEntries <= 0 ||
 		config.MaxSessions <= 0 || config.MaxLanesPerSession <= 0 || config.MaxPendingAdmissions <= 0 ||
 		config.ReconnectGrace <= 0 ||
 		config.IngressLimits.Packets <= 0 ||
@@ -555,7 +554,7 @@ func (s *Server) serveRawCreate(ctx context.Context, connection net.Conn, hello 
 		return err
 	}
 	if err := s.replay.CheckAndStore(hello.Nonce, now, expires); err != nil {
-		code, class, scope := replayRejection(err, protocol.ErrorSessionRejected, protocol.ErrorScopeSession)
+		code, class, scope := replayRejection(err)
 		s.rejectWithKey(connection, hello.Nonce, code, class, scope, "request nonce rejected", s.config.Token)
 		return err
 	}
@@ -676,18 +675,7 @@ func (s *Server) serveRawJoin(connection net.Conn, hello protocol.ClientHello,
 			protocol.ErrorLaneRejected, protocol.ErrorScopeLane, "authentication failed", secret[:])
 		return err
 	}
-	now := s.authenticationTime()
-	if err := auth.ValidateTimestamp(hello.UnixSeconds, now, s.config.AuthenticationSkew); err != nil {
-		s.rejectWithKey(connection, hello.Nonce, protocol.ErrorClockSkew,
-			protocol.ErrorRetryable, protocol.ErrorScopeLane, "request timestamp rejected", secret[:])
-		return err
-	}
-	if err := session.acceptJoinNonce(hello.Nonce, hello.UnixSeconds, now); err != nil {
-		code, class, scope := replayRejection(err, protocol.ErrorLaneRejected, protocol.ErrorScopeLane)
-		s.rejectWithKey(connection, hello.Nonce, code, class, scope, "request nonce rejected", secret[:])
-		return err
-	}
-	if err := session.reserveLane(hello.LaneID, hello.Generation, hello.PathGroupID); err != nil {
+	if err := session.reserveJoinLane(hello); err != nil {
 		code, class, scope := reservationRejection(err)
 		s.rejectWithKey(connection, hello.Nonce, code, class, scope,
 			"lane generation rejected", secret[:])
@@ -853,7 +841,7 @@ func (s *Server) serveWebSocketCreate(ctx context.Context, writer http.ResponseW
 		return err
 	}
 	if err := s.replay.CheckAndStore(creation.Nonce, now, expires); err != nil {
-		code, class, scope := replayRejection(err, protocol.ErrorSessionRejected, protocol.ErrorScopeSession)
+		code, class, scope := replayRejection(err)
 		return s.rejectWebSocket(writer, creation.Nonce, code, class, scope, "request nonce rejected", s.config.Token, err)
 	}
 	if !s.config.Targets.Allows(creation.Target) {
@@ -936,16 +924,7 @@ func (s *Server) serveWebSocketJoin(ctx context.Context, writer http.ResponseWri
 		return s.rejectWebSocket(writer, join.Nonce, protocol.ErrorAuthentication,
 			protocol.ErrorLaneRejected, protocol.ErrorScopeLane, "authentication failed", secret[:], err)
 	}
-	now := s.authenticationTime()
-	if err := auth.ValidateTimestamp(join.UnixSeconds, now, s.config.AuthenticationSkew); err != nil {
-		return s.rejectWebSocket(writer, join.Nonce, protocol.ErrorClockSkew,
-			protocol.ErrorRetryable, protocol.ErrorScopeLane, "request timestamp rejected", secret[:], err)
-	}
-	if err := session.acceptJoinNonce(join.Nonce, join.UnixSeconds, now); err != nil {
-		code, class, scope := replayRejection(err, protocol.ErrorLaneRejected, protocol.ErrorScopeLane)
-		return s.rejectWebSocket(writer, join.Nonce, code, class, scope, "request nonce rejected", secret[:], err)
-	}
-	if err := session.reserveLane(join.LaneID, join.Generation, join.PathGroupID); err != nil {
+	if err := session.reserveJoinLane(join); err != nil {
 		code, class, scope := reservationRejection(err)
 		return s.rejectWebSocket(writer, join.Nonce, code, class, scope,
 			"lane generation rejected", secret[:], err)
@@ -1022,21 +1001,23 @@ func webSocketRejectionStatus(code protocol.ErrorCode) int {
 	}
 }
 
-// replayRejection preserves retryable expiry races and the caller's terminal replay disposition.
-func replayRejection(err error, class protocol.ErrorClass, scope protocol.ErrorScope) (protocol.ErrorCode, protocol.ErrorClass, protocol.ErrorScope) {
+// replayRejection maps creation replay checks to one stable protocol disposition.
+func replayRejection(err error) (protocol.ErrorCode, protocol.ErrorClass, protocol.ErrorScope) {
 	switch {
 	case errors.Is(err, auth.ErrTimestampOutsideWindow):
 		return protocol.ErrorClockSkew, protocol.ErrorRetryable, protocol.ErrorScopeLane
 	case errors.Is(err, auth.ErrReplayCacheFull):
-		return protocol.ErrorRateLimited, protocol.ErrorRetryable, scope
+		return protocol.ErrorRateLimited, protocol.ErrorRetryable, protocol.ErrorScopeSession
 	default:
-		return protocol.ErrorReplay, class, scope
+		return protocol.ErrorReplay, protocol.ErrorSessionRejected, protocol.ErrorScopeSession
 	}
 }
 
 // reservationRejection maps lane reservation state to one stable protocol disposition.
 func reservationRejection(err error) (protocol.ErrorCode, protocol.ErrorClass, protocol.ErrorScope) {
 	switch {
+	case errors.Is(err, auth.ErrTimestampOutsideWindow):
+		return protocol.ErrorClockSkew, protocol.ErrorRetryable, protocol.ErrorScopeLane
 	case errors.Is(err, ErrSessionClosed):
 		return protocol.ErrorSessionNotFound, protocol.ErrorSessionGone, protocol.ErrorScopeSession
 	case errors.Is(err, ErrLaneLimit):

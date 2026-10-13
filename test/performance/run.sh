@@ -14,8 +14,26 @@ mkdir -p "$2"
 results=$(cd "$2" && pwd)
 repetitions=${3:-3}
 case "$repetitions" in
-  ''|*[!0-9]*|0) echo "repetitions must be positive" >&2; exit 2 ;;
+  ''|0*|*[!0-9]*) echo "repetitions must be positive without leading zeros" >&2; exit 2 ;;
 esac
+duration=${WIREHOP_TEST_DURATION:-20}
+case "$duration" in
+  ''|0*|*[!0-9]*) echo "duration must be an integer of at least 20 seconds without leading zeros" >&2; exit 2 ;;
+esac
+if ! [ "$duration" -ge 20 ] 2>/dev/null; then echo "duration must be at least 20 seconds" >&2; exit 2; fi
+observe=${WIREHOP_TEST_OBSERVE:-false}
+trace=${WIREHOP_TEST_TRACE:-}
+latency=false
+set --
+if [ -n "${WIREHOP_TEST_LATENCY_BINARY:-}" ]; then
+  latency_binary=$(cd "$(dirname "$WIREHOP_TEST_LATENCY_BINARY")" && pwd)/$(basename "$WIREHOP_TEST_LATENCY_BINARY")
+  if [ ! -f "$latency_binary" ] || [ ! -x "$latency_binary" ]; then
+    echo "latency binary must be an executable regular file" >&2
+    exit 2
+  fi
+  latency=true
+  set -- -v "$latency_binary:/latency:ro"
+fi
 scripts=$(CDPATH='' cd "$(dirname "$0")/../integration" && pwd)
 image=${WIREHOP_TEST_IMAGE:-wirehop-integration}
 network=wirehop-performance-$$
@@ -34,6 +52,7 @@ trap 'exit 143' TERM
 docker network create --internal "$network" > /dev/null
 subnet=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$network")
 docker run -d --name "$router" --network "$network" --read-only --tmpfs /tmp --cap-add NET_ADMIN \
+  -v "$scripts:/test:ro" -v "$results:/results" \
   --sysctl net.ipv4.ip_forward=1 --sysctl net.ipv4.conf.all.send_redirects=0 \
   --sysctl net.ipv4.conf.default.send_redirects=0 --entrypoint sh "$image" -c 'sleep 7200' > /dev/null
 router_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$router")
@@ -54,6 +73,9 @@ for profile in HighCapacity LowCapacity; do
       case_results="$results/$profile-$repetition-$path"
       mkdir "$case_results"
       echo "$profile repetition=$repetition path=$path"
+      if [ "$observe" = true ]; then
+        docker exec -d "$router" sh /test/observe.sh router "/results/$profile-$repetition-$path"
+      fi
       docker exec -i "$router" sh -s -- "$low_rate" "$high_rate" <<'SH'
 set -eu
 tc qdisc del dev eth0 root 2>/dev/null || true
@@ -66,8 +88,11 @@ for field in sport dport; do
 done
 SH
       docker run -d --name "$server" --network "$network" --read-only --cap-add NET_ADMIN --tmpfs /tmp \
+        "$@" \
         -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$case_results:/results" \
         -e WIREHOP_TEST_ROUTED=true -e "WIREHOP_TEST_ROUTER=$router_ip" -e "WIREHOP_TEST_SUBNET=$subnet" \
+        -e "WIREHOP_TEST_OBSERVE=$observe" -e "WIREHOP_TEST_TRACE=${trace:+$trace-server}" \
+        -e "WIREHOP_TEST_LATENCY=$latency" \
         --entrypoint sh "$image" -c \
         'ip route replace "$WIREHOP_TEST_SUBNET" via "$WIREHOP_TEST_ROUTER" dev eth0
 exec sh /test/node.sh server tcp-asymmetric' > /dev/null
@@ -80,12 +105,31 @@ exec sh /test/node.sh server tcp-asymmetric' > /dev/null
       if [ "$ready" != true ]; then docker logs "$server" >&2; exit 1; fi
       server_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$server")
       docker run -d --name "$client" --network "$network" --read-only --cap-add NET_ADMIN --tmpfs /tmp \
+        "$@" \
         -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$case_results:/results" \
         -e WIREHOP_TEST_ROUTED=true -e "WIREHOP_TEST_SERVER=$server_ip" -e "WIREHOP_TEST_PATH=$path" \
+        -e "WIREHOP_TEST_OBSERVE=$observe" -e "WIREHOP_TEST_DURATION=$duration" \
+        -e "WIREHOP_TEST_TRACE=${trace:+$trace-client}" \
+        -e "WIREHOP_TEST_LATENCY=$latency" \
         -e "WIREHOP_TEST_ROUTER=$router_ip" --entrypoint sh "$image" -c \
         'ip route add "$WIREHOP_TEST_SERVER/32" via "$WIREHOP_TEST_ROUTER"
 exec sh /test/node.sh client tcp-asymmetric' > /dev/null
       status=$(docker wait "$client")
+      if [ "$observe" = true ] && [ "$status" = 0 ]; then
+        observed=false
+        for attempt in $(seq 1 50); do
+          if [ -f "$case_results/client-observations-done" ] && [ -f "$case_results/server-observations-done" ] &&
+            [ -f "$case_results/router-observations-done" ]; then
+            observed=true
+            break
+          fi
+          sleep 0.1
+        done
+        if [ "$observed" != true ]; then
+          echo "observation did not complete: $case_results" >&2
+          exit 1
+        fi
+      fi
       docker logs "$client" > "$case_results/client-container.log" 2>&1
       docker logs "$server" > "$case_results/server-container.log" 2>&1
       docker exec "$server" nstat -az > "$case_results/server-nstat.txt"
