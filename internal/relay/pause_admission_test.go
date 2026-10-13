@@ -7,6 +7,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
@@ -103,6 +104,8 @@ func TestSchedulerRunTimingPauseKeepsControlProgress(t *testing.T) {
 			}
 		}()
 		registration := schedulerRegistration(1, 1, store)
+		initialTiming := clockmap.Sample{LocalReceiveMicros: 500_000}
+		registration.InitialTiming = &initialTiming
 		controls := 0
 		registration.SendControl = func(_ protocol.Frame, complete func()) bool {
 			controls++
@@ -123,7 +126,7 @@ func TestSchedulerRunTimingPauseKeepsControlProgress(t *testing.T) {
 		}
 		leaseContext, release := context.WithCancel(ctx)
 		defer release()
-		ready, _ := scheduler.beginMeasurementDrain(leaseContext, nil)
+		ready, _ := scheduler.beginMeasurementDrain(leaseContext, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
 		synctest.Wait()
 		for _, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation} {
 			payload := relayWireGuardPacket(kind)

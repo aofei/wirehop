@@ -126,6 +126,7 @@ type schedulerEvent struct {
 type measurementDrain struct {
 	released func(time.Duration)
 	ctx      context.Context
+	target   protocol.LaneGeneration
 	ready    chan struct{}
 	valid    atomic.Bool
 	finished bool
@@ -151,6 +152,7 @@ type rateObservation struct {
 type scheduledLane struct {
 	registration         LaneRegistration
 	rttMicros            uint64
+	latestRTTMicros      uint64
 	minimumRTTMicros     uint64
 	timingReferenceRate  uint64
 	timingReferenceRTT   uint64
@@ -167,6 +169,7 @@ type scheduledLane struct {
 	probeUntil           time.Time
 	nextProbeAt          time.Time
 	probeBytes           uint64
+	probeByteLimit       uint64 // Captured when the discovery period first admits padding.
 	lastProgressAt       time.Time
 	rttObserved          bool
 	degraded             bool
@@ -227,12 +230,14 @@ func NewScheduler(ingress *packetqueue.Queue[Packet]) (*Scheduler, error) {
 
 // beginMeasurementDrain requests a session-wide data pause without blocking a carrier writer.
 // The context owns the operation. The proof publishes its fixed deadline, and released receives actual pause cost.
+// Admission samples the target generation's latest and operating RTT without changing an exposed promise afterward.
 // A saturated event queue returns nil and leaves timing unvalidated.
-func (s *Scheduler) beginMeasurementDrain(ctx context.Context, released func(time.Duration)) (<-chan struct{}, func() (time.Time, bool)) {
+func (s *Scheduler) beginMeasurementDrain(ctx context.Context, target protocol.LaneGeneration,
+	released func(time.Duration)) (<-chan struct{}, func() (time.Time, bool)) {
 	if ctx.Err() != nil || !s.pendingMeasurementDrain.CompareAndSwap(false, true) {
 		return nil, nil
 	}
-	drain := &measurementDrain{ctx: ctx, ready: make(chan struct{}), released: released}
+	drain := &measurementDrain{ctx: ctx, target: target, ready: make(chan struct{}), released: released}
 	stop := context.AfterFunc(ctx, s.notifyMeasurementChanged)
 	select {
 	case s.events <- schedulerEvent{kind: schedulerDrainData, drain: drain}:
@@ -704,7 +709,9 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 	}
 	now := time.Now()
 	active := !s.measurementStarted.IsZero()
-	if drain.ctx.Err() != nil || active && !now.Before(s.measurementDeadline) {
+	target := lanes[drain.target.LaneID]
+	validTarget := target != nil && target.registration.Generation == drain.target.Generation && !target.abandoning
+	if drain.ctx.Err() != nil || !active && !validTarget || active && !now.Before(s.measurementDeadline) {
 		started := s.measurementStarted
 		drain.finish(false)
 		s.measurementDrain = nil
@@ -743,7 +750,7 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 			return
 		}
 		s.measurementStarted = now
-		s.measurementDeadline = now.Add(measurementPauseLimit)
+		s.measurementDeadline = now.Add(measurementPauseDuration(max(target.rttMicros, target.latestRTTMicros)))
 		if deadline, ok := drain.ctx.Deadline(); ok && deadline.Before(s.measurementDeadline) {
 			s.measurementDeadline = deadline
 		}
@@ -764,6 +771,16 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 	if !drain.finished {
 		drain.finish(true)
 	}
+}
+
+// measurementPauseDuration allows four observed round trips plus scheduling headroom within the transaction limit.
+func measurementPauseDuration(rttMicros uint64) time.Duration {
+	const minimum = 250 * time.Millisecond
+	const headroom = 100 * time.Millisecond
+	if rttMicros >= uint64((measurementPauseLimit-headroom)/(4*time.Microsecond)) {
+		return measurementPauseLimit
+	}
+	return max(minimum, 4*time.Duration(rttMicros)*time.Microsecond+headroom)
 }
 
 // routeReport duplicates feedback over its own connected lane and one best alternate lane.
@@ -900,7 +917,7 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 	}
 	scheduled := false
 	for _, lane := range candidates.lanes[:candidates.count] {
-		if lane.enqueue(item, packetID, now) {
+		if lane.enqueue(item, packetID, size, now) {
 			if !control && !initialKeepalive {
 				s.recordTransportAssignment(lanes, *preferred, lane, now)
 				*preferred = lane.registration.LaneID
@@ -1058,17 +1075,9 @@ func (l *scheduledLane) retentionDelay(bytes uint64) uint64 {
 	return base + queueMicros
 }
 
-// enqueue retains one newly identified packet after successful store admission.
-func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64, now time.Time) bool {
+// enqueue retains one newly identified packet using the encoded size already validated by the scheduler.
+func (l *scheduledLane) enqueue(item *packetqueue.Item[Packet], packetID uint64, size int, now time.Time) bool {
 	packet := item.Value.Retain()
-	data := protocol.Data{
-		PacketID: packetID, DeadlineMicros: uint64(item.Deadline.UnixMicro()), Payload: packet.Payload,
-	}
-	size, err := protocol.DataFrameSize(data)
-	if err != nil {
-		packet.Release()
-		return false
-	}
 	budget, ok := item.TakeRetention(size)
 	if !ok {
 		packet.Release()
@@ -1236,6 +1245,7 @@ func (l *scheduledLane) applyRoundTrip(roundTrip uint64, revalidated bool) {
 	if roundTrip == 0 {
 		return
 	}
+	l.latestRTTMicros = roundTrip
 	if revalidated || l.minimumRTTMicros == 0 || roundTrip < l.minimumRTTMicros {
 		l.minimumRTTMicros = roundTrip
 	}

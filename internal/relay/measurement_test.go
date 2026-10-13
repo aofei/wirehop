@@ -1,12 +1,14 @@
 package relay
 
 import (
+	"context"
 	"errors"
 	"math"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
@@ -65,6 +67,9 @@ func TestMeasurementCoordinatorParallelPreparation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := newMeasurementFixture(t, true, 1)
 		server := newMeasurementFixture(t, false, 1)
+		for _, endpoint := range []*measurementFixture{client, server} {
+			endpoint.lanes[1].applyTiming(clockmap.Sample{LocalReceiveMicros: 1_200_000}, false)
+		}
 		client.commit(t, 1)
 		client.scheduler.RequestMeasurement(client.target)
 		client.apply(t)
@@ -111,6 +116,78 @@ func TestMeasurementCoordinatorParallelPreparation(t *testing.T) {
 	})
 }
 
+func TestMeasurementCoordinatorAbruptRTTIncrease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := newMeasurementFixture(t, true, 1)
+		server := newMeasurementFixture(t, false, 1)
+		for _, endpoint := range []*measurementFixture{client, server} {
+			lane := endpoint.lanes[1]
+			lane.applyTiming(clockmap.Sample{LocalReceiveMicros: 600_000}, false)
+			if lane.minimumRTTMicros != 10_000 || lane.rttMicros != 83_750 || lane.latestRTTMicros != 600_000 {
+				t.Fatal("ordinary RTT increase changed the minimum or bypassed operating RTT smoothing")
+			}
+		}
+		client.scheduler.RequestMeasurement(client.target)
+		client.apply(t)
+		budget := time.Until(client.scheduler.measurementDeadline)
+		if budget != 2500*time.Millisecond {
+			t.Fatalf("first-step pause budget = %s, want 2.5 seconds", budget)
+		}
+		begin := client.write(t, 0)
+		time.Sleep(300 * time.Millisecond)
+		begin.deliver(t, server, 300_000)
+		server.apply(t)
+		ready := server.write(t, 300_000)
+		time.Sleep(300 * time.Millisecond)
+		ready.deliver(t, client, 600_000)
+		probe := client.write(t, 600_000)
+		time.Sleep(300 * time.Millisecond)
+		probe.deliver(t, server, 900_000)
+		reply := server.write(t, 900_000)
+		time.Sleep(300 * time.Millisecond)
+		reply.deliver(t, client, 1_200_000)
+		if client.lanes[1].minimumRTTMicros != 10_000 || server.lanes[1].minimumRTTMicros != 10_000 {
+			t.Fatal("unpublished measurement raised the minimum RTT")
+		}
+		client.apply(t)
+		result := client.write(t, 1_200_000)
+		if !result.value.Valid || client.lanes[1].minimumRTTMicros != 600_000 {
+			t.Fatal("first measurement after an abrupt increase expired before validating the actual RTT")
+		}
+		result.sent()
+		client.apply(t)
+		time.Sleep(300 * time.Millisecond)
+		result.deliver(t, server, 1_500_000)
+		server.apply(t)
+		if client.paused() || server.paused() || server.lanes[1].minimumRTTMicros != 600_000 {
+			t.Fatal("first RTT-step measurement did not complete independently at both endpoints")
+		}
+		lane := client.lanes[1]
+		low := clockmap.Sample{LocalReceiveMicros: 10_000}
+		lane.applyTiming(low, false)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		_, proof := client.scheduler.beginMeasurementDrain(ctx, client.target, nil)
+		client.apply(t)
+		deadline, valid := proof()
+		if !valid || time.Until(deadline) >= budget || lane.latestRTTMicros != 10_000 {
+			t.Fatal("later low RTT retained the old step's larger pause budget")
+		}
+		cancel()
+		client.apply(t)
+		for range 32 {
+			lane.applyTiming(low, false)
+		}
+		ctx, cancel = context.WithCancel(t.Context())
+		defer cancel()
+		_, proof = client.scheduler.beginMeasurementDrain(ctx, client.target, nil)
+		client.apply(t)
+		if deadline, valid := proof(); !valid || time.Until(deadline) != 250*time.Millisecond {
+			t.Fatal("converged low RTT did not restore the minimum pause budget")
+		}
+	})
+}
+
 func TestMeasurementCoordinatorTimeout(t *testing.T) {
 	for stop, phase := range []string{"QueuedBegin", "AwaitReady", "QueuedReady", "ExposedReady", "QueuedProbe", "ExposedProbe", "QueuedReply", "ExposedReply", "QueuedResult", "ExposedResult"} {
 		t.Run(phase, func(t *testing.T) {
@@ -134,7 +211,7 @@ func TestMeasurementCoordinatorTimeout(t *testing.T) {
 						client.apply(t)
 					}
 				}
-				time.Sleep(measurementPauseLimit)
+				time.Sleep(measurementPauseDuration(client.lanes[1].rttMicros))
 				for _, endpoint := range []*measurementFixture{client, server} {
 					endpoint.apply(t)
 					if endpoint.paused() || endpoint.scheduler.measurements.active != nil {
@@ -188,6 +265,7 @@ func TestMeasurementCoordinatorOwnership(t *testing.T) {
 	t.Run("DuplicateBeginNeverExtendsDeadline", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			server := newMeasurementFixture(t, false, 1)
+			server.lanes[1].rttMicros = 1_000_000
 			begin := protocol.Measurement{Kind: protocol.MeasurementBegin, ID: 7}
 			server.receive(t, server.target, begin, 1)
 			server.apply(t)
@@ -476,6 +554,7 @@ func TestMeasurementCoordinatorPauseCost(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				client := newMeasurementFixture(t, true, 1)
+				client.lanes[1].rttMicros = 500_000
 				wait := time.Second
 				if test.expire {
 					wait = measurementPauseLimit
@@ -616,6 +695,8 @@ func TestMeasurementCoordinatorRequiresUnrelatedCommittedPrefix(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := newMeasurementFixture(t, true, 2)
 		server := newMeasurementFixture(t, false, 2)
+		client.lanes[1].rttMicros = 300_000
+		server.lanes[1].rttMicros = 300_000
 		client.commit(t, 2)
 		client.scheduler.RequestMeasurement(client.target)
 		client.apply(t)

@@ -275,6 +275,147 @@ func BenchmarkSelectCandidates(b *testing.B) {
 	})
 }
 
+func BenchmarkSchedulerSelectTransportCandidates(b *testing.B) {
+	for _, tt := range []struct {
+		name          string
+		lanes         int
+		slower        bool
+		faster        bool
+		queuedPrimary bool
+		fullPrimary   bool
+		maximumScore  uint64
+		wantCandidate protocol.LaneID
+	}{
+		{name: "Single", lanes: 1, wantCandidate: 1},
+		{name: "EqualPair", lanes: 2, wantCandidate: 1},
+		{name: "SlowerPair", lanes: 2, slower: true, wantCandidate: 1},
+		{name: "EqualSixteen", lanes: 16, wantCandidate: 1},
+		{name: "SlowerSixteen", lanes: 16, slower: true, wantCandidate: 1},
+		{name: "FasterHighDelayAlternative", lanes: 16, faster: true, wantCandidate: 1},
+		{name: "FasterAlternativeUnderLoad", lanes: 16, faster: true, queuedPrimary: true, wantCandidate: 16},
+		{name: "DeadlineRejectedAlternative", lanes: 16, faster: true, maximumScore: 1000, wantCandidate: 1},
+		{name: "FullPrimary", lanes: 16, fullPrimary: true},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			now := time.UnixMicro(1 << 40)
+			lanes := benchmarkTransportLanes(b, tt.lanes, now)
+			for laneID, lane := range lanes {
+				if tt.slower && laneID != 1 {
+					lane.deliveryRate /= 2
+				}
+			}
+			if tt.faster {
+				lanes[protocol.LaneID(tt.lanes)].deliveryRate *= 2
+			}
+			if tt.queuedPrimary {
+				store := lanes[1].registration.Store
+				for index := range 20 {
+					transmission := schedulerTransmission(uint64(index+1), wgpacket.TransportData, now.Add(time.Second))
+					transmission.packet.Payload = make([]byte, 4096)
+					copy(transmission.packet.Payload, relayWireGuardPacket(wgpacket.TransportData))
+					if err := store.pushAt(transmission, now); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+			if tt.fullPrimary {
+				store := lanes[1].registration.Store
+				store.limits.Packets = 1
+				if err := store.push(schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))); err != nil {
+					b.Fatal(err)
+				}
+			}
+			maximumScore := tt.maximumScore
+			if maximumScore == 0 {
+				maximumScore = math.MaxUint64
+			}
+			var scheduler Scheduler
+			b.ReportAllocs()
+			for b.Loop() {
+				selected := scheduler.selectTransportCandidates(lanes, 1, 1500, maximumScore, now)
+				if tt.wantCandidate == 0 {
+					if selected.count != 0 || selected.available {
+						b.Fatalf("selection = %+v, want no available candidate", selected)
+					}
+					continue
+				}
+				if selected.count != 1 || selected.lanes[0].registration.LaneID != tt.wantCandidate {
+					b.Fatalf("selection = %+v, want lane %d", selected, tt.wantCandidate)
+				}
+				benchmarkCandidateSink = uint64(selected.lanes[0].registration.LaneID)
+			}
+		})
+	}
+}
+
+func BenchmarkSchedulerScheduleCycle(b *testing.B) {
+	for _, tt := range []struct {
+		name    string
+		lanes   int
+		payload int
+	}{
+		{name: "SingleSmall", lanes: 1, payload: 32},
+		{name: "SingleMTU", lanes: 1, payload: 1452},
+		{name: "SixteenSmall", lanes: 16, payload: 32},
+		{name: "SixteenMTU", lanes: 16, payload: 1452},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			now := time.UnixMicro(1 << 40)
+			lanes := benchmarkTransportLanes(b, tt.lanes, now)
+			store := lanes[1].registration.Store
+			payload := make([]byte, tt.payload)
+			copy(payload, relayWireGuardPacket(wgpacket.TransportData))
+			deadline := now.Add(time.Second)
+			preferred := protocol.LaneID(1)
+			scheduler := Scheduler{packetID: 1 << 28}
+			var batch [1]protocol.Data
+			var ownership [1]datagram.Packet
+			var item packetqueue.Item[Packet]
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				item = packetqueue.Item[Packet]{
+					Value: Packet{Packet: datagram.Packet{Kind: wgpacket.TransportData, Payload: payload}},
+					Size:  len(payload), Deadline: deadline,
+				}
+				if scheduled, err := scheduler.schedule(lanes, &preferred, &item, now); err != nil || !scheduled {
+					b.Fatalf("schedule() = %t, %v", scheduled, err)
+				}
+				if preferred != 1 {
+					b.Fatalf("preferred lane = %d, want 1", preferred)
+				}
+				count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes)
+				if err != nil || count != 1 || batch[0].PacketID != scheduler.packetID {
+					b.Fatalf("takeBatch() = %d, %v, packet ID %d, want %d", count, err, batch[0].PacketID, scheduler.packetID)
+				}
+				releaseBatchOwnership(ownership[:count])
+				if _, stale, err := store.acknowledge(store.sentPackets, uint64(now.UnixMicro())); err != nil || stale {
+					b.Fatalf("acknowledge() = stale %t, %v", stale, err)
+				}
+			}
+		})
+	}
+}
+
+func benchmarkTransportLanes(b *testing.B, count int, now time.Time) map[protocol.LaneID]*scheduledLane {
+	b.Helper()
+	lanes := make(map[protocol.LaneID]*scheduledLane, count)
+	for index := range count {
+		store, err := newTransmissionStore(packetqueue.Limits{Packets: 256, Bytes: 2 * 1024 * 1024},
+			func() time.Time { return now })
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { releaseTransmissions(store.drain()) })
+		laneID := protocol.LaneID(index + 1)
+		lanes[laneID] = &scheduledLane{
+			registration: LaneRegistration{LaneID: laneID, Generation: 1, PathGroupID: protocol.PathGroupID(index + 1), Store: store},
+			rttMicros:    uint64(10_000 + index*1000), deliveryRate: 10_000_000, rateObserved: true,
+		}
+	}
+	return lanes
+}
+
 func BenchmarkTransmissionStoreCycle(b *testing.B) {
 	b.Run("Local", func(b *testing.B) { benchmarkTransmissionStoreCycle(b, nil) })
 	budget, err := retention.NewBudget(retention.Limits{Packets: 1024, Bytes: 16 * 1024 * 1024})

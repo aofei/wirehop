@@ -557,8 +557,8 @@ func TestSchedulerSlowProbeStaysSingleFrameAndRefreshes(t *testing.T) {
 }
 
 func TestSchedulerSelectTransportCandidatesCapacity(t *testing.T) {
-	first := schedulerLane(t, 1, 1, 10_000, 1_000_000)
-	second := schedulerLane(t, 2, 2, 300_000, 10_000_000)
+	first := schedulerLane(t, 1, 1, 300_000, 1_000_000)
+	second := schedulerLane(t, 2, 2, 10_000, 10_000_000)
 	lanes := map[protocol.LaneID]*scheduledLane{1: first, 2: second}
 	t.Cleanup(func() { releaseTransmissions(first.registration.Store.drain()) })
 	t.Cleanup(func() { releaseTransmissions(second.registration.Store.drain()) })
@@ -830,7 +830,7 @@ func TestSchedulerProbeBudgetAndCooldown(t *testing.T) {
 			t.Fatalf("probe feedback retained capacity: %+v", got)
 		}
 	}
-	if second.probeBytes > maximumTransportProbeBytes || maximumTransportProbeBytes-second.probeBytes >= 4101 {
+	if second.probeBytes > baseTransportProbeBytes || baseTransportProbeBytes-second.probeBytes >= 4101 {
 		t.Fatalf("probe byte cap = %d", second.probeBytes)
 	}
 	now = second.nextProbeAt.Add(-time.Microsecond)
@@ -840,7 +840,7 @@ func TestSchedulerProbeBudgetAndCooldown(t *testing.T) {
 	}
 	now = second.nextProbeAt
 	scheduler.lastTransportAt = now
-	if !scheduler.fillTransportProbe(lanes, 1, now, 0) || second.probeBytes >= maximumTransportProbeBytes {
+	if !scheduler.fillTransportProbe(lanes, 1, now, 0) || second.probeBytes >= baseTransportProbeBytes {
 		t.Fatal("active traffic did not restart a fresh bounded period")
 	}
 	releaseTransmissions(second.registration.Store.drain())
@@ -1178,6 +1178,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	old.probeUntil = now.Add(minimumTransportProbeDuration)
 	old.nextProbeAt = old.probeUntil.Add(transportProbeInterval)
 	old.probeBytes = 4101
+	old.probeByteLimit = baseTransportProbeBytes
 	if err := oldStore.push(retainedTransmission{deadlineMicros: uint64(old.probeUntil.UnixMicro()),
 		packet: datagram.Packet{Payload: probePadding[:]}}); err != nil {
 		t.Fatal(err)
@@ -1220,7 +1221,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 		t.Fatal("replacement did not close the old store")
 	}
 	fresh := lanes[1]
-	if !fresh.probeUntil.IsZero() || !fresh.nextProbeAt.IsZero() || fresh.probeBytes != 0 ||
+	if !fresh.probeUntil.IsZero() || !fresh.nextProbeAt.IsZero() || fresh.probeBytes != 0 || fresh.probeByteLimit != 0 ||
 		fresh.rateHistoryCount != 0 || fresh.rateHistory != ([5]rateObservation{}) || fresh.rateObserved {
 		t.Fatal("replacement inherited old capacity-discovery state")
 	}
@@ -1295,7 +1296,7 @@ func TestSchedulerPromotionPreservesActiveProbe(t *testing.T) {
 	if !scheduler.fillTransportProbe(lanes, 2, now, 0) || second.probeBytes <= 4101 {
 		t.Fatal("primary selection stopped an incomplete capacity measurement")
 	}
-	if second.probeUntil != until || second.probeBytes > maximumTransportProbeBytes {
+	if second.probeUntil != until || second.probeBytes > baseTransportProbeBytes {
 		t.Fatal("primary discovery exceeded its original period or byte cap")
 	}
 	now = until

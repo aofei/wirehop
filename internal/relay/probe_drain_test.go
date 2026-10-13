@@ -34,7 +34,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 				cancel()
 				scheduler.updateMeasurementDrain(lanes)
 			}()
-			ready, valid := scheduler.beginMeasurementDrain(ctx, nil)
+			ready, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
 			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
 			if measurementDrainValid(valid) {
 				t.Error("pending refresh published a pause proof during active discovery")
@@ -107,7 +107,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 				cancel()
 				scheduler.updateMeasurementDrain(lanes)
 			}()
-			_, valid := scheduler.beginMeasurementDrain(ctx, nil)
+			_, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
 			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
 			if !measurementDrainValid(valid) {
 				t.Fatal("empty session did not enter a validated timing pause")
@@ -139,7 +139,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			lanes[3] = fresh
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			ready, valid := scheduler.beginMeasurementDrain(ctx, nil)
+			ready, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
 			for _, applied := range []bool{false, true} {
 				if applied {
 					scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
@@ -188,7 +188,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 				cancel()
 				scheduler.updateMeasurementDrain(lanes)
 			}()
-			ready, valid := scheduler.beginMeasurementDrain(ctx, nil)
+			ready, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
 			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
 			if measurementDrainValid(valid) || scheduler.measurementDrain == nil || scheduler.measurementTimer == nil {
 				t.Fatal("active discovery did not retain an applied timing waiter and its timer")

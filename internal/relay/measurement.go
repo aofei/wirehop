@@ -122,7 +122,8 @@ func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), measurementPauseLimit)
 	a := &measurementAttempt{id: id, peer: peer, ctx: ctx, cancel: cancel}
 	m.active = a
-	a.ready, a.proof = m.scheduler.beginMeasurementDrain(ctx, func(cost time.Duration) { m.released(a, cost) })
+	target := protocol.LaneGeneration{LaneID: peer.LaneID, Generation: peer.Generation}
+	a.ready, a.proof = m.scheduler.beginMeasurementDrain(ctx, target, func(cost time.Duration) { m.released(a, cost) })
 	if a.ready == nil {
 		m.active = nil
 		m.nextAt = time.Now().Add(measurementRetryInterval)

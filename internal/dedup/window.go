@@ -69,6 +69,10 @@ func (w *Window) Observe(sequence uint64) Result {
 // advance clears ring positions that no longer identify retained sequence numbers.
 func (w *Window) advance(sequence uint64) {
 	distance := sequence - w.highest
+	// Observe immediately sets the only newly exposed ring position on a consecutive advance.
+	if distance == 1 {
+		return
+	}
 	if distance >= w.capacity {
 		clear(w.bits)
 		return

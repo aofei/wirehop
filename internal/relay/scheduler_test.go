@@ -1546,7 +1546,7 @@ func TestScheduledLaneTransfersAggregateCapacity(t *testing.T) {
 				t.Fatal(err)
 			}
 			lane := &scheduledLane{registration: LaneRegistration{Store: store}}
-			if queued := lane.enqueue(&item, 1, monotime.Time(1000)); queued != test.wantQueued {
+			if queued := lane.enqueue(&item, 1, encodedSize, monotime.Time(1000)); queued != test.wantQueued {
 				t.Fatalf("enqueue() = %t, want %t", queued, test.wantQueued)
 			}
 			if test.wantQueued {
@@ -2211,6 +2211,7 @@ func schedulerLaneWithLimits(t *testing.T, id, group byte, rtt, rate uint64,
 	lane := &scheduledLane{
 		registration: schedulerRegistration(id, group, store),
 		rttMicros:    rtt, deliveryRate: rate, rttObserved: true, rateObserved: true,
+		probeByteLimit: baseTransportProbeBytes,
 	}
 	store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
 	lane.registration.SendDeliveryReport = func(report protocol.DeliveryReport, _ time.Time, sent func()) bool {

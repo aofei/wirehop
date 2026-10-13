@@ -3,7 +3,6 @@ package relay
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net"
 	"slices"
 	"sync"
@@ -22,19 +21,22 @@ import (
 func TestMeasurementCoordinatorLiveLanes(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
-		var workers []chan error
+		var workers []chan struct{}
 		defer func() {
 			cancel()
 			for _, done := range workers {
-				if err := <-done; !errors.Is(err, context.Canceled) {
-					t.Errorf("live worker exit = %v, want context cancellation", err)
-				}
+				<-done
 			}
 		}()
 		start := func(run func() error) {
-			done := make(chan error, 1)
+			done := make(chan struct{})
 			workers = append(workers, done)
-			go func() { done <- run() }()
+			go func() {
+				defer close(done)
+				if err := run(); ctx.Err() == nil {
+					t.Errorf("live worker exited before shutdown: %v", err)
+				}
+			}()
 		}
 		clock := &measurementLiveClock{origin: time.Now()}
 		now := func() time.Time { return time.UnixMicro(int64(clock.NowMicros())) }

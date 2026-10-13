@@ -126,7 +126,7 @@ func TestScheduledLaneApplyTimingClampsZero(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var lane scheduledLane
 			lane.applyTiming(tt.sample, true)
-			if lane.minimumRTTMicros != 1 || lane.rttMicros != 1 {
+			if lane.minimumRTTMicros != 1 || lane.rttMicros != 1 || lane.latestRTTMicros != 1 {
 				t.Fatalf("minimum = %d, RTT = %d, want positive clamped timing", lane.minimumRTTMicros, lane.rttMicros)
 			}
 		})
@@ -146,6 +146,7 @@ func TestScheduledLaneApplyTimingRejectsNegativeRTT(t *testing.T) {
 			lane.minimumRTTMicros = 100_000
 			lane.timingReferenceRate = 900_000
 			lane.timingReferenceRTT = 150_000
+			lane.latestRTTMicros = 150_000
 			window := lane.deliveryWindowBytes()
 			// A one-microsecond clock-rate difference over a long peer wait is not a path RTT.
 			lane.applyTiming(clockmap.Sample{
@@ -153,7 +154,7 @@ func TestScheduledLaneApplyTimingRejectsNegativeRTT(t *testing.T) {
 				RemoteReceiveMicros: 200, RemoteSendMicros: 5_000_201,
 			}, tt.revalidated)
 			if lane.minimumRTTMicros != 100_000 || lane.rttMicros != 100_000 || lane.deliveryWindowBytes() != window ||
-				lane.timingReferenceRate != 900_000 || lane.timingReferenceRTT != 150_000 {
+				lane.timingReferenceRate != 900_000 || lane.timingReferenceRTT != 150_000 || lane.latestRTTMicros != 150_000 {
 				t.Fatal("negative RTT changed the minimum, operating point, delivery window, or retry evidence")
 			}
 		})

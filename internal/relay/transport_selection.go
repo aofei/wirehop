@@ -19,8 +19,8 @@ const (
 	minimumTransportProbeDuration = 4 * time.Second
 	// maximumTransportProbeDuration bounds discovery on very high-delay paths.
 	maximumTransportProbeDuration = 8 * time.Second
-	// maximumTransportProbeBytes bounds the total padding sent in one discovery period.
-	maximumTransportProbeBytes = 2 * 1024 * 1024
+	// baseTransportProbeBytes bounds discovery unless one path receives an incumbent-sized capacity sample.
+	baseTransportProbeBytes = 2 * 1024 * 1024
 	// minimumTransportHoldDuration prevents repeated primary changes while the inner flow adjusts to a new RTT.
 	minimumTransportHoldDuration = 2 * time.Second
 	// maximumTransportHoldDuration bounds primary hysteresis on very high-delay paths.
@@ -57,13 +57,34 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 	}
 	if !holding {
 		var best *scheduledLane
+		var promotionScoreLimit uint64
+		promotionLimitSet := false
 		for _, candidate := range lanes {
 			if candidate == primary || candidate.degraded || candidate.abandoning || !candidate.rateObserved ||
-				frameBytes > uint64(candidate.registration.Store.limits.Bytes) || candidate.score(frameBytes) >= maximumScore {
+				frameBytes > uint64(candidate.registration.Store.limits.Bytes) {
 				continue
 			}
 			faster := candidate.deliveryRate > saturatingAdd(primary.deliveryRate, primary.deliveryRate/4)
-			if !faster {
+			if !faster || !candidate.canAccept(frameBytes) {
+				continue
+			}
+			score := candidate.score(frameBytes)
+			if score >= maximumScore {
+				continue
+			}
+			if !promotionLimitSet {
+				promotionScoreLimit = math.MaxUint64
+				gap := now.Sub(s.lastTransportAt)
+				if s.lastTransportAt.IsZero() ||
+					gap > time.Duration(frameBytes*uint64(time.Second)/primary.deliveryRate) {
+					promotionScoreLimit = primary.score(frameBytes)
+				}
+				promotionLimitSet = true
+			}
+			// Isolated or regularly spaced packets need a completion improvement. Offering another
+			// packet within its primary serialization time permits immediate capacity promotion.
+			// Finite bursts and mixed packet sizes can also satisfy this direction-local signal.
+			if score >= promotionScoreLimit {
 				continue
 			}
 			if best == nil || candidate.deliveryRate > best.deliveryRate ||
@@ -96,7 +117,12 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 	waitingDrain := s.measurementDrain != nil || s.pendingMeasurementDrain.Load()
 	var group protocol.PathGroupID
 	distinct := false
+	// Fund one complete larger sample instead of splitting it into inconclusive samples across many paths.
+	boostedPeriod := false
 	for _, lane := range lanes {
+		if now.Before(lane.probeUntil) && lane.probeByteLimit > baseTransportProbeBytes {
+			boostedPeriod = true
+		}
 		if lane.degraded || lane.abandoning {
 			continue
 		}
@@ -104,7 +130,6 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 			group = lane.registration.PathGroupID
 		} else if lane.registration.PathGroupID != group {
 			distinct = true
-			break
 		}
 	}
 	if !distinct {
@@ -121,7 +146,7 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 		if candidate.degraded || candidate.abandoning || candidate.registration.LaneID == preferred && !active {
 			continue
 		}
-		if active && candidate.probeBytes+uint64(size) > maximumTransportProbeBytes {
+		if active && saturatingAdd(candidate.probeBytes, uint64(size)) > candidate.probeByteLimit {
 			continue
 		}
 		if !active && (now.Before(candidate.nextProbeAt) || !candidate.nextProbeAt.IsZero() &&
@@ -168,6 +193,13 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 		probe.probeBytes = 0
 	}
 	limit := probe.probeWindowBytes(reserveBytes)
+	byteBudget := probe.probeByteLimit
+	if !now.Before(probe.probeUntil) {
+		byteBudget = baseTransportProbeBytes
+		if !boostedPeriod {
+			byteBudget = probe.transportProbeByteBudget(lanes[preferred])
+		}
+	}
 	singleProbe := !probe.rateObserved || probe.deliveryWindowBytes() < minimumDeliveryWindow+2*uint64(size)
 	progressed := false
 	s.lastProbeLane = probe.registration.LaneID
@@ -187,7 +219,7 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 			break
 		}
 		if bytes > limit || uint64(size) > limit-bytes || !probe.registration.Store.canAccept(uint64(size)) ||
-			probe.probeBytes+uint64(size) > maximumTransportProbeBytes {
+			saturatingAdd(probe.probeBytes, uint64(size)) > byteBudget {
 			break
 		}
 		transmission := retainedTransmission{deadlineMicros: uint64(deadline.UnixMicro()), packet: datagram.Packet{Payload: probePadding[:]}}
@@ -195,7 +227,7 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 			break
 		}
 		if !now.Before(probe.probeUntil) {
-			probe.probeBytes = 0
+			probe.probeByteLimit = byteBudget
 			probe.probeUntil = deadline
 			probe.nextProbeAt = deadline.Add(transportProbeInterval)
 		}
@@ -206,6 +238,21 @@ func (s *Scheduler) fillTransportProbe(lanes map[protocol.LaneID]*scheduledLane,
 		}
 	}
 	return progressed
+}
+
+// transportProbeByteBudget funds four feedback cycles at the incumbent's promotion threshold.
+// The startup allowance remains available for small stores, while large samples never exceed one hard store capacity.
+func (l *scheduledLane) transportProbeByteBudget(primary *scheduledLane) uint64 {
+	if primary == nil {
+		return baseTransportProbeBytes
+	}
+	maximum := max(uint64(baseTransportProbeBytes), uint64(l.registration.Store.limits.Bytes))
+	rate := saturatingAdd(primary.deliveryRate, primary.deliveryRate/4)
+	horizon := l.deliveryWindowHorizonMicros()
+	if horizon == math.MaxUint64 || rate > math.MaxUint64/horizon {
+		return maximum
+	}
+	return min(maximum, max(uint64(baseTransportProbeBytes), rate*horizon/1_000_000))
 }
 
 // probeRepresentatives selects one healthy lane per group in reusable scratch storage.
