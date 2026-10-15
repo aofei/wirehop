@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/netip"
 	neturl "net/url"
 	"strings"
@@ -100,6 +101,55 @@ func TestSecureWebSocketRelay(t *testing.T) {
 	laneURL, clientTLS, stopServer := startWebSocketServer(t, token, []netip.AddrPort{target}, true)
 	defer stopServer()
 	testRelay(t, laneURL, target, token, clientTLS)
+}
+
+func TestWebSocketRelayThroughReverseProxy(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		secureFrontend bool
+		secureBackend  bool
+	}{
+		{name: "WSToWS"},
+		{name: "WSToWSS", secureBackend: true},
+		{name: "WSSToWS", secureFrontend: true},
+		{name: "WSSToWSS", secureFrontend: true, secureBackend: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			target, stopTarget := startEchoTarget(t)
+			defer stopTarget()
+			token := []byte("reverse-proxy-test-token")
+			instance := newServer(t, token, []netip.AddrPort{target})
+			laneURL, backendTLS, stopBackend := startWebSocketServerInstance(t, instance, tt.secureBackend)
+			defer stopBackend()
+			upstreamURL, err := neturl.Parse("http" + strings.TrimPrefix(strings.TrimSuffix(laneURL, "/_wirehop"), "ws"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			defer transport.CloseIdleConnections()
+			transport.TLSClientConfig = backendTLS
+			proxy := httputil.NewSingleHostReverseProxy(upstreamURL)
+			proxy.Transport = transport
+			frontend := httptest.NewUnstartedServer(proxy)
+			var frontendTLS *tls.Config
+			if tt.secureFrontend {
+				frontend.StartTLS()
+				roots := x509.NewCertPool()
+				roots.AddCert(frontend.Certificate())
+				frontendTLS = &tls.Config{RootCAs: roots}
+			} else {
+				frontend.Start()
+			}
+			defer frontend.Close()
+			// Reverse-proxy routing must preserve the escaped path authenticated by the client.
+			url := "ws" + strings.TrimPrefix(frontend.URL, "http") + "/%2Fwirehop"
+			testRelay(t, url, target, token, frontendTLS)
+			waitForServer(t, func(snapshot server.Snapshot) bool {
+				return snapshot.Sessions == 0 && snapshot.PendingAdmissions == 0 &&
+					snapshot.RetainedPackets == 0 && snapshot.RetainedBytes == 0
+			}, instance)
+		})
+	}
 }
 
 func TestWebSocketHMACReconnect(t *testing.T) {

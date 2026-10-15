@@ -102,6 +102,45 @@ func TestRemote(t *testing.T) {
 	packet.Release()
 }
 
+func TestRemoteReadBatchCancellation(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		expired bool
+	}{
+		{name: "Canceled"},
+		{name: "Expired", expired: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := wireGuardPacket(4, 32)
+			remote := &Remote{pending: remoteRead{count: 1}}
+			remote.pending.packets[0] = ownPacket(wgpacket.TransportData, payload)
+			defer remote.pending.release()
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if tt.expired {
+				ctx, cancel = context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+			} else {
+				ctx, cancel = context.WithCancel(t.Context())
+				cancel()
+			}
+			defer cancel()
+			var packets [1]Packet
+			count, err := remote.ReadBatch(ctx, packets[:])
+			if count > 0 {
+				packets[0].Release()
+			}
+			if count != 0 || !errors.Is(err, ctx.Err()) {
+				t.Fatalf("canceled read = %d packets, %v, want no packets and %v", count, err, ctx.Err())
+			}
+			count, err = remote.ReadBatch(t.Context(), packets[:])
+			if count != 1 || err != nil || string(packets[0].Payload) != string(payload) {
+				t.Fatalf("read after cancellation = %d packets, %v", count, err)
+			}
+			packets[0].Release()
+		})
+	}
+}
+
 func TestRemotePreservesReserved(t *testing.T) {
 	peer := listenUDP(t)
 	endpoint, err := targetpkg.FromAddrPort(peer.LocalAddr().(*net.UDPAddr).AddrPort())

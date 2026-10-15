@@ -30,7 +30,8 @@ disabled because WireGuard ciphertext is not usefully compressible.
 
 `ws://` and `wss://` lanes honor the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables. Secure
 WebSocket lanes use HTTPS proxy selection and a CONNECT tunnel through HTTP or HTTPS proxies. Selected `socks5` and
-`socks5h` proxy URLs use native SOCKS tunneling.
+`socks5h` proxy URLs use native SOCKS tunneling. SOCKS user info requires a 1-255 byte username and a password of at
+most 255 bytes.
 
 A reverse proxy must preserve the exact path, admission request headers, WebSocket Upgrade, selected subprotocol, and
 `WireHop-Rejection` response header. It must not cache or intercept WireHop admission responses. For nginx, use

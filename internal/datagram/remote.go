@@ -154,17 +154,25 @@ func (e *Remote) Read(ctx context.Context) (Packet, error) {
 	return Packet{}, err
 }
 
-// ReadBatch returns an accepted target packet vector from either address family.
+// ReadBatch returns an accepted target packet vector from either address family. An already canceled context leaves
+// pending packets untouched.
 func (e *Remote) ReadBatch(ctx context.Context, packets []Packet) (int, error) {
 	if len(packets) == 0 {
 		return 0, nil
 	}
 	e.readMu.Lock()
 	defer e.readMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if e.pendingOffset < e.pending.count {
 		return e.consumePending(packets), nil
 	}
 	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-e.ctx.Done():
+		return 0, e.ctx.Err()
 	case result := <-e.reads:
 		if result.err != nil {
 			return 0, result.err
@@ -172,10 +180,6 @@ func (e *Remote) ReadBatch(ctx context.Context, packets []Packet) (int, error) {
 		e.pending = result
 		e.pendingOffset = 0
 		return e.consumePending(packets), nil
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	case <-e.ctx.Done():
-		return 0, e.ctx.Err()
 	}
 }
 

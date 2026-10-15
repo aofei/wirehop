@@ -1369,6 +1369,13 @@ func webSocketProxyAddress(proxy *neturl.URL) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported WebSocket proxy scheme %q", proxy.Scheme)
 	}
+	if (proxy.Scheme == "socks5" || proxy.Scheme == "socks5h") && proxy.User != nil {
+		username := proxy.User.Username()
+		password, _ := proxy.User.Password()
+		if len(username) == 0 || len(username) > 255 || len(password) > 255 {
+			return "", errors.New("SOCKS proxy username must contain 1-255 bytes and password must contain at most 255 bytes")
+		}
+	}
 	hostname := proxy.Hostname()
 	if hostname == "" {
 		return "", errors.New("WebSocket proxy has no host")

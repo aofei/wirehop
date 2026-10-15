@@ -933,6 +933,13 @@ func TestWebSocketFirstHopNormalizesProxyScheme(t *testing.T) {
 		{proxy: "http://proxy.example:00080", want: "proxy.example:80"},
 		{proxy: "socks5://proxy.example", want: "proxy.example:1080"},
 		{proxy: "socks5h://proxy.example", want: "proxy.example:1080"},
+		{proxy: "socks5://user@proxy.example", want: "proxy.example:1080"},
+		{proxy: "socks5h://user:@proxy.example", want: "proxy.example:1080"},
+		{proxy: "socks5://" + strings.Repeat("u", 255) + ":" + strings.Repeat("p", 255) + "@proxy.example", want: "proxy.example:1080"},
+		{proxy: "socks5h://" + strings.Repeat("u", 255) + ":" + strings.Repeat("p", 255) + "@proxy.example", want: "proxy.example:1080"},
+		{proxy: "socks5://" + neturl.User(strings.Repeat("\xc3\xa9", 127)).String() + "@proxy.example", want: "proxy.example:1080"},
+		{proxy: "socks5h://" + neturl.UserPassword("user", strings.Repeat("\xc3\xa9", 127)).String() + "@proxy.example", want: "proxy.example:1080"},
+		{proxy: "http://" + strings.Repeat("u", 256) + ":" + strings.Repeat("p", 256) + "@proxy.example", want: "proxy.example:80"},
 	} {
 		proxyURL, err := neturl.Parse(test.proxy)
 		if err != nil {
@@ -962,6 +969,14 @@ func TestValidateConfigRejectsInvalidProxy(t *testing.T) {
 		{Scheme: "https", Host: "proxy.example:service"},
 		{Scheme: "https", Host: "proxy.example:"},
 		{Scheme: "https", Host: "]"},
+		{Scheme: "socks5", Host: "proxy.example", User: neturl.UserPassword("", "test-proxy-secret")},
+		{Scheme: "socks5h", Host: "proxy.example", User: neturl.UserPassword("", "test-proxy-secret")},
+		{Scheme: "socks5", Host: "proxy.example", User: neturl.UserPassword(strings.Repeat("u", 256), "test-proxy-secret")},
+		{Scheme: "socks5h", Host: "proxy.example", User: neturl.UserPassword(strings.Repeat("u", 256), "test-proxy-secret")},
+		{Scheme: "socks5", Host: "proxy.example", User: neturl.UserPassword("user", strings.Repeat("p", 256))},
+		{Scheme: "socks5h", Host: "proxy.example", User: neturl.UserPassword("user", strings.Repeat("p", 256))},
+		{Scheme: "socks5", Host: "proxy.example", User: neturl.UserPassword(strings.Repeat("\xc3\xa9", 128), "test-proxy-secret")},
+		{Scheme: "socks5h", Host: "proxy.example", User: neturl.UserPassword("user", strings.Repeat("\xc3\xa9", 128))},
 	} {
 		config := Config{
 			Lanes:  testLaneSpecs(t, "wss://relay.example:443/_wirehop"),
@@ -975,8 +990,15 @@ func TestValidateConfigRejectsInvalidProxy(t *testing.T) {
 			Deadlines:           relay.DeadlinePolicy{Control: time.Second, Transport: time.Second},
 			DeduplicationWindow: 1,
 		}
-		if _, err := validateConfig(config); !errors.Is(err, ErrInvalidConfig) {
+		_, err := validateConfig(config)
+		if !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("validateConfig(proxy=%q) error = %v, want %v", proxyURL, err, ErrInvalidConfig)
+		}
+		if proxyURL.User != nil {
+			password, _ := proxyURL.User.Password()
+			if strings.Contains(err.Error(), password) {
+				t.Fatalf("validateConfig() error exposes the proxy password: %v", err)
+			}
 		}
 	}
 }

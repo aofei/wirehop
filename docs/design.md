@@ -162,8 +162,9 @@ A terminal security, policy, or protocol rejection moves a lane from `connecting
 terminal states end the current supervisor and never reconnect within that session. A replacement session starts new
 supervisors from the complete configured lane set.
 
-An `active` lane is not necessarily scheduling-eligible because eligibility also depends on the path-group limit,
-retained-store capacity, deadline risk, and abandonment state.
+An `active` lane is not necessarily scheduling-eligible. Eligibility depends on direction-local primary selection,
+retained-store capacity, packet deadlines, and degradation or abandonment. A timing pause independently gates Data
+writes.
 
 ## Path group model
 
@@ -191,8 +192,8 @@ a reconnect generation that proposes a different group.
 Different path groups may still share access links, radio resources, proxies, or server bottlenecks. A path group is a
 conservative scheduling and observability boundary, not proof that groups are physically disjoint.
 
-The path group identifier participates in same-group lane eligibility and WireGuard control-packet duplication across
-groups. RTT, delivery rate, retained backlog, and deadline risk remain lane-local rather than being merged into a
+Path groups guide preferred-lane stability, capacity-discovery representatives, and WireGuard control-packet
+duplication. RTT, delivery rate, retained backlog, and deadline risk remain lane-local rather than being merged into a
 synthetic group estimate.
 
 ## Lane lifecycle
@@ -1165,6 +1166,8 @@ is dropped. Each local listener therefore serves one active WireGuard UDP source
 require separate client or forward instances and listen addresses. The shared WireHop server can still serve their
 independent sessions.
 
+UDP reads started with an already canceled or expired context leave pending datagrams untouched.
+
 The direct forwarder runs one synchronous worker in each UDP direction. It has no intermediate packet queue and bounds
 each UDP write to one second. A per-datagram drop does not stop forwarding. Cancellation or a terminal endpoint read or
 write failure closes both endpoints, waits for both workers, and terminates the command.
@@ -1218,8 +1221,8 @@ Concurrent joins serialize at that reservation. A still-timely replay of a consu
 `stale_generation`, while a newer generation still requires the correct session HMAC and immutable path group.
 
 Clients generate a fresh random nonce for every creation and join attempt. A nonce also binds a signed response to the
-pending request. Removing the join cache does not remove that response-binding requirement or permit clients to reuse
-nonces deliberately. Timestamp rejection remains retryable `clock_skew` before a join generation is consumed.
+pending request. Generation-based join replay protection retains this response-binding requirement. Clients must not
+reuse nonces deliberately. Timestamp rejection remains retryable `clock_skew` before a join generation is consumed.
 
 ### Authentication for TCP and TLS lanes
 
@@ -1501,7 +1504,8 @@ an idle lane can still answer WebSocket Ping frames.
 
 WebSocket lanes honor `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`. Proxy selection maps `ws://` to HTTP policy and
 `wss://` to HTTPS policy. Secure WebSocket lanes use CONNECT through selected HTTP or HTTPS proxies. Selected `socks5`
-and `socks5h` proxies use their native TCP tunneling behavior.
+and `socks5h` proxies use their native TCP tunneling behavior. SOCKS user info requires a 1-255 byte username and a
+password of at most 255 bytes. Invalid proxy configuration is rejected before binding the local UDP socket.
 
 Rejected HTTP proxy tunnels preserve their numeric CONNECT status. Authentication or policy rejection, including HTTP
 407 and 403, disables that lane. HTTP 408, 429, and 5xx remain retryable. These decisions use the same status policy as
@@ -2366,10 +2370,10 @@ requests alone. Discovery is bounded, subordinate to useful traffic, and disable
 group. Padding consumes carrier bandwidth and flight credit even when its memory is shared.
 
 TCP provides reliable ordered bytes, as specified in
-[RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html#section-2.2). A lost byte blocks later frames in that carrier,
-including an application expiry or FEC frame. Independent lanes isolate that stream ordering, but cannot make a stalled
-lane skip missing bytes. An unreliable carrier such as [QUIC DATAGRAM](https://www.rfc-editor.org/rfc/rfc9221.html)
-requires UDP reachability and changes the deployment boundary.
+[RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html#section-2.2). A lost byte blocks later Data and control frames in
+that carrier. Independent lanes isolate that stream ordering, but cannot make a stalled lane skip missing bytes. An
+unreliable carrier such as [QUIC DATAGRAM](https://www.rfc-editor.org/rfc/rfc9221.html) requires UDP reachability and
+changes the deployment boundary.
 
 WebSocket client masking remains mandatory over TLS under
 [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.3). WireHop disables compression and coalesces only
