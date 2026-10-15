@@ -1297,7 +1297,7 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 			return secure, nil
 		}
 	}
-	webSocket, response, err := websocket.Dial(handshakeContext, url.String(), &websocket.DialOptions{
+	connection, response, err := carrier.DialWebSocket(handshakeContext, url.String(), &websocket.DialOptions{
 		HTTPClient: &http.Client{
 			Transport:     httpTransport,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -1319,16 +1319,15 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 	default:
 	}
 	if err != nil {
-		if webSocket != nil {
-			webSocket.CloseNow()
+		if connection != nil {
+			connection.Close()
 		}
 		return nil, response, handshakeContext, cancel, 0, &webSocketHandshakeError{cause: err}
 	}
-	if webSocket.Subprotocol() != wsheader.Subprotocol {
-		webSocket.CloseNow()
+	if connection.Subprotocol() != wsheader.Subprotocol {
+		connection.Close()
 		return nil, response, handshakeContext, cancel, 0, ErrUnexpectedServerResponse
 	}
-	connection := carrier.NewWebSocketConn(webSocket)
 	connection.SetNetworkConnection(preparedWebSocket)
 	return connection, response, handshakeContext, cancel, clientSendMicros.Load(), nil
 }

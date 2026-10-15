@@ -214,13 +214,13 @@ func TestServerCandidateRetention(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						stream, _, err := websocket.Dial(parent, httpServer.URL+"/_wirehop", &websocket.DialOptions{
+						stream, _, err := carrier.DialWebSocket(parent, httpServer.URL+"/_wirehop", &websocket.DialOptions{
 							HTTPHeader: headers, Subprotocols: []string{wsheader.Subprotocol},
 						})
 						if err != nil {
 							t.Fatal(err)
 						}
-						connection = carrier.NewWebSocketConn(stream)
+						connection = stream
 						defer connection.Close()
 						frame, err := connection.ReadFrame(parent)
 						if err != nil {

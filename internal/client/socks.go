@@ -35,5 +35,9 @@ func (c *Client) prepareSOCKS(ctx context.Context, connection net.Conn, proxyURL
 	}
 	tunnelContext, cancel := context.WithTimeout(ctx, c.config.HandshakeTimeout)
 	defer cancel()
-	return dialer.(proxy.ContextDialer).DialContext(tunnelContext, "tcp", targetAddress)
+	if _, err := dialer.(proxy.ContextDialer).DialContext(tunnelContext, "tcp", targetAddress); err != nil {
+		return nil, err
+	}
+	// The SOCKS wrapper adds only the bound address. Retain the configured socket for abortive teardown.
+	return connection, nil
 }

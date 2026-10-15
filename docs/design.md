@@ -649,8 +649,7 @@ preserving the operating average unless the new minimum is higher.
 This policy favors stable bulk throughput after capacity discovery. It does not guarantee capacity aggregation, optimal
 interactive latency, or fairness between independent kernel TCP connections. A capacity change can temporarily stale an
 estimate, and a primary change can still reorder in-flight packets. Different path groups can share a physical
-bottleneck. Measure each path separately and the combination using the actual workload in both directions. WireHop
-cannot infer inner flow semantics from encrypted WireGuard transport packets.
+bottleneck. WireHop cannot infer inner flow semantics from encrypted WireGuard transport packets.
 
 ## Lane count policy
 
@@ -1468,6 +1467,16 @@ exceptional owned first-frame capacity above 32 KiB. Larger encoding buffers are
 decoding remains incremental within a message without retaining a complete message allocation. These scratch buffers,
 size-class overhead, and kernel socket buffers are separate from the retained relay-work budget.
 
+One session-wide UDP write slot serializes delivery across carrier readers and exclusively owns the deduplication window
+and delivery scratch storage. Successful UDP submissions update that window before the slot is released. Failed or
+dropped submissions do not record their packet IDs. A separate mutex protects clock-mapping snapshots and updates, and
+it is never held during UDP I/O. Acquiring the write slot refreshes the mapping before deadline checks, so waiting for
+another lane does not preserve an obsolete mapping. A batch with no deliverable packets starts no UDP write deadline.
+
+TCP and TLS readers borrow complete buffered frames before changing the socket read deadline. Every call first checks
+its current context. A read that needs more bytes applies that call's deadline before refilling the buffer, including
+clearing a deadline from an earlier admission phase. Returned frame payloads remain valid until the next read call.
+
 ### WebSocket transport
 
 Each WebSocket lane uses a separate HTTP/1.1 Upgrade and TCP connection. WireHop does not multiplex lanes over one
@@ -2027,12 +2036,15 @@ exposure is published before writing because feedback can return on another lane
 queue admission does not consume a Ping ID. A builder or carrier failure ends the generation and does not imply
 per-frame transactional completion.
 
-Each control batch retains the carrier stall deadline. WebSocket receivers expose each complete WireHop frame as it
-arrives, without waiting for the remaining WebSocket message or its closing fragment. A later malformed frame cannot
-undo a valid prefix already delivered. An incomplete frame at a normal WebSocket message boundary is a protocol
-violation. A transport disconnection before that boundary is a recoverable carrier failure. TLS still must receive and
-authenticate a complete record before exposing its contents. Coalescing can therefore change receive latency even
-without a collection timer. The frame budget and timing boundaries bound this effect.
+Each control batch retains the carrier stall deadline. WebSocket receivers decode incrementally without requiring a
+message's closing fragment before returning a complete prefix. The carrier library fills each requested payload read
+within its current WebSocket frame. A 32 KiB reader refill can therefore wait for the remaining bytes of that frame, up
+to the requested length, before exposing a complete WireHop prefix. A later malformed frame cannot undo a valid prefix
+already delivered. An incomplete frame at a normal WebSocket message boundary is a protocol violation. A transport
+disconnection before that boundary is a recoverable carrier failure. TLS also must receive and authenticate a complete
+record before exposing its contents. Coalescing can therefore change receive latency even without a collection timer.
+The frame budget and timing boundaries bound the amount of coalesced work. Liveness checks still govern a blocked
+carrier. Read-ahead provides no per-packet latency guarantee.
 
 A changed report snapshot is offered to its target lane and the best alternate lane when connected and not abandoning.
 Each writer constructs its own delay value for that same cumulative snapshot. The first completed carrier write marks
@@ -2053,6 +2065,13 @@ violations. Decoding is incremental within a message, and cancellation belongs t
 call that opened that message. Clock-sync admission reads enforce their phase deadline independently of lane
 cancellation. The lane owner controls teardown, preserving abortive close when a generation must discard old stream
 bytes. For TCP and TLS lanes, length-prefixed frames are read directly from the ordered byte stream.
+
+Abortive teardown closes the underlying TCP socket before releasing TLS or WebSocket state. Configuring zero linger
+alone is insufficient because TLS closure can attempt to send a close notification while the send buffer is full.
+
+Transport EOF remains distinct from WebSocket message EOF across HTTP upgrade buffering, TLS, and proxy routes. A failed
+WebSocket payload read exposes no partial bytes because client masking may not have been removed yet. Complete WireHop
+prefixes returned by successful payload reads remain deliverable before a later transport failure.
 
 ## CLI model
 

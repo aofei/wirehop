@@ -141,7 +141,7 @@ func TestServerJoinNonceReuse(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					connection, response, err := websocket.Dial(ctx, serverURL, &websocket.DialOptions{
+					stream, response, err := carrier.DialWebSocket(ctx, serverURL, &websocket.DialOptions{
 						HTTPHeader: headers, Subprotocols: []string{wsheader.Subprotocol},
 					})
 					if err != nil {
@@ -154,7 +154,6 @@ func TestServerJoinNonceReuse(t *testing.T) {
 							t.Fatalf("replayed join rejection = %+v, %v", rejection, err)
 						}
 					} else {
-						stream := carrier.NewWebSocketConn(connection)
 						frame, err := stream.ReadFrame(ctx)
 						stream.Close()
 						if !wantAccepted {

@@ -209,13 +209,12 @@ func deliveryTestCarrier(t *testing.T, ctx context.Context, scheme string, encod
 		return connection, err
 	}
 	t.Cleanup(transport.CloseIdleConnections)
-	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
+	stream, _, err := carrier.DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
 		HTTPClient: &http.Client{Transport: transport},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream := carrier.NewWebSocketConn(connection)
 	stream.SetNetworkConnection(<-rawConnections)
 	t.Cleanup(func() { stream.Close() })
 	return stream

@@ -193,61 +193,70 @@ func TestStreamConnAbort(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("TLSFullSendBuffer", func(t *testing.T) {
+		testTLSAbortWithFullSendBuffer(t, false)
+	})
 }
 
 func TestWebSocketConnAbort(t *testing.T) {
-	serverResult := make(chan error, 1)
-	accepted := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		connection, err := websocket.Accept(writer, request, nil)
-		if err != nil {
+	t.Run("WS", func(t *testing.T) {
+		serverResult := make(chan error, 1)
+		accepted := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			connection, err := AcceptWebSocket(writer, request, nil)
+			if err != nil {
+				serverResult <- err
+				return
+			}
+			defer connection.Close()
+			close(accepted)
+			_, _, err = connection.conn.Read(request.Context())
 			serverResult <- err
-			return
-		}
-		defer connection.CloseNow()
-		close(accepted)
-		_, _, err = connection.Read(request.Context())
-		serverResult <- err
-	}))
-	defer server.Close()
+		}))
+		defer server.Close()
 
-	rawConnections := make(chan net.Conn, 1)
-	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-		connection, err := (&net.Dialer{}).DialContext(ctx, network, address)
-		if err == nil {
-			rawConnections <- connection
+		rawConnections := make(chan net.Conn, 1)
+		transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			connection, err := (&net.Dialer{}).DialContext(ctx, network, address)
+			if err == nil {
+				rawConnections <- connection
+			}
+			return connection, err
+		}}
+		defer transport.CloseIdleConnections()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
+			HTTPClient: &http.Client{Transport: transport},
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
-		return connection, err
-	}}
-	defer transport.CloseIdleConnections()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: transport},
+		connection.SetNetworkConnection(<-rawConnections)
+		<-accepted
+		if err := connection.Abort(); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.Abort(); err != nil {
+			t.Fatalf("second Abort() error = %v", err)
+		}
+		if err := connection.Close(); err != nil {
+			t.Fatalf("Close() after Abort() error = %v", err)
+		}
+		select {
+		case err := <-serverResult:
+			if err == nil {
+				t.Fatal("peer read succeeded after abortive close")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("peer read remained blocked after abortive close")
+		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stream := NewWebSocketConn(connection)
-	stream.SetNetworkConnection(<-rawConnections)
-	<-accepted
-	if err := stream.Abort(); err != nil {
-		t.Fatal(err)
-	}
-	if err := stream.Abort(); err != nil {
-		t.Fatalf("second Abort() error = %v", err)
-	}
-	if err := stream.Close(); err != nil {
-		t.Fatalf("Close() after Abort() error = %v", err)
-	}
-	select {
-	case err := <-serverResult:
-		if err == nil {
-			t.Fatal("peer read succeeded after abortive close")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("peer read remained blocked after abortive close")
-	}
+
+	t.Run("WSSFullSendBuffer", func(t *testing.T) {
+		testTLSAbortWithFullSendBuffer(t, true)
+	})
 }
 
 func TestWebSocketConnBoundedWritesPreserveControlFrames(t *testing.T) {
@@ -265,57 +274,51 @@ func TestWebSocketConnBoundedWritesPreserveControlFrames(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			const timeout = 100 * time.Millisecond
-			type connectionKey struct{}
 			written := make(chan error, 1)
 			done := make(chan struct{})
 			server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				defer close(done)
-				connection, err := websocket.Accept(writer, request, nil)
+				connection, err := AcceptWebSocket(writer, request, nil)
 				if err != nil {
 					written <- err
 					return
 				}
-				defer connection.CloseNow()
-				stream := NewWebSocketConn(connection)
-				stream.SetNetworkConnection(request.Context().Value(connectionKey{}).(net.Conn))
+				defer connection.Close()
 				if tt.data {
-					err = WriteDataBatchWithin(ctx, stream, []protocol.Data{{
+					err = WriteDataBatchWithin(ctx, connection, []protocol.Data{{
 						PacketID: 1, DeadlineMicros: 1, Payload: []byte{4, 0, 0, 0},
 					}}, timeout)
 				} else {
-					err = WriteFramesWithin(ctx, stream, []protocol.Frame{{Type: protocol.FramePing}}, timeout)
+					err = WriteFramesWithin(ctx, connection, []protocol.Frame{{Type: protocol.FramePing}}, timeout)
 				}
 				written <- err
-				stream.ReadFrame(ctx)
+				connection.ReadFrame(ctx)
 			}))
-			server.Config.ConnContext = func(ctx context.Context, connection net.Conn) context.Context {
-				return context.WithValue(ctx, connectionKey{}, connection)
-			}
 			if tt.secure {
 				server.StartTLS()
 			} else {
 				server.Start()
 			}
 			defer server.Close()
-			connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
+			connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
 				HTTPClient: server.Client(),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() {
-				connection.CloseNow()
+				connection.Close()
 				<-done
 			}()
-			if _, _, err := connection.Read(ctx); err != nil {
+			if _, _, err := connection.conn.Read(ctx); err != nil {
 				t.Fatal(err)
 			}
 			if err := <-written; err != nil {
 				t.Fatal(err)
 			}
-			connection.CloseRead(ctx)
+			connection.conn.CloseRead(ctx)
 			time.Sleep(timeout)
-			if err := connection.Ping(ctx); err != nil {
+			if err := connection.conn.Ping(ctx); err != nil {
 				t.Fatalf("Ping() after the completed write deadline expired: %v", err)
 			}
 		})
@@ -326,18 +329,17 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 	t.Run("MaximumMessage", func(t *testing.T) {
 		result := make(chan error, 1)
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			connection, err := websocket.Accept(writer, request, nil)
+			connection, err := AcceptWebSocket(writer, request, nil)
 			if err != nil {
 				result <- err
 				return
 			}
-			defer connection.CloseNow()
+			defer connection.Close()
 			var frames [2]protocol.Frame
-			stream := NewWebSocketConn(connection)
 			count := 0
 			for count < len(frames) && err == nil {
 				var read int
-				read, err = stream.ReadFrames(request.Context(), frames[:len(frames)-count])
+				read, err = connection.ReadFrames(request.Context(), frames[:len(frames)-count])
 				for index, frame := range frames[:read] {
 					data, parseErr := protocol.ParseData(frame)
 					if parseErr != nil || data.PacketID != math.MaxUint64-uint64(count+index) ||
@@ -357,12 +359,11 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stream := NewWebSocketConn(connection)
-		defer stream.Close()
+		defer connection.Close()
 		var data [2]protocol.Data
 		for index := range data {
 			data[index] = protocol.Data{PacketID: math.MaxUint64 - uint64(index), DeadlineMicros: math.MaxUint64 - math.MaxUint64%protocol.DeadlineResolutionMicros,
@@ -371,7 +372,7 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 		if WebSocketReadLimit != 131_112 {
 			t.Fatalf("message limit = %d, want 131112", WebSocketReadLimit)
 		}
-		if err := stream.WriteDataBatch(ctx, data[:]); err != nil {
+		if err := connection.WriteDataBatch(ctx, data[:]); err != nil {
 			t.Fatal(err)
 		}
 		if err := <-result; err != nil {
@@ -381,13 +382,13 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 	t.Run("LargeFrame", func(t *testing.T) {
 		result := make(chan error, 1)
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			connection, err := websocket.Accept(writer, request, nil)
+			connection, err := AcceptWebSocket(writer, request, nil)
 			if err != nil {
 				result <- err
 				return
 			}
-			defer connection.Close(websocket.StatusNormalClosure, "")
-			frame, err := NewWebSocketConn(connection).ReadFrame(request.Context())
+			defer connection.Close()
+			frame, err := connection.ReadFrame(request.Context())
 			if err == nil {
 				var data protocol.Data
 				data, err = protocol.ParseData(frame)
@@ -400,13 +401,12 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stream := NewWebSocketConn(connection)
-		defer stream.Close()
-		if err := stream.WriteDataBatch(ctx, []protocol.Data{{
+		defer connection.Close()
+		if err := connection.WriteDataBatch(ctx, []protocol.Data{{
 			PacketID: 1, DeadlineMicros: 100, Payload: make([]byte, protocol.MaxPacketSize),
 		}}); err != nil {
 			t.Fatal(err)
@@ -419,32 +419,31 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 	t.Run("OversizedMessage", func(t *testing.T) {
 		result := make(chan error, 1)
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			connection, err := websocket.Accept(writer, request, nil)
+			connection, err := AcceptWebSocket(writer, request, nil)
 			if err != nil {
 				result <- err
 				return
 			}
-			defer connection.Close(websocket.StatusNormalClosure, "")
-			stream := NewWebSocketConn(connection)
+			defer connection.Close()
 			for err == nil {
-				_, err = stream.ReadFrame(request.Context())
+				_, err = connection.ReadFrame(request.Context())
 			}
 			result <- err
 		}))
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer connection.Close(websocket.StatusNormalClosure, "")
+		defer connection.Close()
 		encoded, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FrameDeliveryReport, Payload: make([]byte, 1200)})
 		if err != nil {
 			t.Fatal(err)
 		}
 		message := bytes.Repeat(encoded, WebSocketReadLimit/len(encoded)+1)
-		if err := connection.Write(ctx, websocket.MessageBinary, message); err != nil {
+		if err := connection.conn.Write(ctx, websocket.MessageBinary, message); err != nil {
 			t.Fatal(err)
 		}
 		if err := <-result; !errors.Is(err, ErrInvalidWebSocketMessage) {
@@ -456,11 +455,11 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 		release := make(chan struct{})
 		accepted := make(chan struct{})
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			connection, err := websocket.Accept(writer, request, nil)
+			connection, err := AcceptWebSocket(writer, request, nil)
 			if err != nil {
 				return
 			}
-			defer connection.CloseNow()
+			defer connection.Close()
 			close(accepted)
 			<-release
 		}))
@@ -468,12 +467,11 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 		defer close(release)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stream := NewWebSocketConn(connection)
-		defer stream.Close()
+		defer connection.Close()
 		<-accepted
 		packets := make([]protocol.Data, 3)
 		for index := range packets {
@@ -482,7 +480,7 @@ func TestWebSocketConnReadLimit(t *testing.T) {
 				Payload: make([]byte, protocol.MaxPacketSize),
 			}
 		}
-		if err := stream.WriteDataBatch(ctx, packets); !errors.Is(err, ErrWebSocketMessageTooLarge) {
+		if err := connection.WriteDataBatch(ctx, packets); !errors.Is(err, ErrWebSocketMessageTooLarge) {
 			t.Fatalf("WriteDataBatch() error = %v, want %v", err, ErrWebSocketMessageTooLarge)
 		}
 	})
@@ -505,15 +503,14 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 	t.Run("MultipleFrames", func(t *testing.T) {
 		result := make(chan error, 1)
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			connection, err := websocket.Accept(writer, request, nil)
+			connection, err := AcceptWebSocket(writer, request, nil)
 			if err != nil {
 				result <- err
 				return
 			}
-			defer connection.CloseNow()
-			stream := NewWebSocketConn(connection)
+			defer connection.Close()
 			for _, expected := range frames {
-				frame, err := stream.ReadFrame(request.Context())
+				frame, err := connection.ReadFrame(request.Context())
 				if err != nil {
 					result <- err
 					return
@@ -528,12 +525,12 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer connection.CloseNow()
-		if err := connection.Write(ctx, websocket.MessageBinary, encoded); err != nil {
+		defer connection.Close()
+		if err := connection.conn.Write(ctx, websocket.MessageBinary, encoded); err != nil {
 			t.Fatal(err)
 		}
 		if err := <-result; err != nil {
@@ -544,14 +541,14 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 	t.Run("FrameBatch", func(t *testing.T) {
 		result := make(chan error, 1)
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			connection, err := websocket.Accept(writer, request, nil)
+			connection, err := AcceptWebSocket(writer, request, nil)
 			if err != nil {
 				result <- err
 				return
 			}
-			defer connection.CloseNow()
+			defer connection.Close()
 			var received [4]protocol.Frame
-			count, err := NewWebSocketConn(connection).ReadFrames(request.Context(), received[:])
+			count, err := connection.ReadFrames(request.Context(), received[:])
 			if err == nil && (count != len(frames) || !reflect.DeepEqual(received[:count], frames)) {
 				err = errors.New("decoded WebSocket frame batch mismatch")
 			}
@@ -560,12 +557,12 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer connection.CloseNow()
-		if err := connection.Write(ctx, websocket.MessageBinary, encoded); err != nil {
+		defer connection.Close()
+		if err := connection.conn.Write(ctx, websocket.MessageBinary, encoded); err != nil {
 			t.Fatal(err)
 		}
 		if err := <-result; err != nil {
@@ -575,31 +572,30 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 
 	t.Run("PendingFrameHonorsCancellation", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			connection, err := websocket.Accept(writer, request, nil)
+			connection, err := AcceptWebSocket(writer, request, nil)
 			if err != nil {
 				return
 			}
-			defer connection.CloseNow()
-			connection.Write(request.Context(), websocket.MessageBinary, encoded)
+			defer connection.Close()
+			connection.conn.Write(request.Context(), websocket.MessageBinary, encoded)
 		}))
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stream := NewWebSocketConn(connection)
-		defer stream.Close()
-		if _, err := stream.ReadFrame(ctx); err != nil {
+		defer connection.Close()
+		if _, err := connection.ReadFrame(ctx); err != nil {
 			t.Fatal(err)
 		}
 		canceled, stop := context.WithCancel(context.Background())
 		stop()
-		if _, err := stream.ReadFrame(canceled); !errors.Is(err, context.Canceled) {
+		if _, err := connection.ReadFrame(canceled); !errors.Is(err, context.Canceled) {
 			t.Fatalf("ReadFrame() error = %v, want %v", err, context.Canceled)
 		}
-		if frame, err := stream.ReadFrame(ctx); err != nil || !reflect.DeepEqual(frame, frames[1]) {
+		if frame, err := connection.ReadFrame(ctx); err != nil || !reflect.DeepEqual(frame, frames[1]) {
 			t.Fatalf("ReadFrame() after cancellation = %#v, %v, want %#v", frame, err, frames[1])
 		}
 	})
@@ -633,31 +629,30 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 			defer cancel()
 			result := make(chan error, 1)
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				connection, err := websocket.Accept(writer, request, nil)
+				connection, err := AcceptWebSocket(writer, request, nil)
 				if err != nil {
 					result <- err
 					return
 				}
-				defer connection.CloseNow()
-				stream := NewWebSocketConn(connection)
+				defer connection.Close()
 				for _, expected := range tt.prefix {
-					frame, err := stream.ReadFrame(ctx)
+					frame, err := connection.ReadFrame(ctx)
 					if err != nil || !reflect.DeepEqual(frame, expected) {
 						result <- errors.New("valid WebSocket frame prefix was rejected or changed")
 						return
 					}
 				}
-				_, err = stream.ReadFrame(ctx)
+				_, err = connection.ReadFrame(ctx)
 				result <- err
 			}))
 			defer server.Close()
-			connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer connection.CloseNow()
+			defer connection.Close()
 			for _, message := range tt.messages {
-				if err := connection.Write(ctx, tt.messageType, message); err != nil {
+				if err := connection.conn.Write(ctx, tt.messageType, message); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -695,13 +690,13 @@ func TestReusableBuffer(t *testing.T) {
 func TestWebSocketConnWriteBoundary(t *testing.T) {
 	result := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		connection, err := websocket.Accept(writer, request, nil)
+		connection, err := AcceptWebSocket(writer, request, nil)
 		if err != nil {
 			result <- err
 			return
 		}
-		defer connection.CloseNow()
-		messageType, message, err := connection.Read(request.Context())
+		defer connection.Close()
+		messageType, message, err := connection.conn.Read(request.Context())
 		if err == nil && messageType != websocket.MessageBinary {
 			err = ErrInvalidWebSocketMessage
 		}
@@ -717,13 +712,12 @@ func TestWebSocketConnWriteBoundary(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream := NewWebSocketConn(connection)
-	defer stream.Close()
-	if err := stream.WriteFrames(ctx, []protocol.Frame{
+	defer connection.Close()
+	if err := connection.WriteFrames(ctx, []protocol.Frame{
 		{Type: protocol.FramePing, Payload: make([]byte, 16)},
 		{Type: protocol.FrameDeliveryReport, Payload: make([]byte, 8)},
 	}); err != nil {

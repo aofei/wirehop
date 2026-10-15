@@ -42,13 +42,14 @@ type ReceiverConfig struct {
 	UDPWriteTimeout   time.Duration
 }
 
-// Receiver deduplicates and delivers one session direction across all lanes.
+// Receiver deduplicates and delivers one session direction across all lanes. The UDP write slot owns deduplication
+// and delivery scratch storage, while mappingMu protects clock updates and snapshots.
 type Receiver struct {
 	endpoint        datagram.Endpoint
 	clock           Clock
 	udpWriteTimeout time.Duration
 	writeSlot       chan struct{}
-	mu              sync.Mutex
+	mappingMu       sync.Mutex
 	mapping         clockmap.Mapping
 	deduplication   *dedup.Window
 	payloads        [datagram.MaximumBatchSize][]byte
@@ -84,23 +85,23 @@ func (r *Receiver) UpdateClock(mapping clockmap.Mapping) {
 	if !ClockMappingUsable(mapping) {
 		return
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mappingMu.Lock()
+	defer r.mappingMu.Unlock()
 	r.mapping = mapping
 }
 
 // ValidateDeadline verifies that deadline maps into the receiver clock and respects the protocol lifetime bound.
 func (r *Receiver) ValidateDeadline(deadlineMicros uint64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mappingMu.Lock()
+	defer r.mappingMu.Unlock()
 	_, err := deadlineStatus(r.mapping, r.clock.NowMicros(), deadlineMicros)
 	return err
 }
 
 // ValidateDeadlines verifies one sender deadline vector against a shared receiver clock sample.
 func (r *Receiver) ValidateDeadlines(deadlines []uint64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mappingMu.Lock()
+	defer r.mappingMu.Unlock()
 	nowMicros := r.clock.NowMicros()
 	for _, deadlineMicros := range deadlines {
 		if _, err := deadlineStatus(r.mapping, nowMicros, deadlineMicros); err != nil {
@@ -143,9 +144,9 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 		return ErrInvalidReceiver
 	}
 	select {
-	case r.writeSlot <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
+	case r.writeSlot <- struct{}{}:
 	}
 	// Bound cleanup to the largest used prefix, including partially validated runs.
 	buffered := 0
@@ -155,22 +156,20 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 		clear(r.deadlines[:buffered])
 		<-r.writeSlot
 	}()
-	r.mu.Lock()
-	mapping := r.mapping
-	r.mu.Unlock()
-	writeDeadline := time.Now().Add(r.udpWriteTimeout)
-	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(writeDeadline) {
-		writeDeadline = parentDeadline
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	r.mappingMu.Lock()
+	mapping := r.mapping
+	r.mappingMu.Unlock()
+	var writeDeadline time.Time
 	for dataOffset := 0; dataOffset < len(data); {
 		accepted := 0
-		r.mu.Lock()
 		nowMicros := r.clock.NowMicros()
 		for dataOffset < len(data) {
 			packet := data[dataOffset]
 			expired, err := deadlineStatus(mapping, nowMicros, packet.DeadlineMicros)
 			if err != nil {
-				r.mu.Unlock()
 				buffered = max(buffered, accepted)
 				return err
 			}
@@ -187,10 +186,15 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 			accepted++
 			dataOffset++
 		}
-		r.mu.Unlock()
 		buffered = max(buffered, accepted)
 		if accepted == 0 {
 			continue
+		}
+		if writeDeadline.IsZero() {
+			writeDeadline = time.Now().Add(r.udpWriteTimeout)
+			if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(writeDeadline) {
+				writeDeadline = parentDeadline
+			}
 		}
 		err := r.writeAcceptedBatch(ctx, r.payloads[:accepted], r.packetIDs[:accepted], r.deadlines[:accepted], mapping, writeDeadline)
 		if err != nil {
@@ -227,11 +231,9 @@ func (r *Receiver) writeAcceptedBatch(ctx context.Context, payloads [][]byte, pa
 		}
 		written, err := datagram.WriteBatch(ctx, r.endpoint, payloads[offset:], writeDeadline)
 		if written > 0 {
-			r.mu.Lock()
 			for _, packetID := range packetIDs[offset : offset+written] {
 				r.deduplication.Observe(packetID)
 			}
-			r.mu.Unlock()
 			offset += written
 		}
 		if err == nil {

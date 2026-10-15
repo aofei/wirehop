@@ -54,7 +54,7 @@ type boundedWriter interface {
 	writeDataBatchWithin(context.Context, []protocol.Data, time.Duration) error
 }
 
-// ReadFrames reads one or more immediately available frames while preserving scalar fallback behavior.
+// ReadFrames reads the next frame and any already buffered prefix while preserving scalar fallback behavior.
 func ReadFrames(ctx context.Context, connection Conn, frames []protocol.Frame) (int, error) {
 	if len(frames) == 0 {
 		return 0, nil
@@ -155,19 +155,29 @@ type webSocketMessageReader struct {
 	ended  bool
 }
 
-// Read tracks only the exact EOF emitted for the end of a WebSocket message.
+// Read tracks message boundaries and discards failed reads whose bytes may still be WebSocket-masked.
 func (r *webSocketMessageReader) Read(buffer []byte) (int, error) {
 	count, err := r.reader.Read(buffer)
 	if err == io.EOF {
 		r.ended = true
+	} else if err != nil {
+		return 0, err
 	}
 	return count, err
 }
 
-// NewWebSocketConn wraps one WebSocket while preserving its message boundaries.
-func NewWebSocketConn(connection *websocket.Conn) *WebSocketConn {
+// newWebSocketConn wraps a WebSocket whose transport keeps connection EOF distinct from message boundaries.
+func newWebSocketConn(connection *websocket.Conn, networkConnection net.Conn) *WebSocketConn {
 	connection.SetReadLimit(WebSocketReadLimit)
-	return &WebSocketConn{conn: connection, messageReader: bufio.NewReaderSize(nil, streamReadBufferSize)}
+	return &WebSocketConn{
+		conn: connection, networkConnection: networkConnection,
+		messageReader: bufio.NewReaderSize(nil, streamReadBufferSize),
+	}
+}
+
+// Subprotocol returns the WebSocket subprotocol negotiated during the HTTP upgrade.
+func (c *WebSocketConn) Subprotocol() string {
+	return c.conn.Subprotocol()
 }
 
 // SetNetworkConnection retains the underlying connection for direct deadlines and abortive teardown.
@@ -175,7 +185,7 @@ func (c *WebSocketConn) SetNetworkConnection(connection net.Conn) {
 	c.networkConnection = connection
 }
 
-// ReadFrame returns the next complete frame without waiting for the end of its binary WebSocket message.
+// ReadFrame returns the next complete frame from the current binary WebSocket message.
 func (c *WebSocketConn) ReadFrame(ctx context.Context) (protocol.Frame, error) {
 	var frames [1]protocol.Frame
 	count, err := c.ReadFrames(ctx, frames[:])
@@ -410,13 +420,13 @@ func (c *WebSocketConn) Close() error {
 // Abort discards unacknowledged carrier bytes and closes the WebSocket without a close handshake.
 func (c *WebSocketConn) Abort() error {
 	c.closeOnce.Do(func() {
-		lingerErr := setAbortiveClose(c.networkConnection)
-		c.closeErr = errors.Join(lingerErr, c.conn.CloseNow())
+		socketErr := abortTCP(c.networkConnection)
+		c.closeErr = errors.Join(socketErr, c.conn.CloseNow())
 	})
 	return c.closeErr
 }
 
-// ReadFrame reads one complete frame with the context deadline applied to the stream.
+// ReadFrame reads one complete frame, applying the context deadline before network I/O.
 func (c *StreamConn) ReadFrame(ctx context.Context) (protocol.Frame, error) {
 	var frames [1]protocol.Frame
 	count, err := c.ReadFrames(ctx, frames[:])
@@ -435,12 +445,18 @@ func (c *StreamConn) ReadFrames(ctx context.Context, frames []protocol.Frame) (i
 		return 0, err
 	}
 	c.frameReader.Reset()
-	if err := c.conn.SetReadDeadline(contextDeadline(ctx)); err != nil {
-		return 0, fmt.Errorf("set carrier read deadline: %w", err)
-	}
-	frame, err := readCarrierFrame(c.reader, &c.frameReader)
+	frame, available, err := protocol.ReadBufferedFrame(c.reader)
 	if err != nil {
 		return 0, fmt.Errorf("read carrier frame: %w", err)
+	}
+	if !available {
+		if err := c.conn.SetReadDeadline(contextDeadline(ctx)); err != nil {
+			return 0, fmt.Errorf("set carrier read deadline: %w", err)
+		}
+		frame, err = readCarrierFrame(c.reader, &c.frameReader)
+		if err != nil {
+			return 0, fmt.Errorf("read carrier frame: %w", err)
+		}
 	}
 	frames[0] = frame
 	count := 1
@@ -566,8 +582,12 @@ func (c *StreamConn) Close() error {
 // Abort discards unacknowledged carrier bytes before closing the stream.
 func (c *StreamConn) Abort() error {
 	c.closeOnce.Do(func() {
-		lingerErr := setAbortiveClose(c.conn)
-		c.closeErr = errors.Join(lingerErr, c.conn.Close())
+		socketErr := abortTCP(c.conn)
+		closeErr := c.conn.Close()
+		if errors.Is(closeErr, net.ErrClosed) {
+			closeErr = nil
+		}
+		c.closeErr = errors.Join(socketErr, closeErr)
 	})
 	return c.closeErr
 }
@@ -580,14 +600,15 @@ func reusableBuffer(buffer []byte) []byte {
 	return buffer[:0]
 }
 
-// setAbortiveClose configures the TCP socket under known connection wrappers to discard pending bytes on close.
-func setAbortiveClose(connection net.Conn) error {
+// abortTCP discards pending bytes and closes TCP beneath known wrappers before TLS can send a close notification.
+func abortTCP(connection net.Conn) error {
 	for connection != nil {
 		if tcp, ok := connection.(*net.TCPConn); ok {
-			if err := tcp.SetLinger(0); err != nil {
-				return fmt.Errorf("configure abortive carrier close: %w", err)
+			lingerErr := tcp.SetLinger(0)
+			if lingerErr != nil {
+				lingerErr = fmt.Errorf("configure abortive carrier close: %w", lingerErr)
 			}
-			return nil
+			return errors.Join(lingerErr, tcp.Close())
 		}
 		provider, ok := connection.(interface{ NetConn() net.Conn })
 		if !ok {

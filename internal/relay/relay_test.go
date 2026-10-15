@@ -1482,7 +1482,7 @@ func TestReceiverFailedHighPacketIDDoesNotAdvanceWindow(t *testing.T) {
 }
 
 func TestReceiverDeliverBatch(t *testing.T) {
-	t.Run("ConcurrentBitmapGrowth", func(t *testing.T) {
+	t.Run("ConcurrentBitmapGrowthAndClockUpdates", func(t *testing.T) {
 		const lanes = 8
 		const repetitions = 16
 		packetIDs := [...]uint64{1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257}
@@ -1495,7 +1495,7 @@ func TestReceiverDeliverBatch(t *testing.T) {
 			t.Fatal(err)
 		}
 		start := make(chan struct{})
-		results := make(chan error, lanes)
+		results := make(chan error, lanes+1)
 		for lane := range lanes {
 			go func() {
 				var batch [len(packetIDs)]protocol.Data
@@ -1515,8 +1515,19 @@ func TestReceiverDeliverBatch(t *testing.T) {
 				results <- nil
 			}()
 		}
+		go func() {
+			<-start
+			for index := range lanes * repetitions {
+				receiver.UpdateClock(clockmap.Mapping{OffsetMicros: int64(index % 3), UncertaintyMicros: uint64(index % 3)})
+				if err := receiver.ValidateDeadline(100_900); err != nil {
+					results <- err
+					return
+				}
+			}
+			results <- nil
+		}()
 		close(start)
-		for range lanes {
+		for range lanes + 1 {
 			if err := <-results; err != nil {
 				t.Fatal(err)
 			}
@@ -1643,6 +1654,62 @@ func TestReceiverSerializesUDPWrites(t *testing.T) {
 	endpoint.release <- struct{}{}
 	if err := <-retryResult; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReceiverDeliverBatchCancellation(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		duplicate bool
+		expired   bool
+	}{
+		{name: "Fresh"},
+		{name: "Duplicate", duplicate: true},
+		{name: "Expired", expired: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			endpoint := newTestEndpoint()
+			receiver, err := NewReceiver(ReceiverConfig{
+				Endpoint: endpoint, Clock: &testClock{now: 1000}, DeduplicationSize: 64,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := []protocol.Data{{
+				PacketID: 1, DeadlineMicros: 100_900, Payload: relayWireGuardPacket(wgpacket.TransportData),
+			}}
+			if tt.duplicate {
+				if err := receiver.deliverBatch(t.Context(), data); err != nil {
+					t.Fatal(err)
+				}
+				<-endpoint.writes
+			}
+			if tt.expired {
+				data[0].DeadlineMicros = 999
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if err := receiver.deliverBatch(ctx, data); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled delivery = %v, want context canceled", err)
+			}
+			if len(endpoint.writes) != 0 {
+				t.Fatal("canceled delivery wrote UDP data")
+			}
+			if len(receiver.writeSlot) != 0 {
+				t.Fatal("canceled delivery retained the UDP write slot")
+			}
+			data[0].DeadlineMicros = 100_900
+			if err := receiver.deliverBatch(t.Context(), data); err != nil {
+				t.Fatal(err)
+			}
+			wantWrites := 1
+			if tt.duplicate {
+				wantWrites = 0
+			}
+			if len(endpoint.writes) != wantWrites {
+				t.Fatal("canceled delivery changed deduplication state")
+			}
+		})
 	}
 }
 

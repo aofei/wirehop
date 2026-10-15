@@ -2,7 +2,6 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -123,12 +122,6 @@ type admissionConnection struct {
 // admissionContextKey identifies a pre-reserved WebSocket admission connection.
 type admissionContextKey struct{}
 
-// webSocketResponseWriter clears HTTP handshake deadlines when the upgraded socket is hijacked.
-type webSocketResponseWriter struct {
-	http.ResponseWriter
-	connection *net.Conn
-}
-
 // reportableLaneError marks a local carrier or session failure that requires operator attention.
 type reportableLaneError struct {
 	cause error
@@ -157,20 +150,6 @@ func (e *activeLaneError) Error() string {
 // Unwrap returns the original active lane failure.
 func (e *activeLaneError) Unwrap() error {
 	return e.cause
-}
-
-// Hijack transfers the connection to WebSocket ownership without retaining HTTP request deadlines.
-func (w webSocketResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	connection, readWriter, err := http.NewResponseController(w.ResponseWriter).Hijack()
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := connection.SetDeadline(time.Time{}); err != nil {
-		connection.Close()
-		return nil, nil, fmt.Errorf("clear WebSocket handshake deadline: %w", err)
-	}
-	*w.connection = connection
-	return connection, readWriter, nil
 }
 
 // Snapshot is a point-in-time view of bounded server resources.
@@ -1031,22 +1010,17 @@ func reservationRejection(err error) (protocol.ErrorCode, protocol.ErrorClass, p
 
 // acceptWebSocket upgrades one validated request with the exact WireHop subprotocol.
 func acceptWebSocket(writer http.ResponseWriter, request *http.Request) (*carrier.WebSocketConn, error) {
-	var networkConnection net.Conn
-	webSocket, err := websocket.Accept(webSocketResponseWriter{
-		ResponseWriter: writer, connection: &networkConnection,
-	}, request,
+	connection, err := carrier.AcceptWebSocket(writer, request,
 		&websocket.AcceptOptions{
 			Subprotocols: []string{wsheader.Subprotocol}, CompressionMode: websocket.CompressionDisabled,
 		})
 	if err != nil {
 		return nil, err
 	}
-	if webSocket.Subprotocol() != wsheader.Subprotocol {
-		webSocket.CloseNow()
+	if connection.Subprotocol() != wsheader.Subprotocol {
+		connection.Close()
 		return nil, wsheader.ErrInvalid
 	}
-	connection := carrier.NewWebSocketConn(webSocket)
-	connection.SetNetworkConnection(networkConnection)
 	return connection, nil
 }
 

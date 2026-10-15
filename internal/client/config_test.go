@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/lanespec"
 	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
@@ -790,7 +791,7 @@ func testDialWebSocketThroughSOCKS5Proxy(t *testing.T, proxyScheme string, secur
 	if got, want := <-requested, net.JoinHostPort("relay.example", port); got != want {
 		t.Fatalf("SOCKS5 target = %q, want %q", got, want)
 	}
-	if err := connection.Close(); err != nil {
+	if err := connection.(*carrier.WebSocketConn).Abort(); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-proxyDone; err != nil {

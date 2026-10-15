@@ -121,22 +121,22 @@ func BenchmarkWebSocketConnReadFrames(b *testing.B) {
 					done := make(chan struct{})
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						defer close(done)
-						connection, err := websocket.Accept(w, r, nil)
+						connection, err := AcceptWebSocket(w, r, nil)
 						if err != nil {
 							return
 						}
-						defer connection.CloseNow()
-						for connection.Write(context.Background(), websocket.MessageBinary, message) == nil {
+						defer connection.Close()
+						for connection.conn.Write(context.Background(), websocket.MessageBinary, message) == nil {
 						}
 					}))
 					b.Cleanup(server.Close)
-					connection, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+					connection, _, err := DialWebSocket(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 					if err != nil {
 						b.Fatal(err)
 					}
-					stream := NewWebSocketConn(connection)
+
 					b.Cleanup(func() {
-						stream.Close()
+						connection.Close()
 						<-done
 					})
 					ctx := context.Background()
@@ -150,7 +150,7 @@ func BenchmarkWebSocketConnReadFrames(b *testing.B) {
 					b.SetBytes(int64(len(message)))
 					for b.Loop() {
 						for remaining := frameCount; remaining > 0; {
-							count, err := stream.ReadFrames(ctx, frames[:remaining])
+							count, err := connection.ReadFrames(ctx, frames[:remaining])
 							if err != nil || count == 0 {
 								b.Fatalf("read batch = %d, %v", count, err)
 							}
@@ -213,6 +213,42 @@ func BenchmarkWebSocketConnReadBufferedFrames(b *testing.B) {
 						benchmarkFrameSink = frames[count-1]
 					}
 				})
+			}
+		})
+	}
+}
+
+func BenchmarkStreamConnReadBufferedFrames(b *testing.B) {
+	for _, frameCount := range []int{1, maximumStreamReadBatchFrames} {
+		b.Run(strconv.Itoa(frameCount), func(b *testing.B) {
+			var encoded []byte
+			payload := make([]byte, 1452)
+			payload[0] = 4
+			for index := range frameCount {
+				var err error
+				encoded, err = protocol.AppendDataFrame(encoded, protocol.Data{
+					PacketID: 1_000_000_000 + uint64(index), DeadlineMicros: 86_405_000_000, Payload: payload,
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			input := &fragmentedReadConn{input: bytes.NewReader(encoded), limit: len(encoded)}
+			stream := NewStreamConn(input)
+			var frames [maximumStreamReadBatchFrames]protocol.Frame
+			b.SetBytes(int64(frameCount * len(payload)))
+			b.ReportAllocs()
+			for b.Loop() {
+				input.input.Reset(encoded)
+				stream.reader.Reset(input)
+				if _, err := stream.reader.Peek(len(encoded)); err != nil {
+					b.Fatal(err)
+				}
+				count, err := stream.ReadFrames(context.Background(), frames[:])
+				if err != nil || count != frameCount {
+					b.Fatalf("read batch = %d, %v", count, err)
+				}
+				benchmarkFrameSink = frames[count-1]
 			}
 		})
 	}

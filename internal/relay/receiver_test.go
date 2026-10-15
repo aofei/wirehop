@@ -2,17 +2,84 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"math"
 	"net"
 	"testing"
+	"testing/synctest"
 
 	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
+
+func TestReceiverDeliverBatchWhileWaiting(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		cancel bool
+	}{
+		{name: "ClockUpdate"},
+		{name: "Cancellation", cancel: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				endpoint := &blockingWriteEndpoint{
+					testEndpoint: newTestEndpoint(), entered: make(chan byte, 2), release: make(chan struct{}),
+				}
+				receiver, err := NewReceiver(ReceiverConfig{
+					Endpoint: endpoint, Clock: &testClock{now: 1000}, DeduplicationSize: 64,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				data := []protocol.Data{{
+					PacketID: 1, DeadlineMicros: 100_900, Payload: relayWireGuardPacket(wgpacket.TransportData),
+				}}
+				first := make(chan error, 1)
+				go func() { first <- receiver.deliverBatch(t.Context(), data) }()
+				<-endpoint.entered
+				waiting := append([]protocol.Data(nil), data...)
+				waiting[0].PacketID = 2
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				second := make(chan error, 1)
+				go func() { second <- receiver.deliverBatch(ctx, waiting) }()
+				synctest.Wait()
+				var wantError error
+				if tt.cancel {
+					cancel()
+					wantError = context.Canceled
+				} else {
+					receiver.UpdateClock(clockmap.Mapping{OffsetMicros: -100_000})
+				}
+				endpoint.release <- struct{}{}
+				if err := <-first; err != nil {
+					t.Fatal(err)
+				}
+				if err := <-second; !errors.Is(err, wantError) {
+					t.Fatalf("waiting delivery = %v, want %v", err, wantError)
+				}
+				if len(endpoint.entered) != 0 || len(receiver.writeSlot) != 0 || receiver.deduplication.Highest() != 1 {
+					t.Fatal("waiting delivery used stale state, wrote UDP data, or retained the write slot")
+				}
+				retry := newTestEndpoint()
+				receiver.endpoint = retry
+				waiting[0].DeadlineMicros = 200_900
+				for range 2 {
+					if err := receiver.deliverBatch(t.Context(), waiting); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if len(retry.writes) != 1 {
+					t.Fatal("waiting delivery changed later exactly-once delivery")
+				}
+			})
+		})
+	}
+}
 
 func FuzzReceiverDeliverBatch(f *testing.F) {
 	var encoded []byte

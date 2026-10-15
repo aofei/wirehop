@@ -532,6 +532,55 @@ func BenchmarkReceiverDeliver(b *testing.B) {
 	}
 }
 
+func BenchmarkReceiverDeliverBatch(b *testing.B) {
+	for _, tt := range []struct {
+		name      string
+		count     int
+		duplicate bool
+	}{
+		{name: "Single", count: 1},
+		{name: "Sixteen", count: datagram.MaximumBatchSize},
+		{name: "Duplicate", count: datagram.MaximumBatchSize, duplicate: true},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			receiver, err := NewReceiver(ReceiverConfig{
+				Endpoint: benchmarkBatchEndpoint{}, Clock: &testClock{now: 1}, DeduplicationSize: 1_048_576,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			var batch [datagram.MaximumBatchSize]protocol.Data
+			payload := relayWireGuardPacket(wgpacket.TransportData)
+			for index := range tt.count {
+				batch[index] = protocol.Data{PacketID: uint64(index + 1), DeadlineMicros: 1_000_000, Payload: payload}
+			}
+			if tt.duplicate {
+				if err := receiver.deliverBatch(context.Background(), batch[:tt.count]); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.SetBytes(int64(tt.count * len(payload)))
+			b.ReportAllocs()
+			for b.Loop() {
+				if !tt.duplicate {
+					for index := range tt.count {
+						batch[index].PacketID += uint64(tt.count)
+					}
+				}
+				if err := receiver.deliverBatch(context.Background(), batch[:tt.count]); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+type benchmarkBatchEndpoint struct{ benchmarkEndpoint }
+
+func (benchmarkBatchEndpoint) WriteBatch(_ context.Context, payloads [][]byte, _ time.Time) (int, error) {
+	return len(payloads), nil
+}
+
 type benchmarkStreamSink struct{}
 
 func (benchmarkStreamSink) Read([]byte) (int, error)         { panic("unexpected read") }

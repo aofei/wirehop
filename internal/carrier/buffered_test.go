@@ -85,6 +85,106 @@ func (c *fragmentedReadConn) Read(buffer []byte) (int, error) {
 
 func (*fragmentedReadConn) SetReadDeadline(time.Time) error { return nil }
 
+type deadlineReadConn struct {
+	*fragmentedReadConn
+	deadline time.Time
+}
+
+func (c *deadlineReadConn) SetReadDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	return nil
+}
+
+func TestStreamConnReadFramesBufferedDeadline(t *testing.T) {
+	encoded, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FramePing, Payload: []byte{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := &deadlineReadConn{
+		fragmentedReadConn: &fragmentedReadConn{input: bytes.NewReader(bytes.Repeat(encoded, 3)), limit: 2 * len(encoded)},
+	}
+	stream := NewStreamConn(input)
+	deadline := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	t.Cleanup(cancel)
+	if _, err := stream.ReadFrame(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if input.deadline != deadline || input.reads != 1 {
+		t.Fatal("initial read did not apply its deadline before filling the buffer")
+	}
+	if _, err := stream.ReadFrame(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if input.deadline != deadline || input.reads != 1 {
+		t.Fatal("buffered read changed the socket deadline or refilled the buffer")
+	}
+	if _, err := stream.ReadFrame(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !input.deadline.IsZero() || input.reads != 2 {
+		t.Fatal("blocking read retained the previous call's deadline")
+	}
+}
+
+func TestStreamConnReadFramesExpiredSocketDeadline(t *testing.T) {
+	for _, withDeadline := range []bool{false, true} {
+		name := "Background"
+		if withDeadline {
+			name = "NewDeadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			encoded, err := protocol.MarshalFrame(protocol.Frame{Type: protocol.FramePing, Payload: []byte{1}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire := bytes.Repeat(encoded, 3)
+			left, right := net.Pipe()
+			finished := make(chan error, 1)
+			go func() {
+				_, err := right.Write(wire[:len(wire)-1])
+				if err == nil {
+					_, err = right.Write(wire[len(wire)-1:])
+				}
+				finished <- err
+			}()
+			t.Cleanup(func() {
+				left.Close()
+				right.Close()
+				<-finished
+			})
+			stream := NewStreamConn(left)
+			if _, err := stream.ReadFrame(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := left.SetReadDeadline(time.Now().Add(-time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			canceled, cancel := context.WithCancel(t.Context())
+			cancel()
+			expired, stop := context.WithDeadline(t.Context(), time.Now().Add(-time.Hour))
+			defer stop()
+			for _, ctx := range []context.Context{canceled, expired} {
+				if _, err := stream.ReadFrame(ctx); !errors.Is(err, ctx.Err()) {
+					t.Fatalf("canceled buffered read = %v, want %v", err, ctx.Err())
+				}
+			}
+			if frame, err := stream.ReadFrame(t.Context()); err != nil || !bytes.Equal(frame.Payload, []byte{1}) {
+				t.Fatalf("buffered read with expired socket deadline = %#v, %v", frame, err)
+			}
+			ctx := t.Context()
+			if withDeadline {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, time.Second)
+				defer cancel()
+			}
+			if frame, err := stream.ReadFrame(ctx); err != nil || !bytes.Equal(frame.Payload, []byte{1}) {
+				t.Fatalf("refill after expired socket deadline = %#v, %v", frame, err)
+			}
+		})
+	}
+}
+
 func TestWebSocketConnBorrowedBatchStopsBeforeRefill(t *testing.T) {
 	want := []protocol.Frame{
 		{Type: protocol.FrameData, Payload: bytes.Repeat([]byte{0xa5}, 1452)},
@@ -330,33 +430,32 @@ func TestWebSocketConnLargeFrameBatch(t *testing.T) {
 			want = append(want, last)
 			written := make(chan error, 1)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				connection, err := websocket.Accept(w, r, nil)
+				connection, err := AcceptWebSocket(w, r, nil)
 				if err != nil {
 					written <- err
 					return
 				}
-				defer connection.CloseNow()
-				err = connection.Write(r.Context(), websocket.MessageBinary, message)
+				defer connection.Close()
+				err = connection.conn.Write(r.Context(), websocket.MessageBinary, message)
 				if err == nil {
-					err = connection.Write(r.Context(), websocket.MessageBinary, nextMessage)
+					err = connection.conn.Write(r.Context(), websocket.MessageBinary, nextMessage)
 				}
 				written <- err
-				connection.Read(r.Context())
+				connection.conn.Read(r.Context())
 			}))
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
-			connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			connection, _, err := DialWebSocket(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			stream := NewWebSocketConn(connection)
-			defer stream.Close()
+			defer connection.Close()
 			var frames [maximumStreamReadBatchFrames]protocol.Frame
 			capacities := [...]int{16, 2, 1, 15}
 			for offset, call := 0, 0; offset < len(want); call++ {
 				readContext, stop := context.WithCancel(ctx)
-				count, err := stream.ReadFrames(readContext, frames[:capacities[call%len(capacities)]])
+				count, err := connection.ReadFrames(readContext, frames[:capacities[call%len(capacities)]])
 				stop()
 				if err != nil || count == 0 || offset+count > len(want) || !reflect.DeepEqual(frames[:count], want[offset:offset+count]) {
 					t.Fatalf("WebSocket batch at %d = %d frames, %v", offset, count, err)
