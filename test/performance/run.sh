@@ -22,7 +22,6 @@ case "$duration" in
 esac
 if ! [ "$duration" -ge 20 ] 2>/dev/null; then echo "duration must be at least 20 seconds" >&2; exit 2; fi
 observe=${WIREHOP_TEST_OBSERVE:-false}
-trace=${WIREHOP_TEST_TRACE:-}
 latency=false
 set --
 if [ -n "${WIREHOP_TEST_LATENCY_BINARY:-}" ]; then
@@ -91,7 +90,7 @@ SH
         "$@" \
         -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$case_results:/results" \
         -e WIREHOP_TEST_ROUTED=true -e "WIREHOP_TEST_ROUTER=$router_ip" -e "WIREHOP_TEST_SUBNET=$subnet" \
-        -e "WIREHOP_TEST_OBSERVE=$observe" -e "WIREHOP_TEST_TRACE=${trace:+$trace-server}" \
+        -e "WIREHOP_TEST_OBSERVE=$observe" \
         -e "WIREHOP_TEST_LATENCY=$latency" \
         --entrypoint sh "$image" -c \
         'ip route replace "$WIREHOP_TEST_SUBNET" via "$WIREHOP_TEST_ROUTER" dev eth0
@@ -109,7 +108,6 @@ exec sh /test/node.sh server tcp-asymmetric' > /dev/null
         -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$case_results:/results" \
         -e WIREHOP_TEST_ROUTED=true -e "WIREHOP_TEST_SERVER=$server_ip" -e "WIREHOP_TEST_PATH=$path" \
         -e "WIREHOP_TEST_OBSERVE=$observe" -e "WIREHOP_TEST_DURATION=$duration" \
-        -e "WIREHOP_TEST_TRACE=${trace:+$trace-client}" \
         -e "WIREHOP_TEST_LATENCY=$latency" \
         -e "WIREHOP_TEST_ROUTER=$router_ip" --entrypoint sh "$image" -c \
         'ip route add "$WIREHOP_TEST_SERVER/32" via "$WIREHOP_TEST_ROUTER"

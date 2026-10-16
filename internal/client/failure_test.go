@@ -345,6 +345,49 @@ func TestSuperviseLanePreparationCancellation(t *testing.T) {
 }
 
 func TestClientRetryCandidate(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		first error
+		retry bool
+	}{
+		{name: "SessionGone", first: ErrSessionGone, retry: true},
+		{name: "AuthenticatedSessionGone", first: &RejectionError{
+			Code: protocol.ErrorSessionNotFound, Class: protocol.ErrorSessionGone, Scope: protocol.ErrorScopeSession,
+		}, retry: true},
+		{name: "RetryableSession", first: &RejectionError{
+			Code: protocol.ErrorUnavailable, Class: protocol.ErrorRetryable, Scope: protocol.ErrorScopeSession,
+		}, retry: true},
+		{name: "RejectedSession", first: &RejectionError{
+			Code: protocol.ErrorTargetDenied, Class: protocol.ErrorSessionRejected, Scope: protocol.ErrorScopeSession,
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			instance := &Client{
+				config: Config{Clock: monotime.New(), SessionAttemptTimeout: time.Second,
+					Dialer: &net.Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
+						attempts++
+						if attempts == 1 {
+							return tt.first
+						}
+						return ErrLaneRejected
+					}},
+				},
+				lanes: []clientLane{{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}},
+			}
+			failures := make(chan laneResult, 1)
+			candidate := instance.retryCandidate(t.Context(), 0, failures)
+			want, wantAttempts := tt.first, 1
+			if tt.retry {
+				want, wantAttempts = ErrLaneRejected, 2
+			}
+			if !errors.Is(candidate.err, want) || attempts != wantAttempts || len(failures) != wantAttempts-1 {
+				t.Fatalf("candidate = %v, attempts = %d, retry notices = %d, want %v after %d attempts",
+					candidate.err, attempts, len(failures), want, wantAttempts)
+			}
+		})
+	}
+
 	t.Run("TerminalRejection", func(t *testing.T) {
 		attempts := 0
 		instance := &Client{

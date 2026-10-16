@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
+	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,6 +63,128 @@ func TestOptionsProbeCount(t *testing.T) {
 			config := options{duration: tt.duration, interval: 10 * time.Millisecond}
 			if count := config.probeCount(); count != tt.want {
 				t.Fatalf("probeCount() = %d, want %d", count, tt.want)
+			}
+		})
+	}
+}
+
+func TestServe(t *testing.T) {
+	testCanceledDNS(t, func(ctx context.Context) error {
+		return serve(ctx, options{listen: "canceled-preparation.invalid:0", size: 64})
+	}, false)
+}
+
+func TestProbe(t *testing.T) {
+	testCanceledDNS(t, func(ctx context.Context) error {
+		_, err := probe(ctx, options{target: "canceled-preparation.invalid:9000", size: 64,
+			duration: time.Second, interval: 10 * time.Millisecond})
+		return err
+	}, true)
+	for _, tt := range []struct {
+		name    string
+		network string
+		ip      net.IP
+	}{
+		{name: "IPv4", network: "udp4", ip: net.IPv4(127, 0, 0, 1)},
+		{name: "IPv6", network: "udp6", ip: net.IPv6loopback},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			connection, err := net.ListenUDP(tt.network, &net.UDPAddr{IP: tt.ip})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stopped := make(chan struct{})
+			t.Cleanup(func() {
+				connection.Close()
+				<-stopped
+			})
+			go func() {
+				defer close(stopped)
+				buffer := make([]byte, 128)
+				for {
+					length, peer, err := connection.ReadFromUDPAddrPort(buffer)
+					if err != nil {
+						return
+					}
+					if _, err := connection.WriteToUDPAddrPort(buffer[:length], peer); err != nil {
+						return
+					}
+				}
+			}()
+			measured, err := probe(t.Context(), options{target: connection.LocalAddr().String(), size: 64,
+				duration: 50 * time.Millisecond, interval: 5 * time.Millisecond, drain: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if measured.Sent == 0 || measured.Received != measured.Sent || measured.Lost != 0 || measured.Unexpected != 0 {
+				t.Fatalf("loopback measurement = %+v", measured)
+			}
+		})
+	}
+}
+
+func testCanceledDNS(t *testing.T, run func(context.Context) error, wantCanceled bool) {
+	t.Helper()
+	for _, tt := range []struct {
+		name   string
+		before bool
+	}{
+		{name: "CanceledBeforePreparation", before: true},
+		{name: "CanceledDuringDNS"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			finished := make(chan struct{})
+			var once sync.Once
+			original := net.DefaultResolver
+			net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				once.Do(func() { close(started) })
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-release:
+					return nil, context.Canceled
+				}
+			}}
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(func() {
+				cancel()
+				close(release)
+				select {
+				case <-finished:
+				case <-time.After(2 * time.Second):
+					t.Error("preparation did not stop after the DNS fixture was released")
+				}
+				net.DefaultResolver = original
+			})
+			if tt.before {
+				cancel()
+			}
+			var err error
+			go func() {
+				err = run(ctx)
+				close(finished)
+			}()
+			if !tt.before {
+				select {
+				case <-started:
+				case <-time.After(2 * time.Second):
+					t.Fatal("preparation did not start DNS resolution")
+				}
+				cancel()
+			}
+			select {
+			case <-finished:
+			case <-time.After(time.Second):
+				t.Fatal("preparation ignored context cancellation during DNS resolution")
+			}
+			if wantCanceled {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("preparation error = %v, want context cancellation", err)
+				}
+			} else if err != nil {
+				t.Fatalf("listener cancellation = %v, want a clean shutdown", err)
 			}
 		})
 	}

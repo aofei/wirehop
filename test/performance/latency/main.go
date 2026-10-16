@@ -149,14 +149,14 @@ func parseProbe(payload []byte, size int) (uint64, bool) {
 
 // serve echoes valid probes until its owning context closes the UDP socket.
 func serve(ctx context.Context, config options) error {
-	address, err := net.ResolveUDPAddr("udp", config.listen)
+	socket, err := (&net.ListenConfig{}).ListenPacket(ctx, "udp", config.listen)
 	if err != nil {
-		return fmt.Errorf("resolve listener: %w", err)
-	}
-	connection, err := net.ListenUDP("udp", address)
-	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return fmt.Errorf("listen: %w", err)
 	}
+	connection := socket.(*net.UDPConn)
 	defer connection.Close()
 	stopClose := context.AfterFunc(ctx, func() { connection.Close() })
 	defer stopClose()
@@ -187,14 +187,11 @@ func serve(ctx context.Context, config options) error {
 
 // probe sends independently of reply processing and drains until the last send's fixed timeout.
 func probe(parent context.Context, config options) (result, error) {
-	address, err := net.ResolveUDPAddr("udp", config.target)
-	if err != nil {
-		return result{}, fmt.Errorf("resolve target: %w", err)
-	}
-	connection, err := net.DialUDP("udp", nil, address)
+	socket, err := (&net.Dialer{}).DialContext(parent, "udp", config.target)
 	if err != nil {
 		return result{}, fmt.Errorf("dial target: %w", err)
 	}
+	connection := socket.(*net.UDPConn)
 	defer connection.Close()
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)

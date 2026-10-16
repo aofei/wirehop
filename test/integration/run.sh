@@ -6,6 +6,10 @@ if [ "$#" -lt 2 ]; then
   exit 2
 fi
 binary=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+  echo "binary must be an executable regular file: $binary" >&2
+  exit 2
+fi
 mkdir -p "$2"
 results=$(cd "$2" && pwd)
 scripts=$(CDPATH='' cd "$(dirname "$0")" && pwd)
@@ -102,9 +106,7 @@ for scenario in "$@"; do
   docker logs "$server" > "$results/$scenario/server-container.log" 2>&1
   docker exec "$server" nstat -az > "$results/$scenario/server-nstat.txt"
   docker exec "$server" wg show wgtest latest-handshakes > "$results/$scenario/server-handshake.txt"
-  case "$scenario" in
-    *-rtt-step*) docker exec "$server" tc -s qdisc show dev eth0 > "$results/$scenario/server-qdisc-final.txt" ;;
-  esac
+  docker exec "$server" tc -s qdisc show dev eth0 > "$results/$scenario/server-qdisc-final.txt"
   docker rm -f "$client" "$server" > /dev/null
   if [ "$status" != 0 ]; then
     echo "case failed: $scenario (container exit $status), inspect $results/$scenario" >&2

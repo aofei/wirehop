@@ -79,7 +79,6 @@ case "$scenario" in
   tcp-loss) tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 0.5% ;;
   *-rtt-step*)
     tc qdisc replace dev eth0 root handle 10: netem delay 5ms rate 20mbit limit 10000
-    tc -s qdisc show dev eth0 > "/results/$role-qdisc-initial.txt"
     ip -brief address show > "/results/$role-addresses.txt"
     ip route show table all > "/results/$role-routes.txt"
     (
@@ -111,6 +110,7 @@ case "$scenario" in
     tc qdisc replace dev eth0 parent 1:1 handle 10: netem delay 100ms 20ms loss 0.2% limit 8
     ;;
 esac
+tc -s qdisc show dev eth0 > "/results/$role-qdisc-initial.txt"
 
 case "$scenario" in
   native-capacity-change*|tcp-multipath-capacity-change*)
@@ -280,6 +280,7 @@ case "$scenario" in
   *-rtt-step*) set -- "$@" --get-server-output ;;
 esac
 date +%s > /results/flow-start.txt
+tc -s qdisc show dev eth0 > /results/client-qdisc-before.txt
 nstat -az > /results/client-before.txt
 ss -u -a -m > /results/client-sockets.txt
 ss -tnH state established > /results/client-tcp-sockets.txt
@@ -300,7 +301,5 @@ if [ -n "$observer" ]; then wait "$observer"; fi
 nstat -az > /results/client-after.txt
 ss -tnH state established > /results/client-tcp-sockets-after.txt
 wg show wgtest latest-handshakes > /results/client-handshake.txt
-case "$scenario" in
-  *-rtt-step*) tc -s qdisc show dev eth0 > /results/client-qdisc-final.txt ;;
-esac
+tc -s qdisc show dev eth0 > /results/client-qdisc-final.txt
 exit "$status"

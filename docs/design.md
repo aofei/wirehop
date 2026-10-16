@@ -360,14 +360,19 @@ Every connection, handshake, and control-plane failure maps to one stable error 
 | `configuration` | Malformed URL, unsupported scheme, missing token, invalid TLS option | Fail before network startup |
 | `retryable` | DNS failure including missing records, network failure, timeout, clock skew, HTTP 408, 429, or 5xx | Reconnect with backoff |
 | `lane_rejected` | Certificate validation failure, authentication rejection, incompatible protocol | Reject that lane |
-| `session_gone` | Join refers to an unknown, closed, or expired session | Coordinate session replacement |
+| `session_gone` | Provisional session closes during creation or join refers to an absent session | Retry creation or coordinate session replacement |
 | `session_rejected` | All viable endpoints reject the credentials, target, or protocol | Terminate the client |
+
+Carrier socket permission denials reject only the affected lane. Connection refusal, reset, and timeout remain retryable.
 
 A rejection from one endpoint is lane-specific until the client has evaluated other viable candidates. This prevents a
 misdirected or incorrectly configured URL from turning its own authentication failure into a false session-wide failure.
 Before session establishment, the client treats a remote `session_rejected` response as evidence for that candidate and
 promotes it to a process-level terminal result only after every viable candidate has failed terminally. An in-session
 `session_rejected` control received on an admitted lane and scoped to the current session is terminal immediately.
+
+A `session_gone` rejection during session creation retries that candidate with backoff. No shared session has been
+selected yet, so that rejection does not invalidate another candidate or terminate startup.
 
 A `session_gone` response from a lane that was previously admitted to the current session invalidates the shared session
 and starts coordinated replacement immediately. Waiting for every other lane supervisor could block recovery
@@ -382,16 +387,16 @@ is disabled for that session and does not participate in reconnect backoff. Sess
 lanes again. A client that terminated after all candidates were rejected requires a restart after its configuration or
 remote deployment is corrected.
 
-Raw-stream responses, WebSocket rejections, and in-session error frames carry machine-readable error classes. A
-WebSocket rejection that follows successful request parsing carries an authenticated binary rejection in the
-`WireHop-Rejection` response header. Its signed class and scope override the HTTP status for client lifecycle decisions.
-An unsigned or invalid response retains status-based handling for intermediary-generated errors. Retry behavior never
-depends on free-form diagnostic text. The `lane_rejected` class always has lane scope. The `session_gone` and
-`session_rejected` classes always have session scope. A `retryable` error may use either scope according to the resource
-that failed. A lane-scoped retryable error reconnects only that stable lane identity. A session-scoped retryable error
-replaces the complete session after bounded backoff. An in-session `session_rejected` or session-scoped `retryable`
-error received on an admitted lane applies to the complete session rather than only its carrying lane. Raw servers
-return an HMAC-authenticated terminal rejection when the client hello uses an unsupported WireHop version.
+Raw-stream responses, WireHop WebSocket admission rejections, and in-session error frames carry machine-readable error
+classes. A WireHop admission rejection for a successfully parsed WebSocket request carries an authenticated binary
+rejection in the `WireHop-Rejection` response header. Its signed class and scope override the HTTP status for client
+lifecycle decisions. An unsigned or invalid response retains status-based handling. Retry behavior never depends on
+free-form diagnostic text. The `lane_rejected` class always has lane scope. The `session_gone` and `session_rejected`
+classes always have session scope. A `retryable` error may use either scope according to the resource that failed. A
+lane-scoped retryable error reconnects only that stable lane identity. A session-scoped retryable error replaces the
+complete session after bounded backoff. An in-session `session_rejected` or session-scoped `retryable` error received on
+an admitted lane applies to the complete session rather than only its carrying lane. Raw servers return an
+HMAC-authenticated terminal rejection when the client hello uses an unsupported WireHop version.
 
 ### Reconnection policy
 
@@ -1342,10 +1347,10 @@ returns `stale_generation`.
 The direct server uses a 16 KiB request-header budget, and the client limits relay or proxy response headers to 16 KiB
 during the WebSocket handshake.
 
-After successfully parsing an admission request, the server represents every rejection with the same signed server hello
-used by raw-stream carriers. It writes the unpadded base64url encoding into one `WireHop-Rejection` response header. The
-header is limited to 768 characters, derived from the 576-byte maximum server hello. Decoding rejects CR, LF, padding,
-and nonzero unused trailing bits. An explicit CR/LF check is necessary because Go
+WireHop admission rejections for a successfully parsed request use the same signed server hello as raw-stream carriers.
+The server writes the unpadded base64url encoding into one `WireHop-Rejection` response header. The header is limited to
+768 characters, derived from the 576-byte maximum server hello. Decoding rejects CR, LF, padding, and nonzero unused
+trailing bits. An explicit CR/LF check is necessary because Go
 [Base64 strict decoding](https://pkg.go.dev/encoding/base64#Encoding.Strict) still ignores those characters. Creation
 rejections use the long-term token. Rejections for a retained session use its session secret. An unknown-session
 rejection uses the long-term token because no session secret remains. The signed response includes the request nonce,
@@ -1354,16 +1359,19 @@ server Unix time, error code, class, scope, and bounded diagnostic.
 Authentication and clock-skew rejections use HTTP 401, target denial uses 403, replay and generation conflicts use 409,
 an unknown session uses 410, admission rate limiting uses 429, and temporary server failures use 5xx.
 
+Failures before WireHop parses the admission fields and failures in WebSocket Upgrade validation can produce unsigned
+HTTP responses or close the connection. These failures do not carry authenticated WireHop rejection metadata.
+
 The client trusts this metadata only after verifying the HMAC and exact request nonce. A valid `clock_skew` rejection is
 lane-scoped and retryable. It refreshes the lane's authentication clock before the next attempt. Authentication failure
 and nonce replay remain terminal. Missing, malformed, incorrectly signed, or request-mismatched metadata cannot alter
 the authentication clock.
 
 The client does not follow HTTP redirects during WebSocket admission. A lane URL is an exact admission endpoint, and
-forwarding signed admission headers to a redirected URL would weaken that boundary. For an unsigned intermediary
-response, HTTP 408, 429, and 5xx are retryable. Every other unsigned non-upgrade HTTP response permanently rejects only
-that lane candidate. In particular, HTTP 410 triggers session replacement only when its rejection metadata authenticates
-a `session_gone` result.
+forwarding signed admission headers to a redirected URL would weaken that boundary. Unsigned HTTP 408, 429, and 5xx
+responses are retryable. Every other unsigned non-upgrade HTTP response permanently rejects only that lane candidate. In
+particular, HTTP 410 triggers session replacement only when its rejection metadata authenticates a `session_gone`
+result.
 
 ## TLS policy
 
@@ -2284,11 +2292,13 @@ keeps the client running. The warning identifies the lane occurrence, canonical 
 either the local error or stable remote code, class, and scope. Individual lane supervisors also report prolonged
 retryable instability, using a 30-second quiet window and at most one warning per minute. Briefly successful reconnects
 do not reset that window. Thirty seconds of sustained service produces one recovery message if a warning was emitted and
-resets the window for a subsequent outage. Local abandonment retains its specific error cause. WebSocket close failures
-retain the close status without the peer's reason text. Remote admission and relay errors retain code, class, and scope
-even when formatted as a terminal command error. Failed HTTP upgrades retain the status without echoing untrusted
-response headers. Malformed HTTP responses use local transport error categories, preserving the underlying error for
-retry and TLS failure classification without formatting the parser's raw response text.
+resets the window for a subsequent outage. Local abandonment retains its specific error cause. TLS handshake failures
+report local transport categories without certificate names or other peer-controlled fields. The underlying error
+remains available for retry and certificate-failure classification. WebSocket close failures retain the close status
+without the peer's reason text. Remote admission and relay errors retain code, class, and scope even when formatted as a
+terminal command error. Failed HTTP upgrades retain the status without echoing untrusted response headers. Malformed
+HTTP responses use local transport error categories, preserving the underlying error for retry and TLS failure
+classification without formatting the parser's raw response text.
 
 Client session creation and forward target preparation remain quiet for their first 30 seconds. Failed attempts after
 that window emit at most one warning per minute. Recovery produces one informational message only if that preparation

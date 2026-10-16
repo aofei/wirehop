@@ -31,6 +31,10 @@ address, forcing recovery from an obsolete TCP connection.
 The rate-limited cases add 100 ms one-way delay, 20 ms jitter, and 0.2% loss with an eight-packet netem queue. They test
 continued connectivity at low capacity, not comparative mobile throughput or battery consumption.
 
+Configured random loss and queue overflow are separate. Overflow can substantially increase loss and create receive gaps
+beyond the carrier's liveness budget. Inner TCP can also remain in retransmission backoff while the carriers stay
+connected. Inspect the saved queue counters, socket identities, and endpoint logs when a run fails.
+
 The `tcp-asymmetric` case uses distinct TCP path groups with 5 ms one-way delay at 100 Mbit/s and 150 ms one-way delay
 at 20 Mbit/s. `tcp-asymmetric-stall` additionally interrupts only the faster path for four seconds. Its `-reverse` and
 `-bidir` variants exercise the opposite direction and simultaneous bidirectional traffic. Each exercised direction must
@@ -96,10 +100,10 @@ cases permit reconnection. Healthy parallel-lane cases permit concurrent admissi
 carrier endpoint pairs to remain identical before and after the flow, with no additional carrier connection attempts
 during the flow. The asymmetric stall case requires both carriers before fault injection and permits recovery through a
 new connection. Rekey cases require a later kernel handshake while the same iperf3 TCP flow remains active. Results
-preserve iperf3 JSON, kernel counters, socket receive limits, handshake timestamps, software versions, and WireHop
-diagnostics. Compare goodput, retransmissions, and `UdpRcvbufErrors` across repeated runs on the same engine. Kernel
-counters are namespace totals, so `TcpOutRsts` alone cannot identify an outer carrier reset. The tests use MTU 1420 and
-fixed public test keys exclusively inside the isolated network.
+preserve iperf3 JSON, kernel counters, endpoint qdisc settings and counters, socket receive limits, handshake
+timestamps, software versions, and WireHop diagnostics. Compare goodput, retransmissions, and `UdpRcvbufErrors` across
+repeated runs on the same engine. Kernel counters are namespace totals, so `TcpOutRsts` alone cannot identify an outer
+carrier reset. The tests use MTU 1420 and fixed public test keys exclusively inside the isolated network.
 
 These cases establish connectivity and recovery under the specified faults. Their endpoint-egress netem settings and
 short flows do not establish comparative WAN throughput or multipath capacity aggregation. For performance comparisons,

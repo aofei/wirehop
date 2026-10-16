@@ -21,12 +21,150 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/client"
 	"github.com/aofei/wirehop/internal/policy"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/server"
 	"github.com/aofei/wirehop/internal/target"
+	"github.com/aofei/wirehop/internal/wsheader"
 )
+
+func TestClientBootstrapSessionGone(t *testing.T) {
+	for _, scheme := range []string{"TCP", "TLS", "WS", "WSS"} {
+		t.Run(scheme, func(t *testing.T) {
+			endpoint, stopTarget := startEchoTarget(t)
+			defer stopTarget()
+			token := []byte("test-token")
+			instance := newServer(t, token, []netip.AddrPort{endpoint})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			reject := func(nonce protocol.Nonce) (protocol.ServerHello, error) {
+				response := protocol.ServerHello{
+					Result: protocol.ServerRejected, RequestNonce: nonce, ServerUnixSeconds: time.Now().Unix(),
+					ErrorCode: protocol.ErrorSessionNotFound, ErrorClass: protocol.ErrorSessionGone,
+					ErrorScope: protocol.ErrorScopeSession,
+				}
+				err := protocol.SignServerHello(&response, token)
+				return response, err
+			}
+			var laneURL string
+			var clientTLS *tls.Config
+			if scheme == "WS" || scheme == "WSS" {
+				var requests atomic.Int32
+				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if requests.Add(1) != 1 {
+						instance.WebSocketHandler(ctx).ServeHTTP(w, r)
+						return
+					}
+					hello, err := wsheader.Parse(r)
+					if err == nil {
+						err = wsheader.Verify(r, hello, token)
+					}
+					if err == nil {
+						var response protocol.ServerHello
+						response, err = reject(hello.Nonce)
+						if err == nil {
+							err = wsheader.SetRejection(w.Header(), response)
+						}
+					}
+					if err != nil {
+						t.Errorf("prepare authenticated rejection: %v", err)
+						http.Error(w, "invalid test admission", http.StatusInternalServerError)
+						return
+					}
+					http.Error(w, "session unavailable", http.StatusGone)
+				})
+				var remote *httptest.Server
+				if scheme == "WSS" {
+					remote = httptest.NewTLSServer(handler)
+					roots := x509.NewCertPool()
+					roots.AddCert(remote.Certificate())
+					clientTLS = &tls.Config{RootCAs: roots}
+				} else {
+					remote = httptest.NewServer(handler)
+				}
+				defer func() {
+					cancel()
+					remote.Close()
+				}()
+				laneURL = strings.Replace(remote.URL, "http", "ws", 1) + "/_wirehop"
+			} else {
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var configured net.Listener = carrier.NewTCPOptionsListener(listener)
+				if scheme == "TLS" {
+					var serverTLS *tls.Config
+					serverTLS, clientTLS = testTLSConfigs(t)
+					configured = tls.NewListener(configured, serverTLS)
+				}
+				rejectFirst := func() error {
+					connection, err := configured.Accept()
+					if err != nil {
+						return err
+					}
+					defer connection.Close()
+					if err := connection.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+						return err
+					}
+					hello, err := protocol.ReadClientHello(connection)
+					if err != nil {
+						return err
+					}
+					if err := protocol.VerifyClientHello(hello, token); err != nil {
+						return err
+					}
+					response, err := reject(hello.Nonce)
+					if err != nil {
+						return err
+					}
+					return protocol.WriteServerHello(connection, response)
+				}
+				done := make(chan error, 1)
+				go func() {
+					err := rejectFirst()
+					if err == nil {
+						err = instance.Serve(ctx, configured)
+					}
+					done <- err
+				}()
+				defer func() {
+					cancel()
+					configured.Close()
+					if err := <-done; err != nil {
+						t.Errorf("Serve() error = %v", err)
+					}
+				}()
+				laneURL = strings.ToLower(scheme) + "://" + listener.Addr().String()
+			}
+			config := clientConfig(t, laneURL, endpoint, token, clientTLS)
+			var attempts atomic.Int32
+			config.Dialer = &net.Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
+				attempts.Add(1)
+				return nil
+			}}
+			local, err := client.Start(ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer local.Close()
+			waitForServer(t, func(snapshot server.Snapshot) bool {
+				return !local.SessionID().IsZero() && snapshot.Sessions == 1 && snapshot.AttachedLanes == 1
+			}, instance)
+			if attempts.Load() != 2 {
+				t.Fatalf("creation attempts = %d, want 2", attempts.Load())
+			}
+			peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			assertRelayExchange(t, peer, local.LocalAddr())
+		})
+	}
+}
 
 func TestClientBypassesStalledAdmission(t *testing.T) {
 	for _, scheme := range []string{"TCP", "TLS", "WS", "WSS"} {

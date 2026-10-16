@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aofei/backoff"
@@ -44,7 +45,7 @@ var (
 	ErrInvalidConfig = errors.New("invalid client configuration")
 	// ErrUnexpectedServerResponse indicates a valid but contextually impossible handshake response.
 	ErrUnexpectedServerResponse = errors.New("unexpected server response")
-	// ErrSessionGone indicates that the server no longer retains a session being joined.
+	// ErrSessionGone indicates that the server no longer retains an admitted or provisional session.
 	ErrSessionGone = errors.New("relay session is gone")
 	// ErrSessionAttemptTimeout indicates that one lane's session creation attempt exhausted its operation budget.
 	ErrSessionAttemptTimeout = errors.New("relay session creation timed out")
@@ -580,7 +581,8 @@ func (c *Client) retryCandidate(ctx context.Context, index int, failures chan<- 
 			candidate.err = context.Cause(ctx)
 			return candidate
 		}
-		if classifyLaneFailure(candidate.err) != failureRetry && !retryableSessionFailure(candidate.err) {
+		if classifyLaneFailure(candidate.err) != failureRetry &&
+			!retryableSessionFailure(candidate.err) && !sessionGoneFailure(candidate.err) {
 			return candidate
 		}
 		select {
@@ -679,6 +681,9 @@ func retryableSessionFailure(err error) bool {
 func sessionGoneFailure(err error) bool {
 	if errors.Is(err, ErrSessionGone) {
 		return true
+	}
+	if rejection, ok := errors.AsType[*RejectionError](err); ok {
+		return rejection.Class == protocol.ErrorSessionGone && rejection.Scope == protocol.ErrorScopeSession
 	}
 	remote, ok := errors.AsType[*relay.RemoteError](err)
 	return ok && remote.Value.Class == protocol.ErrorSessionGone &&
@@ -957,7 +962,7 @@ func (c *Client) dialStream(ctx context.Context, spec lanespec.Spec) (net.Conn, 
 	defer cancel()
 	if err := secure.HandshakeContext(handshakeContext); err != nil {
 		connection.Close()
-		return nil, fmt.Errorf("perform TLS lane handshake: %w", err)
+		return nil, &handshakeError{carrier: "TLS", cause: err}
 	}
 	return secure, nil
 }
@@ -1322,7 +1327,7 @@ func (c *Client) dialWebSocket(ctx context.Context, url laneurl.URL,
 		if connection != nil {
 			connection.Close()
 		}
-		return nil, response, handshakeContext, cancel, 0, &webSocketHandshakeError{cause: err}
+		return nil, response, handshakeContext, cancel, 0, &handshakeError{carrier: "WebSocket", cause: err}
 	}
 	if connection.Subprotocol() != wsheader.Subprotocol {
 		connection.Close()
@@ -1523,6 +1528,9 @@ func classifyLaneFailure(err error) failureDisposition {
 	if errors.Is(err, protocol.ErrAuthenticationFailed) || errors.Is(err, ErrUnexpectedServerResponse) ||
 		errors.Is(err, ErrLaneRejected) || errors.Is(err, os.ErrPermission) ||
 		relay.IsProtocolViolation(err) {
+		return failureCloseLane
+	}
+	if errno, ok := netsetup.SocketErrno(err); ok && errno == syscall.EACCES {
 		return failureCloseLane
 	}
 	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {

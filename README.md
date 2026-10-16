@@ -283,7 +283,7 @@ and join that session concurrently. Lane-scoped rejections close only the affect
 Session-scoped failures coordinate complete session replacement or termination. Retryable lane failures reconnect
 independently with increasing generations and full-jitter backoff. After the first session succeeds, retryable session
 replacement continues without an overall recovery deadline. A permanent lane failure writes one warning when another
-lane supervisor keeps the client running. Individual lane reconnects remain silent.
+lane supervisor keeps the client running. Brief individual lane reconnects remain silent.
 
 ## Target resolution and failover
 

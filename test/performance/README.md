@@ -68,8 +68,3 @@ traffic.
 The latency tool also supports standalone `-listen ADDRESS` and `-target ADDRESS` modes, including IPv6 addresses in
 brackets. `-size`, `-interval`, `-duration`, and `-drain` select the probe parameters. It uses local monotonic send and
 receive times and does not require synchronized host clocks.
-
-`WIREHOP_TEST_TRACE` passes a file prefix to both endpoints with separate client/server suffixes. Standard binaries
-ignore it. Experimental Go source overlays can use it to export scheduler state without adding production tracing hooks.
-Such overlays need bounded, asynchronous export, recorded source and binary fingerprints, and identical sampling for
-both candidates. Include observation overhead when interpreting those experiments.
