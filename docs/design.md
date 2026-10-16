@@ -1431,6 +1431,14 @@ Fast-path behavior:
 - Use an abortive TCP close for an abandoned generation so unacknowledged stale bytes are discarded
 - Bound each WebSocket binary message to two maximum encoded frames, or 131,112 bytes, on receipt
 
+`tls://` Data coalescing considers record packing only when the soft writer budget reaches its 64 KiB maximum. Smaller
+budgets retain ordinary coalescing. When an eligible batch would cross a 16 KiB record boundary, the writer compares its
+complete-frame prefix with a bounded preview of the remaining queued batch. It prefers that prefix only when the preview
+indicates higher average plaintext occupancy across full-sized records. Larger frames and less efficient prefixes retain
+ordinary coalescing. The preview does not simulate flight credit. The frame count and flight credit still bound actual
+admission, and individual frames remain indivisible. The preview does not wait for additional Data or extend receiver
+reads. TLS may use smaller records during connection startup.
+
 Socket write success only means that the local kernel or TLS stack accepted bytes. It never counts as peer delivery or
 as permission to release retained backlog and packet state.
 

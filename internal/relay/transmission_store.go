@@ -403,7 +403,8 @@ func (s *TransmissionStore) pushAt(transmission retainedTransmission, now time.T
 }
 
 // takeBatch moves an available write-order batch into the sent prefix and retains its packet buffers for the caller.
-func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []datagram.Packet, targetBytes int) (int, error) {
+// targetBytes is a soft writer budget. A positive recordBytes lets the bounded preview prefer a complete-frame prefix.
+func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []datagram.Packet, targetBytes, recordBytes int) (int, error) {
 	if len(destination) == 0 || len(ownership) < len(destination) || targetBytes <= 0 {
 		return 0, ErrInvalidTransmissionStore
 	}
@@ -426,6 +427,12 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 		source, transmission, ok := s.nextQueuedLocked(sentMicros)
 		if !ok {
 			break
+		}
+		if recordBytes > 0 && count > 0 && int(transmission.size) > recordBytes-bytes {
+			if bytes <= recordBytes && s.preferRecordPrefixLocked(len(destination)-count, targetBytes, recordBytes, bytes, sentMicros) {
+				break
+			}
+			recordBytes = 0
 		}
 		if s.sentPackets == math.MaxUint64 || uint64(transmission.size) > math.MaxUint64-s.sentBytes {
 			if count == 0 {
@@ -480,6 +487,28 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 		s.notifyLocked()
 	}
 	return count, nil
+}
+
+// preferRecordPrefixLocked estimates whether one record's committed prefix packs better than ordinary coalescing.
+// Its bounded suffix preview does not change queues or simulate flight credit. takeBatch enforces admission limits.
+func (s *TransmissionStore) preferRecordPrefixLocked(frames, targetBytes, recordBytes, prefixBytes int, nowMicros uint64) bool {
+	bytes, inspected := prefixBytes, 0
+preview:
+	for _, source := range [2]*transmissionDeque{&s.control, &s.normal} {
+		for index := source.head; index < len(source.items); index++ {
+			if inspected == frames || bytes >= targetBytes {
+				break preview
+			}
+			inspected++
+			transmission := &source.items[index]
+			if nowMicros >= transmission.deadlineMicros {
+				continue
+			}
+			bytes += int(transmission.size)
+		}
+	}
+	records := (bytes-1)/recordBytes + 1
+	return prefixBytes*records > bytes
 }
 
 // nextQueuedLocked returns the next live transmission in carrier priority order.

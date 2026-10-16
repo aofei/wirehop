@@ -17,6 +17,7 @@ import (
 	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
+	"github.com/aofei/wirehop/internal/retention"
 	"github.com/aofei/wirehop/internal/wgpacket"
 )
 
@@ -2350,36 +2351,94 @@ func TestLaneWriteTimeout(t *testing.T) {
 }
 
 func TestLaneDataWriteFailureRetainsSentPrefix(t *testing.T) {
-	writeErr := errors.New("scripted data write failure")
-	carrier := newTestCarrier()
-	carrier.dataWriteErr = writeErr
-	lane := newTestLane(t, carrier, newTestEndpoint())
-	transmission := schedulerTransmission(7, wgpacket.TransportData, time.Now().Add(time.Second))
-	if err := lane.store.push(transmission); err != nil {
-		t.Fatal(err)
-	}
-
-	result := make(chan error, 1)
-	go func() { result <- lane.Run(context.Background()) }()
-	select {
-	case err := <-result:
-		if !errors.Is(err, writeErr) {
-			t.Fatalf("Run() error = %v, want %v", err, writeErr)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for data write failure")
-	}
-
-	if lane.store.sent.len() != 1 || lane.store.normal.len() != 0 {
-		t.Fatalf("store order = %d sent and %d queued, want 1 sent and 0 queued",
-			lane.store.sent.len(), lane.store.normal.len())
-	}
-	if packets, bytes := lane.store.backlog(); packets != 1 || bytes != uint64(transmission.size) {
-		t.Fatalf("retained backlog = %d packets and %d bytes", packets, bytes)
-	}
-	drained := lane.store.drain()
-	if len(drained) != 1 || drained[0].packetID != transmission.packetID {
-		t.Fatalf("drained transmissions = %+v", drained)
+	for _, tt := range []struct {
+		name        string
+		packets     int
+		budget      uint64
+		recordBytes int
+		wantSent    int
+	}{
+		{name: "SingleFrame", packets: 1, budget: 1024, wantSent: 1},
+		{name: "StreamBatch", packets: 16, budget: 64 * 1024, wantSent: 16},
+		{name: "TLSRecordPrefix", packets: 16, budget: 64 * 1024, recordBytes: 16 * 1024, wantSent: 11},
+		{name: "TLSRateLimitedBatch", packets: 16, budget: 32 * 1024, recordBytes: 16 * 1024, wantSent: 16},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			budget, err := retention.NewBudget(retention.Limits{Packets: tt.packets, Bytes: 64 * 1024})
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewTransmissionStoreWithBudget(packetqueue.Limits{Packets: tt.packets, Bytes: 64 * 1024},
+				budget, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				releaseTransmissions(store.drain())
+				if got := budget.Usage(); got != (retention.Usage{}) {
+					t.Errorf("failed generation retained aggregate ownership: %+v", got)
+				}
+			})
+			store.setDeliveryWindows(64*1024, 64*1024)
+			store.writeBudget.Store(tt.budget)
+			writeErr := errors.New("scripted data write failure")
+			connection := newTestCarrier()
+			connection.dataWriteErr = writeErr
+			lane := newTestLane(t, connection, newTestEndpoint())
+			lane.store = store
+			lane.dataRecordBytes = tt.recordBytes
+			var retainedBytes uint64
+			for index := range tt.packets {
+				retainedBytes += pushFlightCreditPacket(t, store, uint64(index+7), 1452, now.Add(time.Second))
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			result := make(chan error, 1)
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				result <- lane.Run(ctx)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				connection.Close()
+				<-finished
+			})
+			select {
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for data write failure")
+			case err := <-result:
+				if !errors.Is(err, writeErr) {
+					t.Fatalf("Run() error = %v, want %v", err, writeErr)
+				}
+			}
+			if store.sent.len() != tt.wantSent || store.normal.len() != tt.packets-tt.wantSent || store.reportedPackets != 0 {
+				t.Fatalf("failed write retained %d sent, %d queued, and %d acknowledged packets",
+					store.sent.len(), store.normal.len(), store.reportedPackets)
+			}
+			if packets, bytes := store.backlog(); packets != tt.packets || bytes != retainedBytes {
+				t.Fatalf("retained backlog = %d packets and %d bytes", packets, bytes)
+			}
+			if got := budget.Usage(); got != (retention.Usage{Packets: tt.packets, Bytes: int(retainedBytes)}) {
+				t.Fatalf("failed write changed aggregate ownership: %+v", got)
+			}
+			for index, data := range lane.dataBatch {
+				if data.PacketID != 0 || data.DeadlineMicros != 0 || data.Payload != nil || lane.dataOwnership[index].Payload != nil {
+					t.Fatalf("failed write retained writer references at slot %d", index)
+				}
+			}
+			assertTransmissionStoreInvariants(t, store)
+			drained := store.drain()
+			defer releaseTransmissions(drained)
+			if len(drained) != tt.packets {
+				t.Fatalf("drained %d transmissions, want %d", len(drained), tt.packets)
+			}
+			for index, transmission := range drained {
+				if transmission.packetID != uint64(index+7) || len(transmission.packet.Payload) != 1452 {
+					t.Fatalf("failed generation changed retained packet %d: %+v", index, transmission)
+				}
+			}
+		})
 	}
 }
 

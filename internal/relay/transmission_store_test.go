@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +70,98 @@ func TestTransmissionStoreValidation(t *testing.T) {
 	}
 }
 
+func TestTransmissionStoreTakeBatchRecordPacking(t *testing.T) {
+	now := time.Unix(100, 0)
+	deadline := now.Add(time.Second)
+	small := schedulerTransmission(1, wgpacket.TransportData, deadline)
+	smallFrameBytes := dataFrameSize(small.data())
+	for _, tt := range []struct {
+		name         string
+		sizes        []int
+		target       int
+		record       int
+		expired      int
+		expiredAfter int
+		want         []int
+	}{
+		{name: "Unbounded", sizes: slices.Repeat([]int{1452}, 16), target: 64 * 1024, want: []int{16}},
+		{name: "TLSRecord", sizes: slices.Repeat([]int{1452}, 16), target: 64 * 1024, record: 16 * 1024, want: []int{11, 5}},
+		{name: "ExactLimit", sizes: []int{32, 32, 32}, target: 4096, record: 2 * smallFrameBytes, want: []int{2, 1}},
+		{name: "IncludesMetadata", sizes: []int{32, 32, 32}, target: 4096, record: 2*smallFrameBytes - 1, want: []int{3}},
+		{name: "SoftWriterBudget", sizes: slices.Repeat([]int{1452}, 5), target: 4096, record: 16 * 1024, want: []int{3, 2}},
+		{name: "MixedSizes", sizes: []int{9000, 4000, 3500, 32}, target: 64 * 1024, record: 16 * 1024, want: []int{2, 2}},
+		{name: "OversizedFirst", sizes: []int{32768, 32, 32}, target: 64 * 1024, record: 16 * 1024, want: []int{3}},
+		{name: "MaximumDatagram", sizes: []int{protocol.MaxPacketSize, 32}, target: 64 * 1024, record: 16 * 1024, want: []int{1, 1}},
+		{name: "OversizedAfterPrefix", sizes: []int{32, 32768, 32}, target: 64 * 1024, record: 16 * 1024, want: []int{3}},
+		{name: "SubFrameLimit", sizes: []int{32, 32}, target: 4096, record: 1, want: []int{2}},
+		{name: "PoorRecordFill", sizes: slices.Repeat([]int{3000}, 16), target: 64 * 1024, record: 16 * 1024, want: []int{16}},
+		{name: "JumboFrames", sizes: slices.Repeat([]int{9000}, 16), target: 64 * 1024, record: 16 * 1024, want: []int{8, 8}},
+		{name: "OversizedFrames", sizes: slices.Repeat([]int{32768}, 4), target: 64 * 1024, record: 16 * 1024, want: []int{2, 2}},
+		{name: "PacketSizeChange", sizes: slices.Concat(slices.Repeat([]int{9000}, 8), slices.Repeat([]int{1452}, 16)), target: 64 * 1024, record: 16 * 1024, want: []int{8, 11, 5}},
+		{name: "ExpiredPrefix", sizes: slices.Repeat([]int{1452}, 16), target: 64 * 1024, record: 16 * 1024, expired: 1, want: []int{11, 5}},
+		{name: "LongExpiredPrefix", sizes: slices.Repeat([]int{1452}, 16), target: 64 * 1024, record: 16 * 1024, expired: 16, want: []int{11, 5}},
+		{name: "ExpiredMiddle", sizes: slices.Repeat([]int{1452}, 16), target: 64 * 1024, record: 16 * 1024, expired: 1, expiredAfter: 12, want: []int{11, 5}},
+		{name: "LongExpiredMiddle", sizes: slices.Repeat([]int{1452}, 16), target: 64 * 1024, record: 16 * 1024, expired: 16, expiredAfter: 12, want: []int{11, 5}},
+		// Counting the expired frame would cross a second record boundary and choose the wrong prefix.
+		{name: "ExpiredPreviewBoundary", sizes: []int{14500, 18180, 32}, target: 64 * 1024, record: 16 * 1024, expired: 1, expiredAfter: 2, want: []int{3}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			current := now
+			store := schedulerStore(t, packetqueue.Limits{Packets: 32, Bytes: 256 * 1024})
+			store.now = func() time.Time { return current }
+			store.setDeliveryWindows(256*1024, 256*1024)
+			t.Cleanup(func() { releaseTransmissions(store.drain()) })
+			for index, size := range tt.sizes {
+				if index == tt.expiredAfter {
+					for range tt.expired {
+						if err := store.push(schedulerTransmission(1, wgpacket.TransportData, current.Add(time.Microsecond))); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				transmission := schedulerTransmission(uint64(index+1), wgpacket.TransportData, deadline)
+				transmission.packet.Payload = make([]byte, size)
+				transmission.packet.Payload[0] = 4
+				if err := store.push(transmission); err != nil {
+					t.Fatal(err)
+				}
+			}
+			current = current.Add(time.Microsecond)
+			var data [maximumDataBatchFrames]protocol.Data
+			var ownership [maximumDataBatchFrames]datagram.Packet
+			next := 0
+			for _, want := range tt.want {
+				select {
+				case <-store.Ready():
+				default:
+					t.Fatal("queued suffix was not notified")
+				}
+				count, err := store.takeBatch(data[:], ownership[:], tt.target, tt.record)
+				releaseBatchOwnership(ownership[:count])
+				if err != nil || count != want {
+					t.Fatalf("takeBatch() = %d, %v, want %d frames", count, err, want)
+				}
+				for _, packet := range data[:count] {
+					if packet.PacketID != uint64(next+1) || len(packet.Payload) != tt.sizes[next] {
+						t.Fatalf("frame %d changed identity or payload: %+v", next, packet)
+					}
+					next++
+				}
+				assertTransmissionStoreInvariants(t, store)
+			}
+			if next != len(tt.sizes) {
+				t.Fatalf("delivered %d frames, want %d", next, len(tt.sizes))
+			}
+			if count, err := store.takeBatch(data[:], ownership[:], tt.target, tt.record); count != 0 || !errors.Is(err, packetqueue.ErrEmpty) {
+				t.Fatalf("drained takeBatch() = %d, %v", count, err)
+			}
+			if packets, _ := store.backlog(); packets != len(tt.sizes) {
+				t.Fatalf("retained %d packets after expiry, want %d unacknowledged frames", packets, len(tt.sizes))
+			}
+		})
+	}
+}
+
 func TestTransmissionStoreTimingResumeAtCounterLimit(t *testing.T) {
 	now := time.UnixMicro(1000)
 	store := newDeliverySampleStore(t, &now)
@@ -90,7 +183,7 @@ func TestTransmissionStoreTimingResumeAtCounterLimit(t *testing.T) {
 	}
 	var data [1]protocol.Data
 	var ownership [1]datagram.Packet
-	count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+	count, err := store.takeBatch(data[:], ownership[:], math.MaxInt, 0)
 	releaseBatchOwnership(ownership[:count])
 	if count != 0 || !errors.Is(err, ErrCounterExhausted) {
 		t.Fatalf("takeBatch() after counter exhaustion = %d, %v", count, err)
@@ -144,7 +237,7 @@ func testTransmissionStorePreservesWriteView(t *testing.T, action string) {
 	}
 	var batch [1]protocol.Data
 	var ownership [1]datagram.Packet
-	count, err := store.takeBatch(batch[:], ownership[:], 4096)
+	count, err := store.takeBatch(batch[:], ownership[:], 4096, 0)
 	if err != nil || count != 1 {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
@@ -409,7 +502,7 @@ func testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits(t *testin
 	store.reportedBytes = store.sentBytes
 	var batch [3]protocol.Data
 	var ownership [3]datagram.Packet
-	count, err := store.takeBatch(batch[:], ownership[:], limits.Bytes)
+	count, err := store.takeBatch(batch[:], ownership[:], limits.Bytes, 0)
 	defer releaseBatchOwnership(ownership[:count])
 	if err != nil || count != len(batch) || store.sentPackets != math.MaxUint64 || store.sentBytes != math.MaxUint64 {
 		t.Fatalf("takeBatch() = %d, %v, want complete prefix at both cumulative limits", count, err)
@@ -477,7 +570,7 @@ func TestTransmissionStoreAggregateBudget(t *testing.T) {
 	}
 	var batch [1]protocol.Data
 	var ownership [1]datagram.Packet
-	count, err := first.takeBatch(batch[:], ownership[:], 4096)
+	count, err := first.takeBatch(batch[:], ownership[:], 4096, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +638,7 @@ func TestTransmissionStoreCarrierOrderAndAcknowledgement(t *testing.T) {
 
 	var batch [3]protocol.Data
 	var ownership [3]datagram.Packet
-	count, err := store.takeBatch(batch[:], ownership[:], 4096)
+	count, err := store.takeBatch(batch[:], ownership[:], 4096, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,7 +854,7 @@ func TestTransmissionStoreTakeBatchSkipsExpiredWork(t *testing.T) {
 	now = now.Add(time.Millisecond)
 	var batch [4]protocol.Data
 	var ownership [4]datagram.Packet
-	count, err := store.takeBatch(batch[:], ownership[:], 4096)
+	count, err := store.takeBatch(batch[:], ownership[:], 4096, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -843,6 +936,7 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 		packetLimit bool
 		capacity    int
 		byteSlack   int
+		recordBytes int
 		wantCount   int
 	}{
 		{name: "PacketCounterFull", packetLimit: true},
@@ -852,6 +946,8 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 		{name: "ByteCounterWouldOverflow", capacity: 1, byteSlack: -1},
 		{name: "ByteCounterFitsOne", capacity: 1, wantCount: 1},
 		{name: "ByteCounterFitsTwo", capacity: 2, wantCount: 2},
+		{name: "TLSRecordPacketCounterFitsTwo", packetLimit: true, capacity: 2, recordBytes: 16 * 1024, wantCount: 2},
+		{name: "TLSRecordByteCounterFitsTwo", capacity: 2, recordBytes: 16 * 1024, wantCount: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.UnixMicro(1000)
@@ -871,7 +967,11 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 			}
 			t.Cleanup(func() { releaseTransmissions(store.drain()) })
 			var prefixBytes [4]int
-			for index, size := range []int{32, 1452, 8000} {
+			firstSize := 32
+			if test.recordBytes > 0 {
+				firstSize = 14500
+			}
+			for index, size := range []int{firstSize, 1452, 8000} {
 				transmission := schedulerTransmission(uint64(index+1), wgpacket.TransportData, now.Add(time.Second))
 				transmission.packet.Payload = make([]byte, size)
 				transmission.packet.Payload[0] = 4
@@ -893,7 +993,7 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 			initialPackets, initialBytes := store.sentPackets, store.sentBytes
 			var batch [3]protocol.Data
 			var ownership [3]datagram.Packet
-			count, err := store.takeBatch(batch[:], ownership[:], 32*1024)
+			count, err := store.takeBatch(batch[:], ownership[:], 32*1024, test.recordBytes)
 			defer releaseBatchOwnership(ownership[:count])
 			if count != test.wantCount || count == 0 && !errors.Is(err, ErrCounterExhausted) || count > 0 && err != nil {
 				t.Fatalf("takeBatch() = %d, %v, want %d packets within cumulative counter limits", count, err, test.wantCount)
@@ -909,7 +1009,7 @@ func TestTransmissionStoreTakeBatchCounterBoundaries(t *testing.T) {
 			var next [1]protocol.Data
 			var nextOwnership [1]datagram.Packet
 			for attempt := range 2 {
-				if taken, err := store.takeBatch(next[:], nextOwnership[:], 32*1024); taken != 0 || !errors.Is(err, ErrCounterExhausted) {
+				if taken, err := store.takeBatch(next[:], nextOwnership[:], 32*1024, test.recordBytes); taken != 0 || !errors.Is(err, ErrCounterExhausted) {
 					t.Fatalf("exhausted takeBatch() = %d, %v, want an unchanged queued suffix", taken, err)
 				}
 				if attempt == 0 {
@@ -1100,6 +1200,7 @@ func TestTransmissionStoreStateMachine(t *testing.T) {
 		name              string
 		bytes             int
 		aggregate, probes bool
+		recordBatching    bool
 	}{
 		{name: "Local", bytes: 4096},
 		{name: "Aggregate", bytes: 4096, aggregate: true},
@@ -1107,6 +1208,12 @@ func TestTransmissionStoreStateMachine(t *testing.T) {
 		{name: "AggregateWithProbes", bytes: 16 * 1024, aggregate: true, probes: true},
 		{name: "LocalSingleProbeCapacity", bytes: 4101, probes: true},
 		{name: "AggregateSingleProbeCapacity", bytes: 4101, aggregate: true, probes: true},
+		{name: "LocalRecordBatching", bytes: 4096, recordBatching: true},
+		{name: "AggregateRecordBatching", bytes: 4096, aggregate: true, recordBatching: true},
+		{name: "LocalWithProbesRecordBatching", bytes: 16 * 1024, probes: true, recordBatching: true},
+		{name: "AggregateWithProbesRecordBatching", bytes: 16 * 1024, aggregate: true, probes: true, recordBatching: true},
+		{name: "LocalSingleProbeCapacityRecordBatching", bytes: 4101, probes: true, recordBatching: true},
+		{name: "AggregateSingleProbeCapacityRecordBatching", bytes: 4101, aggregate: true, probes: true, recordBatching: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			limits := packetqueue.Limits{Packets: 32, Bytes: tt.bytes}
@@ -1120,14 +1227,14 @@ func TestTransmissionStoreStateMachine(t *testing.T) {
 			}
 			for seed := range uint64(16) {
 				t.Run(fmt.Sprintf("Seed%d", seed), func(t *testing.T) {
-					testTransmissionStoreStateMachine(t, limits, budget, tt.probes, 0x4d595df4d0f33173+seed)
+					testTransmissionStoreStateMachine(t, limits, budget, tt.probes, tt.recordBatching, 0x4d595df4d0f33173+seed)
 				})
 			}
 		})
 	}
 }
 
-func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, budget *retention.Budget, probes bool, seed uint64) {
+func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, budget *retention.Budget, probes, recordBatching bool, seed uint64) {
 	t.Helper()
 	now := time.Unix(0, 0)
 	store, err := newTransmissionStoreWithBudget(limits, func() time.Time { return now }, budget)
@@ -1174,7 +1281,11 @@ func testTransmissionStoreStateMachine(t *testing.T, limits packetqueue.Limits, 
 		case 2:
 			var batch [8]protocol.Data
 			var ownership [8]datagram.Packet
-			count, err := store.takeBatch(batch[:], ownership[:], int(next()%1024+1))
+			recordBytes := 0
+			if recordBatching {
+				recordBytes = int(next() % 1024)
+			}
+			count, err := store.takeBatch(batch[:], ownership[:], int(next()%1024+1), recordBytes)
 			if err != nil && !errors.Is(err, packetqueue.ErrEmpty) {
 				t.Fatalf("takeBatch() error = %v", err)
 			}

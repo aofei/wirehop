@@ -650,7 +650,7 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("timed out waiting for scheduled packets")
 		}
-		added, err := store.takeBatch(received[count:], ownership[count:], 8192)
+		added, err := store.takeBatch(received[count:], ownership[count:], 8192, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -894,7 +894,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	}
 	var batch [2]protocol.Data
 	var ownership [2]datagram.Packet
-	count, err := store.takeBatch(batch[:], ownership[:], 4096)
+	count, err := store.takeBatch(batch[:], ownership[:], 4096, 0)
 	if err != nil || count != 2 {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
@@ -1404,7 +1404,7 @@ func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T
 		}
 		dataBytes += uint64(transmission.size)
 	}
-	count, err := lane.registration.Store.takeBatch(batch[:], ownership[:], math.MaxInt)
+	count, err := lane.registration.Store.takeBatch(batch[:], ownership[:], math.MaxInt, 0)
 	if err != nil || count != transmissionCount {
 		t.Fatalf("takeBatch() = %d, %v", count, err)
 	}
@@ -1600,7 +1600,7 @@ func TestSchedulerMigratesTransportOnce(t *testing.T) {
 
 	var migrated [2]protocol.Data
 	var ownership [2]datagram.Packet
-	count, err := destination.registration.Store.takeBatch(migrated[:], ownership[:], 4096)
+	count, err := destination.registration.Store.takeBatch(migrated[:], ownership[:], 4096, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1693,7 +1693,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 			defer sourceOwnership[0].Release()
 			defer destinationOwnership[0].Release()
 			if test.sourceWrite {
-				if count, err := sourceStore.takeBatch(sourceData[:], sourceOwnership[:], 4096); err != nil || count != 1 {
+				if count, err := sourceStore.takeBatch(sourceData[:], sourceOwnership[:], 4096, 0); err != nil || count != 1 {
 					t.Fatalf("source takeBatch() = %d, %v", count, err)
 				}
 				if !test.sourcePending {
@@ -1746,7 +1746,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				// Complete the old write before the destination acquires its write reference.
 				sourceOwnership[0].Release()
 			}
-			if count, err := destinationStore.takeBatch(destinationData[:], destinationOwnership[:], 4096); err != nil || count != 1 {
+			if count, err := destinationStore.takeBatch(destinationData[:], destinationOwnership[:], 4096, 0); err != nil || count != 1 {
 				t.Fatalf("destination takeBatch() = %d, %v", count, err)
 			}
 			if destinationData[0].PacketID != transmission.packetID ||
@@ -2262,7 +2262,7 @@ func takeOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data {
 	t.Helper()
 	var batch [1]protocol.Data
 	var ownership [1]datagram.Packet
-	count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize)
+	count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2282,7 +2282,7 @@ func awaitOneTransmission(t *testing.T, store *TransmissionStore) protocol.Data 
 	for {
 		var batch [1]protocol.Data
 		var ownership [1]datagram.Packet
-		count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize)
+		count, err := store.takeBatch(batch[:], ownership[:], protocol.MaxEncodedFrameSize, 0)
 		switch {
 		case err == nil && count == 1:
 			data := batch[0]

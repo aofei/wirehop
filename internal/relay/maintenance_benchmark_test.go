@@ -129,7 +129,7 @@ func BenchmarkSchedulerMaintenance(b *testing.B) {
 					}
 					var data [1]protocol.Data
 					var ownership [1]datagram.Packet
-					count, err := store.takeBatch(data[:], ownership[:], 4096)
+					count, err := store.takeBatch(data[:], ownership[:], 4096, 0)
 					releaseBatchOwnership(ownership[:count])
 					if err != nil || count != 1 {
 						b.Fatalf("takeBatch() = %d, %v, want one sent packet", count, err)
@@ -173,7 +173,7 @@ func BenchmarkExpiredSentAssessment(b *testing.B) {
 			var data [16]protocol.Data
 			var ownership [16]datagram.Packet
 			for sent := 0; sent < packets; {
-				count, err := store.takeBatch(data[:], ownership[:], limits.Bytes)
+				count, err := store.takeBatch(data[:], ownership[:], limits.Bytes, 0)
 				releaseBatchOwnership(ownership[:count])
 				if err != nil || count == 0 {
 					b.Fatalf("takeBatch() = %d, %v", count, err)

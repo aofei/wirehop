@@ -135,7 +135,7 @@ func BenchmarkSchedulerFillTransportProbe(b *testing.B) {
 				}
 				lane := lanes[scheduler.lastProbeLane]
 				store := lane.registration.Store
-				count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+				count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 				releaseBatchOwnership(ownership[:count])
 				if err != nil || count != 1 {
 					b.Fatalf("takeBatch() = %d, %v", count, err)
@@ -191,7 +191,7 @@ func BenchmarkSchedulerApplyEvent(b *testing.B) {
 					if err := store.push(transmission); err != nil {
 						b.Fatal(err)
 					}
-					count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+					count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 					releaseBatchOwnership(ownership[:count])
 					if err != nil || count != 1 {
 						b.Fatalf("takeBatch() = %d, %v", count, err)
@@ -246,7 +246,7 @@ func BenchmarkSelectCandidates(b *testing.B) {
 		if committed := index / 2; committed > 0 {
 			var batch [16]protocol.Data
 			var ownership [16]datagram.Packet
-			count, err := store.takeBatch(batch[:committed], ownership[:], committed*1500)
+			count, err := store.takeBatch(batch[:committed], ownership[:], committed*1500, 0)
 			releaseBatchOwnership(ownership[:count])
 			if err != nil || count != committed {
 				b.Fatalf("takeBatch() = %d, %v, want %d committed packets", count, err, committed)
@@ -384,7 +384,7 @@ func BenchmarkSchedulerScheduleCycle(b *testing.B) {
 				if preferred != 1 {
 					b.Fatalf("preferred lane = %d, want 1", preferred)
 				}
-				count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes)
+				count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes, 0)
 				if err != nil || count != 1 || batch[0].PacketID != scheduler.packetID {
 					b.Fatalf("takeBatch() = %d, %v, packet ID %d, want %d", count, err, batch[0].PacketID, scheduler.packetID)
 				}
@@ -445,7 +445,7 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 		if err := store.push(transmission); err != nil {
 			b.Fatal(err)
 		}
-		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes)
+		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes, 0)
 		if err != nil || count != 1 {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}
@@ -479,7 +479,7 @@ func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(transmission.packet.Payload) * len(batch)))
 	for b.Loop() {
-		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes)
+		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes, 0)
 		if err != nil || count != len(batch) {
 			b.Fatalf("takeBatch() = %d, %v", count, err)
 		}

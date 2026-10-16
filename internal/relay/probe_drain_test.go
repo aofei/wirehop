@@ -51,7 +51,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 				if ordinal == 2 && !scheduler.fillTransportProbe(lanes, preferred, protocolNow(), 0) {
 					t.Fatal("pending refresh prevented progress within the existing probe period")
 				}
-				count, err := probe.registration.Store.takeBatch(data[:], ownership[:], 4096)
+				count, err := probe.registration.Store.takeBatch(data[:], ownership[:], 4096, 0)
 				if count != 1 || err != nil {
 					t.Fatalf("active discovery lost its send opportunity while refresh waited: count %d, error %v", count, err)
 				}

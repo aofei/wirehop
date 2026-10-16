@@ -159,7 +159,7 @@ func TestScheduledLanePartialBurstPreservesCapacity(t *testing.T) {
 			var data [2]protocol.Data
 			var ownership [2]datagram.Packet
 			for range 4 {
-				count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+				count, err := store.takeBatch(data[:], ownership[:], math.MaxInt, 0)
 				releaseBatchOwnership(ownership[:count])
 				if err != nil || count != len(data) {
 					t.Fatalf("takeBatch() = %d, %v", count, err)
@@ -231,7 +231,7 @@ func TestScheduledLaneTimingResumePreservesCapacity(t *testing.T) {
 				t.Helper()
 				var data [2]protocol.Data
 				var ownership [2]datagram.Packet
-				count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+				count, err := store.takeBatch(data[:], ownership[:], math.MaxInt, 0)
 				releaseBatchOwnership(ownership[:count])
 				if err != nil || count != len(data) {
 					t.Fatalf("takeBatch() = %d, %v", count, err)
@@ -327,7 +327,7 @@ func TestTransmissionStorePreservesApplicationLimitedFlight(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+		count, err := store.takeBatch(data[:], ownership[:], math.MaxInt, 0)
 		releaseBatchOwnership(ownership[:count])
 		if err != nil || count != 7 {
 			t.Fatalf("takeBatch() = %d, %v", count, err)
@@ -350,7 +350,7 @@ func TestTransmissionStorePreservesSupplyStateAcrossPartialBatchReports(t *testi
 	}
 	var data [2]protocol.Data
 	var ownership [2]datagram.Packet
-	count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+	count, err := store.takeBatch(data[:], ownership[:], math.MaxInt, 0)
 	releaseBatchOwnership(ownership[:count])
 	if err != nil || count != 2 {
 		t.Fatalf("takeBatch() = %d, %v", count, err)

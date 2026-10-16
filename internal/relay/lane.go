@@ -129,6 +129,7 @@ type Lane struct {
 	controlBatch      [maximumConsecutiveControlFrames]protocol.Frame
 	dataBatch         [maximumDataBatchFrames]protocol.Data
 	dataOwnership     [maximumDataBatchFrames]datagram.Packet
+	dataRecordBytes   int
 	progress          deliveryProgress
 	pingMu            sync.Mutex
 	pendingPingID     uint64
@@ -193,7 +194,8 @@ func NewLane(config LaneConfig) (*Lane, error) {
 	initialFrames := append([]protocol.Frame(nil), config.InitialFrames...)
 	return &Lane{
 		carrier: config.Carrier, receiver: config.Receiver, store: config.Store, clock: config.Clock,
-		observer: config.Observer, sessionClose: config.SessionClose, sessionFailure: config.SessionFailure,
+		dataRecordBytes: carrier.DataRecordSize(config.Carrier),
+		observer:        config.Observer, sessionClose: config.SessionClose, sessionFailure: config.SessionFailure,
 		laneID: config.LaneID, generation: config.Generation, initialFrames: initialFrames,
 		clockSyncTimeout: config.ClockSyncTimeout, clockSynced: config.ClockSynced,
 		control: make(chan controlWrite, config.ControlCapacity), pong: make(chan controlWrite, 1),
@@ -560,7 +562,12 @@ func (l *Lane) writeReadyData(ctx context.Context) error {
 // writeDataBatch coalesces only data already available without introducing a batching delay.
 func (l *Lane) writeDataBatch(ctx context.Context) error {
 	target := max(uint64(1024), l.store.writeBudget.Load())
-	count, err := l.store.takeBatch(l.dataBatch[:], l.dataOwnership[:], int(target))
+	recordBytes := l.dataRecordBytes
+	// Preserve rate-limited batches until the writer reaches its maximum coalescing budget.
+	if target < targetDataBatchBytes {
+		recordBytes = 0
+	}
+	count, err := l.store.takeBatch(l.dataBatch[:], l.dataOwnership[:], int(target), recordBytes)
 	if err != nil {
 		return err
 	}

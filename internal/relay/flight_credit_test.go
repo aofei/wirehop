@@ -97,6 +97,67 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		assertFlightCreditTake(t, store, 2)
 		assertTransmissionStoreInvariants(t, store)
 	})
+	t.Run("TLSRecordPrefixWithSharedProbeCredit", func(t *testing.T) {
+		now := time.UnixMicro(1000)
+		store := newFlightCreditStore(t, &now, 65536)
+		var normalBytes uint64
+		for id := uint64(1); id <= 10; id++ {
+			normalBytes = pushFlightCreditPacket(t, store, id, 1616, now.Add(time.Second))
+		}
+		var probeBytes uint64
+		for range 4 {
+			probeBytes = pushFlightCreditPacket(t, store, 0, protocol.ProbePayloadSize, now.Add(time.Second))
+		}
+		pushFlightCreditPacket(t, store, 11, 1616, now.Add(time.Second))
+		control := schedulerTransmission(100, wgpacket.HandshakeInitiation, now.Add(time.Second))
+		if err := store.push(control); err != nil {
+			t.Fatal(err)
+		}
+		// The control and ten transport frames fit one record. Four probes exceed the normal window by 20 bytes.
+		prefixBytes := uint64(control.size) + 10*normalBytes
+		store.setDeliveryWindows(16*1024, prefixBytes+4*probeBytes)
+		take := func(ids ...uint64) {
+			t.Helper()
+			var data [16]protocol.Data
+			var ownership [16]datagram.Packet
+			count, err := store.takeBatch(data[:], ownership[:], 64*1024, 16*1024)
+			defer releaseBatchOwnership(ownership[:count])
+			if len(ids) == 0 {
+				if count != 0 || !errors.Is(err, packetqueue.ErrEmpty) {
+					t.Fatalf("blocked TLS batch = %d, %v", count, err)
+				}
+			} else if count != len(ids) || err != nil {
+				t.Fatalf("TLS batch = %d, %v, want IDs %v", count, err, ids)
+			}
+			for index, id := range ids {
+				if data[index].PacketID != id {
+					t.Fatalf("TLS batch packet %d ID = %d, want %d", index, data[index].PacketID, id)
+				}
+			}
+			assertTransmissionStoreInvariants(t, store)
+		}
+		take(100, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+		take(0, 0, 0)
+		take(0)
+		consumeFlightCreditReady(store)
+		take()
+		assertFlightCreditSilent(t, store)
+		acknowledgeFlightCredit(t, store, 11, now.Add(time.Millisecond))
+		assertFlightCreditReady(t, store)
+		if got := store.budget.Usage(); got != (retention.Usage{Packets: 5, Bytes: int(normalBytes + 4*probeBytes)}) {
+			t.Fatalf("TLS prefix acknowledgement changed remaining normal/probe ownership: %+v", got)
+		}
+		take()
+		assertFlightCreditSilent(t, store)
+		acknowledgeFlightCredit(t, store, 12, now.Add(2*time.Millisecond))
+		assertFlightCreditReady(t, store)
+		take(11)
+		acknowledgeFlightCredit(t, store, 16, now.Add(3*time.Millisecond))
+		if got := store.budget.Usage(); got != (retention.Usage{}) || !store.sentEmpty() {
+			t.Fatalf("completed TLS flight retained ownership: %+v", got)
+		}
+	})
+
 	t.Run("WireGuardControlUsesNormalCredit", func(t *testing.T) {
 		now := time.UnixMicro(1000)
 		store := newFlightCreditStore(t, &now, 65536)
@@ -223,7 +284,7 @@ func assertFlightCreditTake(t *testing.T, store *TransmissionStore, ids ...uint6
 	t.Helper()
 	var data [16]protocol.Data
 	var ownership [16]datagram.Packet
-	count, err := store.takeBatch(data[:], ownership[:], math.MaxInt)
+	count, err := store.takeBatch(data[:], ownership[:], math.MaxInt, 0)
 	defer releaseBatchOwnership(ownership[:count])
 	if len(ids) == 0 {
 		if count != 0 || !errors.Is(err, packetqueue.ErrEmpty) {

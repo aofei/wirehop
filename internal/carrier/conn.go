@@ -4,6 +4,7 @@ package carrier
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,8 @@ const (
 	streamReadBufferSize = 32 * 1024
 	// maximumStreamReadBatchFrames matches the relay's bounded carrier read vector.
 	maximumStreamReadBatchFrames = 16
+	// maximumTLSRecordPayload is the maximum plaintext payload of one TLS record.
+	maximumTLSRecordPayload = 16 * 1024
 )
 
 var (
@@ -132,6 +135,17 @@ func (l *TCPOptionsListener) Accept() (net.Conn, error) {
 // NewStreamConn wraps one connected TCP or TLS stream.
 func NewStreamConn(conn net.Conn) *StreamConn {
 	return &StreamConn{conn: conn, reader: bufio.NewReaderSize(conn, streamReadBufferSize)}
+}
+
+// DataRecordSize returns the maximum plaintext record size relevant to Data coalescing. Zero leaves the normal frame
+// and writer budgets in effect.
+func DataRecordSize(connection Conn) int {
+	if stream, ok := connection.(*StreamConn); ok {
+		if _, secure := stream.conn.(*tls.Conn); secure {
+			return maximumTLSRecordPayload
+		}
+	}
+	return 0
 }
 
 // WebSocketConn carries complete WireHop frames in bounded binary WebSocket messages.

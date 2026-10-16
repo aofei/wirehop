@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -330,6 +331,81 @@ func TestStreamConnBorrowedBatchStopsBeforeRefill(t *testing.T) {
 	}
 	if err := <-result; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStreamConnTLSRecordPrefix(t *testing.T) {
+	fixture := httptest.NewTLSServer(http.NotFoundHandler())
+	fixture.Close()
+	for _, tt := range []struct {
+		name    string
+		version uint16
+	}{
+		{name: "TLS12", version: tls.VersionTLS12},
+		{name: "TLS13", version: tls.VersionTLS13},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			left, right := net.Pipe()
+			serverConfig := fixture.TLS.Clone()
+			serverConfig.MinVersion, serverConfig.MaxVersion = tt.version, tt.version
+			clientConfig := fixture.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+			clientConfig.MinVersion, clientConfig.MaxVersion = tt.version, tt.version
+			clientConfig.ServerName = "example.com"
+			server := tls.Server(left, serverConfig)
+			client := tls.Client(right, clientConfig)
+			stream := NewStreamConn(client)
+			want := []protocol.Frame{
+				{Type: protocol.FrameData, Payload: bytes.Repeat([]byte{0xa5}, 32)},
+				{Type: protocol.FrameData, Payload: bytes.Repeat([]byte{0x5a}, 1452)},
+			}
+			first, err := protocol.MarshalFrame(want[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			tail, err := protocol.MarshalFrame(want[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefix := append(first, tail[:len(tail)/2]...)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			resume := make(chan struct{})
+			finished := make(chan error, 1)
+			t.Cleanup(func() {
+				close(resume)
+				left.Close()
+				right.Close()
+				<-finished
+			})
+			go func() {
+				defer close(finished)
+				err := server.HandshakeContext(ctx)
+				if err == nil {
+					_, err = server.Write(prefix)
+				}
+				if err == nil {
+					<-resume
+					_, err = server.Write(tail[len(tail)/2:])
+				}
+				finished <- err
+			}()
+			if err := client.HandshakeContext(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var frames [maximumStreamReadBatchFrames]protocol.Frame
+			count, err := stream.ReadFrames(ctx, frames[:])
+			if err != nil || count != 1 || !reflect.DeepEqual(frames[0], want[0]) {
+				t.Fatalf("complete TLS prefix = %d frames, %v", count, err)
+			}
+			resume <- struct{}{}
+			count, err = stream.ReadFrames(ctx, frames[:])
+			if err != nil || count != 1 || !reflect.DeepEqual(frames[0], want[1]) {
+				t.Fatalf("TLS record continuation = %d frames, %v", count, err)
+			}
+			if err := <-finished; err != nil {
+				t.Fatalf("TLS record writer = %v", err)
+			}
+		})
 	}
 }
 

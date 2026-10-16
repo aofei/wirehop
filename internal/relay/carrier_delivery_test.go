@@ -7,13 +7,16 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aofei/wirehop/internal/carrier"
+	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
+	"github.com/aofei/wirehop/internal/wgpacket"
 	"github.com/coder/websocket"
 )
 
@@ -31,6 +34,167 @@ func (e *heldDeliveryEndpoint) Write(ctx context.Context, payload []byte, deadli
 		return e.testEndpoint.Write(ctx, payload, deadline)
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func TestLaneWriteDataBatchTLS(t *testing.T) {
+	fixture := httptest.NewTLSServer(http.NotFoundHandler())
+	fixture.Close()
+	for _, transport := range []struct {
+		name         string
+		version      uint16
+		serverWriter bool
+		adaptive     bool
+	}{
+		{name: "TLS12Client", version: tls.VersionTLS12},
+		{name: "TLS12Server", version: tls.VersionTLS12, serverWriter: true},
+		{name: "TLS13Client", version: tls.VersionTLS13},
+		{name: "TLS13Server", version: tls.VersionTLS13, serverWriter: true},
+		{name: "TLS12ClientStartup", version: tls.VersionTLS12, adaptive: true},
+		{name: "TLS12ServerStartup", version: tls.VersionTLS12, serverWriter: true, adaptive: true},
+		{name: "TLS13ClientStartup", version: tls.VersionTLS13, adaptive: true},
+		{name: "TLS13ServerStartup", version: tls.VersionTLS13, serverWriter: true, adaptive: true},
+	} {
+		t.Run(transport.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name   string
+				sizes  []int
+				want   []int
+				probes bool
+			}{
+				{name: "MTU", sizes: slices.Repeat([]int{1452}, 16), want: []int{11, 5}},
+				{name: "Small", sizes: slices.Repeat([]int{32}, 16), want: []int{16}},
+				// The first two frames encode to 16384 or 16385 bytes with the IDs and deadlines below.
+				{name: "ExactRecord", sizes: []int{16331, 32, 32}, want: []int{2, 1}},
+				{name: "RecordOverflow", sizes: []int{16332, 32, 32}, want: []int{1, 2}},
+				{name: "Mixed", sizes: []int{9000, 4000, 3500}, want: []int{2, 1}},
+				{name: "Oversized", sizes: []int{32, 32768, 32}, want: []int{3}},
+				{name: "MaximumDatagram", sizes: []int{protocol.MaxPacketSize, 32}, want: []int{1, 1}},
+				{name: "Probes", sizes: slices.Repeat([]int{protocol.ProbePayloadSize}, 4), want: []int{3, 1}, probes: true},
+				{name: "PoorRecordFill", sizes: slices.Repeat([]int{3000}, 16), want: []int{16}},
+				{name: "JumboFrames", sizes: slices.Repeat([]int{9000}, 16), want: []int{8, 8}},
+				{name: "OversizedFrames", sizes: slices.Repeat([]int{32768}, 4), want: []int{2, 2}},
+				{name: "PacketSizeChange", sizes: slices.Concat(slices.Repeat([]int{9000}, 8), slices.Repeat([]int{1452}, 16)), want: []int{8, 11, 5}},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+					defer cancel()
+					left, right := net.Pipe()
+					serverConfig := fixture.TLS.Clone()
+					serverConfig.MinVersion, serverConfig.MaxVersion = transport.version, transport.version
+					clientConfig := fixture.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+					clientConfig.MinVersion, clientConfig.MaxVersion = transport.version, transport.version
+					clientConfig.ServerName = fixture.Certificate().DNSNames[0]
+					// Steady-state cases use full-sized records to expose exact batch boundaries.
+					serverConfig.DynamicRecordSizingDisabled = !transport.adaptive
+					clientConfig.DynamicRecordSizingDisabled = !transport.adaptive
+					var writer, reader *tls.Conn
+					if transport.serverWriter {
+						writer, reader = tls.Server(left, serverConfig), tls.Client(right, clientConfig)
+					} else {
+						writer, reader = tls.Client(left, clientConfig), tls.Server(right, serverConfig)
+					}
+					handshake := make(chan error, 1)
+					go func() {
+						defer close(handshake)
+						handshake <- reader.HandshakeContext(ctx)
+					}()
+					t.Cleanup(func() {
+						left.Close()
+						right.Close()
+						<-handshake
+					})
+					if err := writer.HandshakeContext(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if err := <-handshake; err != nil {
+						t.Fatal(err)
+					}
+					now := time.Unix(100, 0)
+					store := schedulerStore(t, packetqueue.Limits{Packets: 32, Bytes: 256 * 1024})
+					store.now = func() time.Time { return now }
+					store.setDeliveryWindows(256*1024, 256*1024)
+					store.writeBudget.Store(64 * 1024)
+					t.Cleanup(func() { releaseTransmissions(store.drain()) })
+					clock := &testClock{now: uint64(now.UnixMicro())}
+					receiver, err := NewReceiver(ReceiverConfig{
+						Endpoint: newTestEndpoint(), Clock: clock, DeduplicationSize: 64,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					lane, err := newObservedLane(LaneConfig{
+						Carrier: carrier.NewStreamConn(writer), Receiver: receiver, Store: store, Clock: clock,
+						LaneID: protocol.LaneID(1), Generation: 1,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					var expected []protocol.Data
+					for index, size := range tt.sizes {
+						transmission := schedulerTransmission(uint64(index)+1_000_000_000, wgpacket.TransportData, now.Add(time.Second))
+						transmission.packet.Payload = bytes.Repeat([]byte{byte(index + 1)}, size)
+						copy(transmission.packet.Payload, []byte{4, 0, 0, 0})
+						if tt.probes {
+							transmission.packetID = 0
+							transmission.packet.Kind = wgpacket.NonWireGuard
+						}
+						expected = append(expected, transmission.data())
+						if err := store.push(transmission); err != nil {
+							t.Fatal(err)
+						}
+					}
+					results := make(chan error, len(tt.want))
+					finished := make(chan struct{})
+					go func() {
+						defer close(finished)
+						for range tt.want {
+							err := lane.writeDataBatch(ctx)
+							results <- err
+							if err != nil {
+								return
+							}
+						}
+					}()
+					t.Cleanup(func() {
+						left.Close()
+						right.Close()
+						<-finished
+					})
+					peer := carrier.NewStreamConn(reader)
+					var frames [maximumDataBatchFrames]protocol.Frame
+					next := 0
+					for _, want := range tt.want {
+						encodedBytes := 0
+						for _, frame := range expected[next : next+want] {
+							encodedBytes += dataFrameSize(frame)
+						}
+						for received := 0; received < want; {
+							count, err := peer.ReadFrames(ctx, frames[:])
+							if err != nil || count == 0 || count > want-received || !transport.adaptive && encodedBytes <= 16*1024 && count != want {
+								t.Fatalf("TLS read batch = %d frames, %v, want %d remaining", count, err, want-received)
+							}
+							for _, frame := range frames[:count] {
+								data, err := protocol.ParseData(frame)
+								want := expected[next]
+								if err != nil || data.PacketID != want.PacketID || data.DeadlineMicros != want.DeadlineMicros ||
+									!bytes.Equal(data.Payload, want.Payload) {
+									t.Fatalf("TLS changed frame %d: %+v, %v", next, data, err)
+								}
+								next++
+							}
+							received += count
+						}
+						if err := <-results; err != nil {
+							t.Fatal(err)
+						}
+					}
+					if next != len(expected) {
+						t.Fatalf("TLS received %d frames, want %d", next, len(expected))
+					}
+				})
+			}
+		})
 	}
 }
 

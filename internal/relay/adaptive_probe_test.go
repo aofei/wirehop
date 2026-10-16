@@ -90,7 +90,7 @@ func TestSchedulerHighBDPTransportProbe(t *testing.T) {
 				peakRetained = max(peakRetained, retained)
 				var flightBytes uint64
 				for {
-					count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+					count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 					if errors.Is(err, packetqueue.ErrEmpty) {
 						break
 					}
@@ -165,7 +165,7 @@ func TestSchedulerHighBDPMultiLaneProbe(t *testing.T) {
 				for index, candidate := range candidates {
 					store := candidate.registration.Store
 					for {
-						count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+						count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 						if errors.Is(err, packetqueue.ErrEmpty) {
 							break
 						}

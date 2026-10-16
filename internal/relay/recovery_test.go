@@ -380,7 +380,7 @@ func TestSchedulerRecoversThroughHealthyLastLaneInGroup(t *testing.T) {
 			store := lanes[protocol.LaneID(tt.count)].registration.Store
 			var data [6]protocol.Data
 			var ownership [6]datagram.Packet
-			count, err := store.takeBatch(data[:], ownership[:], protocol.MaxEncodedFrameSize)
+			count, err := store.takeBatch(data[:], ownership[:], protocol.MaxEncodedFrameSize, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

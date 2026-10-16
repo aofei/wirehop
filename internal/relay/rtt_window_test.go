@@ -203,7 +203,7 @@ func TestScheduledLaneRefreshTimingAfterCapacityAndDelayIncrease(t *testing.T) {
 				var data [16]protocol.Data
 				var ownership [16]datagram.Packet
 				for committed := 0; committed < queued; {
-					n, err := store.takeBatch(data[:], ownership[:], 64*1024)
+					n, err := store.takeBatch(data[:], ownership[:], 64*1024, 0)
 					releaseBatchOwnership(ownership[:n])
 					if err != nil || n == 0 {
 						t.Fatalf("take batch: count %d, error %v", n, err)
@@ -354,7 +354,7 @@ func runRTTWindowStorePhase(t *testing.T, lane *scheduledLane, now *time.Time, c
 		var data [16]protocol.Data
 		var ownership [16]datagram.Packet
 		for {
-			count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+			count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 			releaseBatchOwnership(ownership[:count])
 			if errors.Is(err, packetqueue.ErrEmpty) {
 				break

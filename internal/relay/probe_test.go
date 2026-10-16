@@ -455,7 +455,7 @@ func TestSchedulerFillTransportProbe(t *testing.T) {
 		}
 		var data [16]protocol.Data
 		var ownership [16]datagram.Packet
-		count, err := lane.registration.Store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+		count, err := lane.registration.Store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 		if err != nil || count != packets {
 			t.Fatalf("take probes = %d, %v", count, err)
 		}
@@ -659,7 +659,7 @@ func TestTransmissionStoreAcknowledgeMixedProbePrefix(t *testing.T) {
 	}
 	var data [maximumDataBatchFrames]protocol.Data
 	var ownership [maximumDataBatchFrames]datagram.Packet
-	count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+	count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 	if err != nil || count != 5 {
 		t.Fatalf("mixed writer batch = %d, %v", count, err)
 	}
@@ -1027,16 +1027,23 @@ func TestLaneWriteDataBatchBudget(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		budget uint64
+		limit  int
 		want   int
 	}{
 		{name: "Startup", want: 1},
 		{name: "SlowPath", budget: 1024, want: 1},
 		{name: "MeasuredPath", budget: 4096, want: 3},
 		{name: "HighCapacity", budget: 64 * 1024, want: maximumDataBatchFrames},
+		{name: "TLSStartup", limit: 16 * 1024, want: 1},
+		{name: "TLSMeasuredPath", budget: 4096, limit: 16 * 1024, want: 3},
+		{name: "TLSCapacityLimited", budget: 32 * 1024, limit: 16 * 1024, want: maximumDataBatchFrames},
+		{name: "TLSBelowMaximum", budget: 64*1024 - 1, limit: 16 * 1024, want: maximumDataBatchFrames},
+		{name: "TLSHighCapacity", budget: 64 * 1024, limit: 16 * 1024, want: 11},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			connection := newTestCarrier()
 			lane := newTestLane(t, connection, newTestEndpoint())
+			lane.dataRecordBytes = tt.limit
 			lane.store = schedulerStore(t, packetqueue.Limits{Packets: 32, Bytes: 128 * 1024})
 			lane.store.setDeliveryWindows(128*1024, 128*1024)
 			lane.store.writeBudget.Store(tt.budget)
@@ -1065,6 +1072,52 @@ func TestLaneWriteDataBatchBudget(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("TLSCapacityChanges", func(t *testing.T) {
+		now := time.Unix(100, 0)
+		connection := newTestCarrier()
+		lane := newTestLane(t, connection, newTestEndpoint())
+		lane.dataRecordBytes = 16 * 1024
+		lane.store = schedulerStore(t, packetqueue.Limits{Packets: 64, Bytes: 128 * 1024})
+		lane.store.now = func() time.Time { return now }
+		lane.store.setDeliveryWindows(128*1024, 128*1024)
+		t.Cleanup(func() { releaseTransmissions(lane.store.drain()) })
+		for id := uint64(1); id <= 64; id++ {
+			pushFlightCreditPacket(t, lane.store, id, 1452, now.Add(time.Second))
+		}
+		next := uint64(1)
+		for _, step := range []struct {
+			budget uint64
+			want   int
+		}{
+			{budget: 64 * 1024, want: 11},
+			{budget: 32 * 1024, want: 16},
+			{budget: 1024, want: 1},
+			{budget: 64*1024 - 1, want: 16},
+			{budget: 64 * 1024, want: 11},
+			{budget: 64 * 1024, want: 9},
+		} {
+			lane.store.writeBudget.Store(step.budget)
+			if err := lane.writeDataBatch(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			frames := <-connection.writes
+			if len(frames) != step.want {
+				t.Fatalf("budget %d committed %d frames, want %d", step.budget, len(frames), step.want)
+			}
+			for _, frame := range frames {
+				data, err := protocol.ParseData(frame)
+				if err != nil || data.PacketID != next || len(data.Payload) != 1452 {
+					t.Fatalf("budget %d changed frame %d: %+v, %v", step.budget, next, data, err)
+				}
+				next++
+			}
+			assertTransmissionStoreInvariants(t, lane.store)
+		}
+		if lane.store.sentPackets != 64 || lane.store.reportedPackets != 0 {
+			t.Fatal("budget changes lost committed frames or acknowledged undelivered data")
+		}
+	})
 }
 
 func TestSchedulerMigrateDiscardsCapacityProbe(t *testing.T) {

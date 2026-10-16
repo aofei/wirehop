@@ -18,6 +18,29 @@ import (
 	"github.com/coder/websocket"
 )
 
+func TestDataRecordSize(t *testing.T) {
+	left, right := net.Pipe()
+	t.Cleanup(func() {
+		left.Close()
+		right.Close()
+	})
+	for _, tt := range []struct {
+		name       string
+		connection Conn
+		want       int
+	}{
+		{name: "TCP", connection: NewStreamConn(left)},
+		{name: "TLS", connection: NewStreamConn(tls.Client(left, &tls.Config{})), want: 16 * 1024},
+		{name: "WebSocket", connection: &WebSocketConn{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DataRecordSize(tt.connection); got != tt.want {
+				t.Fatalf("DataRecordSize() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStreamConn(t *testing.T) {
 	leftStream, rightStream := net.Pipe()
 	left := NewStreamConn(leftStream)

@@ -254,7 +254,7 @@ func TestTransmissionStoreTransferQueuedToWakesExposedPadding(t *testing.T) {
 	<-source.Ready()
 	var frames [1]protocol.Data
 	var ownership [1]datagram.Packet
-	count, err := source.takeBatch(frames[:], ownership[:], 8192)
+	count, err := source.takeBatch(frames[:], ownership[:], 8192, 0)
 	if count != 0 || !errors.Is(err, packetqueue.ErrEmpty) {
 		t.Fatalf("large head did not exhaust credit: %d, %v", count, err)
 	}
@@ -331,7 +331,7 @@ func TestTransmissionStoreTransferQueuedToConcurrentCommit(t *testing.T) {
 		for {
 			var frames [1]protocol.Data
 			var ownership [1]datagram.Packet
-			count, err := source.takeBatch(frames[:], ownership[:], 4096)
+			count, err := source.takeBatch(frames[:], ownership[:], 4096, 0)
 			releaseBatchOwnership(ownership[:count])
 			if errors.Is(err, packetqueue.ErrEmpty) {
 				written <- ids

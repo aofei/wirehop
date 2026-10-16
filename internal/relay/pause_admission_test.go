@@ -73,7 +73,7 @@ func TestSchedulerScheduleTimingPause(t *testing.T) {
 				}
 				var data [1]protocol.Data
 				var ownership [1]datagram.Packet
-				if n, err := lane.registration.Store.takeBatch(data[:], ownership[:], 65536); n != 0 || !errors.Is(err, packetqueue.ErrEmpty) {
+				if n, err := lane.registration.Store.takeBatch(data[:], ownership[:], 65536, 0); n != 0 || !errors.Is(err, packetqueue.ErrEmpty) {
 					t.Fatal("paused staged Data reached carrier commit")
 				}
 			}

@@ -58,7 +58,7 @@ func TestScheduledLaneDeliveryRateRecoversSmallFlights(t *testing.T) {
 				for {
 					var data [16]protocol.Data
 					var ownership [16]datagram.Packet
-					count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes)
+					count, err := store.takeBatch(data[:], ownership[:], targetDataBatchBytes, 0)
 					releaseBatchOwnership(ownership[:count])
 					if errors.Is(err, packetqueue.ErrEmpty) {
 						break
