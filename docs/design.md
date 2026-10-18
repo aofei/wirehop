@@ -1640,21 +1640,23 @@ envelope:
 
 | Order | Encoding | Field |
 | ---: | --- | --- |
-| 1 | `uvarint` | Packed header: `(content_length << 4) | frame_type` |
-| 2 | N bytes | Type-specific payload |
+| 1 | Little-endian `u16` | Type in bits 0 through 3, low 11 length bits in bits 4 through 14, extension flag in bit 15 |
+| 2 | Optional `u8` | High length bits when the extension flag is set |
+| 3 | N bytes | Type-specific payload |
 
 In framed messages, `uvarint` is shortest-form unsigned LEB128. Each byte contributes seven value bits,
 least-significant group first, and its high bit indicates another byte. Zero occupies one byte. A `uint64` occupies at
 most ten bytes, and the tenth byte can contain only bit 0. Nonminimal encodings, overflow, and values outside a field's
 semantic bounds are protocol violations. Integers must be complete within their containing frame or WebSocket message. A
 stream that ends partway through a header or payload fails with unexpected EOF. These rules apply to every `uvarint`
-field, including content lengths. Admission hellos use the explicitly mixed fixed-width and variable-width layouts
-above.
+field in a frame payload. Admission hellos use the explicitly mixed fixed-width and variable-width layouts above.
 
-The low four bits of the packed header carry the frame type, and the remaining bits carry the content length. Types zero
-and 12 through 15 are invalid. The content length excludes the common header and cannot exceed 65,553 bytes. The packed
-header occupies one byte through content length 7, two bytes through 1023, and three bytes thereafter. The maximum
-encoded frame is 65,556 bytes. A reader validates the bounded header before allocating content storage.
+Types zero and 12 through 15 are invalid. The content length excludes the common header and cannot exceed 65,553 bytes.
+The common header occupies two bytes through content length 2047 and three bytes thereafter. When present, the extension
+byte must be nonzero, and the content length is `(base >> 4 & 0x7ff) | (extension << 11)`. An absent extension has value
+zero. For example, Data content lengths 34, 1452, 2048, and 65,553 have headers `23 02`, `c3 5a`, `03 80 01`, and
+`13 81 20`. The maximum encoded frame is 65,556 bytes. A reader validates the bounded header before allocating content
+storage.
 
 Protocol version 1 frame types are grouped by purpose: admission responses, Data and delivery feedback, clock mapping
 and timing measurements, then lane and session termination and errors. The registry and payload descriptions use the
@@ -1669,7 +1671,7 @@ same order:
 | 5 | Clock sync | 4 to 40 bytes | Client to server, first post-admission frame |
 | 6 | Ping | 1 to 10 bytes | Both directions after admission |
 | 7 | Pong | 3 to 30 bytes | Both directions after admission |
-| 8 | Measurement | 1 to 45 bytes | Direction and phase depend on the measurement operation |
+| 8 | Measurement | 1 to 35 bytes | Direction and phase depend on the measurement operation |
 | 9 | Lane abandon | 2 to 20 bytes | Both directions after admission |
 | 10 | Session close | 1 byte | Client to server after admission |
 | 11 | Error | 5 to 535 bytes | Both directions after admission |
@@ -1708,8 +1710,7 @@ Payload descriptions follow frame-type order. Fields within each payload appear 
 - `Measurement Begin`: kind `2` and operation ID. The carrying lane generation is the measurement target
 - `Measurement Ready`: kind `3`, operation ID, and acceptance flag (`0` or `1`)
 - `Measurement Probe`: kind `4`, operation ID, probe send time `t1`, and remaining hold in microseconds
-- `Measurement Reply`: kind `5`, operation ID, echoed `t1`, receive time `t2`, reply send time `t3`, and remaining hold
-  in microseconds
+- `Measurement Reply`: kind `5`, operation ID, receive time `t2`, reply send time `t3`, and remaining hold in microseconds
 - `Measurement Result`: kind `6`, operation ID, valid flag (`0` or `1`), and reply receive time `t4`. A rejected result
   has flag `0` and timestamp `0`
 - `Lane abandon`: lane ID and generation (two `uvarint` values)
@@ -1722,11 +1723,11 @@ field sequence must end after their final field. Data and Error consume their re
 above. The table's Data minimum includes the shortest recognized WireGuard packet.
 
 Let `U(x)` be the shortest unsigned LEB128 length of `x`, and let `P` be the WireGuard datagram length. Data content
-length is `L = U(packet_id) + U(deadline_millis) + P`. Its complete encoded length is `U((L << 4) | 3) + L`, and its
-per-datagram overhead is `U((L << 4) | 3) + U(packet_id) + U(deadline_millis)`. For valid WireGuard datagrams, the
-overhead ranges from 4 to 21 bytes. For example, a 1452-byte datagram with a five-byte packet ID and five-byte deadline
-has 13 bytes of overhead. The maximum occurs with a ten-byte packet ID, an eight-byte representable deadline, and a
-three-byte packed header.
+length is `L = U(packet_id) + U(deadline_millis) + P`. Let `H(L)` be 2 for `L < 2048` and 3 otherwise. Its complete
+encoded length is `H(L) + L`, and its per-datagram overhead is `H(L) + U(packet_id) + U(deadline_millis)`. For valid
+WireGuard datagrams, the overhead ranges from 4 to 21 bytes. For example, a 1452-byte datagram with a five-byte packet
+ID and five-byte deadline has 12 bytes of overhead. The maximum occurs with a ten-byte packet ID, an eight-byte
+representable deadline, and a three-byte packed header.
 
 A generic frame parser can skip or reject a complete frame without interpreting Data fields. A separate WireGuard packet
 length is unnecessary because the packet occupies the rest of the Data content after the two integers. The lane
@@ -1738,7 +1739,7 @@ WireGuard packet structure. The sender keeps migration state locally, while copi
 Ping and Pong IDs are nonzero. Ping counters start at 1 for each connection generation and never wrap. Exhausting the
 counter ends that generation. Measurement operation IDs are nonzero session counters, independent of Ping counters.
 Request has no operation ID. Exhausting the operation counter disables further measurements without disrupting Data.
-Measurement holds cannot exceed 4,000,000 microseconds. The maximum Measurement content is a 45-byte Reply with
+Measurement holds cannot exceed 4,000,000 microseconds. The maximum Measurement content is a 35-byte Reply with
 full-width operation ID and timestamps and a four-byte hold. Readers reject a larger Measurement from its frame header
 before allocating payload storage. Ready rejection acquires no pause. Probe requires a positive hold. A zero Reply hold
 rejects the measurement. Delivery reports and lane-abandon frames require a nonzero lane ID and generation.
@@ -1906,6 +1907,9 @@ Concurrent targets sample their actual carriers independently within the origina
 cannot release another target's quiet promise, and adding a target during preparation cannot extend the operation or its
 captured pause deadline. An unsolicited carrier cannot supply another target's timestamps or inherit its RTT.
 
+Each endpoint retains `t1` from its own Probe transaction. Reply carries only `t2` and `t3` and uses the operation ID,
+actual carrier generation, and expected phase to identify that retained sample.
+
 A negative Ready retires only its target. Remaining ready targets proceed regardless of response order without extending
 the captured deadline or bypassing the local prefix proof. If the server cannot queue its primary's initial Request, it
 removes that unannounced member so the other carriers can still prepare. The client can still enroll that carrier with
@@ -1932,7 +1936,7 @@ sequenceDiagram
     C->>C: Seal the prepared cohort
     Note over C,S: Continue independently on each actual carrier
     C->>S: Probe(id, t1, remaining hold)
-    S->>C: Reply(id, t1, t2, t3, remaining hold)
+    S->>C: Reply(id, t2, t3, remaining hold)
     C->>C: Validate and apply or reject the actual carrier's RTT
     C->>S: Result(id, valid, t4)
     S->>S: Independently validate and apply or reject RTT
@@ -2370,8 +2374,9 @@ session secrets, packet payloads, and identifying target metadata by default.
 
 ### Frame identity and expiry
 
-The common header packs type and length into one canonical integer. It needs no padding, and ordinary MTU-sized frames
-use three header bytes. Data metadata remains stateless across frames and carrier generations, allowing duplicate and
+The common header packs type and length into a two-byte base with one optional extension byte. Ordinary MTU-sized frames
+need only the base. Tiny control contents use the same two-byte base, trading one byte against a uniform common read and
+the smaller MTU envelope. Data metadata remains stateless across frames and carrier generations, allowing duplicate and
 migrated packets to keep their original identities and deadlines without resetting a decoder dictionary.
 
 Direction-local packet IDs identify duplicates independently of WireGuard receiver indices, counters, and key lifetimes.
@@ -2403,7 +2408,8 @@ clock mapping without sending a timestamp merely to have it echoed. The calculat
 
 Only the Ping initiator completes the ordinary sample. The responder obtains its own ordinary samples by initiating its
 own Ping. In a coordinated Measurement, the server also validates the complete sample after receiving the Result's `t4`,
-so Probe carries `t1` and Reply preserves it for operation validation.
+so Probe carries `t1` and both endpoints retain it under the operation's ID, carrier generation, and phase. Reply does
+not repeat that timestamp.
 
 Ping maintains liveness and ordinary timing without pausing Data. Dedicated Measurement phases coordinate a bounded
 session-wide drain before raising the minimum RTT. Raising that minimum from queued samples would enlarge flight credit

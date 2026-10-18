@@ -108,13 +108,27 @@ func AppendFrame(destination []byte, frame Frame) ([]byte, error) {
 	destination = destination[:offset+size]
 	headerSize := size - len(frame.Payload)
 	copy(destination[offset+headerSize:], frame.Payload)
-	binary.PutUvarint(destination[offset:], uint64(len(frame.Payload))<<4|uint64(frame.Type))
+	putFrameHeader(destination[offset:], len(frame.Payload), frame.Type)
 	return destination, nil
 }
 
 // FrameSize returns the complete canonical encoded size for a validated frame-content length.
 func FrameSize(contentSize int) int {
-	return uvarintSize(uint64(contentSize)<<4) + contentSize
+	if contentSize < 2048 {
+		return 2 + contentSize
+	}
+	return 3 + contentSize
+}
+
+// putFrameHeader writes the canonical two- or three-byte envelope for validated content.
+func putFrameHeader(destination []byte, contentSize int, frameType FrameType) {
+	header := uint32(contentSize)<<4 | uint32(frameType)
+	if contentSize < 2048 {
+		binary.LittleEndian.PutUint16(destination, uint16(header))
+		return
+	}
+	binary.LittleEndian.PutUint16(destination, uint16(header)|0x8000)
+	destination[2] = byte(header >> 15)
 }
 
 // ReadFrame reads one complete typed and length-prefixed frame from reader.
@@ -126,12 +140,12 @@ func ReadFrame(reader io.Reader) (Frame, error) {
 // Read reads one frame whose payload remains valid until the next Read or Reset call.
 func (r *FrameReader) Read(reader io.Reader) (Frame, error) {
 	r.Reset()
-	if _, err := io.ReadFull(reader, r.header[:1]); err != nil {
+	if _, err := io.ReadFull(reader, r.header[:2]); err != nil {
 		return Frame{}, err
 	}
-	headerSize := 1
-	for r.header[headerSize-1] >= 0x80 && headerSize < len(r.header) {
-		if _, err := io.ReadFull(reader, r.header[headerSize:headerSize+1]); err != nil {
+	headerSize := 2
+	if r.header[1]&0x80 != 0 {
+		if _, err := io.ReadFull(reader, r.header[2:3]); err != nil {
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
@@ -221,7 +235,12 @@ func (s *FrameSequence) Next() (Frame, bool) {
 		return Frame{}, false
 	}
 	message := s.message[s.offset:]
-	header, headerSize := binary.Uvarint(message)
+	header := uint32(binary.LittleEndian.Uint16(message))
+	headerSize := 2
+	if header&0x8000 != 0 {
+		header = header&0x7fff | uint32(message[2])<<15
+		headerSize = 3
+	}
 	encodedLength := headerSize + int(header>>4)
 	frame := Frame{Type: FrameType(header & 0x0f), Payload: message[headerSize:encodedLength]}
 	s.offset += encodedLength
@@ -252,30 +271,20 @@ func AppendFrames(destination []Frame, message []byte) ([]Frame, error) {
 
 // frameHeader validates one bounded header and returns its content length and header size.
 func frameHeader(message []byte) (int, int, error) {
-	if len(message) == 0 {
+	if len(message) < 2 {
 		return 0, 0, ErrTrailingFrameData
 	}
-	header := uint32(message[0])
-	width := 1
-	if header >= 0x80 {
-		if len(message) < 2 {
+	header := uint32(binary.LittleEndian.Uint16(message))
+	width := 2
+	if header&0x8000 != 0 {
+		if len(message) < 3 {
 			return 0, 0, ErrTrailingFrameData
 		}
-		header = header&0x7f | uint32(message[1])<<7
-		width = 2
-		if message[1] >= 0x80 {
-			if len(message) < 3 {
-				return 0, 0, ErrTrailingFrameData
-			}
-			if message[2] >= 0x80 {
-				return 0, 0, ErrFrameTooLarge
-			}
-			header = header&0x3fff | uint32(message[2])<<14
-			width = 3
-		}
-		if message[width-1] == 0 {
+		if message[2] == 0 {
 			return 0, 0, ErrInvalidInteger
 		}
+		header = header&0x7fff | uint32(message[2])<<15
+		width = 3
 	}
 	if !FrameType(header & 0x0f).Valid() {
 		return 0, 0, ErrInvalidFrameType

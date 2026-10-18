@@ -641,9 +641,9 @@ func TestWebSocketConnMessageBoundaries(t *testing.T) {
 			prefix:   frames,
 			want:     protocol.ErrTrailingFrameData},
 		{name: "NonminimalLength", messageType: websocket.MessageBinary,
-			messages: [][]byte{{0x85, 0}}, want: protocol.ErrInvalidInteger},
+			messages: [][]byte{{0x05, 0x80, 0}}, want: protocol.ErrInvalidInteger},
 		{name: "ValidPrefixBeforeNonminimalLength", messageType: websocket.MessageBinary,
-			messages: [][]byte{append(append([]byte(nil), encoded...), 0x85, 0)},
+			messages: [][]byte{append(append([]byte(nil), encoded...), 0x05, 0x80, 0)},
 			prefix:   frames,
 			want:     protocol.ErrInvalidInteger},
 	} {

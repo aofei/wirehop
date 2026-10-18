@@ -709,6 +709,56 @@ func TestMeasurementCoordinatorIgnoresWrongCarrierPhases(t *testing.T) {
 	})
 }
 
+func TestSchedulerObserveMeasurementRetainedProbe(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		lane       protocol.LaneID
+		generation uint64
+		otherID    bool
+	}{
+		{name: "UnrelatedCarrier", lane: 2, generation: 1},
+		{name: "OtherGeneration", lane: 1, generation: 2},
+		{name: "OtherOperation", lane: 1, generation: 1, otherID: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client := newMeasurementFixture(t, true, 1)
+				server := newMeasurementFixture(t, false, 1)
+				prepareMeasurement(t, client, server)
+				client.write(t, 100).deliver(t, server, 200)
+				reply := server.write(t, 250)
+				if reply.value.ProbeMicros != 0 {
+					t.Fatal("reply repeated the retained probe timestamp")
+				}
+				value := reply.value
+				if tt.otherID {
+					value.ID++
+				}
+				client.receive(t, protocol.LaneGeneration{LaneID: tt.lane, Generation: tt.generation}, value, 300)
+				client.apply(t)
+				attempt := client.scheduler.measurements.active
+				if attempt == nil || attempt.stage != protocol.MeasurementProbe || attempt.sample.LocalSendMicros != 100 ||
+					len(client.writes) != 0 || client.lanes[1].minimumRTTMicros != 10_000 {
+					t.Fatal("unrelated reply changed the retained probe or published timing")
+				}
+				reply.deliver(t, client, 400)
+				client.apply(t)
+				result := client.write(t, 500)
+				if !result.value.Valid || client.lanes[1].minimumRTTMicros != 250 {
+					t.Fatal("matching reply did not use the retained local send time")
+				}
+				result.sent()
+				client.apply(t)
+				result.deliver(t, server, 600)
+				server.apply(t)
+				if client.paused() || server.paused() || server.lanes[1].minimumRTTMicros != 250 {
+					t.Fatal("retained probe did not complete the independently validated exchange")
+				}
+			})
+		})
+	}
+}
+
 func TestMeasurementCoordinatorRequiresUnrelatedCommittedPrefix(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := newMeasurementFixture(t, true, 2)

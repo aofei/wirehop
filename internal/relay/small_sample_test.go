@@ -176,7 +176,11 @@ func pushRateRecoveryFrame(t *testing.T, store *TransmissionStore, id uint64, si
 	if err != nil {
 		t.Fatal(err)
 	}
-	transmission.packet.Payload = make([]byte, size-3-len(frame.Payload))
+	contentSize := size - 2
+	if contentSize >= 2048 {
+		contentSize--
+	}
+	transmission.packet.Payload = make([]byte, contentSize-len(frame.Payload))
 	transmission.packet.Payload[0] = 4
 	if got := dataFrameSize(transmission.data()); got != size {
 		t.Fatalf("encoded frame size = %d, want %d", got, size)

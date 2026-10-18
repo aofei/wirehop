@@ -58,10 +58,10 @@ func TestWebSocketConnReadFramesBufferedUpgrade(t *testing.T) {
 				wantFrames int
 				wantError  error
 			}{
-				{name: "CompleteMessage", payload: []byte{0x16, 1, 0x17, 2}, length: 4, wantFrames: 2,
+				{name: "CompleteMessage", payload: []byte{0x16, 0, 1, 0x17, 0, 2}, length: 6, wantFrames: 2,
 					wantError: io.ErrUnexpectedEOF},
-				{name: "TruncatedMessage", payload: []byte{0x16, 1}, length: 4, wantError: io.ErrUnexpectedEOF},
-				{name: "IncompleteFrame", payload: []byte{0x16, 1, 0x80}, length: 3, wantFrames: 1,
+				{name: "TruncatedMessage", payload: []byte{0x16, 0, 1}, length: 6, wantError: io.ErrUnexpectedEOF},
+				{name: "IncompleteFrame", payload: []byte{0x16, 0, 1, 0x80}, length: 4, wantFrames: 1,
 					wantError: protocol.ErrTrailingFrameData},
 				{name: "EmptyMessage", wantError: ErrInvalidWebSocketMessage},
 			} {

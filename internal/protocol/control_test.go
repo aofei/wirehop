@@ -22,30 +22,30 @@ func TestControlFrameWireLayout(t *testing.T) {
 		{name: "SessionCreated", value: SessionCreated{
 			SessionID: testSessionID(1), SessionSecret: testSessionSecret(2), PathGroupID: testPathGroupID(3),
 			ReceiveMicros: 128, SendMicros: 16384,
-		}, encoded: "e106" + id1 + secret2 + "038001808001"},
+		}, encoded: "6103" + id1 + secret2 + "038001808001"},
 		{name: "LaneAccepted", value: LaneAccepted{
 			SessionID: testSessionID(1), PathGroupID: testPathGroupID(3), ReceiveMicros: 128, SendMicros: 16384,
-		}, encoded: "e202" + id1 + "038001808001"},
+		}, encoded: "6201" + id1 + "038001808001"},
 		{name: "DeliveryReport", value: DeliveryReport{
 			LaneID: testLaneID(1), Generation: 128, DataPackets: 127,
 			PingID: 1, DelayMicros: 16383,
-		}, encoded: "740180017f01ff7f"},
+		}, encoded: "74000180017f01ff7f"},
 		{name: "ClockSync", value: ClockSync{
 			ClientSendMicros: 127, ServerReceiveMicros: 128, ServerSendMicros: 16383, ClientReceiveMicros: 16384,
-		}, encoded: "85017f8001ff7f808001"},
-		{name: "Ping", value: TimingPing{ID: 128}, encoded: "268001"},
+		}, encoded: "85007f8001ff7f808001"},
+		{name: "Ping", value: TimingPing{ID: 128}, encoded: "26008001"},
 		{name: "Pong", value: TimingPong{ID: 1, ReceiveMicros: 128, SendMicros: 16384},
-			encoded: "67018001808001"},
+			encoded: "6700018001808001"},
 		{name: "LaneAbandon", value: LaneGeneration{LaneID: testLaneID(1), Generation: 128},
-			encoded: "39018001"},
-		{name: "SessionClose", value: CloseClientShutdown, encoded: "1a01"},
+			encoded: "3900018001"},
+		{name: "SessionClose", value: CloseClientShutdown, encoded: "1a0001"},
 		{name: "LaneError", value: ErrorFrame{
 			Code: ErrorProtocolViolation, Class: ErrorLaneRejected, Scope: ErrorScopeLane,
 			LaneID: testLaneID(1), Generation: 128, Diagnostic: "ok",
-		}, encoded: "8b010a02010180016f6b"},
+		}, encoded: "8b000a02010180016f6b"},
 		{name: "SessionError", value: ErrorFrame{
 			Code: ErrorAuthentication, Class: ErrorSessionRejected, Scope: ErrorScopeSession, Diagnostic: "bad",
-		}, encoded: "8b010304020000626164"},
+		}, encoded: "8b000304020000626164"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			want, err := hex.DecodeString(tt.encoded)

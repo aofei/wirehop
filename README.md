@@ -183,12 +183,12 @@ does not determine the WireGuard MTU.
 
 ### Carrier overhead
 
-Each WireGuard datagram receives an unsigned LEB128 header packing its frame type and content length, followed by
-shortest-form unsigned LEB128 integers for its packet ID and absolute millisecond deadline. WireHop framing overhead
-varies from 4 to 21 bytes. For example, a 1452-byte WireGuard datagram with a five-byte packet ID and five-byte deadline
-adds 13 bytes. TCP/IP, TLS records, and WebSocket frames add carrier overhead. Coalescing amortizes TLS and WebSocket
-overhead across already-ready frames without waiting for more traffic. Control coalescing is bounded by frame count and
-ends at timing and lifecycle frames.
+Each WireGuard datagram receives a two-byte header packing its frame type and content length, with a third byte for
+content of at least 2048 bytes, followed by shortest-form unsigned LEB128 integers for its packet ID and absolute
+millisecond deadline. WireHop framing overhead varies from 4 to 21 bytes. For example, a 1452-byte WireGuard datagram
+with a five-byte packet ID and five-byte deadline adds 12 bytes. TCP/IP, TLS records, and WebSocket frames add carrier
+overhead. Coalescing amortizes TLS and WebSocket overhead across already-ready frames without waiting for more traffic.
+Control coalescing is bounded by frame count and ends at timing and lifecycle frames.
 
 WireHop framing and TCP, TLS, or WebSocket headers are absent from the datagram delivered to WireGuard, so do not
 subtract them again from that UDP path's MTU. The outer TCP path still obeys its own PMTU and MSS constraints through

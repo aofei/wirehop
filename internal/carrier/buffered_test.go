@@ -221,10 +221,15 @@ func FuzzCarrierReadFrames(f *testing.F) {
 		{}, {byte(protocol.FrameData)}, {0}, {0, 0},
 		{byte(protocol.FramePing)}, {0x81, 0},
 		{byte(protocol.FramePing), 0x81, 0x80},
+		{0x05, 0x80, 0}, {0x03, 0x80}, {0x23, 0x81, 0x20}, {0x48, 0x02},
 	} {
-		f.Add(encoded, uint16(0), uint8(15))
+		for _, maximumRead := range []uint16{0, 65_535} {
+			for _, batchSize := range []uint8{0, 15} {
+				f.Add(encoded, maximumRead, batchSize)
+			}
+		}
 	}
-	for _, size := range []int{0, 32, 1452, streamReadBufferSize, 40_000, protocol.MaxFrameContentSize} {
+	for _, size := range []int{0, 32, 1452, 2047, 2048, streamReadBufferSize, 40_000, protocol.MaxFrameContentSize} {
 		encoded, err := protocol.MarshalFrame(protocol.Frame{
 			Type: protocol.FrameData, Payload: bytes.Repeat([]byte{0xa5}, size),
 		})

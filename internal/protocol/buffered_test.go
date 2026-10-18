@@ -23,10 +23,11 @@ func FuzzReadBufferedFrame(f *testing.F) {
 	for _, encoded := range [][]byte{
 		{}, {byte(FramePing)}, {0x81}, {0}, {0, 0},
 		{0x81, 0}, {0x81, 0x80}, {0x81, 0x80, 0x80},
+		{0x05, 0x80, 0}, {0x03, 0x80}, {0x23, 0x81, 0x20},
 	} {
 		f.Add(encoded)
 	}
-	for _, size := range []int{32, 1452, 32768, MaxFrameContentSize} {
+	for _, size := range []int{32, 1452, 2047, 2048, 32768, MaxFrameContentSize} {
 		encoded, err := MarshalFrame(Frame{Type: FrameData, Payload: bytes.Repeat([]byte{0xa5}, size)})
 		if err != nil {
 			f.Fatal(err)

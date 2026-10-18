@@ -3,8 +3,8 @@ package protocol
 // MaxMeasurementHoldMicros bounds the Data pause advertised by one Probe or Reply independently of liveness timeouts.
 const MaxMeasurementHoldMicros = 4_000_000
 
-// MaxMeasurementContentSize bounds a Reply with full-width IDs and timestamps and a four-byte pause hold.
-const MaxMeasurementContentSize = 45
+// MaxMeasurementContentSize bounds a Reply with a full-width operation ID, two timestamps, and a four-byte hold.
+const MaxMeasurementContentSize = 35
 
 // MeasurementKind identifies a phase of the client-coordinated measurement transaction.
 type MeasurementKind uint8
@@ -25,7 +25,7 @@ const (
 )
 
 // Measurement carries one phase. Only the fields encoded for that phase may be nonzero.
-// ProbeMicros, ReceiveMicros, and ReplyMicros are t1, t2, and t3 in a Reply. ReceiveMicros is t4 in a Result.
+// ProbeMicros is t1 in a Probe. ReceiveMicros and ReplyMicros are t2 and t3 in a Reply. ReceiveMicros is t4 in a Result.
 type Measurement struct {
 	Kind          MeasurementKind
 	ID            uint64
@@ -69,11 +69,10 @@ func MarshalMeasurement(value Measurement) (Frame, error) {
 		}
 		payload = integerPayload(0, uint64(value.Kind), value.ID, value.ProbeMicros, value.HoldMicros)
 	case MeasurementReply:
-		if value.ReplyMicros < value.ReceiveMicros || value.Valid {
+		if value.ProbeMicros != 0 || value.ReplyMicros < value.ReceiveMicros || value.Valid {
 			return Frame{}, ErrInvalidControlFrame
 		}
-		payload = integerPayload(0, uint64(value.Kind), value.ID, value.ProbeMicros,
-			value.ReceiveMicros, value.ReplyMicros, value.HoldMicros)
+		payload = integerPayload(0, uint64(value.Kind), value.ID, value.ReceiveMicros, value.ReplyMicros, value.HoldMicros)
 	case MeasurementResult:
 		if value.ProbeMicros != 0 || value.ReplyMicros != 0 || value.HoldMicros != 0 || !value.Valid && value.ReceiveMicros != 0 {
 			return Frame{}, ErrInvalidControlFrame
@@ -109,8 +108,7 @@ func ParseMeasurement(frame Frame) (Measurement, error) {
 	case MeasurementProbe:
 		remaining, err = parseIntegers(remaining, &value.ID, &value.ProbeMicros, &value.HoldMicros)
 	case MeasurementReply:
-		remaining, err = parseIntegers(remaining, &value.ID, &value.ProbeMicros,
-			&value.ReceiveMicros, &value.ReplyMicros, &value.HoldMicros)
+		remaining, err = parseIntegers(remaining, &value.ID, &value.ReceiveMicros, &value.ReplyMicros, &value.HoldMicros)
 	case MeasurementResult:
 		remaining, err = parseIntegers(remaining, &value.ID, &valid, &value.ReceiveMicros)
 		value.Valid = valid == 1

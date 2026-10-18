@@ -7,7 +7,7 @@ import (
 	"math/bits"
 )
 
-// ErrInvalidInteger indicates an overflowing or nonminimal unsigned LEB128 encoding.
+// ErrInvalidInteger indicates an overflowing or nonminimal unsigned integer encoding.
 var ErrInvalidInteger = errors.New("invalid unsigned integer encoding")
 
 // uvarintSize returns the shortest unsigned LEB128 encoding length of value.

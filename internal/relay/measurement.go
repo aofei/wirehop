@@ -423,11 +423,11 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 			}
 			a.stage = protocol.MeasurementReply
 			return protocol.Measurement{Kind: protocol.MeasurementReply, ID: a.id,
-				ProbeMicros: a.sample.LocalSendMicros, ReceiveMicros: a.sample.RemoteReceiveMicros,
-				ReplyMicros: send, HoldMicros: a.replyBudget}, true
+				ReceiveMicros: a.sample.RemoteReceiveMicros,
+				ReplyMicros:   send, HoldMicros: a.replyBudget}, true
 		}})
 	case protocol.MeasurementReply:
-		if a.stage != protocol.MeasurementProbe || value.ProbeMicros != a.sample.LocalSendMicros {
+		if a.stage != protocol.MeasurementProbe {
 			return ErrUnexpectedFrame
 		}
 		a.sample.RemoteReceiveMicros = value.ReceiveMicros

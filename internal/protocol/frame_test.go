@@ -36,8 +36,8 @@ func TestFrameTypeWireLayout(t *testing.T) {
 				t.Fatalf("frame type = %d, want %d", tt.frameType, tt.id)
 			}
 			encoded, err := MarshalFrame(Frame{Type: tt.frameType})
-			if err != nil || !bytes.Equal(encoded, []byte{tt.id}) {
-				t.Fatalf("empty frame = %x, %v, want %02x", encoded, err, tt.id)
+			if err != nil || !bytes.Equal(encoded, []byte{tt.id, 0}) {
+				t.Fatalf("empty frame = %x, %v, want %02x00", encoded, err, tt.id)
 			}
 		})
 	}
@@ -58,7 +58,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(encoded, []byte{0x34, 1, 2, 3}) {
+	if !bytes.Equal(encoded, []byte{0x34, 0, 1, 2, 3}) {
 		t.Fatalf("MarshalFrame() = %v", encoded)
 	}
 
@@ -82,7 +82,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(empty, []byte{byte(FramePing)}) {
+	if !bytes.Equal(empty, []byte{byte(FramePing), 0}) {
 		t.Fatalf("empty MarshalFrame() = %v", empty)
 	}
 }
@@ -93,7 +93,7 @@ func TestAppendFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(encoded, []byte{9, 0x26, 1, 2}) {
+	if !bytes.Equal(encoded, []byte{9, 0x26, 0, 1, 2}) {
 		t.Fatalf("AppendFrame() = %v", encoded)
 	}
 }
@@ -248,7 +248,7 @@ func TestReadBufferedFrame(t *testing.T) {
 		{name: "Complete", encoded: encoded, buffered: len(encoded), available: true},
 		{name: "ShortHeader", encoded: encoded[:1], buffered: 1},
 		{name: "ShortContent", encoded: encoded[:len(encoded)-1], buffered: len(encoded) - 1},
-		{name: "TooLarge", encoded: []byte{0xa2, 0x82, 0x40}, buffered: 3, wantErr: ErrFrameTooLarge},
+		{name: "TooLarge", encoded: []byte{0x22, 0x81, 0x20}, buffered: 3, wantErr: ErrFrameTooLarge},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := bufio.NewReaderSize(bytes.NewReader(tt.encoded), len(encoded))
@@ -271,10 +271,11 @@ func TestFrameErrors(t *testing.T) {
 		encoded []byte
 		want    error
 	}{
-		{name: "TooLarge", encoded: []byte{0xa2, 0x82, 0x40}, want: ErrFrameTooLarge},
-		{name: "UnknownType", encoded: []byte{15}, want: ErrInvalidFrameType},
+		{name: "TooLarge", encoded: []byte{0x22, 0x81, 0x20}, want: ErrFrameTooLarge},
+		{name: "UnknownType", encoded: []byte{15, 0}, want: ErrInvalidFrameType},
 		{name: "ShortHeader", encoded: []byte{0x82}, want: io.ErrUnexpectedEOF},
-		{name: "ShortContent", encoded: []byte{0x22, 1}, want: io.ErrUnexpectedEOF},
+		{name: "ShortExtension", encoded: []byte{0x02, 0x80}, want: io.ErrUnexpectedEOF},
+		{name: "ShortContent", encoded: []byte{0x22, 0, 1}, want: io.ErrUnexpectedEOF},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ReadFrame(bytes.NewReader(tt.encoded))
@@ -292,8 +293,8 @@ func TestParseFramesErrors(t *testing.T) {
 		want    error
 	}{
 		{name: "TrailingPrefix", message: []byte{0x80}, want: ErrTrailingFrameData},
-		{name: "ShortContent", message: []byte{0x22, 1}, want: ErrTrailingFrameData},
-		{name: "UnknownType", message: []byte{15}, want: ErrInvalidFrameType},
+		{name: "ShortContent", message: []byte{0x22, 0, 1}, want: ErrTrailingFrameData},
+		{name: "UnknownType", message: []byte{15, 0}, want: ErrInvalidFrameType},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ParseFrames(tt.message)
@@ -329,7 +330,7 @@ func TestDataRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(direct, generic) || !bytes.Equal(direct[:1], []byte{0x73}) {
+	if !bytes.Equal(direct, generic) || !bytes.Equal(direct[:2], []byte{0x73, 0}) {
 		t.Fatalf("MarshalDataFrame() = %v, want %v", direct, generic)
 	}
 	if size, err := DataFrameSize(want); err != nil || size != len(direct) {
@@ -366,8 +367,8 @@ func TestDataErrors(t *testing.T) {
 
 func FuzzParseFrames(f *testing.F) {
 	f.Add([]byte(nil))
-	f.Add([]byte{byte(FramePing)})
-	f.Add([]byte{0x15, 1})
+	f.Add([]byte{byte(FramePing), 0})
+	f.Add([]byte{0x15, 0, 1})
 	f.Fuzz(func(t *testing.T, message []byte) {
 		frames, parseErr := ParseFrames(message)
 		reader := bytes.NewReader(message)
@@ -436,12 +437,13 @@ func TestFrameReaderLengthBoundaries(t *testing.T) {
 		size   int
 		header []byte
 	}{
-		{name: "Empty", header: []byte{3}},
-		{name: "OneByte", size: 7, header: []byte{0x73}},
-		{name: "TwoBytes", size: 8, header: []byte{0x83, 1}},
-		{name: "TwoByteMaximum", size: 1023, header: []byte{0xf3, 0x7f}},
-		{name: "ThreeBytes", size: 1024, header: []byte{0x83, 0x80, 1}},
-		{name: "Maximum", size: 65553, header: []byte{0x93, 0x82, 0x40}},
+		{name: "Empty", header: []byte{3, 0}},
+		{name: "Small", size: 7, header: []byte{0x73, 0}},
+		{name: "EightBytes", size: 8, header: []byte{0x83, 0}},
+		{name: "MTU", size: 1452, header: []byte{0xc3, 0x5a}},
+		{name: "TwoByteMaximum", size: 2047, header: []byte{0xf3, 0x7f}},
+		{name: "ThreeBytes", size: 2048, header: []byte{0x03, 0x80, 1}},
+		{name: "Maximum", size: 65553, header: []byte{0x13, 0x81, 0x20}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			payload := bytes.Repeat([]byte{0xa5}, tt.size)
@@ -452,7 +454,7 @@ func TestFrameReaderLengthBoundaries(t *testing.T) {
 			if !bytes.Equal(encoded[:len(tt.header)], tt.header) || len(encoded) != tt.size+len(tt.header) {
 				t.Fatalf("encoded size or header differs from vector: %d, %v", len(encoded), encoded[:len(tt.header)])
 			}
-			stream := iotest.OneByteReader(bytes.NewReader(append(bytes.Clone(encoded), byte(FrameDeliveryReport))))
+			stream := iotest.OneByteReader(bytes.NewReader(append(bytes.Clone(encoded), byte(FrameDeliveryReport), 0)))
 			var decoder FrameReader
 			frame, err := decoder.Read(stream)
 			if err != nil || frame.Type != FrameData || !bytes.Equal(frame.Payload, payload) {
@@ -467,23 +469,27 @@ func TestFrameReaderLengthBoundaries(t *testing.T) {
 }
 
 func TestReadBufferedFramePartialHeader(t *testing.T) {
-	encoded, err := MarshalFrame(Frame{Type: FrameData, Payload: make([]byte, 128)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for cut := 0; cut <= len(encoded); cut++ {
-		reader := bufio.NewReaderSize(bytes.NewReader(encoded[:cut]), len(encoded))
-		reader.Peek(cut)
-		frame, ready, err := ReadBufferedFrame(reader)
-		if err != nil || ready != (cut == len(encoded)) {
-			t.Fatalf("cut %d: ready %t, error %v", cut, ready, err)
-		}
-		if !ready && reader.Buffered() != cut {
-			t.Fatalf("partial frame consumed bytes at cut %d", cut)
-		}
-		if ready && len(frame.Payload) != 128 {
-			t.Fatal("complete payload changed")
-		}
+	for _, size := range []int{0, 128, 2047, 2048} {
+		t.Run("Content"+strconv.Itoa(size), func(t *testing.T) {
+			encoded, err := MarshalFrame(Frame{Type: FrameData, Payload: make([]byte, size)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for cut := 0; cut <= len(encoded); cut++ {
+				reader := bufio.NewReaderSize(bytes.NewReader(encoded[:cut]), len(encoded))
+				reader.Peek(cut)
+				frame, ready, err := ReadBufferedFrame(reader)
+				if err != nil || ready != (cut == len(encoded)) {
+					t.Fatalf("cut %d: ready %t, error %v", cut, ready, err)
+				}
+				if !ready && reader.Buffered() != cut {
+					t.Fatalf("partial frame consumed bytes at cut %d", cut)
+				}
+				if ready && len(frame.Payload) != size {
+					t.Fatal("complete payload changed")
+				}
+			}
+		})
 	}
 }
 
@@ -500,14 +506,14 @@ func TestReadBufferedFramePreservesBorrowedPrefix(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	encoded = append(encoded, 0x81, 0x80)
+	encoded = append(encoded, 0x01, 0x80)
 	reader := bufio.NewReaderSize(bytes.NewReader(encoded), len(encoded))
 	buffered, err := reader.Peek(len(encoded))
 	if err != nil {
 		t.Fatal(err)
 	}
 	first, ready, err := ReadBufferedFrame(reader)
-	if err != nil || !ready || &first.Payload[0] != &buffered[3] {
+	if err != nil || !ready || &first.Payload[0] != &buffered[2] {
 		t.Fatalf("first frame did not borrow buffered content: %t, %v", ready, err)
 	}
 	second, ready, err := ReadBufferedFrame(reader)
@@ -528,15 +534,14 @@ func TestFrameCanonicalLength(t *testing.T) {
 		header []byte
 		want   error
 	}{
-		{name: "ZeroType", header: []byte{0}, want: ErrInvalidFrameType},
-		{name: "UnknownType", header: []byte{15}, want: ErrInvalidFrameType},
+		{name: "ZeroType", header: []byte{0, 0}, want: ErrInvalidFrameType},
+		{name: "UnknownType", header: []byte{15, 0}, want: ErrInvalidFrameType},
 		{name: "UnknownTypeWithLength", header: []byte{0x8f, 1}, want: ErrInvalidFrameType},
-		{name: "NonminimalZero", header: []byte{0x85, 0}, want: ErrInvalidInteger},
-		{name: "NonminimalOne", header: []byte{0x95, 0, 9}, want: ErrInvalidInteger},
-		{name: "NonminimalThirdByte", header: []byte{0x81, 0x80, 0}, want: ErrInvalidInteger},
-		{name: "TooLarge", header: []byte{0xa1, 0x82, 0x40}, want: ErrFrameTooLarge},
-		{name: "TooLong", header: []byte{0x81, 0x80, 0x80, 0}, want: ErrFrameTooLarge},
-		{name: "OversizedMeasurement", header: binary.AppendUvarint(nil, uint64(MaxMeasurementContentSize+1)<<4|uint64(FrameMeasurement)), want: ErrFrameTooLarge},
+		{name: "NonminimalZero", header: []byte{0x05, 0x80, 0}, want: ErrInvalidInteger},
+		{name: "NonminimalOne", header: []byte{0x15, 0x80, 0}, want: ErrInvalidInteger},
+		{name: "TooLarge", header: []byte{0x21, 0x81, 0x20}, want: ErrFrameTooLarge},
+		{name: "MaximumExtension", header: []byte{0xf1, 0xff, 0xff}, want: ErrFrameTooLarge},
+		{name: "OversizedMeasurement", header: []byte{0x48, 0x02}, want: ErrFrameTooLarge},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var decoder FrameReader
@@ -559,11 +564,12 @@ func TestFrameCanonicalLength(t *testing.T) {
 }
 
 func TestFrameHeaderValues(t *testing.T) {
-	// Exercise every canonical value representable by a three-byte packed header.
+	// Exercise every value representable by the two-byte base and its optional extension.
 	var encoded [3]byte
 	for frameType := FrameType(0); frameType < 16; frameType++ {
-		for length := range 1 << 17 {
-			width := binary.PutUvarint(encoded[:], uint64(length)<<4|uint64(frameType))
+		for length := range 1 << 19 {
+			width := FrameSize(length) - length
+			putFrameHeader(encoded[:], length, frameType)
 			got, headerSize, err := frameHeader(encoded[:width])
 			if !frameType.Valid() {
 				if !errors.Is(err, ErrInvalidFrameType) {
@@ -592,7 +598,7 @@ func TestDataFullWidthAndReusableEncoding(t *testing.T) {
 		overhead     int
 	}{
 		{name: "Small", id: 1, deadline: 1, payloadSize: 32, overhead: 4},
-		{name: "Ordinary", id: 8_640_000_000, deadline: 604_805_000_000, payloadSize: 1452, overhead: 13},
+		{name: "Ordinary", id: 8_640_000_000, deadline: 604_805_000_000, payloadSize: 1452, overhead: 12},
 		{name: "FullWidth", id: math.MaxUint64, deadline: math.MaxUint64 - math.MaxUint64%1000, payloadSize: MaxPacketSize, overhead: 21},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -642,16 +648,16 @@ func TestAppendOverlappingPayload(t *testing.T) {
 		sizes     []int
 		append    func([]byte, []byte) ([]byte, error)
 	}{
-		{name: "Frame", frameType: FrameDeliveryReport, sizes: []int{0, 7, 8, 1023, 1024, MaxFrameContentSize},
+		{name: "Frame", frameType: FrameDeliveryReport, sizes: []int{0, 7, 8, 2047, 2048, MaxFrameContentSize},
 			append: func(destination, payload []byte) ([]byte, error) {
 				return AppendFrame(destination, Frame{Type: FrameDeliveryReport, Payload: payload})
 			}},
-		{name: "Data", frameType: FrameData, metadata: []byte{1, 1}, sizes: []int{0, 5, 6, 1021, 1022, MaxPacketSize},
+		{name: "Data", frameType: FrameData, metadata: []byte{1, 1}, sizes: []int{0, 5, 6, 2045, 2046, MaxPacketSize},
 			append: func(destination, payload []byte) ([]byte, error) {
 				return AppendDataFrame(destination, Data{PacketID: 1, DeadlineMicros: 2, Payload: payload})
 			}},
 		{name: "FullWidthData", frameType: FrameData, metadata: wideMetadata,
-			sizes: []int{0, 5, 6, 1021, 1022, MaxPacketSize},
+			sizes: []int{0, 5, 6, 2029, 2030, MaxPacketSize},
 			append: func(destination, payload []byte) ([]byte, error) {
 				return AppendDataFrame(destination, Data{PacketID: math.MaxUint64,
 					DeadlineMicros: math.MaxUint64 - math.MaxUint64%1000, Payload: payload})
@@ -660,7 +666,9 @@ func TestAppendOverlappingPayload(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, size := range tt.sizes {
 				t.Run("Payload"+strconv.Itoa(size), func(t *testing.T) {
-					header := binary.AppendUvarint(nil, uint64(size+len(tt.metadata))<<4|uint64(tt.frameType))
+					contentSize := size + len(tt.metadata)
+					header := make([]byte, FrameSize(contentSize)-contentSize)
+					putFrameHeader(header, contentSize, tt.frameType)
 					header = append(header, tt.metadata...)
 					for _, prefixSize := range []int{0, 1, 5} {
 						for _, sourceOffset := range []int{0, prefixSize + 1, prefixSize + len(header) + 1} {

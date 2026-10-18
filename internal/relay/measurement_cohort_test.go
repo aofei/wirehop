@@ -146,7 +146,7 @@ func TestMeasurementCoordinatorConcurrentTargets(t *testing.T) {
 					t.Fatal("rejected carrier blocked or acquired the remaining target's probe")
 				}
 				client.receive(t, ready, protocol.Measurement{
-					Kind: protocol.MeasurementReply, ID: begin.value.ID, ProbeMicros: 100,
+					Kind: protocol.MeasurementReply, ID: begin.value.ID,
 					ReceiveMicros: 200, ReplyMicros: 200, HoldMicros: 1000,
 				}, 300)
 				client.apply(t)
