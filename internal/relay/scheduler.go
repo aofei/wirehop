@@ -124,13 +124,14 @@ type schedulerEvent struct {
 
 // measurementDrain holds the sole measurement operation's session-wide Data pause.
 type measurementDrain struct {
-	released func(time.Duration)
-	ctx      context.Context
-	target   protocol.LaneGeneration
-	ready    chan struct{}
-	valid    atomic.Bool
-	finished bool
-	deadline time.Time
+	released     func(time.Duration)
+	ctx          context.Context
+	target       protocol.LaneGeneration
+	ready        chan struct{}
+	valid        atomic.Bool
+	finished     bool
+	deadline     time.Time
+	localRequest bool
 }
 
 // finish publishes or revokes proof that every paused generation's committed prefix was parsed.
@@ -230,14 +231,15 @@ func NewScheduler(ingress *packetqueue.Queue[Packet]) (*Scheduler, error) {
 
 // beginMeasurementDrain requests a session-wide data pause without blocking a carrier writer.
 // The context owns the operation. The proof publishes its fixed deadline, and released receives actual pause cost.
-// Admission samples the target generation's latest and operating RTT without changing an exposed promise afterward.
+// Local requests with no unvalidated RTT increase can use a shorter pause. Other requests retain the full budget.
+// Neither admission policy changes an exposed promise afterward.
 // A saturated event queue returns nil and leaves timing unvalidated.
-func (s *Scheduler) beginMeasurementDrain(ctx context.Context, target protocol.LaneGeneration,
+func (s *Scheduler) beginMeasurementDrain(ctx context.Context, target protocol.LaneGeneration, localRequest bool,
 	released func(time.Duration)) (<-chan struct{}, func() (time.Time, bool)) {
 	if ctx.Err() != nil || !s.pendingMeasurementDrain.CompareAndSwap(false, true) {
 		return nil, nil
 	}
-	drain := &measurementDrain{ctx: ctx, target: target, ready: make(chan struct{}), released: released}
+	drain := &measurementDrain{ctx: ctx, target: target, localRequest: localRequest, ready: make(chan struct{}), released: released}
 	stop := context.AfterFunc(ctx, s.notifyMeasurementChanged)
 	select {
 	case s.events <- schedulerEvent{kind: schedulerDrainData, drain: drain}:
@@ -691,6 +693,11 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			return
 		}
 		s.measurementDrain = event.drain
+		if primary := lanes[*preferred]; primary != nil {
+			s.measurements.includePrimary(protocol.LaneGeneration{
+				LaneID: primary.registration.LaneID, Generation: primary.registration.Generation,
+			})
+		}
 	}
 }
 
@@ -750,7 +757,13 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 			return
 		}
 		s.measurementStarted = now
-		s.measurementDeadline = now.Add(measurementPauseDuration(max(target.rttMicros, target.latestRTTMicros)))
+		pause := measurementPauseLimit
+		if drain.localRequest && target.latestRTTMicros <= target.minimumRTTMicros {
+			pause = measurementPauseDuration(max(target.rttMicros, target.latestRTTMicros))
+		}
+		// A peer may have newer timing, and a local increase can still be a transitional sample.
+		// Neither sample bounds the round trips needed to finish the operation.
+		s.measurementDeadline = now.Add(pause)
 		if deadline, ok := drain.ctx.Deadline(); ok && deadline.Before(s.measurementDeadline) {
 			s.measurementDeadline = deadline
 		}
@@ -773,7 +786,7 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 	}
 }
 
-// measurementPauseDuration allows four observed round trips plus scheduling headroom within the transaction limit.
+// measurementPauseDuration budgets a locally requested pause from four observed round trips and scheduling headroom.
 func measurementPauseDuration(rttMicros uint64) time.Duration {
 	const minimum = 250 * time.Millisecond
 	const headroom = 100 * time.Millisecond

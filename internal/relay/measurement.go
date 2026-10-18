@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	// measurementPauseLimit bounds preparation and completion independently of connection failure detection.
-	measurementPauseLimit = time.Duration(protocol.MaxMeasurementHoldMicros) * time.Microsecond
+	// measurementPauseLimit bounds the whole transaction, including preparation before the timed exchange.
+	// Two wire-hold intervals leave room for delayed prefix feedback as well as the timed exchange.
+	measurementPauseLimit = 2 * time.Duration(protocol.MaxMeasurementHoldMicros) * time.Microsecond
 	// measurementRetryInterval bounds unsuccessful attempts and unsolicited peer hints.
 	measurementRetryInterval = 5 * time.Second
 	// measurementQuietRatio limits recurring pause cost to one part in fifty of elapsed runtime.
@@ -25,7 +26,7 @@ type MeasurementWrite struct {
 	Sent  func()
 }
 
-// measurementAttempt owns one actual carrier, one session pause, and a non-extendable deadline.
+// measurementAttempt samples one actual carrier within the session operation's non-extendable pause.
 type measurementAttempt struct {
 	id          uint64
 	peer        LaneRegistration
@@ -33,11 +34,14 @@ type measurementAttempt struct {
 	probeBudget uint64
 	replyBudget uint64
 	ctx         context.Context
-	cancel      context.CancelFunc
+	cancel      context.CancelFunc // Only the initial target owns operation cancellation.
 	ready       <-chan struct{}
 	proof       func() (time.Time, bool)
 	stage       protocol.MeasurementKind
 	prepared    bool
+	peerReady   bool
+	readyQueued bool
+	finished    bool
 }
 
 // measurementCoordinator owns the sole operation across all session carrier readers and writers.
@@ -47,6 +51,8 @@ type measurementCoordinator struct {
 	scheduler     *Scheduler
 	peers         map[protocol.LaneID]LaneRegistration
 	active        *measurementAttempt
+	attempts      map[protocol.LaneID]*measurementAttempt
+	probesStarted bool
 	nextID        uint64
 	lastPeerID    uint64
 	nextAt        time.Time
@@ -79,6 +85,7 @@ func (m *measurementCoordinator) close() {
 		m.active = nil
 	}
 	clear(m.peers)
+	clear(m.attempts)
 	m.mu.Unlock()
 }
 
@@ -92,7 +99,10 @@ func (s *Scheduler) RequestMeasurement(target protocol.LaneGeneration) {
 	defer m.mu.Unlock()
 	peer, ok := m.peers[target.LaneID]
 	if !ok || peer.Generation != target.Generation || peer.SendMeasurement == nil || m.closed ||
-		m.active != nil || time.Now().Before(m.nextAt) {
+		time.Now().Before(m.nextAt) {
+		return
+	}
+	if m.active != nil && m.attempts[target.LaneID] != nil {
 		return
 	}
 	if !peer.MeasurementInitiator {
@@ -105,35 +115,94 @@ func (s *Scheduler) RequestMeasurement(target protocol.LaneGeneration) {
 		}})
 		return
 	}
-	m.startClientLocked(peer)
+	if m.active != nil {
+		m.joinLocked(peer, false)
+		return
+	}
+	m.startClientLocked(peer, true)
 }
 
 // startClientLocked allocates an operation for the requesting carrier generation.
-func (m *measurementCoordinator) startClientLocked(peer LaneRegistration) {
+func (m *measurementCoordinator) startClientLocked(peer LaneRegistration, localRequest bool) {
 	if m.nextID == ^uint64(0) {
 		return
 	}
 	m.nextID++
-	m.startLocked(peer, m.nextID)
+	m.startLocked(peer, m.nextID, localRequest)
 }
 
 // startLocked reserves session ownership before asynchronously preparing both endpoints.
-func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64) {
+func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64, localRequest bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), measurementPauseLimit)
 	a := &measurementAttempt{id: id, peer: peer, ctx: ctx, cancel: cancel}
+	if !peer.MeasurementInitiator {
+		a.stage = protocol.MeasurementBegin
+	}
 	m.active = a
+	m.attempts = map[protocol.LaneID]*measurementAttempt{peer.LaneID: a}
+	m.probesStarted = false
 	target := protocol.LaneGeneration{LaneID: peer.LaneID, Generation: peer.Generation}
-	a.ready, a.proof = m.scheduler.beginMeasurementDrain(ctx, target, func(cost time.Duration) { m.released(a, cost) })
+	a.ready, a.proof = m.scheduler.beginMeasurementDrain(ctx, target, localRequest, func(cost time.Duration) { m.released(a, cost) })
 	if a.ready == nil {
 		m.active = nil
+		clear(m.attempts)
 		m.nextAt = time.Now().Add(measurementRetryInterval)
 		a.cancel()
 		return
 	}
+	m.prepareLocked(a)
+}
+
+// joinLocked returns a newly enrolled generation within the same fixed session pause, or nil once enrollment ends.
+func (m *measurementCoordinator) joinLocked(peer LaneRegistration, receivedBegin bool) *measurementAttempt {
+	root := m.active
+	if root.ctx.Err() != nil || root.finished || m.probesStarted {
+		return nil
+	}
+	a := &measurementAttempt{
+		id: root.id, peer: peer, ctx: root.ctx, ready: root.ready, proof: root.proof,
+	}
+	if !peer.MeasurementInitiator && receivedBegin {
+		a.stage = protocol.MeasurementBegin
+	}
+	m.attempts[peer.LaneID] = a
+	m.prepareLocked(a)
+	return a
+}
+
+// includePrimary enrolls an active directional primary without requiring a separate timing refresh decision.
+func (m *measurementCoordinator) includePrimary(target protocol.LaneGeneration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	peer, ok := m.peers[target.LaneID]
+	if !ok || peer.Generation != target.Generation || m.active == nil || m.active.ctx.Err() != nil ||
+		m.attempts[target.LaneID] != nil {
+		return
+	}
+	a := m.joinLocked(peer, false)
+	if a == nil || peer.MeasurementInitiator {
+		return
+	}
+	if !peer.SendMeasurement(MeasurementWrite{Build: func(uint64) (protocol.Measurement, bool) {
+		return protocol.Measurement{Kind: protocol.MeasurementRequest}, true
+	}}) {
+		// An independent client Begin may still enroll this unannounced carrier before timing starts.
+		delete(m.attempts, peer.LaneID)
+	}
+}
+
+// ownsLocked identifies a current member without accepting completions from an earlier session pause.
+func (m *measurementCoordinator) ownsLocked(a *measurementAttempt) bool {
+	return m.active != nil && m.attempts[a.peer.LaneID] == a && !a.finished
+}
+
+// prepareLocked queues one target's preparation while all members share the session drain and its deadline.
+func (m *measurementCoordinator) prepareLocked(a *measurementAttempt) {
+	peer := a.peer
 	if peer.MeasurementInitiator && !peer.SendMeasurement(MeasurementWrite{Build: func(uint64) (protocol.Measurement, bool) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if m.active != a || a.ctx.Err() != nil {
+		if !m.ownsLocked(a) || a.ctx.Err() != nil {
 			return protocol.Measurement{}, false
 		}
 		a.stage = protocol.MeasurementBegin
@@ -143,11 +212,11 @@ func (m *measurementCoordinator) startLocked(peer LaneRegistration, id uint64) {
 	}
 	go func() {
 		select {
-		case <-ctx.Done():
+		case <-a.ctx.Done():
 		case <-a.ready:
 			m.prepared(a)
 		}
-		<-ctx.Done()
+		<-a.ctx.Done()
 		m.finish(a)
 	}()
 }
@@ -162,11 +231,30 @@ func (m *measurementCoordinator) prepared(a *measurementAttempt) {
 	}
 	a.prepared = true
 	if a.peer.MeasurementInitiator {
-		if a.stage == protocol.MeasurementReady {
-			m.queueProbeLocked(a)
-		}
-		return
+		m.probePreparedLocked()
+	} else {
+		m.readyPreparedLocked()
 	}
+}
+
+// readyPreparedLocked confirms each member only after the client has enrolled every server-requested primary.
+func (m *measurementCoordinator) readyPreparedLocked() {
+	for _, member := range m.attempts {
+		if !member.finished && (member.stage == 0 || !member.prepared) {
+			return
+		}
+	}
+	for _, member := range m.attempts {
+		if member.finished || member.readyQueued {
+			continue
+		}
+		member.readyQueued = true
+		m.queueReadyLocked(member)
+	}
+}
+
+// queueReadyLocked acknowledges one actual carrier's membership and the shared session prefix proof.
+func (m *measurementCoordinator) queueReadyLocked(a *measurementAttempt) {
 	if !a.peer.SendMeasurement(MeasurementWrite{Build: func(uint64) (protocol.Measurement, bool) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -177,6 +265,24 @@ func (m *measurementCoordinator) prepared(a *measurementAttempt) {
 		return protocol.Measurement{Kind: protocol.MeasurementReady, ID: a.id, Valid: true}, true
 	}}) {
 		m.finishLocked(a)
+	}
+}
+
+// probePreparedLocked seals the cohort once both endpoints have prepared every enrolled carrier.
+func (m *measurementCoordinator) probePreparedLocked() {
+	if m.probesStarted {
+		return
+	}
+	for _, member := range m.attempts {
+		if !member.finished && (!member.prepared || !member.peerReady) {
+			return
+		}
+	}
+	m.probesStarted = true
+	for _, member := range m.attempts {
+		if !member.finished {
+			m.queueProbeLocked(member)
+		}
 	}
 }
 
@@ -203,7 +309,7 @@ func (m *measurementCoordinator) queueProbeLocked(a *measurementAttempt) {
 
 // usableLocked checks operation ownership, the actual generation, and the scheduler's unchanged session prefix proof.
 func (m *measurementCoordinator) usableLocked(a *measurementAttempt) bool {
-	if m.active != a || a.ctx.Err() != nil || a.proof == nil {
+	if !m.ownsLocked(a) || a.ctx.Err() != nil || a.proof == nil {
 		return false
 	}
 	if m.peers[a.peer.LaneID].Generation != a.peer.Generation {
@@ -222,7 +328,7 @@ func (m *measurementCoordinator) budgetLocked(a *measurementAttempt) uint64 {
 	if own, ok := a.ctx.Deadline(); ok && own.Before(deadline) {
 		deadline = own
 	}
-	return uint64(max(0, time.Until(deadline)/time.Microsecond))
+	return min(protocol.MaxMeasurementHoldMicros, uint64(max(0, time.Until(deadline)/time.Microsecond)))
 }
 
 // ObserveMeasurement dispatches a parsed phase on its actual carrier generation.
@@ -243,12 +349,26 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 		return ErrUnexpectedFrame
 	}
 	if value.Kind == protocol.MeasurementRequest {
-		if m.active == nil && !time.Now().Before(m.nextAt) {
-			m.startClientLocked(peer)
+		if !time.Now().Before(m.nextAt) {
+			if m.active == nil {
+				m.startClientLocked(peer, false)
+			} else if m.attempts[peer.LaneID] == nil {
+				m.joinLocked(peer, false)
+			}
 		}
 		return nil
 	}
 	if value.Kind == protocol.MeasurementBegin {
+		if m.active != nil && m.active.id == value.ID {
+			if member := m.attempts[peer.LaneID]; member == nil {
+				m.joinLocked(peer, true)
+			} else if member != m.active && member.stage == 0 && !member.finished {
+				// An enrolled server primary still requires Begin before accepting its actual Probe.
+				member.stage = protocol.MeasurementBegin
+				m.readyPreparedLocked()
+			}
+			return nil
+		}
 		if value.ID <= m.lastPeerID {
 			return nil
 		}
@@ -257,28 +377,28 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 			m.rejectBeginLocked(peer, value.ID)
 			return nil
 		}
-		m.startLocked(peer, value.ID)
+		m.startLocked(peer, value.ID, false)
 		return nil
 	}
-	a := m.active
-	if a == nil || a.id != value.ID {
+	a := m.attempts[source.LaneID]
+	if a == nil || a.id != value.ID || a.finished {
 		return nil
 	}
-	if source.LaneID != a.peer.LaneID || source.Generation != a.peer.Generation {
+	if source.Generation != a.peer.Generation {
 		return nil
 	}
 	if value.Kind == protocol.MeasurementReady {
-		if a.stage != protocol.MeasurementBegin {
+		if a.stage != protocol.MeasurementBegin || a.peerReady {
 			return ErrUnexpectedFrame
 		}
 		if !value.Valid {
 			m.finishLocked(a)
+			m.probePreparedLocked()
 			return nil
 		}
 		a.stage = protocol.MeasurementReady
-		if a.prepared {
-			m.queueProbeLocked(a)
-		}
+		a.peerReady = true
+		m.probePreparedLocked()
 		return nil
 	}
 	switch value.Kind {
@@ -286,6 +406,7 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 		if a.stage != protocol.MeasurementReady {
 			return ErrUnexpectedFrame
 		}
+		m.probesStarted = true
 		a.sample.LocalSendMicros = value.ProbeMicros
 		a.sample.RemoteReceiveMicros = now
 		a.probeBudget = value.HoldMicros
@@ -293,7 +414,7 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 		peer.SendMeasurement(MeasurementWrite{Build: func(send uint64) (protocol.Measurement, bool) {
 			m.mu.Lock()
 			defer m.mu.Unlock()
-			if m.active != a || a.ctx.Err() != nil {
+			if !m.ownsLocked(a) || a.ctx.Err() != nil {
 				return protocol.Measurement{}, false
 			}
 			a.sample.RemoteSendMicros = send
@@ -368,13 +489,13 @@ func (m *measurementCoordinator) resultLocked(a *measurementAttempt) (uint64, bo
 func (m *measurementCoordinator) sendResult(a *measurementAttempt, valid bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.active != a || a.ctx.Err() != nil {
+	if !m.ownsLocked(a) || a.ctx.Err() != nil {
 		return
 	}
 	a.peer.SendMeasurement(MeasurementWrite{Build: func(uint64) (protocol.Measurement, bool) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if m.active != a || a.ctx.Err() != nil {
+		if !m.ownsLocked(a) || a.ctx.Err() != nil {
 			return protocol.Measurement{}, false
 		}
 		value := protocol.Measurement{Kind: protocol.MeasurementResult, ID: a.id, Valid: valid && m.usableLocked(a)}
@@ -395,9 +516,16 @@ func (m *measurementCoordinator) finish(a *measurementAttempt) {
 
 // finishLocked requests release without making another operation eligible before the Data gates reopen.
 func (m *measurementCoordinator) finishLocked(a *measurementAttempt) {
-	if m.active == a {
-		a.cancel()
+	if !m.ownsLocked(a) {
+		return
 	}
+	a.finished = true
+	for _, member := range m.attempts {
+		if !member.finished {
+			return
+		}
+	}
+	m.active.cancel()
 }
 
 // released charges actual Data pause time after the scheduler has reopened every current store.
@@ -409,5 +537,6 @@ func (m *measurementCoordinator) released(a *measurementAttempt, cost time.Durat
 	}
 	m.nextAt = time.Now().Add(max(measurementRetryInterval, cost*measurementQuietRatio))
 	m.active = nil
+	clear(m.attempts)
 	a.cancel()
 }

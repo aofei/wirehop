@@ -119,24 +119,29 @@ func testTLSAbortWithFullSendBuffer(t *testing.T, useWebSocket bool) {
 	if err := raw.SetWriteBuffer(4096); err != nil {
 		t.Fatal(err)
 	}
-	if err := raw.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
-		t.Fatal(err)
-	}
 	// Fill TCP directly so the completed TLS writer does not retain a prior write error.
-	written, err := raw.Write(make([]byte, 8*1024*1024))
-	assertNetworkTimeout(t, err)
-	if written == 0 {
-		t.Fatal("TCP send buffer accepted no bytes")
-	}
-	if err := raw.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
-		t.Fatal(err)
-	}
-	for {
-		if _, err := raw.Write([]byte{0}); err != nil {
-			assertNetworkTimeout(t, err)
-			break
+	// A fresh deadline for each write distinguishes backpressure from time spent in successful writes.
+	writeUntilBlocked := func(buffer []byte) int {
+		written := 0
+		for {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("fill TCP send buffer: %v", err)
+			}
+			if err := raw.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			n, err := raw.Write(buffer)
+			written += n
+			if err != nil {
+				assertNetworkTimeout(t, err)
+				return written
+			}
 		}
 	}
+	if writeUntilBlocked(make([]byte, 64*1024)) == 0 {
+		t.Fatal("TCP send buffer accepted no bytes")
+	}
+	writeUntilBlocked([]byte{0})
 	if err := raw.SetWriteDeadline(time.Time{}); err != nil {
 		t.Fatal(err)
 	}

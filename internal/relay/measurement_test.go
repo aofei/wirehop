@@ -64,12 +64,25 @@ func TestMeasurementCoordinatorExchange(t *testing.T) {
 }
 
 func TestMeasurementCoordinatorParallelPreparation(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		rtt  uint64
+	}{
+		{name: "ObservedRTT", rtt: 1_200_000},
+		{name: "IncreasingRTTDuringPreparation", rtt: 600_000},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			testMeasurementParallelPreparation(t, tt.rtt)
+		})
+	}
+}
+
+func testMeasurementParallelPreparation(t *testing.T, observedRTT uint64) {
 	synctest.Test(t, func(t *testing.T) {
 		client := newMeasurementFixture(t, true, 1)
 		server := newMeasurementFixture(t, false, 1)
-		for _, endpoint := range []*measurementFixture{client, server} {
-			endpoint.lanes[1].applyTiming(clockmap.Sample{LocalReceiveMicros: 1_200_000}, false)
-		}
+		client.lanes[1].rttMicros = 100_000
+		client.lanes[1].applyTiming(clockmap.Sample{LocalReceiveMicros: observedRTT}, false)
 		client.commit(t, 1)
 		client.scheduler.RequestMeasurement(client.target)
 		client.apply(t)
@@ -130,8 +143,8 @@ func TestMeasurementCoordinatorAbruptRTTIncrease(t *testing.T) {
 		client.scheduler.RequestMeasurement(client.target)
 		client.apply(t)
 		budget := time.Until(client.scheduler.measurementDeadline)
-		if budget != 2500*time.Millisecond {
-			t.Fatalf("first-step pause budget = %s, want 2.5 seconds", budget)
+		if budget != measurementPauseLimit {
+			t.Fatalf("first-step pause budget = %s, want the full transaction budget", budget)
 		}
 		begin := client.write(t, 0)
 		time.Sleep(300 * time.Millisecond)
@@ -167,7 +180,7 @@ func TestMeasurementCoordinatorAbruptRTTIncrease(t *testing.T) {
 		lane.applyTiming(low, false)
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		_, proof := client.scheduler.beginMeasurementDrain(ctx, client.target, nil)
+		_, proof := client.scheduler.beginMeasurementDrain(ctx, client.target, true, nil)
 		client.apply(t)
 		deadline, valid := proof()
 		if !valid || time.Until(deadline) >= budget || lane.latestRTTMicros != 10_000 {
@@ -180,7 +193,7 @@ func TestMeasurementCoordinatorAbruptRTTIncrease(t *testing.T) {
 		}
 		ctx, cancel = context.WithCancel(t.Context())
 		defer cancel()
-		_, proof = client.scheduler.beginMeasurementDrain(ctx, client.target, nil)
+		_, proof = client.scheduler.beginMeasurementDrain(ctx, client.target, true, nil)
 		client.apply(t)
 		if deadline, valid := proof(); !valid || time.Until(deadline) != 250*time.Millisecond {
 			t.Fatal("converged low RTT did not restore the minimum pause budget")
@@ -211,7 +224,7 @@ func TestMeasurementCoordinatorTimeout(t *testing.T) {
 						client.apply(t)
 					}
 				}
-				time.Sleep(measurementPauseDuration(client.lanes[1].rttMicros))
+				time.Sleep(measurementPauseLimit)
 				for _, endpoint := range []*measurementFixture{client, server} {
 					endpoint.apply(t)
 					if endpoint.paused() || endpoint.scheduler.measurements.active != nil {
@@ -238,8 +251,10 @@ func TestMeasurementCoordinatorOwnership(t *testing.T) {
 			}
 			client.apply(t)
 			begin := client.write(t, 1)
-			if len(client.writes) != 0 || begin.source != client.target || client.scheduler.measurements.nextID != 1 {
-				t.Fatal("requests did not coalesce into one requesting carrier measurement")
+			other := client.write(t, 1)
+			if len(client.writes) != 0 || begin.source != client.target || other.source.LaneID != 2 ||
+				begin.value.ID != other.value.ID || client.scheduler.measurements.nextID != 1 {
+				t.Fatal("requests did not coalesce into one session pause with independent carrier measurements")
 			}
 		})
 	})
@@ -421,6 +436,7 @@ type measurementFixture struct {
 	lanes     map[protocol.LaneID]*scheduledLane
 	target    protocol.LaneGeneration
 	writes    chan measurementQueued
+	preferred protocol.LaneID
 }
 
 type measurementQueued struct {
@@ -479,8 +495,7 @@ func (f *measurementFixture) apply(t *testing.T) {
 		synctest.Wait()
 		select {
 		case event := <-f.scheduler.events:
-			var preferred protocol.LaneID
-			f.scheduler.applyEvent(f.lanes, &preferred, event, time.Now())
+			f.scheduler.applyEvent(f.lanes, &f.preferred, event, time.Now())
 		default:
 			f.scheduler.updateMeasurementDrain(f.lanes)
 			synctest.Wait()
@@ -508,6 +523,9 @@ func (f *measurementFixture) write(t *testing.T, now uint64) measurementTransmis
 		value, valid := queued.request.Build(now)
 		if !valid {
 			t.Fatal("queued measurement expired unexpectedly")
+		}
+		if _, err := protocol.MarshalMeasurement(value); err != nil {
+			t.Fatalf("queued measurement cannot be encoded: %v", err)
 		}
 		if queued.request.Sent == nil {
 			queued.request.Sent = func() {}

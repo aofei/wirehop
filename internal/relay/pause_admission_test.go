@@ -126,7 +126,7 @@ func TestSchedulerRunTimingPauseKeepsControlProgress(t *testing.T) {
 		}
 		leaseContext, release := context.WithCancel(ctx)
 		defer release()
-		ready, _ := scheduler.beginMeasurementDrain(leaseContext, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
+		ready, _ := scheduler.beginMeasurementDrain(leaseContext, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 		synctest.Wait()
 		for _, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.HandshakeInitiation} {
 			payload := relayWireGuardPacket(kind)

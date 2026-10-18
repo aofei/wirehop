@@ -362,3 +362,61 @@ func TestTransmissionStorePreservesSupplyStateAcrossPartialBatchReports(t *testi
 		}
 	}
 }
+
+func TestScheduledLaneTimingPausePreservesCapacity(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		paused  bool
+		resumed bool
+		initial bool
+		delay   time.Duration
+		want    uint64
+	}{
+		{name: "ConstrainedDecrease", delay: 1200 * time.Millisecond, want: 6826},
+		{name: "PausedDecrease", paused: true, delay: 1200 * time.Millisecond, want: 170_533},
+		{name: "ResumedOldPrefix", paused: true, resumed: true, delay: 1200 * time.Millisecond, want: 170_533},
+		{name: "PausedIncrease", paused: true, delay: time.Millisecond, want: 8_192_000},
+		{name: "PausedInitialEstimate", paused: true, initial: true, delay: 1200 * time.Millisecond, want: 6826},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.UnixMicro(3_000_000)
+			store := newDeliverySampleStore(t, &now)
+			store.setDeliveryWindows(16_384, 16_384)
+			lane := &scheduledLane{
+				registration: schedulerRegistration(1, 1, store),
+				rttMicros:    10_000, minimumRTTMicros: 10_000,
+			}
+			if !tt.initial {
+				lane.updateDeliveryRate(deliverySample{bytes: 170_533, intervalMicros: 1_000_000}, 1_000_000)
+			}
+			for id := uint64(1); id <= 2; id++ {
+				if err := store.push(deliverySampleTransmission(t, store, id)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for range 2 {
+				takeOneTransmission(t, store)
+			}
+			if store.sent.items[store.sent.head+1].applicationLimited {
+				t.Fatal("fixture did not commit a constrained prefix before pausing")
+			}
+			if tt.paused {
+				store.beginMeasurementPause()
+			}
+			if tt.resumed {
+				store.endMeasurementPause()
+			}
+			now = now.Add(tt.delay)
+			progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 2}, uint64(now.UnixMicro()), now)
+			if err != nil || !progressed {
+				t.Fatalf("paused prefix report = %t, %v", progressed, err)
+			}
+			if lane.deliveryRate != tt.want {
+				t.Fatalf("delivery rate = %d B/s, want %d B/s", lane.deliveryRate, tt.want)
+			}
+			if !store.sentEmpty() || lane.lastDataPackets != 2 || store.measurementDrain.Load() != (tt.paused && !tt.resumed) {
+				t.Fatal("capacity protection lost parsing progress or changed the Data gate")
+			}
+		})
+	}
+}

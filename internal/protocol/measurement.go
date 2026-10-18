@@ -1,6 +1,6 @@
 package protocol
 
-// MaxMeasurementHoldMicros bounds a measurement's remaining Data pause independently of liveness timeouts.
+// MaxMeasurementHoldMicros bounds the Data pause advertised by one Probe or Reply independently of liveness timeouts.
 const MaxMeasurementHoldMicros = 4_000_000
 
 // MaxMeasurementContentSize bounds a Reply with full-width IDs and timestamps and a four-byte pause hold.

@@ -19,6 +19,20 @@ import (
 )
 
 func TestMeasurementCoordinatorLiveLanes(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		targets int
+	}{
+		{name: "SingleTarget", targets: 1},
+		{name: "ConcurrentTargets", targets: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			testMeasurementLiveTargets(t, tt.targets)
+		})
+	}
+}
+
+func testMeasurementLiveTargets(t *testing.T, targets int) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		var workers []chan struct{}
@@ -135,7 +149,9 @@ func TestMeasurementCoordinatorLiveLanes(t *testing.T) {
 			}
 		}
 		started := time.Now()
-		client.scheduler.RequestMeasurement(protocol.LaneGeneration{LaneID: 1, Generation: 1})
+		for index := range targets {
+			client.scheduler.RequestMeasurement(protocol.LaneGeneration{LaneID: protocol.LaneID(index + 1), Generation: 1})
+		}
 		time.Sleep(10 * time.Millisecond)
 		synctest.Wait()
 		if time.Since(started) >= measurementPauseLimit {
@@ -155,39 +171,52 @@ func TestMeasurementCoordinatorLiveLanes(t *testing.T) {
 				store.mu.Lock()
 				window := store.deliveryWindow
 				store.mu.Unlock()
-				if laneIndex == 0 && window >= before[endpointIndex][laneIndex] ||
-					laneIndex == 1 && window != before[endpointIndex][laneIndex] {
+				if laneIndex < targets && window >= before[endpointIndex][laneIndex] ||
+					laneIndex >= targets && window != before[endpointIndex][laneIndex] {
 					t.Fatalf("endpoint %d lane %d window = %d, before %d", endpointIndex, laneIndex+1,
 						window, before[endpointIndex][laneIndex])
 				}
 			}
-			if phases := e.carriers[1].observed(); len(phases) != 0 {
+			if phases := e.carriers[1].observed(); targets == 1 && len(phases) != 0 {
 				t.Fatalf("empty unrelated standby carried measurement phases: %+v", phases)
 			}
 		}
-		for _, check := range []struct {
-			stream *measurementLiveCarrier
-			want   []protocol.MeasurementKind
-		}{
-			{stream: client.carriers[0], want: []protocol.MeasurementKind{
-				protocol.MeasurementBegin, protocol.MeasurementProbe, protocol.MeasurementResult}},
-			{stream: server.carriers[0], want: []protocol.MeasurementKind{
-				protocol.MeasurementReady, protocol.MeasurementReply}},
-		} {
-			phases := check.stream.observed()
-			var kinds []protocol.MeasurementKind
-			for _, phase := range phases {
-				kinds = append(kinds, phase.value.Kind)
-				if phase.value.ID != 1 || phase.value.Kind != protocol.MeasurementBegin && !phase.paused {
-					t.Fatalf("actual phase lost its operation or session hold: %+v", phase)
+		readyCount := 0
+		for index := range targets {
+			for _, check := range []struct {
+				stream *measurementLiveCarrier
+				want   []protocol.MeasurementKind
+				server bool
+			}{
+				{stream: client.carriers[index], want: []protocol.MeasurementKind{
+					protocol.MeasurementBegin, protocol.MeasurementProbe, protocol.MeasurementResult}},
+				{stream: server.carriers[index], want: []protocol.MeasurementKind{protocol.MeasurementReply}, server: true},
+			} {
+				phases := check.stream.observed()
+				var kinds []protocol.MeasurementKind
+				for _, phase := range phases {
+					if phase.value.ID != 1 || phase.value.Kind != protocol.MeasurementBegin && !phase.paused {
+						t.Fatalf("actual phase lost its operation or session hold: %+v", phase)
+					}
+					if phase.value.Kind == protocol.MeasurementResult && !phase.value.Valid {
+						t.Fatal("live client did not publish valid timing evidence")
+					}
+					if check.server && phase.value.Kind == protocol.MeasurementReady {
+						if len(kinds) != 0 || !phase.value.Valid {
+							t.Fatal("session readiness followed a reply or lacked prefix proof")
+						}
+						readyCount++
+						continue
+					}
+					kinds = append(kinds, phase.value.Kind)
 				}
-				if phase.value.Kind == protocol.MeasurementResult && !phase.value.Valid {
-					t.Fatal("live client did not publish valid timing evidence")
+				if !slices.Equal(kinds, check.want) {
+					t.Fatalf("written phases = %v, want %v", kinds, check.want)
 				}
 			}
-			if !slices.Equal(kinds, check.want) {
-				t.Fatalf("written phases = %v, want %v", kinds, check.want)
-			}
+		}
+		if readyCount != targets {
+			t.Fatalf("session readiness frames = %d, want one acknowledgment for each of %d targets", readyCount, targets)
 		}
 		for endpointIndex, e := range endpoints {
 			payload := append(relayWireGuardPacket(wgpacket.TransportData), make([]byte, 16)...)

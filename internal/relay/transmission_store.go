@@ -830,6 +830,10 @@ func (s *TransmissionStore) beginMeasurementPause() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.measurementDrain.Store(true)
+	// Quiescence limits supply for every outstanding sample, including reports received after this gate reopens.
+	for index := s.sent.head; index < len(s.sent.items); index++ {
+		s.sent.items[index].applicationLimited = true
+	}
 }
 
 // endMeasurementPause resumes Data while preserving pause provenance until the first post-resume packet is reported.

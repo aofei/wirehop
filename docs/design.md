@@ -603,13 +603,16 @@ measured capacity nor evict its history. Higher samples remain useful evidence. 
 provisional 1 MB/s estimate, including when it is lower. Duplicate, stale, and invalid reports do not alter the sampling
 anchors. Earlier receive timestamps release valid prefixes without moving the time anchor backwards.
 
-A timing pause also interrupts application supply. When its Data gate actually reopens, the existing limited-flight
-marker advances to the next cumulative packet number, saturating at the counter limit. All descriptors committed before
-the first post-resume acknowledgment capture limited provenance even when queued demand fills the window. A late
-pre-pause acknowledgment cannot reach that boundary. The first acknowledgment covering resumed Data permits later
-constrained commits to measure capacity loss, while previously committed descriptors retain their captured provenance.
-Repeated cleanup without another pause does not rearm the marker. This requires no additional state and prevents early
-partial feedback from treating an intentionally restarted flight as evidence of lower capacity.
+A timing pause also interrupts application supply. Closing the Data gate marks every outstanding committed descriptor as
+application-limited, including reports that arrive after resumption. Feedback draining the old constrained prefix can
+still prove progress and higher capacity, but cannot lower capacity or evict an aged peak while supply is intentionally
+interrupted. When the Data gate actually reopens, the existing limited-flight marker advances to the next cumulative
+packet number, saturating at the counter limit. All descriptors committed before the first post-resume acknowledgment
+capture limited provenance even when queued demand fills the window. A late pre-pause acknowledgment cannot reach that
+boundary. The first acknowledgment covering resumed Data permits later constrained commits to measure capacity loss,
+while previously committed descriptors retain their captured provenance. Repeated cleanup without another pause does not
+rearm the marker. This requires no additional state and prevents early partial feedback from treating an intentionally
+restarted flight as evidence of lower capacity.
 
 A session with at least two healthy distinct path groups becomes eligible for bounded discovery at admission without
 waiting for real transport traffic. Active or pending timing drains defer fresh discovery, and useful traffic keeps
@@ -1679,13 +1682,14 @@ A valid pong must match the sole outstanding ping ID on the carrying lane after 
 time. Session-created and lane-accepted are valid only in their first-response positions and never on an admitted lane.
 Any recognized frame used outside its allowed phase or direction is a protocol violation.
 
-Ping and Pong have no Data-pause semantics. Independent Measurement frames coordinate one session operation on an exact
-carrier generation. Request asks the client to consider a measurement. Begin, Probe, and Result travel from client to
-server. Ready and Reply travel from server to client. Only the client allocates operation IDs. A late operation or a
-frame on a retired target cannot change the active operation. Direction is checked before operation identity. Any phase
-used in the wrong direction is a protocol violation. A current operation used in the wrong phase is also a protocol
-violation. Correctly directed stale operations are ignored. Measurement fields use canonical unsigned integers and must
-end at the phase's final field.
+Ping and Pong have no Data-pause semantics. Independent Measurement frames coordinate one session operation with an
+independent exchange on each requesting carrier generation. Request asks the client to consider a measurement. Begin,
+Probe, and Result travel from client to server. Ready and Reply travel from server to client. Only the client allocates
+operation IDs. Concurrent targets share the operation ID and session pause. A late operation or a frame on a retired
+target cannot change the active operation. Direction is checked before operation identity. Any phase used in the wrong
+direction is a protocol violation. A current operation used in the wrong phase is also a protocol violation. Correctly
+directed stale operations are ignored. Measurement fields use canonical unsigned integers and must end at the phase's
+final field.
 
 Payload descriptions follow frame-type order. Fields within each payload appear in the listed order:
 
@@ -1870,48 +1874,70 @@ rule and fails the generation instead of silently discarding a response.
 
 #### Coordinated RTT measurement
 
-Coordinated RTT measurement uses an independent, client-owned session transaction. At most one operation can prepare,
-measure, or publish at a time across all lanes. Repeated requests coalesce. Each operation measures only its requesting
-carrier generation. All preparation, timing, and result messages travel on that same carrier. Begin identifies the
-operation without repeating its lane identity or carrying a target list. A phase on another carrier or generation cannot
-modify the active operation. An empty slow standby does not participate in the timed exchange. Every session lane's
-committed Data prefix must still drain to remove the session's own load from shared bottlenecks.
+Coordinated RTT measurement uses an independent, client-owned session transaction. At most one operation owns Data gates
+across all lanes. Repeated requests for the same generation coalesce. When preparation starts, each endpoint enrolls its
+current directional primary. The client includes its primary directly, and the server requests its primary without
+waiting for a separate timing-refresh decision. Every target sends its own Begin, Ready, Probe, Reply, and Result on its
+actual carrier, using the same operation ID and session pause. Each Ready acknowledges that carrier's membership and the
+shared session prefix proof. The server waits for Begin on every locally enrolled target before sending any Ready. The
+client waits for Ready on every enrolled target before sending any Probe. These barriers prevent a faster connection
+from completing the transaction before a slower connection announces its membership, even when the initial Begins arrive
+out of order. The cohort cannot grow after timing begins. An empty unrequested standby does not participate in the timed
+exchange. Every session lane's committed Data prefix must still drain to remove the session's own load from shared
+bottlenecks.
 
 The measurement exchange proceeds as follows:
 
 1. The client reserves the session operation, requests its local Data pause, and sends Measurement Begin immediately on
-   the requesting carrier. Begin requests preparation and does not assert that the client's prefix has already drained
-2. The server closes its session Data gates, waits until cumulative DeliveryReports cover every committed prefix, and
-   sends Measurement Ready. Client preparation proceeds concurrently
-3. Only after both its local prefix proof and the server's Ready arrive does the client queue its Probe. The requesting
-   carrier's writer samples `t1` and sends Measurement Probe
+   each enrolled carrier. Begin requests preparation without asserting that the client's prefix has already drained
+2. The server closes its session Data gates, requests any different directional primary, and waits for Begin on every
+   enrolled carrier and cumulative DeliveryReports covering every committed prefix. It then sends Measurement Ready on
+   each target's actual carrier. Client preparation proceeds concurrently
+3. Only after its local prefix proof and every target's Ready arrive does the client seal the cohort and queue each
+   target's Probe. Each target's writer samples `t1` and sends Measurement Probe on that actual carrier
 4. The server samples `t2` when parsing Probe and `t3` when its writer builds the corresponding Reply. A positive Reply
    hold promises continued session Data quiescence from `t3` until that fixed remaining budget expires
 5. The client samples `t4`, validates `RTT = (t4 - t1) - (t3 - t2)`, applies the result, and sends Measurement Result on
    that same carrier. The server reconstructs and independently checks the sample before applying it. Client Data
-   resumes after Result completes its carrier write. Server Data resumes after Result is applied or rejected
+   resumes after every target's Result completes its carrier write. Server Data resumes after every target's Result is
+   applied or rejected
+
+Concurrent targets sample their actual carriers independently within the original fixed pause. One target's completion
+cannot release another target's quiet promise, and adding a target during preparation cannot extend the operation or its
+captured pause deadline. An unsolicited carrier cannot supply another target's timestamps or inherit its RTT.
+
+A negative Ready retires only its target. Remaining ready targets proceed regardless of response order without extending
+the captured deadline or bypassing the local prefix proof. If the server cannot queue its primary's initial Request, it
+removes that unannounced member so the other carriers can still prepare. The client can still enroll that carrier with
+its own Begin before timing starts.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as Server
     C->>C: Reserve operation and request Data pause
-    C->>S: Begin(id) on the requesting carrier
+    C->>S: Begin(id) on each enrolled carrier
     par Client preparation
         C->>C: Close Data gates and await parsed prefixes
     and Server preparation
-        S->>S: Close Data gates and await parsed prefixes
-        S->>C: Ready(id)
+        S->>S: Close Data gates and enroll directional primary
+        opt Another directional primary needs enrollment
+            S->>C: Request on that carrier
+            C->>S: Begin(id) on that carrier
+        end
+        S->>S: Await every target Begin and parsed prefixes
+        S->>C: Ready(id) on each enrolled carrier
     end
-    Note over C,S: Require local proof and peer readiness before any Probe
-    Note over C,S: Continue on that same carrier
+    Note over C,S: Require local proof and every target Ready before any Probe
+    C->>C: Seal the prepared cohort
+    Note over C,S: Continue independently on each actual carrier
     C->>S: Probe(id, t1, remaining hold)
     S->>C: Reply(id, t1, t2, t3, remaining hold)
     C->>C: Validate and apply or reject the actual carrier's RTT
     C->>S: Result(id, valid, t4)
     S->>S: Independently validate and apply or reject RTT
-    C->>C: Resume after Result finishes writing
-    S->>S: Resume after Result finishes processing
+    C->>C: Resume after every target Result finishes writing
+    S->>S: Resume after every target Result finishes processing
     Note over C,S: A fixed local deadline also reopens Data gates
 ```
 
@@ -1921,24 +1947,30 @@ server. Prefix proof establishes peer parsing of committed Data, not acknowledgm
 Protocol controls, transport control traffic, and retransmissions can still occur. The resulting measurement bounds new
 Data commitment from this session. It does not prove that unrelated traffic or the physical path is unloaded.
 
-Both local preparation and wire completion share one non-extendable four-second transaction deadline. When admitting the
-actual local Data pause, the scheduler validates the exact target generation and captures a shorter deadline: four times
-the greater of its operating RTT and latest accepted RTT, plus 100 milliseconds, clamped to 250 milliseconds through
-four seconds and to the transaction's remaining budget. The latest sample prevents the operating average from
-underbudgeting the first measurement after a sharp RTT increase. The captured deadline never extends after admission.
-Endpoints compute their own bounds, so a short local pause does not cancel a longer peer promise. A low-delay target
-with a stalled standby can reopen its own Data gate after 250 milliseconds without falsely validating the minimum RTT.
-These bounds are independent of the ten-second Ping failure and carrier-write timeouts. Multiple carrier round trips and
-any drain wait must fit the budget, so a live lane may still be unable to complete an active measurement. Probe and
-Reply advertise remaining budgets in whole microseconds. The adjusted RTT must be strictly below the Reply budget, and
+Both local preparation and wire completion share one non-extendable eight-second transaction deadline. The transaction
+reserves twice the per-frame four-second wire-hold budget to include preparation. A delayed committed prefix can require
+multiple round trips before readiness, so using the wire-hold ceiling for the whole transaction can expire a healthy
+exchange. When admitting the actual local Data pause, the scheduler validates the exact target generation. A locally
+requested measurement can capture a shorter deadline when its latest RTT is no higher than its validated minimum: four
+times the greater of its operating RTT and latest accepted RTT, plus 100 milliseconds, clamped to 250 milliseconds
+through eight seconds and to the transaction's remaining budget. An unvalidated local increase reserves the remaining
+transaction budget because its first sample can describe only an intermediate stage of a changing path. A peer-requested
+measurement also reserves the remaining budget at either endpoint because the peer can observe an RTT increase before a
+fresh local sample arrives. Neither an intermediate sample nor an old local estimate safely bounds the requested
+preparation. The captured deadline never extends after admission. A short local pause does not cancel a longer peer
+promise. A client measuring a low-delay target from local evidence can reopen its own Data gate after 250 milliseconds
+despite a stalled standby, without falsely validating the minimum RTT. These bounds are independent of the ten-second
+Ping failure and carrier-write timeouts. Multiple carrier round trips and any drain wait must fit the budget, so a live
+lane may still be unable to complete an active measurement. Probe and Reply advertise remaining budgets in whole
+microseconds, capped at the four-second wire-hold limit. The adjusted RTT must be strictly below the Reply budget, and
 the complete client-side span must be strictly below the Probe budget. Reversed timestamps, unsafe arithmetic, expired
 budgets, revoked prefix proof, and changed target generation reject the evidence. Exactly zero adjusted RTT retains the
 one-microsecond quantization floor. The scheduler checks transaction ownership and prefix proof again when applying a
 queued result. A full event queue rejects publication rather than claiming that the controller applied the sample.
 
-Both endpoints retain session ownership until their target completes or their fixed local deadline expires. An exposed
-Probe or positive Reply must honor its fixed promise after ambiguous write failure or lane cancellation. Missing phases
-cannot extend a pause. Deadline expiry resumes Data, and session shutdown releases the operation immediately. Old
+Both endpoints retain session ownership until every admitted target completes or their fixed local deadline expires. An
+exposed Probe or positive Reply must honor its fixed promise after ambiguous write failure or lane cancellation. Missing
+phases cannot extend a pause. Deadline expiry resumes Data, and session shutdown releases the operation immediately. Old
 completions cannot release a newer operation. Failure to measure is not a connection-liveness failure. Ordinary carrier
 errors still follow normal lane teardown.
 
@@ -1949,9 +1981,12 @@ discovery does not incur pause cost. This bounds recurring pause cost to at most
 is a local controller policy, not a wire requirement. Natural low RTT observations can still lower the minimum without
 any measurement transaction.
 
-Requests arriving during an active operation or cooldown coalesce without a pending-target queue. Other lanes no longer
-receive incidental calibration from a shared cohort. Fresh eligible timing observations can request their own operation
-later. This policy does not guarantee measurement fairness between lanes or between different directional primaries.
+Requests for another carrier can join during preparation without acquiring another pause or consuming another operation
+ID. Including both directional primaries lets them calibrate independently before the shared cost governor starts its
+quiet interval, even when one controller has not yet requested a refresh. Requests after timing begins and during
+cooldown coalesce without a pending-target queue. Unrequested carriers receive no incidental calibration. Each target
+still requires its own valid timestamps, unchanged generation, and live prefix proof. Late requests and targets that
+cannot finish within the original pause must wait for fresh eligible evidence after cooldown.
 
 During preparation, new transport may remain on the existing healthy primary within hard memory limits. Queued unsent
 Data does not participate in the committed-prefix proof. Every retained packet keeps its original deadline. An active
@@ -1968,8 +2003,9 @@ writer, so it cannot prevent control progress. Measurement phases use the ordina
 before exposure drops the attempt. Saturation after a promise leaves expiry responsible for bounded recovery.
 
 WireGuard handshake and cookie packets use Data frames and therefore share this bounded pause. No packet lifetime is
-extended. The four-second operation limit stays below the default five-second packet lifetime, although an already old
-packet can still expire during the pause. Resume provenance protects delivery-rate sampling from the artificial pause.
+extended. A packet can expire during the pause, including a fresh packet when preparation and completion exceed its
+default five-second lifetime. Expiry maintenance continues and reclaims queued work. Resume provenance protects
+delivery-rate sampling from the artificial pause.
 
 Locally triggered refresh requests require measured delivery capacity and a newly accepted ordinary timing sample. Both
 its processing-adjusted RTT and the operating RTT average must yield feedback cycles longer than the four-cycle time
@@ -1985,7 +2021,7 @@ recent accepted capacity in bytes per second, the expected loaded cycle is `H + 
 This includes the sampling allowance at every rate. If either fresh or smoothed feedback fits this expected cycle, the
 evidence is ambiguous. A rate decline alone cannot distinguish increased propagation from temporary loss or queueing.
 The controller delays the first ambiguous calibration by 49 times the estimated pause, capped at 49 times the
-four-second operation limit. Both feedback observations exceeding the expected cycle bypass this delay. The same recent
+four-second wire-hold limit. Both feedback observations exceeding the expected cycle bypass this delay. The same recent
 estimate controls flight credit and its queue explanation. An expired startup burst cannot make a stable queue appear
 unexplained. Falling window-limited throughput can enlarge the expected loaded cycle, but the fixed ambiguity start and
 four-second cost cap still make calibration eligible within 196 seconds. This prevents permanent suppression even when

@@ -28,7 +28,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			ready, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
+			ready, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 			var preferred protocol.LaneID
 			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, time.Now())
 			for _, lane := range lanes {
@@ -48,7 +48,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			if !measurementDrainValid(proof) {
 				t.Fatal("prepared pause has no proof")
 			}
-			if other, _ := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil); other != nil {
+			if other, _ := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil); other != nil {
 				t.Fatal("a second transaction acquired the session pause")
 			}
 			cancel()
@@ -70,7 +70,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			lanes := map[protocol.LaneID]*scheduledLane{1: lane}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			_, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
+			_, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 			var preferred protocol.LaneID
 			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, time.Now())
 			if !measurementDrainValid(proof) {
@@ -81,7 +81,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			if measurementDrainValid(proof) || !lane.registration.Store.measurementDrain.Load() {
 				t.Fatal("invalidation retracted an exposed quiet promise")
 			}
-			time.Sleep(measurementPauseDuration(lane.rttMicros))
+			time.Sleep(time.Until(scheduler.measurementDeadline))
 			scheduler.updateMeasurementDrain(lanes)
 			if lane.registration.Store.measurementDrain.Load() || scheduler.measurementDrain != nil {
 				t.Fatal("invalidated promise outlived its fixed deadline")
@@ -95,14 +95,14 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			for range cap(scheduler.events) {
 				scheduler.events <- schedulerEvent{}
 			}
-			if ready, proof := scheduler.beginMeasurementDrain(t.Context(), protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil); ready != nil || proof != nil || scheduler.pendingMeasurementDrain.Load() {
+			if ready, proof := scheduler.beginMeasurementDrain(t.Context(), protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil); ready != nil || proof != nil || scheduler.pendingMeasurementDrain.Load() {
 				t.Fatal("full event queue leaked admission ownership")
 			}
 			for len(scheduler.events) > 0 {
 				<-scheduler.events
 			}
 			ctx, cancel := context.WithCancel(t.Context())
-			ready, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, nil)
+			ready, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 			cancel()
 			var preferred protocol.LaneID
 			scheduler.applyEvent(nil, &preferred, <-scheduler.events, time.Now())
@@ -120,29 +120,38 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 
 func TestSchedulerMeasurementPauseDeadline(t *testing.T) {
 	for _, tt := range []struct {
-		name      string
-		rttMicros uint64
-		latest    uint64
-		operation time.Duration
-		want      time.Duration
+		name        string
+		rttMicros   uint64
+		latest      uint64
+		minimum     uint64
+		peerRequest bool
+		operation   time.Duration
+		want        time.Duration
 	}{
 		{name: "UnknownRTT", want: 250 * time.Millisecond},
 		{name: "LowRTT", rttMicros: 10_000, want: 250 * time.Millisecond},
 		{name: "MinimumBoundary", rttMicros: 37_500, want: 250 * time.Millisecond},
 		{name: "AboveMinimum", rttMicros: 37_501, want: 250*time.Millisecond + 4*time.Microsecond},
 		{name: "RTTIncrease", rttMicros: 600_000, want: 2500 * time.Millisecond},
-		{name: "LatestRTTIncrease", rttMicros: 83_750, latest: 600_000, want: 2500 * time.Millisecond},
+		{name: "LatestRTTIncrease", rttMicros: 83_750, latest: 600_000, want: measurementPauseLimit},
+		{name: "ValidatedHighRTT", rttMicros: 600_000, latest: 600_000, minimum: 600_000, want: 2500 * time.Millisecond},
 		{name: "LatestRTTReduction", rttMicros: 600_000, latest: 10_000, want: 2500 * time.Millisecond},
-		{name: "BelowMaximum", rttMicros: 974_999, want: 4*time.Second - 4*time.Microsecond},
-		{name: "MaximumBoundary", rttMicros: 975_000, want: 4 * time.Second},
-		{name: "Overflow", rttMicros: math.MaxUint64, want: 4 * time.Second},
+		{name: "BelowMaximum", rttMicros: 1_974_999, want: measurementPauseLimit - 4*time.Microsecond},
+		{name: "MaximumBoundary", rttMicros: 1_975_000, want: measurementPauseLimit},
+		{name: "Overflow", rttMicros: math.MaxUint64, want: measurementPauseLimit},
 		{name: "EarlierOperationDeadline", rttMicros: 600_000, operation: 100 * time.Millisecond, want: 100 * time.Millisecond},
+		{name: "PeerRequestWithStaleRTT", peerRequest: true, rttMicros: 10_000, want: measurementPauseLimit},
+		{name: "PeerRequestWithFreshRTT", peerRequest: true, latest: 600_000, want: measurementPauseLimit},
+		{name: "PeerRequestEarlierDeadline", peerRequest: true, operation: 100 * time.Millisecond, want: 100 * time.Millisecond},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newMeasurementFixture(t, true, 1)
 				f.lanes[1].rttMicros = tt.rttMicros
 				f.lanes[1].latestRTTMicros = tt.latest
+				if tt.minimum != 0 {
+					f.lanes[1].minimumRTTMicros = tt.minimum
+				}
 				operation := tt.operation
 				if operation == 0 {
 					operation = measurementPauseLimit
@@ -150,7 +159,7 @@ func TestSchedulerMeasurementPauseDeadline(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), operation)
 				defer cancel()
 				started := time.Now()
-				_, proof := f.scheduler.beginMeasurementDrain(ctx, f.target, nil)
+				_, proof := f.scheduler.beginMeasurementDrain(ctx, f.target, !tt.peerRequest, nil)
 				f.apply(t)
 				deadline, valid := proof()
 				if !valid || !f.paused() || deadline.Sub(started) != tt.want {
@@ -209,8 +218,8 @@ func TestMeasurementCoordinatorAsymmetricPauseDeadlines(t *testing.T) {
 		prepareMeasurement(t, client, server)
 		serverDeadline := server.scheduler.measurementDeadline
 		if time.Until(client.scheduler.measurementDeadline) != 250*time.Millisecond ||
-			time.Until(serverDeadline) != 2500*time.Millisecond {
-			t.Fatal("endpoints did not admit pauses from their own operating RTTs")
+			time.Until(serverDeadline) != measurementPauseLimit {
+			t.Fatal("initiator and responder did not retain their independent pause bounds")
 		}
 		time.Sleep(250 * time.Millisecond)
 		client.apply(t)
@@ -251,7 +260,7 @@ func TestSchedulerMeasurementDrainRejectsInvalidTarget(t *testing.T) {
 				f := newMeasurementFixture(t, true, 1)
 				f.lanes[1].abandoning = tt.abandoning
 				calls := 0
-				ready, proof := f.scheduler.beginMeasurementDrain(t.Context(), tt.target, func(cost time.Duration) {
+				ready, proof := f.scheduler.beginMeasurementDrain(t.Context(), tt.target, true, func(cost time.Duration) {
 					calls++
 					if cost != 0 {
 						t.Fatal("rejected target charged a Data pause")
@@ -273,7 +282,7 @@ func TestSchedulerMeasurementDrainRejectsInvalidTarget(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			f := newMeasurementFixture(t, true, 2)
 			f.lanes[2].probeUntil = time.Now().Add(time.Second)
-			ready, proof := f.scheduler.beginMeasurementDrain(t.Context(), f.target, nil)
+			ready, proof := f.scheduler.beginMeasurementDrain(t.Context(), f.target, true, nil)
 			f.apply(t)
 			if f.paused() || f.scheduler.measurementDrain == nil {
 				t.Fatal("active discovery did not defer pause admission")
