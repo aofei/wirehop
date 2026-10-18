@@ -54,6 +54,12 @@ type flowInterval struct {
 // rttStepQdiscPattern extracts the configured root netem and its cumulative traffic and drop counters.
 var rttStepQdiscPattern = regexp.MustCompile(`(?m)^qdisc netem 10: root ([^\n]*)\n Sent ([0-9]+) bytes [0-9]+ pkt \(dropped ([0-9]+),`)
 
+// capacityChangeQdiscPatterns extract the root TBF and child netem configuration and cumulative counters.
+var capacityChangeQdiscPatterns = [2]*regexp.Regexp{
+	regexp.MustCompile(`(?m)^qdisc tbf 1: root ([^\n]*)\n Sent ([0-9]+) bytes [0-9]+ pkt \(dropped ([0-9]+),`),
+	regexp.MustCompile(`(?m)^qdisc netem 10: parent 1:1 ([^\n]*)\n Sent ([0-9]+) bytes [0-9]+ pkt \(dropped ([0-9]+),`),
+}
+
 // main validates every requested scenario and exits unsuccessfully if any transfer failed or made no progress.
 func main() {
 	if len(os.Args) < 3 {
@@ -96,19 +102,13 @@ func main() {
 		capacityChange := strings.HasPrefix(scenario, "native-capacity-change") ||
 			strings.HasPrefix(scenario, "tcp-multipath-capacity-change")
 		if err == nil && capacityChange {
-			for _, name := range []string{"client-rate-dropped.txt", "client-rate-restored.txt",
-				"server-rate-dropped.txt", "server-rate-restored.txt"} {
-				if _, err = os.Stat(filepath.Join(directory, name)); err != nil {
-					break
-				}
-			}
+			err = verifyCapacityChangeFault(directory, flow.Start.Timestamp.Seconds)
 		}
-		if err == nil && (strings.HasPrefix(scenario, "tcp-asymmetric-stall") || capacityChange) {
-			duration := 20.0
-			if capacityChange {
-				duration = 40
-			}
-			err = verifyThroughputRecovery(flow, strings.HasSuffix(scenario, "-bidir"), duration)
+		if err == nil && capacityChange {
+			err = verifyCapacityChange(scenario, flow)
+		}
+		if err == nil && strings.HasPrefix(scenario, "tcp-asymmetric-stall") {
+			err = verifyThroughputRecovery(flow, strings.HasSuffix(scenario, "-bidir"), 20, 0)
 		}
 		if err == nil && strings.Contains(scenario, "-rtt-step") {
 			err = verifyRTTStep(directory, scenario, flow)
@@ -272,9 +272,145 @@ func verifyRTTStepQdiscs(directory, role string) error {
 	return nil
 }
 
+// verifyCapacityChangeFault requires the prescribed fault timing and retained queues on both endpoints.
+func verifyCapacityChangeFault(directory string, started int64) error {
+	if started == 0 {
+		return fmt.Errorf("missing flow timestamp for capacity change")
+	}
+	for _, role := range []string{"client", "server"} {
+		var changed [2]int64
+		for index, change := range []struct {
+			name string
+			at   int64
+		}{
+			{name: "dropped", at: 5},
+			{name: "restored", at: 12},
+		} {
+			name := role + "-rate-" + change.name + ".txt"
+			data, err := os.ReadFile(filepath.Join(directory, name))
+			if err != nil {
+				return err
+			}
+			at, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			changed[index] = at - started
+			if changed[index] < change.at-1 || changed[index] > change.at+2 {
+				return fmt.Errorf("%s changed at %d seconds, expected approximately %d", name, changed[index], change.at)
+			}
+		}
+		if changed[1]-changed[0] < 6 || changed[1]-changed[0] > 8 {
+			return fmt.Errorf("%s capacity fault lasted %d seconds, expected approximately 7", role, changed[1]-changed[0])
+		}
+		if err := verifyCapacityChangeQdiscs(directory, role); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyCapacityChangeQdiscs checks shaping, counter continuity, and loss-free queue recovery.
+func verifyCapacityChangeQdiscs(directory, role string) error {
+	var previousBytes, previousDrops [2]uint64
+	for _, phase := range []struct{ name, rate, limit string }{
+		{name: "initial", rate: "1Gbit", limit: "10000"},
+		{name: "limited", rate: "32Kbit", limit: "8"},
+		{name: "restored", rate: "1Gbit", limit: "10000"},
+		{name: "final", rate: "1Gbit", limit: "10000"},
+	} {
+		name := role + "-qdisc-" + phase.name + ".txt"
+		data, err := os.ReadFile(filepath.Join(directory, name))
+		if err != nil {
+			return err
+		}
+		for index, pattern := range capacityChangeQdiscPatterns {
+			match := pattern.FindStringSubmatch(string(data))
+			if match == nil {
+				return fmt.Errorf("%s lacks capacity queue %d evidence", name, index)
+			}
+			configuration := " " + strings.Join(strings.Fields(match[1]), " ") + " "
+			settings := []string{"rate " + phase.rate}
+			if index == 0 && phase.name == "limited" {
+				settings = append(settings, "burst 4Kb", "lat 1s")
+			}
+			if index == 1 {
+				settings = []string{"limit " + phase.limit}
+				if phase.name == "limited" {
+					settings = append(settings, "delay 100ms 20ms", "loss 0.2%")
+				} else if strings.Contains(configuration, " delay ") || strings.Contains(configuration, " loss ") {
+					return fmt.Errorf("%s retains delay or loss outside the fault", name)
+				}
+			}
+			for _, setting := range settings {
+				if !strings.Contains(configuration, " "+setting+" ") {
+					return fmt.Errorf("%s lacks expected %s", name, setting)
+				}
+			}
+			bytes, err := strconv.ParseUint(match[2], 10, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			drops, err := strconv.ParseUint(match[3], 10, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			if bytes < previousBytes[index] || drops < previousDrops[index] {
+				return fmt.Errorf("%s resets capacity queue %d counters", name, index)
+			}
+			if (phase.name == "limited" || phase.name == "final") && bytes == previousBytes[index] {
+				return fmt.Errorf("%s records no additional shaped traffic in queue %d", name, index)
+			}
+			if phase.name == "initial" && drops != 0 || phase.name == "final" && drops != previousDrops[index] {
+				return fmt.Errorf("%s records packet drops outside the capacity fault in queue %d", name, index)
+			}
+			previousBytes[index], previousDrops[index] = bytes, drops
+		}
+	}
+	return nil
+}
+
+// verifyCapacityChange checks useful delivery in each exercised direction under a controlled offered load.
+func verifyCapacityChange(scenario string, flow flowResult) error {
+	if !strings.HasSuffix(scenario, "-reverse") {
+		if err := verifyCapacityChangeDirection(flow.ServerOutput, false); err != nil {
+			return fmt.Errorf("forward direction: %w", err)
+		}
+	}
+	bidirectional := strings.HasSuffix(scenario, "-bidir")
+	if bidirectional || strings.HasSuffix(scenario, "-reverse") {
+		if err := verifyCapacityChangeDirection(&flow, bidirectional); err != nil {
+			return fmt.Errorf("reverse direction: %w", err)
+		}
+	}
+	return nil
+}
+
+// verifyCapacityChangeDirection requires receiver evidence from a sustained 40-second flow.
+func verifyCapacityChangeDirection(receiver *flowResult, reverseIntervals bool) error {
+	if receiver == nil || receiver.Error != "" || receiver.Start.Timestamp.Seconds == 0 {
+		return fmt.Errorf("missing completed receiver interval evidence")
+	}
+	var flow flowResult
+	previousEnd := 0.0
+	for _, interval := range receiver.Intervals {
+		sample := interval.Sum
+		if reverseIntervals {
+			sample = interval.Reverse
+		}
+		if sample.Sender == nil || *sample.Sender || sample.Start < previousEnd || sample.End <= sample.Start {
+			return fmt.Errorf("invalid receiver interval evidence")
+		}
+		previousEnd = sample.End
+		flow.Intervals = append(flow.Intervals, flowIntervalResult{Sum: sample})
+	}
+	return verifyThroughputRecovery(flow, false, 40, 5e6)
+}
+
 // verifyThroughputRecovery requires a complete flow and substantial final-five-second throughput in each direction,
 // relative to its own throughput before fault injection at five seconds. duration is the prescribed flow time in seconds.
-func verifyThroughputRecovery(flow flowResult, bidirectional bool, duration float64) error {
+// minimumBaseline is the required pre-fault throughput in bits per second.
+func verifyThroughputRecovery(flow flowResult, bidirectional bool, duration, minimumBaseline float64) error {
 	directions := 1
 	if bidirectional {
 		directions = 2
@@ -297,7 +433,7 @@ func verifyThroughputRecovery(flow flowResult, bidirectional bool, duration floa
 				baselineBytes += sample.Bytes
 				baselineSeconds += seconds
 			}
-			if sample.Start >= duration-5.5 {
+			if sample.Start >= duration-5.5 && sample.End <= duration+0.5 {
 				recoveredBytes += sample.Bytes
 				recoveredSeconds += seconds
 			}
@@ -307,6 +443,10 @@ func verifyThroughputRecovery(flow flowResult, bidirectional bool, duration floa
 		}
 		baseline := float64(baselineBytes) / baselineSeconds
 		recovered := float64(recoveredBytes) / recoveredSeconds
+		if baseline*8 < minimumBaseline {
+			return fmt.Errorf("direction %d baseline throughput is %.3f Mbit/s, require at least %.3f Mbit/s",
+				direction, baseline*8/1e6, minimumBaseline/1e6)
+		}
 		if recovered < baseline/4 {
 			return fmt.Errorf("direction %d recovered %.1f percent of pre-fault throughput, require at least 25 percent",
 				direction, recovered/baseline*100)

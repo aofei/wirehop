@@ -21,10 +21,10 @@ while [ ! -f "$results/flow-start.txt" ]; do sleep 0.1; done
 while [ ! -f "$results/flow-done.txt" ]; do
   {
     date +%s.%N
-    ss -tinm state established
+    ss -toinm state established
     cat /proc/net/dev
     if [ -r /sys/fs/cgroup/cpu.stat ]; then cat /sys/fs/cgroup/cpu.stat; fi
-    if [ "$role" = router ]; then tc -s qdisc show dev eth0; fi
+    tc -s qdisc show dev eth0
   } >> "$results/$role-observations.txt"
   sleep 0.25
 done

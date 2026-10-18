@@ -59,7 +59,11 @@ ip addr add "$local_ip/$prefix" dev wgtest
 ip link set wgtest mtu 1420 up
 ip route add "$remote_ip/$prefix" dev wgtest
 observer=
-if [ "${WIREHOP_TEST_OBSERVE:-false}" = true ]; then
+observe=${WIREHOP_TEST_OBSERVE:-false}
+case "$scenario" in
+  *-capacity-change*) observe=true ;;
+esac
+if [ "$observe" = true ]; then
   sh /test/observe.sh "$role" /results &
   observer=$!
 fi
@@ -104,6 +108,10 @@ case "$scenario" in
       done
     fi
     ;;
+  *-capacity-change*)
+    tc qdisc replace dev eth0 root handle 1: tbf rate 1gbit burst 65536 latency 1s
+    tc qdisc replace dev eth0 parent 1:1 handle 10: netem limit 10000
+    ;;
   *-slow32|*-slow64|*-slow128)
     rate=${scenario##*slow}
     tc qdisc replace dev eth0 root handle 1: tbf rate "${rate}kbit" burst 4096 latency 1s
@@ -117,11 +125,14 @@ case "$scenario" in
     (
       while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
       sleep 5
-      tc qdisc replace dev eth0 root handle 1: tbf rate 32kbit burst 4096 latency 1s
-      tc qdisc replace dev eth0 parent 1:1 handle 10: netem delay 100ms 20ms loss 0.2% limit 8
+      tc qdisc change dev eth0 root handle 1: tbf rate 32kbit burst 4096 latency 1s
+      tc qdisc change dev eth0 parent 1:1 handle 10: netem delay 100ms 20ms loss 0.2% limit 8
       date +%s > "/results/$role-rate-dropped.txt"
       sleep 7
-      tc qdisc del dev eth0 root
+      tc -s qdisc show dev eth0 > "/results/$role-qdisc-limited.txt"
+      tc qdisc change dev eth0 root handle 1: tbf rate 1gbit burst 65536 latency 1s
+      tc qdisc change dev eth0 parent 1:1 handle 10: netem delay 0ms loss 0% limit 10000
+      tc -s qdisc show dev eth0 > "/results/$role-qdisc-restored.txt"
       date +%s > "/results/$role-rate-restored.txt"
     ) &
     ;;
@@ -131,7 +142,7 @@ if [ "$role" = server ]; then
   iperf3 --version > /results/iperf-version.txt
   uname -a > /results/kernel.txt
   case "$scenario" in
-    *-rtt-step*) iperf3 -s -J > /results/iperf-server.log 2>&1 & ;;
+    *-rtt-step*|*-capacity-change*) iperf3 -s -J > /results/iperf-server.log 2>&1 & ;;
     *) iperf3 -s > /results/iperf-server.log 2>&1 & ;;
   esac
   if [ "${WIREHOP_TEST_LATENCY:-false}" = true ]; then
@@ -277,6 +288,7 @@ case "$scenario" in
 esac
 case "$scenario" in
   *-udp) set -- -u -b 20M -l 1200 ;;
+  *-capacity-change*) set -- "$@" -b 20M -l 16K --get-server-output ;;
   *-rtt-step*) set -- "$@" --get-server-output ;;
 esac
 date +%s > /results/flow-start.txt

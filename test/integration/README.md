@@ -52,20 +52,30 @@ distinct TCP destination ports behind those same shared low-rate bottlenecks. Th
 that its padding neither prevents completed useful transfers nor causes extra carrier connections. Both distinct
 carriers must remain connected before and after each flow.
 
-The `tcp-multipath-capacity-change` case starts both same-group lanes at unrestricted capacity, limits both endpoint
-links to 32 kbit/s five seconds into the flow, and restores capacity seven seconds later. Both endpoints must record
-successful rate changes, both lanes must be connected before and after the flow, and final-window throughput must
-recover at least 25 percent of its own pre-fault throughput. Reconnection is permitted during this injected fault
-because previously measured capacity and accumulated TCP backlog can make the old generation unusable. Healthy low-rate
-startup cases retain their stricter no-reconnection check. The capacity-change case's `-reverse` and `-bidir` variants
-apply the same fault to opposite-direction and simultaneous bidirectional traffic. Each exercised direction must meet
-the recovery threshold using its own pre-fault rate.
+The `tcp-multipath-capacity-change` case offers 20 Mbit/s with 16 KiB application writes. Both endpoint links have a 1
+Gbit/s ceiling, drop to 32 kbit/s five seconds into the flow, and return to 1 Gbit/s seven seconds later. The TBF and
+netem queues remain installed across both changes, so restoring capacity does not discard their pending packets. The
+netem limit is 10000 packets outside the fault and eight packets during it. This allows queued retransmissions and
+catch-up traffic to drain without adding queue overflow after restoration. Each exercised direction must deliver at
+least 5 Mbit/s before the fault and recover at least 25 percent of its own pre-fault receiver throughput during the
+final five seconds. The verifier checks both endpoints' rate-change timestamps, each phase's queue settings, cumulative
+counter continuity, and the absence of new queue drops after restoration. Both same-group lanes must be connected before
+and after the flow. Reconnection is permitted during this injected fault because previously measured capacity and
+accumulated TCP backlog can make the old generation unusable. Healthy low-rate startup cases retain their stricter
+no-reconnection check. The capacity-change case's `-reverse` and `-bidir` variants apply the same fault to
+opposite-direction and simultaneous bidirectional traffic. Each exercised direction must meet the recovery threshold
+using its own pre-fault rate.
 
 The `native-capacity-change`, `native-capacity-change-reverse`, and `native-capacity-change-bidir` cases apply the same
-fault and recovery threshold directly to native WireGuard. Severe delay or loss can leave inner TCP waiting in
-retransmission backoff after capacity returns. Forty-second flows leave room to observe sustained recovery after that
-wait, and all intervals remain available for inspecting earlier behavior. The native controls help distinguish inner TCP
-recovery limits from relay-specific regressions.
+offered load, fault, and recovery threshold directly to native WireGuard. An unrestricted pre-fault workload can fill a
+large native TCP congestion window before the 32 kbit/s queue drops hundreds of packets. Retransmission timers can then
+postpone useful recovery beyond a 40-second flow even after capacity returns. The controlled offered load and smaller
+application writes bound the workload independently of runner speed. Preserving the queues also avoids an additional
+packet purge when the fault ends. The original impairment settings and 40-second recovery deadline remain unchanged.
+Both directions use receiver intervals, so buffered sender writes cannot satisfy the recovery check. These cases
+automatically retain TCP timer, socket, and qdisc samples throughout the flow, plus queue counters immediately before
+and after restoring capacity. The native controls help distinguish inner TCP recovery limits from relay-specific
+regressions.
 
 The `tcp-rtt-step` and `tcp-multipath-rtt-step` cases keep a 20 Mbit/s bottleneck throughout a 60-second transfer. Both
 endpoint delays rise from 5 to 600 milliseconds after ten seconds and return to 5 milliseconds thirty seconds later. The
