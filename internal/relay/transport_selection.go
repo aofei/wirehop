@@ -13,6 +13,10 @@ const (
 	initialDeliveryWindow = 16 * 1024
 	// minimumDeliveryWindow permits useful rate samples without a large low-rate backlog.
 	minimumDeliveryWindow = 4 * 1024
+	// minimumTransportQueueBytes bounds startup queueing independently from committed feedback credit.
+	minimumTransportQueueBytes = 16 * 1024
+	// transportQueueHorizon limits ordinary queued admission independently from committed feedback credit.
+	transportQueueHorizon = 50 * time.Millisecond
 	// transportProbeInterval bounds redundant discovery traffic on established paths.
 	transportProbeInterval = 30 * time.Second
 	// minimumTransportProbeDuration lets a high-delay path grow beyond its initial flight.
@@ -34,7 +38,7 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 	primary := lanes[preferred]
 	healthyPreferred := primary != nil && !primary.degraded && !primary.abandoning
 	if !s.measurementStarted.IsZero() {
-		if !healthyPreferred || !primary.canAccept(frameBytes) {
+		if !healthyPreferred || !primary.canAcceptTransport(frameBytes) {
 			return laneCandidates{}
 		}
 		return laneCandidates{lanes: [2]*scheduledLane{primary}, count: 1, available: true}
@@ -65,7 +69,7 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 				continue
 			}
 			faster := candidate.deliveryRate > saturatingAdd(primary.deliveryRate, primary.deliveryRate/4)
-			if !faster || !candidate.canAccept(frameBytes) {
+			if !faster || !candidate.canAcceptTransport(frameBytes) {
 				continue
 			}
 			score := candidate.score(frameBytes)
@@ -99,10 +103,16 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 	if !healthyPreferred && primary.score(frameBytes) >= maximumScore {
 		return selectCandidates(lanes, preferred, frameBytes, maximumScore)
 	}
-	if !primary.canAccept(frameBytes) {
+	if !primary.canAcceptTransport(frameBytes) {
 		return laneCandidates{}
 	}
 	return laneCandidates{lanes: [2]*scheduledLane{primary}, count: 1, available: true}
+}
+
+// canAcceptTransport bounds unsent work without charging committed flight against the queued budget.
+func (l *scheduledLane) canAcceptTransport(frameBytes uint64) bool {
+	limit := max(uint64(minimumTransportQueueBytes), l.deliveryRate/uint64(time.Second/transportQueueHorizon))
+	return l.registration.Store.canAcceptQueued(frameBytes, limit)
 }
 
 // probePadding supplies immutable payload storage shared by capacity probes.

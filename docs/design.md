@@ -363,7 +363,8 @@ Every connection, handshake, and control-plane failure maps to one stable error 
 | `session_gone` | Provisional session closes during creation or join refers to an absent session | Retry creation or coordinate session replacement |
 | `session_rejected` | All viable endpoints reject the credentials, target, or protocol | Terminate the client |
 
-Carrier socket permission denials reject only the affected lane. Connection refusal, reset, and timeout remain retryable.
+Carrier socket permission denials reject only the affected lane. Connection refusal, reset, and timeout remain
+retryable.
 
 A rejection from one endpoint is lane-specific until the client has evaluated other viable candidates. This prevents a
 misdirected or incorrectly configured URL from turning its own authentication failure into a false session-wide failure.
@@ -539,7 +540,7 @@ different fixed values require separate client sessions or direct forwarder proc
 ## Multipath scheduling
 
 The scheduler keeps one transport primary per session direction. It discovers capacity with bounded padding instead of
-relying on inner traffic to saturate every path. A healthy full primary waits for feedback rather than spilling unique
+relying on inner traffic to saturate every path. A healthy full primary waits for space rather than spilling unique
 transport packets onto another path with a different arrival time. Handshake and cookie packets retain their separate
 policy of at most two copies, preferring distinct path groups.
 
@@ -558,25 +559,25 @@ predicted_delay = max(smoothed_rtt / 2 + queued_time, max(0, retained_time - fee
 
 An initial or failed primary is selected by RTT and stable lane identity, including temporarily full paths. A measured
 alternative can replace a healthy primary when its delivery rate exceeds the primary estimate by more than 25 percent,
-it has hard store capacity, and it can meet the current packet deadline. If the gap since the previous successful useful
-assignment exceeds this frame's serialization time at the primary's estimated rate, promotion additionally requires
-strictly earlier predicted completion. The same applies before any useful assignment. Otherwise capacity promotion can
-proceed immediately, preserving bulk startup without waiting for a large incumbent queue. Each prediction uses that
-lane's actual backlog, without moving the old primary's retained work into the alternative's score. The assignment-gap
-signal is direction-local and can classify finite bursts and mixed packet sizes as continuous offering. A change from an
-existing primary holds that choice for at least two seconds and four estimated RTTs, capped at eight seconds. The first
-assignment does not delay a proven capacity improvement. This hold does not suppress failure recovery. A healthy
-transport primary retains ownership until actual packet expiry instead of discarding or redirecting a live packet solely
-because its current delivery prediction exceeds the remaining lifetime. Startup and recovery from a missing, degraded,
-or abandoning primary can still use unmeasured lanes. Sessions whose healthy lanes all share one path group send no
-discovery padding, so idle siblings can remain unmeasured until real traffic or failover uses them. Mixed-group sessions
-elect one healthy representative per group before starting fresh discovery. The healthy transport primary takes
-precedence, followed by an active discovery period, then lower RTT and stable lane ID. Active periods finish before an
-idle sibling can start another period. A credit-blocked representative does not spill padding onto its idle siblings.
-Previously measured capacity can become stale, and capacity promotion can reorder in-flight packets. A primary at its
-hard memory limit retains the pending ingress item until feedback, expiry, or a lifecycle transition permits another
-decision. WireGuard controls can still preempt that pending transport item. An initial empty 32-byte WireGuard keepalive
-uses predicted delivery without fixing the bulk-data primary or restarting idle capacity discovery.
+its store admits ordinary transport, and it can meet the current packet deadline. If the gap since the previous
+successful useful assignment exceeds this frame's serialization time at the primary's estimated rate, promotion
+additionally requires strictly earlier predicted completion. The same applies before any useful assignment. Otherwise
+capacity promotion can proceed immediately, preserving bulk startup without waiting for a large incumbent queue. Each
+prediction uses that lane's actual backlog, without moving the old primary's retained work into the alternative's score.
+The assignment-gap signal is direction-local and can classify finite bursts and mixed packet sizes as continuous
+offering. A change from an existing primary holds that choice for at least two seconds and four estimated RTTs, capped
+at eight seconds. The first assignment does not delay a proven capacity improvement. This hold does not suppress failure
+recovery. A healthy transport primary retains ownership until actual packet expiry instead of discarding or redirecting
+a live packet solely because its current delivery prediction exceeds the remaining lifetime. Startup and recovery from a
+missing, degraded, or abandoning primary can still use unmeasured lanes. Sessions whose healthy lanes all share one path
+group send no discovery padding, so idle siblings can remain unmeasured until real traffic or failover uses them.
+Mixed-group sessions elect one healthy representative per group before starting fresh discovery. The healthy transport
+primary takes precedence, followed by an active discovery period, then lower RTT and stable lane ID. Active periods
+finish before an idle sibling can start another period. A credit-blocked representative does not spill padding onto its
+idle siblings. Previously measured capacity can become stale, and capacity promotion can reorder in-flight packets. A
+primary at its hard memory limit retains the pending ingress item until feedback, expiry, or a lifecycle transition
+permits another decision. WireGuard controls can still preempt that pending transport item. An initial empty 32-byte
+WireGuard keepalive uses predicted delivery without fixing the bulk-data primary or restarting idle capacity discovery.
 
 Each committed transmission records its send time, send-interval anchor, and the preceding cumulative delivered byte
 count and time. Valid feedback samples the bytes since that anchor over the longer corresponding send and feedback
@@ -757,6 +758,26 @@ Scheduler maintenance retries a held ingress packet when another session release
 queued expiry, or generation drain. This does not require new ingress or local lane progress. A lane whose hard byte
 limit cannot fit a capacity probe can still forward ordinary frames that fit.
 
+Ordinary transport admission additionally bounds each lane's unsent encoded bytes to the larger of 16 KiB and 50
+milliseconds at its current parsing-delivery rate estimate. The check observes hard retained capacity and queued bytes
+under the same store mutex. Committed but unreported bytes do not consume this queued budget. An empty queued prefix can
+admit one larger valid datagram when the hard limits permit it, preventing a large legal packet from waiting forever for
+a budget smaller than its own size. A lower estimate stops further admission until queued work drains. It does not
+discard work already admitted, and the estimated-rate budget is not a latency guarantee.
+
+A healthy primary retains its assignment when this budget fills, including the lowest-delay startup choice while its
+discovery data drains. Predicted fallback selection filters candidates by queued admission before ranking them, so an
+inadmissible score winner cannot hide another eligible fallback lane. WireGuard controls retain hard-capacity admission
+and priority. Capacity padding and bounded lifecycle recovery retain their existing independent limits and can
+temporarily exceed the ordinary queued budget. The ingress queue keeps its original burst headroom and aggregate
+retention accounting.
+
+When the queued-byte budget blocks admission, local commitment, queued expiry, or retained-capacity release publishes
+one coalesced session wake. The scheduler retries held ingress without fabricating a delivery report or waiting for the
+maintenance timer. The notification never blocks a carrier writer and carries no generation state or feedback credit. A
+stale wake only causes the scheduler to reconsider its current lanes. Committed-flight credit is still released only by
+a valid parsing report or complete generation drain.
+
 Each packet carries an absolute deadline in the sender's process-relative monotonic clock. Runtime calculations use
 microseconds. The wire deadline rounds up to milliseconds, extending it by at most 999 microseconds. The sender computes
 the initial deadline at UDP ingress from the packet-class lifetime, rounded up to whole microseconds. Ingress rejects an
@@ -796,10 +817,10 @@ together. A separate byte window limits the committed but unreported prefix, sta
 observed, this window covers four feedback cycles plus 4 KiB, with a 4 KiB floor and the configured hard byte limit as
 its ceiling. A cycle is the larger of minimum RTT and half minimum RTT plus feedback return delay, with 25 milliseconds
 of reporting headroom. Ordinary timing samples can only lower the minimum. Raising it requires the coordinated drain
-described below, so passive sample expiry cannot increase the window from its own queued Data. The scheduler can retain
-live work within the hard memory limits while committed credit is exhausted. A window reduction below the current flight
-stops new commitments without discarding queued work or sent descriptors. The writer checks credit for each frame under
-the same mutex used for cumulative progress and window publication. An empty committed prefix can send one larger
+described below, so passive sample expiry cannot increase the window from its own queued Data. Ordinary transport can
+remain queued within its admission budget while committed credit is exhausted. A window reduction below the current
+flight stops new commitments without discarding queued work or sent descriptors. The writer checks credit for each frame
+under the same mutex used for cumulative progress and window publication. An empty committed prefix can send one larger
 datagram when the hard limits permit it. Progress, window updates, queued expiry, and pause completion wake a waiting
 writer without a polling loop. Ordinary Data and WireGuard controls share normal credit. Padding uses its existing
 discovery allowance, and all types count against the same committed prefix. The packet ceiling protects small-packet
@@ -839,6 +860,7 @@ The command uses these packet and resource limits:
 | Creation replay nonces | 65,536 |
 | Session ingress queue per direction | 1024 packets and 4 MiB |
 | Combined transmission store per lane direction | 65,536 packets and 32 MiB |
+| Ordinary unsent admission per lane direction | 50 ms of estimated parsing-delivery rate, with a 16 KiB floor and one empty-queue large-frame allowance |
 | Aggregate retained relay work per client process | 131,072 packets and 256 MiB |
 | Aggregate retained relay work per server process | 262,144 packets and 256 MiB |
 | Deduplication window per session direction | 1,048,576 packet IDs, up to 128 KiB allocated on demand |
@@ -1710,7 +1732,8 @@ Payload descriptions follow frame-type order. Fields within each payload appear 
 - `Measurement Begin`: kind `2` and operation ID. The carrying lane generation is the measurement target
 - `Measurement Ready`: kind `3`, operation ID, and acceptance flag (`0` or `1`)
 - `Measurement Probe`: kind `4`, operation ID, probe send time `t1`, and remaining hold in microseconds
-- `Measurement Reply`: kind `5`, operation ID, receive time `t2`, reply send time `t3`, and remaining hold in microseconds
+- `Measurement Reply`: kind `5`, operation ID, receive time `t2`, reply send time `t3`, and remaining hold in
+  microseconds
 - `Measurement Result`: kind `6`, operation ID, valid flag (`0` or `1`), and reply receive time `t4`. A rejected result
   has flag `0` and timestamp `0`
 - `Lane abandon`: lane ID and generation (two `uvarint` values)

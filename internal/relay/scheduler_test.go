@@ -487,7 +487,7 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 	result := laneCandidates{}
 	var first *scheduledLane
 	for _, lane := range lanes {
-		if lane.degraded || lane.abandoning || !referenceLaneEligible(lanes, lane, frameBytes) {
+		if lane.degraded || lane.abandoning || !referenceLaneEligible(lanes, lane, control, frameBytes) {
 			continue
 		}
 		result.available = true
@@ -509,10 +509,10 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 			preferredLimit = math.MaxUint64
 		}
 		if preferredLane := lanes[preferred]; preferredLane != nil && !preferredLane.degraded && !preferredLane.abandoning &&
-			(frameBytes == 0 || preferredLane.canAccept(frameBytes)) && preferredLane.score(frameBytes) < maximumScore {
+			referenceLaneCanAccept(preferredLane, control, frameBytes) && preferredLane.score(frameBytes) < maximumScore {
 			queued, _ := preferredLane.registration.Store.deliveryBacklog()
 			if frameBytes > 0 && queued == 0 && preferredLane.registration.PathGroupID == first.registration.PathGroupID ||
-				referenceLaneEligible(lanes, preferredLane, frameBytes) && preferredLane.score(frameBytes) <= preferredLimit {
+				referenceLaneEligible(lanes, preferredLane, control, frameBytes) && preferredLane.score(frameBytes) <= preferredLimit {
 				first = preferredLane
 			}
 		}
@@ -522,7 +522,7 @@ func referenceSelectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferr
 	}
 	var second *scheduledLane
 	for _, lane := range lanes {
-		if lane == first || lane.degraded || lane.abandoning || !referenceLaneEligible(lanes, lane, frameBytes) ||
+		if lane == first || lane.degraded || lane.abandoning || !referenceLaneEligible(lanes, lane, control, frameBytes) ||
 			lane.score(frameBytes) >= maximumScore {
 			continue
 		}
@@ -553,15 +553,15 @@ func referenceLaneBetterForFrame(left, right *scheduledLane, frameBytes uint64) 
 		left.registration.LaneID < right.registration.LaneID
 }
 
-func referenceLaneEligible(lanes map[protocol.LaneID]*scheduledLane, lane *scheduledLane, frameBytes uint64) bool {
-	if frameBytes > 0 && !lane.canAccept(frameBytes) {
+func referenceLaneEligible(lanes map[protocol.LaneID]*scheduledLane, lane *scheduledLane, control bool, frameBytes uint64) bool {
+	if !referenceLaneCanAccept(lane, control, frameBytes) {
 		return false
 	}
 	better := 0
 	for _, candidate := range lanes {
 		if candidate == lane || candidate.degraded || candidate.abandoning ||
 			candidate.registration.PathGroupID != lane.registration.PathGroupID ||
-			frameBytes > 0 && !candidate.canAccept(frameBytes) {
+			!referenceLaneCanAccept(candidate, control, frameBytes) {
 			continue
 		}
 		if referenceLaneBetterForFrame(candidate, lane, frameBytes) {
@@ -572,6 +572,16 @@ func referenceLaneEligible(lanes map[protocol.LaneID]*scheduledLane, lane *sched
 		}
 	}
 	return true
+}
+
+func referenceLaneCanAccept(lane *scheduledLane, control bool, frameBytes uint64) bool {
+	if frameBytes == 0 {
+		return true
+	}
+	if control {
+		return lane.canAccept(frameBytes)
+	}
+	return lane.canAcceptTransport(frameBytes)
 }
 
 func TestSchedulerWaitsForPrimaryProgress(t *testing.T) {

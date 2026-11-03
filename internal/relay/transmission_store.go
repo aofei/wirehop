@@ -277,6 +277,7 @@ type TransmissionStore struct {
 	applicationLimitedUntil uint64
 	deliveryWindow          uint64
 	probeWindow             uint64
+	admissionBlocked        bool
 	measurementDrain        atomic.Bool
 	// transportReported saturates at minimumTransportProofBytes and excludes capacity padding.
 	transportReported atomic.Uint64
@@ -284,6 +285,7 @@ type TransmissionStore struct {
 	backlogPackets    atomic.Int64
 	backlogBytes      atomic.Uint64
 	notify            chan struct{}
+	admissionReady    chan<- struct{}
 	done              chan struct{}
 	closed            bool
 }
@@ -483,6 +485,7 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 	for index := len(s.sent.items) - count; index < len(s.sent.items); index++ {
 		s.sent.items[index].applicationLimited = limited
 	}
+	s.notifyAdmissionLocked()
 	if s.control.len()+s.normal.len() > 0 {
 		s.notifyLocked()
 	}
@@ -586,10 +589,13 @@ func (s *TransmissionStore) backlog() (int, uint64) {
 	return int(s.backlogPackets.Load()), s.backlogBytes.Load()
 }
 
-// deliveryBacklog returns unsent and total retained encoded bytes from one consistent snapshot.
+// deliveryBacklog returns unsent and total retained encoded bytes from one snapshot, or zero after generation drain.
 func (s *TransmissionStore) deliveryBacklog() (uint64, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return 0, 0
+	}
 	retained := uint64(s.bytes)
 	return retained - (s.sentBytes - s.reportedBytes), retained
 }
@@ -613,10 +619,29 @@ func (s *TransmissionStore) hasProbe() bool {
 // canAccept reports whether current retained work leaves capacity for one encoded frame.
 func (s *TransmissionStore) canAccept(frameBytes uint64) bool {
 	packets, bytes := s.backlog()
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
 	if packets >= s.limits.Packets || bytes > uint64(s.limits.Bytes) {
 		return false
 	}
 	return frameBytes <= uint64(s.limits.Bytes)-bytes
+}
+
+// canAcceptQueued checks capacity and records queued pressure for a local wake. An empty queue permits one larger frame.
+func (s *TransmissionStore) canAcceptQueued(frameBytes, limit uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.packets >= s.limits.Packets || s.bytes > s.limits.Bytes ||
+		frameBytes > uint64(s.limits.Bytes-s.bytes) {
+		return false
+	}
+	queued := uint64(s.bytes) - (s.sentBytes - s.reportedBytes)
+	accepted := queued == 0 || queued <= limit && frameBytes <= limit-queued
+	s.admissionBlocked = !accepted
+	return accepted
 }
 
 // atRisk reports whether retained work is predicted to miss a deadline in carrier order.
@@ -815,6 +840,21 @@ func (s *TransmissionStore) addBacklogLocked(packets, bytes int) {
 	s.bytes += bytes
 	s.backlogPackets.Store(int64(s.packets))
 	s.backlogBytes.Store(uint64(s.bytes))
+	if packets < 0 {
+		s.notifyAdmissionLocked()
+	}
+}
+
+// notifyAdmissionLocked coalesces retries after queued or retained work shrinks without blocking the carrier writer.
+func (s *TransmissionStore) notifyAdmissionLocked() {
+	if !s.admissionBlocked {
+		return
+	}
+	s.admissionBlocked = false
+	select {
+	case s.admissionReady <- struct{}{}:
+	default:
+	}
 }
 
 // notifyLocked publishes a queued-work retry notification without blocking the caller.

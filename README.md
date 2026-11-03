@@ -267,8 +267,12 @@ wirehop client \
 Each flag occurrence is one stable lane identity and one TCP connection. Repeating the same canonical URL and `resolve`
 value creates multiple connections in the same path group. A different URL or fixed resolution creates a different path
 group. WireHop keeps a stable transport primary, discovers distinct-path capacity with bounded padding, and promotes a
-measurably faster path. A full primary waits for feedback rather than striping unique packets across unequal delays.
+measurably faster path. A full primary waits for space rather than striping unique packets across unequal delays.
 WireGuard controls still use at most two copies, preferring different groups.
+
+Ordinary transport waits in the bounded ingress queue while the primary's unsent budget is full. Local carrier
+commitment wakes admission without waiting for a peer report. Peer parsing feedback independently controls committed
+flight. These limits reduce application backlog but do not guarantee a packet-delivery latency.
 
 Start with one lane and measure each candidate separately. Two repeated declarations can isolate a single carrier stream
 stall, but additional connections do not establish additional physical bandwidth. Paths with different delays can

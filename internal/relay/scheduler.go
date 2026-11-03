@@ -200,9 +200,11 @@ func scoredLaneBetter(left, right scoredLane) bool {
 
 // Scheduler assigns session packets to dynamically registered lanes.
 type Scheduler struct {
-	measurements            *measurementCoordinator
-	ingress                 *packetqueue.Queue[Packet]
-	events                  chan schedulerEvent
+	measurements *measurementCoordinator
+	ingress      *packetqueue.Queue[Packet]
+	events       chan schedulerEvent
+	// transportReady stays open so retiring writers can publish harmless stale wakes.
+	transportReady          chan struct{}
 	controlOrder            []scoredLane
 	probeGroups             map[protocol.PathGroupID]*scheduledLane
 	packetID                uint64
@@ -223,7 +225,10 @@ func NewScheduler(ingress *packetqueue.Queue[Packet]) (*Scheduler, error) {
 		return nil, ErrInvalidScheduler
 	}
 	s := &Scheduler{
-		ingress: ingress, events: make(chan schedulerEvent, schedulerEventCapacity), measurementChanged: make(chan struct{}, 1),
+		ingress:            ingress,
+		events:             make(chan schedulerEvent, schedulerEventCapacity),
+		transportReady:     make(chan struct{}, 1),
+		measurementChanged: make(chan struct{}, 1),
 	}
 	s.measurements = &measurementCoordinator{scheduler: s, peers: make(map[protocol.LaneID]LaneRegistration)}
 	return s, nil
@@ -548,8 +553,11 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		}
 		if progressed && !hasPending {
 			select {
+			case <-ctx.Done():
+				return ctx.Err()
 			case event := <-s.events:
 				s.applyEvent(lanes, &preferred, event, s.ingress.Now())
+			case <-s.transportReady:
 			case <-s.measurementChanged:
 				s.updateMeasurementDrain(lanes)
 			case <-check:
@@ -557,15 +565,16 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 			case <-expiryReady:
 				s.ingress.Expire()
 				expiryAt = time.Time{}
-			case <-ctx.Done():
-				return ctx.Err()
 			default:
 			}
 			continue
 		}
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case event := <-s.events:
 			s.applyEvent(lanes, &preferred, event, s.ingress.Now())
+		case <-s.transportReady:
 		case <-s.measurementChanged:
 			s.updateMeasurementDrain(lanes)
 		case <-s.ingress.Ready():
@@ -574,8 +583,6 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		case <-expiryReady:
 			s.ingress.Expire()
 			expiryAt = time.Time{}
-		case <-ctx.Done():
-			return ctx.Err()
 		}
 	}
 }
@@ -598,6 +605,9 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		if event.registration.InitialTiming != nil {
 			replacement.applyTiming(*event.registration.InitialTiming, false)
 		}
+		replacement.registration.Store.mu.Lock()
+		replacement.registration.Store.admissionReady = s.transportReady
+		replacement.registration.Store.mu.Unlock()
 		if !s.measurementStarted.IsZero() {
 			s.invalidateMeasurementDrain()
 			replacement.registration.Store.beginMeasurementPause()
@@ -953,7 +963,7 @@ func selectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferred protoc
 	var preferredCandidate scoredLane
 	var preferredQueuedBytes uint64
 	if lane := lanes[preferred]; lane != nil && !lane.degraded && !lane.abandoning &&
-		(frameBytes == 0 || lane.canAccept(frameBytes)) {
+		(frameBytes == 0 || lane.canAcceptTransport(frameBytes)) {
 		queuedBytes, retainedBytes := lane.registration.Store.deliveryBacklog()
 		preferredQueuedBytes = queuedBytes
 		preferredCandidate = scoredLane{lane: lane, score: lane.scoreBacklog(frameBytes, queuedBytes, retainedBytes)}
@@ -963,7 +973,7 @@ func selectCandidates(lanes map[protocol.LaneID]*scheduledLane, preferred protoc
 	preferredBetter := 0
 	for _, lane := range lanes {
 		if lane != preferredCandidate.lane &&
-			(lane.degraded || lane.abandoning || frameBytes > 0 && !lane.canAccept(frameBytes)) {
+			(lane.degraded || lane.abandoning || frameBytes > 0 && !lane.canAcceptTransport(frameBytes)) {
 			continue
 		}
 		result.available = true
@@ -1049,9 +1059,14 @@ func (l *scheduledLane) canAccept(frameBytes uint64) bool {
 	return l.registration.Store.canAccept(frameBytes)
 }
 
-// score returns predicted delivery delay in microseconds.
+// score returns predicted delivery delay in microseconds, or an unusable score for a drained generation.
 func (l *scheduledLane) score(frameBytes uint64) uint64 {
 	queuedBytes, backlogBytes := l.registration.Store.deliveryBacklog()
+	select {
+	case <-l.registration.Store.Done():
+		return math.MaxUint64
+	default:
+	}
 	return l.scoreBacklog(frameBytes, queuedBytes, backlogBytes)
 }
 
