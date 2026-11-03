@@ -274,6 +274,12 @@ Ordinary transport waits in the bounded ingress queue while the primary's unsent
 commitment wakes admission without waiting for a peer report. Peer parsing feedback independently controls committed
 flight. These limits reduce application backlog but do not guarantee a packet-delivery latency.
 
+On Linux, WireHop requests a 16 KiB `TCP_NOTSENT_LOWAT` threshold for carrier kernel unsent admission. This is
+independent from the application's queued-data budget and parsing-feedback credit. WireHop inherits the endpoint's TCP
+congestion controller and preserves send-buffer autotuning. The socket policy is local to WireHop and requires no
+host-wide sysctl change. Kernels or socket types that do not implement the option retain their existing write-queue
+policy. Other platforms use their native kernel write-queue policy.
+
 Start with one lane and measure each candidate separately. Two repeated declarations can isolate a single carrier stream
 stall, but additional connections do not establish additional physical bandwidth. Paths with different delays can
 reorder packets and reduce inner TCP goodput below the best single-lane result. WireHop forwards received datagrams

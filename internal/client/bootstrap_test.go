@@ -280,6 +280,8 @@ func testClientBypassesStalledAdmission(t *testing.T, scheme, failure string) {
 		}
 		return nil
 	}}
+	// Preserve the injected failure instead of retrying it inside Go's MPTCP dialer.
+	clientConfig.Dialer.SetMultipathTCP(false)
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	startedAt := time.Now()
@@ -329,6 +331,7 @@ func TestClientBootstrapTerminalCandidates(t *testing.T) {
 		}
 		return os.ErrPermission
 	}}
+	config.Dialer.SetMultipathTCP(false)
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	local, err := client.Start(ctx, config)

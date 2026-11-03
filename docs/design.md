@@ -1454,6 +1454,8 @@ All carrier implementations prioritize bounded latency over maximizing bytes acc
 Fast-path behavior:
 
 - Enable `TCP_NODELAY` on every carrier TCP connection
+- Request a 16 KiB `TCP_NOTSENT_LOWAT` threshold on Linux carrier sockets where supported, independently from
+  application retention and without changing the selected congestion controller or send-buffer autotuning
 - Use binary WebSocket messages without text encoding or base64
 - Schedule each WireGuard datagram independently
 - Allow one socket write or WebSocket message to contain several already-scheduled complete WireHop frames

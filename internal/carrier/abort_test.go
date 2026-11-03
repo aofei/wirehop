@@ -116,6 +116,9 @@ func testTLSAbortWithFullSendBuffer(t *testing.T, useWebSocket bool) {
 	if peerError != nil {
 		t.Fatal(peerError)
 	}
+	if err := ConfigureTCP(raw); err != nil {
+		t.Fatal(err)
+	}
 	if err := raw.SetWriteBuffer(4096); err != nil {
 		t.Fatal(err)
 	}

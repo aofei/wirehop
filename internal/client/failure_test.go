@@ -375,6 +375,8 @@ func TestClientRetryCandidate(t *testing.T) {
 				},
 				lanes: []clientLane{{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}},
 			}
+			// Keep each injected error scoped to one WireHop dial, without Go's MPTCP retry.
+			instance.config.Dialer.SetMultipathTCP(false)
 			failures := make(chan laneResult, 1)
 			candidate := instance.retryCandidate(t.Context(), 0, failures)
 			want, wantAttempts := tt.first, 1
@@ -400,6 +402,7 @@ func TestClientRetryCandidate(t *testing.T) {
 			},
 			lanes: []clientLane{{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}},
 		}
+		instance.config.Dialer.SetMultipathTCP(false)
 		failures := make(chan laneResult, 1)
 		candidate := instance.retryCandidate(t.Context(), 0, failures)
 		if !errors.Is(candidate.err, ErrLaneRejected) || attempts != 1 || len(failures) != 0 {
@@ -419,6 +422,7 @@ func TestClientRetryCandidate(t *testing.T) {
 				},
 				lanes: []clientLane{{spec: testLaneSpec(t, "tcp://127.0.0.1:51820")}},
 			}
+			instance.config.Dialer.SetMultipathTCP(false)
 			ctx, cancel := context.WithCancelCause(t.Context())
 			defer cancel(context.Canceled)
 			failures := make(chan laneResult)

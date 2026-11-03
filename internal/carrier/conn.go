@@ -641,6 +641,9 @@ func ConfigureTCP(conn *net.TCPConn) error {
 	if err := conn.SetKeepAlive(false); err != nil {
 		return fmt.Errorf("disable redundant TCP keepalive: %w", err)
 	}
+	if err := configureTCPWriteQueue(conn); err != nil {
+		return fmt.Errorf("limit unsent TCP data: %w", err)
+	}
 	return nil
 }
 
