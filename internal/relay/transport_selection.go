@@ -46,7 +46,7 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 	holding := healthyPreferred && now.Before(s.transportHoldUntil)
 	if primary == nil || primary.degraded || primary.abandoning {
 		primary = nil
-		for _, candidate := range lanes {
+		for _, candidate := range s.transportLaneOrder(lanes) {
 			if candidate.degraded || candidate.abandoning || frameBytes > uint64(candidate.registration.Store.limits.Bytes) {
 				continue
 			}
@@ -63,7 +63,7 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 		var best *scheduledLane
 		var promotionScoreLimit uint64
 		promotionLimitSet := false
-		for _, candidate := range lanes {
+		for _, candidate := range s.transportLaneOrder(lanes) {
 			if candidate == primary || candidate.degraded || candidate.abandoning || !candidate.rateObserved ||
 				frameBytes > uint64(candidate.registration.Store.limits.Bytes) {
 				continue
@@ -107,6 +107,17 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 		return laneCandidates{}
 	}
 	return laneCandidates{lanes: [2]*scheduledLane{primary}, count: 1, available: true}
+}
+
+// transportLaneOrder reuses lane membership while reading mutable prediction and admission state from live lanes.
+// Registration and removal invalidate the order before another packet can use it.
+func (s *Scheduler) transportLaneOrder(lanes map[protocol.LaneID]*scheduledLane) []*scheduledLane {
+	if len(s.transportOrder) == 0 {
+		for _, lane := range lanes {
+			s.transportOrder = append(s.transportOrder, lane)
+		}
+	}
+	return s.transportOrder
 }
 
 // canAcceptTransport bounds unsent work without charging committed flight against the queued budget.

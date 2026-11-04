@@ -210,6 +210,7 @@ type Scheduler struct {
 	// transportReady stays open so retiring writers can publish harmless stale wakes.
 	transportReady          chan struct{}
 	controlOrder            []scoredLane
+	transportOrder          []*scheduledLane
 	probeGroups             map[protocol.PathGroupID]*scheduledLane
 	packetID                uint64
 	transportHoldUntil      time.Time
@@ -409,6 +410,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	lanes := make(map[protocol.LaneID]*scheduledLane)
+	defer s.invalidateLaneOrders()
 	defer func() {
 		if s.measurements != nil {
 			s.measurements.close()
@@ -639,6 +641,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			replacement.registration.Store.beginMeasurementPause()
 		}
 		lanes[event.registration.LaneID] = replacement
+		s.invalidateLaneOrders()
 		if s.measurements != nil {
 			s.measurements.register(event.registration)
 		}
@@ -658,6 +661,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			}
 			s.invalidateMeasurementDrain()
 			delete(lanes, event.laneID)
+			s.invalidateLaneOrders()
 			s.migrateTransmissions(lanes, lane)
 			if *preferred == event.laneID {
 				*preferred = protocol.LaneID(0)
@@ -735,6 +739,14 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			})
 		}
 	}
+}
+
+// invalidateLaneOrders releases cached lane references while retaining reusable order storage.
+func (s *Scheduler) invalidateLaneOrders() {
+	clear(s.controlOrder)
+	s.controlOrder = s.controlOrder[:0]
+	clear(s.transportOrder)
+	s.transportOrder = s.transportOrder[:0]
 }
 
 // invalidateMeasurementDrain revokes proof when a generation changes without retracting an exposed pause promise.

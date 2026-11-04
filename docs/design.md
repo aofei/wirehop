@@ -555,6 +555,11 @@ Each usable lane direction maintains its smoothed RTT, minimum RTT, delivery rat
 retained encoded bytes. Observations and preferred-lane state are direction-local. The shared session clock mapping does
 not merge their capacity estimates.
 
+The scheduler reuses registered transport-lane membership between registration and removal events. The list holds live
+lane references, so each packet still observes current timing, rates, health, and store admission. Generation changes
+invalidate membership and release retired references from both transport membership and control-order scratch storage.
+Scheduler shutdown clears both order buffers as well.
+
 For a frame of size `F`, the deadline prediction is:
 
 ```text
