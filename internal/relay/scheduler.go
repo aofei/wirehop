@@ -37,6 +37,10 @@ const (
 	preferredLaneHysteresisMicros = 2_000
 	// schedulerEventCapacity bounds queued scheduler transitions.
 	schedulerEventCapacity = 256
+	// maximumScheduleBatchPackets bounds consecutive ingress assignments between maintenance passes.
+	maximumScheduleBatchPackets = datagram.MaximumBatchSize
+	// maximumScheduleBatchDuration ends a batch when its next clock sample observes extended work.
+	maximumScheduleBatchDuration = time.Millisecond
 	// abandonmentCheckInterval bounds reaction time to a stale retained packet.
 	abandonmentCheckInterval = 25 * time.Millisecond
 	// minimumInitialRateSampleBytes qualifies the first capacity estimate independently of recovery proof.
@@ -459,60 +463,82 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 	}()
 	for {
 		now := s.ingress.Now()
+		if hasPreempted && !now.Before(preempted.Deadline) {
+			preempted.Release()
+			preempted = packetqueue.Item[Packet]{}
+			hasPreempted = false
+		}
 		progressed := false
-		if !hasPending {
-			if hasPreempted {
-				pending = preempted
-				preempted = packetqueue.Item[Packet]{}
-				hasPending = true
-				hasPreempted = false
-				progressed = true
-			} else if len(lanes) > 0 {
-				err := s.ingress.TryPop(&pending, now)
+		started := now
+		for index := range maximumScheduleBatchPackets {
+			if index > 0 {
+				now = s.ingress.Now()
+				if now.Sub(started) >= maximumScheduleBatchDuration {
+					break
+				}
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			progressed = false
+			if !hasPending {
+				if hasPreempted {
+					pending = preempted
+					preempted = packetqueue.Item[Packet]{}
+					hasPending = true
+					hasPreempted = false
+					progressed = true
+				} else if len(lanes) > 0 {
+					err := s.ingress.TryPop(&pending, now)
+					switch {
+					case err == nil:
+						hasPending = true
+						progressed = true
+					case errors.Is(err, packetqueue.ErrEmpty):
+					case errors.Is(err, packetqueue.ErrClosed):
+						return queueResult(ctx, "dequeue scheduler ingress", err)
+					default:
+						return err
+					}
+				}
+			}
+			if hasPending && pending.Priority == packetqueue.PriorityNormal {
+				err := s.ingress.TryPopPriority(packetqueue.PriorityControl, &controlCandidate, now)
 				switch {
 				case err == nil:
-					hasPending = true
+					preempted = pending
+					hasPreempted = true
+					pending = controlCandidate
+					controlCandidate = packetqueue.Item[Packet]{}
 					progressed = true
 				case errors.Is(err, packetqueue.ErrEmpty):
 				case errors.Is(err, packetqueue.ErrClosed):
-					return queueResult(ctx, "dequeue scheduler ingress", err)
+					return queueResult(ctx, "dequeue scheduler control ingress", err)
 				default:
 					return err
 				}
 			}
-		}
-		if hasPending && pending.Priority == packetqueue.PriorityNormal {
-			err := s.ingress.TryPopPriority(packetqueue.PriorityControl, &controlCandidate, now)
-			switch {
-			case err == nil:
-				preempted = pending
-				hasPreempted = true
-				pending = controlCandidate
-				controlCandidate = packetqueue.Item[Packet]{}
-				progressed = true
-			case errors.Is(err, packetqueue.ErrEmpty):
-			case errors.Is(err, packetqueue.ErrClosed):
-				return queueResult(ctx, "dequeue scheduler control ingress", err)
-			default:
-				return err
-			}
-		}
-		if hasPending {
-			if len(lanes) > 0 {
-				scheduled, err := s.schedule(lanes, &preferred, &pending, now)
-				if err != nil {
-					return err
-				}
-				if scheduled {
+			if hasPending {
+				if len(lanes) > 0 {
+					scheduled, err := s.schedule(lanes, &preferred, &pending, now)
+					if err != nil {
+						return err
+					}
+					if scheduled {
+						pending = packetqueue.Item[Packet]{}
+						hasPending = false
+						progressed = true
+					}
+				} else if !now.Before(pending.Deadline) {
+					pending.Release()
 					pending = packetqueue.Item[Packet]{}
 					hasPending = false
 					progressed = true
 				}
-			} else if !now.Before(pending.Deadline) {
-				pending.Release()
-				pending = packetqueue.Item[Packet]{}
-				hasPending = false
-				progressed = true
+			}
+			// Establish idle timers before extending a batch, and yield to state changes at each packet boundary.
+			if !progressed || hasPending || !checking || len(s.events) > 0 || len(s.measurementChanged) > 0 {
+				break
 			}
 		}
 		reserveBytes := uint64(0)

@@ -544,6 +544,13 @@ relying on inner traffic to saturate every path. A healthy full primary waits fo
 transport packets onto another path with a different arrival time. Handshake and cookie packets retain their separate
 policy of at most two copies, preferring distinct path groups.
 
+The scheduler handles already available ingress in bounded work batches of at most 16 packet attempts. Every attempt
+reads the current protocol clock and preserves control preemption and cancellation checks. Waiting scheduler events or
+measurement changes end the batch at a packet boundary. A fresh clock reading that observes at least 1 millisecond of
+elapsed work also ends the batch before another attempt. An individual lock wait can exceed that interval. Queue expiry,
+abandonment timers, capacity padding, and the full wake selection run between batches. Idle timers are established
+before extending the first active batch. This adds no packet-formation delay or private prefetched packet queue.
+
 Each usable lane direction maintains its smoothed RTT, minimum RTT, delivery rate, feedback return delay, and queued and
 retained encoded bytes. Observations and preferred-lane state are direction-local. The shared session clock mapping does
 not merge their capacity estimates.
@@ -756,7 +763,8 @@ packet between those states transfers and resizes the same reservation without a
 
 Scheduler maintenance retries a held ingress packet when another session releases shared retention through feedback,
 queued expiry, or generation drain. This does not require new ingress or local lane progress. A lane whose hard byte
-limit cannot fit a capacity probe can still forward ordinary frames that fit.
+limit cannot fit a capacity probe can still forward ordinary frames that fit. A normal packet held behind a preempting
+control keeps its own expiry check, so a later control deadline cannot prolong its payload or budget retention.
 
 Ordinary transport admission additionally bounds each lane's unsent encoded bytes to the larger of 16 KiB and 50
 milliseconds at its current parsing-delivery rate estimate. The check observes hard retained capacity and queued bytes

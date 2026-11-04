@@ -1261,45 +1261,49 @@ func TestLanePingState(t *testing.T) {
 }
 
 func TestLanePingResumesActiveInterval(t *testing.T) {
-	const (
-		pingInterval = 10 * time.Millisecond
-		pingTimeout  = 50 * time.Millisecond
-	)
-	lane := &Lane{
-		clock: &testClock{now: 1000}, laneID: protocol.LaneID(1), generation: 1,
-		control: make(chan controlWrite, 1), pingInterval: pingInterval, pingTimeout: pingTimeout,
-		pingChanged: make(chan struct{}, 1),
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- lane.ping(ctx) }()
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			pingInterval = 10 * time.Millisecond
+			pingTimeout  = 50 * time.Millisecond
+		)
+		lane := &Lane{
+			clock: &testClock{now: 1000}, laneID: protocol.LaneID(1), generation: 1,
+			control: make(chan controlWrite, 1), pingInterval: pingInterval, pingTimeout: pingTimeout,
+			pingChanged: make(chan struct{}, 1),
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- lane.ping(ctx) }()
 
-	for range 4 {
-		request := awaitControlWrite(t, lane.control)
-		frame, err := request.build(lane.clock.NowMicros())
-		if err != nil {
-			t.Fatal(err)
+		for range 4 {
+			request := awaitControlWrite(t, lane.control)
+			frame, err := request.build(lane.clock.NowMicros())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.sent()
+			ping, err := protocol.ParseTimingPing(frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, matched := lane.completePing(ping.ID); !matched {
+				t.Fatal("matching ping did not complete")
+			}
+			synctest.Wait()
 		}
-		request.sent()
-		ping, err := protocol.ParseTimingPing(frame)
-		if err != nil {
-			t.Fatal(err)
+		resumedAt := time.Now()
+		lane.dataWrites.Add(1)
+		lane.signalPingChanged()
+		awaitControlWrite(t, lane.control)
+		if elapsed := time.Since(resumedAt); elapsed != pingInterval {
+			t.Fatalf("active ping resumed after %v, want %v", elapsed, pingInterval)
 		}
-		if _, matched := lane.completePing(ping.ID); !matched {
-			t.Fatal("matching ping did not complete")
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("ping() error = %v, want %v", err, context.Canceled)
 		}
-	}
-	resumedAt := time.Now()
-	lane.dataWrites.Add(1)
-	lane.signalPingChanged()
-	awaitControlWrite(t, lane.control)
-	if elapsed := time.Since(resumedAt); elapsed > 5*pingInterval {
-		t.Fatalf("active ping resumed after %v, want at most %v", elapsed, 5*pingInterval)
-	}
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("ping() error = %v, want %v", err, context.Canceled)
-	}
+	})
 }
 
 func TestIngress(t *testing.T) {
@@ -2153,54 +2157,65 @@ func TestLanePingTimeout(t *testing.T) {
 }
 
 func TestLanePingTimeoutPreemptsIdleBackoff(t *testing.T) {
-	const (
-		pingInterval = 10 * time.Millisecond
-		pingTimeout  = 50 * time.Millisecond
-	)
-	carrier := newTestCarrier()
-	endpoint := newTestEndpoint()
-	store, err := NewTransmissionStore(packetqueue.Limits{Packets: 8, Bytes: 8192})
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock := &testClock{now: 1000}
-	receiver, err := NewReceiver(ReceiverConfig{Endpoint: endpoint, Clock: clock, DeduplicationSize: 64})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lane, err := newObservedLane(LaneConfig{
-		Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
-		Generation: 1, PingInterval: pingInterval, PingTimeout: pingTimeout,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := make(chan error, 1)
-	go func() { result <- lane.Run(context.Background()) }()
-
-	for range 4 {
-		ping := awaitLanePing(t, carrier)
-		pong, err := protocol.MarshalTimingPong(protocol.TimingPong{
-			ID: ping.ID, ReceiveMicros: clock.now, SendMicros: clock.now,
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			pingInterval = 10 * time.Millisecond
+			pingTimeout  = 50 * time.Millisecond
+		)
+		carrier := newTestCarrier()
+		endpoint := newTestEndpoint()
+		store, err := NewTransmissionStore(packetqueue.Limits{Packets: 8, Bytes: 8192})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock := &testClock{now: 1000}
+		receiver, err := NewReceiver(ReceiverConfig{Endpoint: endpoint, Clock: clock, DeduplicationSize: 64})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lane, err := newObservedLane(LaneConfig{
+			Carrier: carrier, Receiver: receiver, Store: store, Clock: clock, LaneID: protocol.LaneID(1),
+			Generation: 1, PingInterval: pingInterval, PingTimeout: pingTimeout,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		carrier.reads <- pong
-	}
-	awaitLanePing(t, carrier)
-	lostAt := time.Now()
-	select {
-	case err := <-result:
-		if !errors.Is(err, ErrPingTimeout) {
-			t.Fatalf("Run() error = %v, want %v", err, ErrPingTimeout)
+		result := make(chan error, 1)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go func() { result <- lane.Run(ctx) }()
+
+		for range 4 {
+			ping := awaitLanePing(t, carrier)
+			pong, err := protocol.MarshalTimingPong(protocol.TimingPong{
+				ID: ping.ID, ReceiveMicros: clock.now, SendMicros: clock.now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			carrier.reads <- pong
+			synctest.Wait()
 		}
-		if elapsed := time.Since(lostAt); elapsed > 3*pingTimeout {
-			t.Fatalf("ping timeout after idle backoff took %v, want at most %v", elapsed, 3*pingTimeout)
+		awaitLanePing(t, carrier)
+		synctest.Wait()
+		synctest.Sleep(pingTimeout - time.Nanosecond)
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("Run() returned %v before the ping timeout", err)
+		default:
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for ping failure")
-	}
+		synctest.Sleep(time.Nanosecond)
+		synctest.Wait()
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrPingTimeout) {
+				t.Fatalf("Run() error = %v, want %v", err, ErrPingTimeout)
+			}
+		default:
+			t.Fatal("idle backoff delayed the ping timeout")
+		}
+	})
 }
 
 func TestLanePingTimeoutStartsAfterCarrierWrite(t *testing.T) {
