@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"os"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -21,6 +22,16 @@ import (
 
 type timingClock struct {
 	now atomic.Uint64
+}
+
+type deadlineHookContext struct {
+	context.Context
+	beforeDeadline func()
+}
+
+func (c deadlineHookContext) Deadline() (time.Time, bool) {
+	c.beforeDeadline()
+	return c.Context.Deadline()
 }
 
 type ingressBatchEndpoint struct {
@@ -129,6 +140,7 @@ func TestReceiverUpdateClock(t *testing.T) {
 type expiringBatchEndpoint struct {
 	*testEndpoint
 	clock   *timingClock
+	partial bool
 	dropped bool
 	calls   int
 }
@@ -139,22 +151,200 @@ func (e *expiringBatchEndpoint) WriteBatch(_ context.Context, payloads [][]byte,
 	if e.dropped {
 		return 1, datagram.ErrDatagramDropped
 	}
+	if e.partial {
+		return 1, nil
+	}
 	return len(payloads), nil
+}
+
+type steppedDeadlineEndpoint struct {
+	*testEndpoint
+	clock        *timingClock
+	deadlines    []time.Time
+	dropFirst    bool
+	timeoutFirst bool
+}
+
+func (e *steppedDeadlineEndpoint) WriteBatch(ctx context.Context, payloads [][]byte, deadline time.Time) (int, error) {
+	e.deadlines = append(e.deadlines, deadline)
+	time.Sleep(10 * time.Millisecond)
+	e.clock.now.Add(10_000)
+	if e.timeoutFirst {
+		e.timeoutFirst = false
+		if err := e.testEndpoint.Write(ctx, payloads[0], deadline); err != nil {
+			return 0, err
+		}
+		remaining := time.Until(deadline)
+		time.Sleep(remaining)
+		e.clock.now.Add(uint64(remaining / time.Microsecond))
+		return 1, os.ErrDeadlineExceeded
+	}
+	written := len(payloads)
+	var writeError error
+	if e.dropFirst {
+		e.dropFirst = false
+		written = 1
+		writeError = datagram.ErrDatagramDropped
+	}
+	for index, payload := range payloads[:written] {
+		if err := e.testEndpoint.Write(ctx, payload, deadline); err != nil {
+			return index, err
+		}
+	}
+	return written, writeError
+}
+
+func TestReceiverWriteBatchOperationDeadline(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		ids          []uint64
+		dropFirst    bool
+		timeoutFirst bool
+		parent       bool
+		calls        int
+		nextID       uint64
+	}{
+		{name: "IncreasingRuns", ids: []uint64{3, 2, 1}, calls: 3, nextID: 4},
+		{name: "PartialDrop", ids: []uint64{1, 2, 3, 4}, dropFirst: true, calls: 2, nextID: 2},
+		{name: "ParentLimitedRuns", ids: []uint64{3, 2, 1}, parent: true, calls: 3, nextID: 4},
+		{name: "ParentLimitedPartialDrop", ids: []uint64{1, 2, 3, 4}, dropFirst: true, parent: true, calls: 2, nextID: 2},
+		{name: "TimeoutAfterPrefix", ids: []uint64{1, 2, 3}, timeoutFirst: true, calls: 1, nextID: 2},
+		{name: "ParentTimeoutAfterPrefix", ids: []uint64{1, 2, 3}, timeoutFirst: true, parent: true, calls: 1, nextID: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				clock := &timingClock{}
+				clock.now.Store(1000)
+				endpoint := &steppedDeadlineEndpoint{
+					testEndpoint: newTestEndpoint(), clock: clock, dropFirst: tt.dropFirst, timeoutFirst: tt.timeoutFirst,
+				}
+				receiver, err := NewReceiver(ReceiverConfig{
+					Endpoint: endpoint, Clock: clock, DeduplicationSize: 64, UDPWriteTimeout: 100 * time.Millisecond,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx := t.Context()
+				began := time.Now()
+				expectedDeadline := began.Add(100 * time.Millisecond)
+				if tt.parent {
+					var cancel context.CancelFunc
+					expectedDeadline = began.Add(50 * time.Millisecond)
+					ctx, cancel = context.WithDeadline(ctx, expectedDeadline)
+					defer cancel()
+				}
+				var data []protocol.Data
+				for _, id := range tt.ids {
+					data = append(data, protocol.Data{
+						PacketID: id, DeadlineMicros: 1_000_000, Payload: relayWireGuardPacket(wgpacket.TransportData),
+					})
+				}
+				err = receiver.deliverBatch(ctx, data)
+				if tt.timeoutFirst {
+					if !errors.Is(err, ErrEndpointFailure) || !errors.Is(err, os.ErrDeadlineExceeded) ||
+						receiver.deduplication.Highest() != tt.ids[0] {
+						t.Fatalf("timeout lost its cause or committed an unwritten suffix: %v", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if len(endpoint.deadlines) != tt.calls || len(receiver.writeSlot) != 0 {
+					t.Fatal("split delivery changed the number of submissions or retained the write slot")
+				}
+				for index, deadline := range endpoint.deadlines {
+					if !deadline.Equal(expectedDeadline) {
+						t.Fatalf("submission %d deadline = %v, want fixed deadline %v", index, deadline, expectedDeadline)
+					}
+				}
+				nextDeadline := time.Now().Add(100 * time.Millisecond)
+				if tt.timeoutFirst {
+					ctx = t.Context()
+				} else if tt.parent {
+					nextDeadline = expectedDeadline
+				}
+				if err := receiver.Deliver(ctx, protocol.Data{
+					PacketID: tt.nextID, DeadlineMicros: 1_000_000, Payload: relayWireGuardPacket(wgpacket.TransportData),
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if len(endpoint.deadlines) != tt.calls+1 || !endpoint.deadlines[tt.calls].Equal(nextDeadline) ||
+					len(receiver.writeSlot) != 0 {
+					t.Fatal("later delivery inherited an old operation limit or changed its parent limit")
+				}
+			})
+		})
+	}
+}
+
+func TestReceiverDeliverAfterDeadlinePreparation(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		deadline    uint64
+		uncertainty uint64
+		writes      int
+	}{
+		{name: "ExpiresDuringPreparation", deadline: 1_000_000},
+		{name: "ExpiresAtPreparationBoundary", deadline: 2_000_000},
+		{name: "RemainsLive", deadline: 2_001_000, writes: 1},
+		{name: "UncertaintyGrace", deadline: 2_000_000, uncertainty: 1000, writes: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := &timingClock{}
+			clock.now.Store(1000)
+			endpoint := newTestEndpoint()
+			receiver, err := NewReceiver(ReceiverConfig{
+				Endpoint: endpoint, Clock: clock, DeduplicationSize: 64,
+				ClockMapping: clockmap.Mapping{UncertaintyMicros: tt.uncertainty},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := deadlineHookContext{
+				Context: t.Context(), beforeDeadline: func() { clock.now.Store(2_000_000) },
+			}
+			data := protocol.Data{
+				PacketID: 1, DeadlineMicros: tt.deadline, Payload: relayWireGuardPacket(wgpacket.TransportData),
+			}
+			if err := receiver.Deliver(ctx, data); err != nil {
+				t.Fatal(err)
+			}
+			if len(endpoint.writes) != tt.writes || receiver.deduplication.Highest() != uint64(tt.writes) ||
+				len(receiver.writeSlot) != 0 {
+				t.Fatalf("deadline preparation: writes/committed/slots = %d/%d/%d, want %d/%d/0",
+					len(endpoint.writes), receiver.deduplication.Highest(), len(receiver.writeSlot), tt.writes, tt.writes)
+			}
+			data.DeadlineMicros = 3_000_000
+			if err := receiver.Deliver(t.Context(), data); err != nil {
+				t.Fatal(err)
+			}
+			if len(endpoint.writes) != 1 || receiver.deduplication.Highest() != 1 || len(receiver.writeSlot) != 0 {
+				t.Fatal("expiry during deadline preparation changed subsequent delivery")
+			}
+		})
+	}
 }
 
 func TestReceiverWriteBatchExpiry(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
+		now     uint64
 		ids     []uint64
+		partial bool
 		dropped bool
 	}{
-		{name: "NewRun", ids: []uint64{5, 3}},
-		{name: "RetryAfterPartialDrop", ids: []uint64{1, 2, 3}, dropped: true},
+		{name: "NewRun", now: 1000, ids: []uint64{5, 3}},
+		{name: "NewRunZeroClock", ids: []uint64{5, 3}},
+		{name: "RetryAfterPartialWrite", now: 1000, ids: []uint64{1, 2, 3}, partial: true},
+		{name: "RetryAfterPartialWriteZeroClock", ids: []uint64{1, 2, 3}, partial: true},
+		{name: "RetryAfterPartialDrop", now: 1000, ids: []uint64{1, 2, 3}, dropped: true},
+		{name: "RetryAfterPartialDropZeroClock", ids: []uint64{1, 2, 3}, dropped: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			clock := &timingClock{}
-			clock.now.Store(1000)
-			endpoint := &expiringBatchEndpoint{testEndpoint: newTestEndpoint(), clock: clock, dropped: tt.dropped}
+			clock.now.Store(tt.now)
+			endpoint := &expiringBatchEndpoint{
+				testEndpoint: newTestEndpoint(), clock: clock, partial: tt.partial, dropped: tt.dropped,
+			}
 			receiver, err := NewReceiver(ReceiverConfig{Endpoint: endpoint, Clock: clock, DeduplicationSize: 64})
 			if err != nil {
 				t.Fatal(err)
@@ -168,6 +358,9 @@ func TestReceiverWriteBatchExpiry(t *testing.T) {
 			}
 			if endpoint.calls != 1 {
 				t.Fatalf("UDP attempts = %d, want 1 before remaining packets expired", endpoint.calls)
+			}
+			if receiver.deduplication.Highest() != tt.ids[0] || len(receiver.writeSlot) != 0 {
+				t.Fatal("expiry changed the committed prefix or retained the write slot")
 			}
 		})
 	}
@@ -217,6 +410,39 @@ func TestReceiverWriteBatchInvalidatedDeadlineReleasesBuffers(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReceiverDeliverBatchDeadlineAfterClockChange(t *testing.T) {
+	clock := &testClock{now: 1000}
+	endpoint := &partialWriteEndpoint{
+		testEndpoint: newTestEndpoint(), failureAt: 1, failure: datagram.ErrDatagramDropped,
+		afterFailure: func() { clock.now = 2000 },
+	}
+	receiver, err := NewReceiver(ReceiverConfig{
+		Endpoint: endpoint, Clock: clock, DeduplicationSize: 64,
+		ClockMapping: clockmap.Mapping{OffsetMicros: -1000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []protocol.Data{
+		{PacketID: 2, DeadlineMicros: 2000, Payload: []byte{2}},
+		{PacketID: 1, DeadlineMicros: 2000 + protocol.MaxPacketLifetimeMicros, Payload: []byte{1}},
+	}
+	if err := receiver.ValidateDeadlines([]uint64{data[0].DeadlineMicros, data[1].DeadlineMicros}); err != nil {
+		t.Fatal(err)
+	}
+	receiver.UpdateClock(clockmap.Mapping{})
+	// The second deadline is valid when submitted, although it exceeds the lifetime bound at the first run's check.
+	if err := receiver.deliverBatch(t.Context(), data); err != nil {
+		t.Fatal(err)
+	}
+	if endpoint.calls != 2 || len(endpoint.writes) != 1 || receiver.deduplication.Highest() != 1 {
+		t.Fatal("clock change or dropped higher ID prevented valid subsequent delivery")
+	}
+	if payload := <-endpoint.writes; len(payload) != 1 || payload[0] != 1 {
+		t.Fatal("delivered the wrong packet after the clock change")
 	}
 }
 

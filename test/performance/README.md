@@ -68,3 +68,16 @@ traffic.
 The latency tool also supports standalone `-listen ADDRESS` and `-target ADDRESS` modes, including IPv6 addresses in
 brackets. `-size`, `-interval`, `-duration`, and `-drain` select the probe parameters. It uses local monotonic send and
 receive times and does not require synchronized host clocks.
+
+## Receiver CPU benchmark
+
+Run the receiver benchmark with the platform's protocol clock:
+
+```sh
+go test ./internal/relay -run '^$' -bench '^BenchmarkReceiverDeliverBatchProtocolClock$' -benchmem -count=5
+```
+
+The benchmark includes deadline generation, validation before delivery, deduplication, and deadline checks before UDP
+submission. It covers single packets, batches, duplicates, reordered packets, and expired packets. The endpoint accepts
+writes in memory to isolate receiver CPU cost. The replay bitmap and initial packet set are populated before timing. Use
+the kernel WireGuard harness to measure network goodput and latency.

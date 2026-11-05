@@ -135,7 +135,8 @@ func (r *Receiver) deliverBatch(ctx context.Context, data []protocol.Data) error
 	return err
 }
 
-// writeBatch serializes and opportunistically batches one lane's UDP delivery vector.
+// writeBatch serializes and groups packets already validated before parse acknowledgement.
+// Unique packets receive a fresh deadline check immediately before each UDP submission.
 func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 	if len(data) == 0 {
 		return nil
@@ -148,7 +149,7 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 		return ctx.Err()
 	case r.writeSlot <- struct{}{}:
 	}
-	// Bound cleanup to the largest used prefix, including partially validated runs.
+	// Bound cleanup to the largest used prefix across all packet runs.
 	buffered := 0
 	defer func() {
 		clear(r.payloads[:buffered])
@@ -163,19 +164,22 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 	mapping := r.mapping
 	r.mappingMu.Unlock()
 	var writeDeadline time.Time
+	var checkedAt uint64
 	for dataOffset := 0; dataOffset < len(data); {
 		accepted := 0
-		nowMicros := r.clock.NowMicros()
 		for dataOffset < len(data) {
 			packet := data[dataOffset]
-			expired, err := deadlineStatus(mapping, nowMicros, packet.DeadlineMicros)
-			if err != nil {
-				buffered = max(buffered, accepted)
-				return err
-			}
-			if r.deduplication.Classify(packet.PacketID) != dedup.New || expired {
+			if r.deduplication.Classify(packet.PacketID) != dedup.New {
 				dataOffset++
 				continue
+			}
+			if checkedAt != 0 {
+				// A packet expired at an earlier check cannot become fresh under this mapping.
+				_, latestDeadline, err := mapping.DeadlineBounds(packet.DeadlineMicros)
+				if err == nil && latestDeadline <= checkedAt {
+					dataOffset++
+					continue
+				}
 			}
 			if accepted > 0 && packet.PacketID <= r.packetIDs[accepted-1] {
 				break
@@ -190,13 +194,8 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 		if accepted == 0 {
 			continue
 		}
-		if writeDeadline.IsZero() {
-			writeDeadline = time.Now().Add(r.udpWriteTimeout)
-			if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(writeDeadline) {
-				writeDeadline = parentDeadline
-			}
-		}
-		err := r.writeAcceptedBatch(ctx, r.payloads[:accepted], r.packetIDs[:accepted], r.deadlines[:accepted], mapping, writeDeadline)
+		var err error
+		checkedAt, err = r.writeAcceptedBatch(ctx, r.payloads[:accepted], r.packetIDs[:accepted], r.deadlines[:accepted], mapping, &writeDeadline)
 		if err != nil {
 			return err
 		}
@@ -204,17 +203,25 @@ func (r *Receiver) writeBatch(ctx context.Context, data []protocol.Data) error {
 	return nil
 }
 
-// writeAcceptedBatch writes one increasing PacketID run and records only its successful packets.
+// writeAcceptedBatch writes one increasing PacketID run, records its successful packets, and returns the last expiry
+// check time. Later runs can discard packets already expired under the same clock mapping.
 func (r *Receiver) writeAcceptedBatch(ctx context.Context, payloads [][]byte, packetIDs, deadlines []uint64,
-	mapping clockmap.Mapping, writeDeadline time.Time) error {
+	mapping clockmap.Mapping, writeDeadline *time.Time) (uint64, error) {
+	var parentDeadline time.Time
+	var hasParentDeadline bool
+	if writeDeadline.IsZero() {
+		// Resolve the caller's deadline before sampling packet freshness.
+		parentDeadline, hasParentDeadline = ctx.Deadline()
+	}
 	offset := 0
+	var nowMicros uint64
 	for offset < len(payloads) {
-		nowMicros := r.clock.NowMicros()
+		nowMicros = r.clock.NowMicros()
 		end := offset
 		for index := offset; index < len(payloads); index++ {
 			expired, err := deadlineStatus(mapping, nowMicros, deadlines[index])
 			if err != nil {
-				return err
+				return nowMicros, err
 			}
 			if !expired {
 				payloads[end] = payloads[index]
@@ -229,7 +236,13 @@ func (r *Receiver) writeAcceptedBatch(ctx context.Context, payloads [][]byte, pa
 		if offset == end {
 			break
 		}
-		written, err := datagram.WriteBatch(ctx, r.endpoint, payloads[offset:], writeDeadline)
+		if writeDeadline.IsZero() {
+			*writeDeadline = time.Now().Add(r.udpWriteTimeout)
+			if hasParentDeadline && parentDeadline.Before(*writeDeadline) {
+				*writeDeadline = parentDeadline
+			}
+		}
+		written, err := datagram.WriteBatch(ctx, r.endpoint, payloads[offset:], *writeDeadline)
 		if written > 0 {
 			for _, packetID := range packetIDs[offset : offset+written] {
 				r.deduplication.Observe(packetID)
@@ -238,20 +251,20 @@ func (r *Receiver) writeAcceptedBatch(ctx context.Context, payloads [][]byte, pa
 		}
 		if err == nil {
 			if written == 0 {
-				return fmt.Errorf("%w: %w", ErrEndpointFailure, io.ErrNoProgress)
+				return nowMicros, fmt.Errorf("%w: %w", ErrEndpointFailure, io.ErrNoProgress)
 			}
 			continue
 		}
 		if errors.Is(err, datagram.ErrNoLocalPeer) {
-			return err
+			return nowMicros, err
 		}
 		if errors.Is(err, datagram.ErrDatagramDropped) {
 			offset++
 			continue
 		}
-		return fmt.Errorf("%w: %w", ErrEndpointFailure, err)
+		return nowMicros, fmt.Errorf("%w: %w", ErrEndpointFailure, err)
 	}
-	return nil
+	return nowMicros, nil
 }
 
 // deadlineStatus validates one sender deadline and reports conservative receiver-side expiry.

@@ -670,6 +670,7 @@ func TestLaneReadDataBatch(t *testing.T) {
 		largePacket   bool
 		widePacketID  bool
 		priorProgress bool
+		duplicate     bool
 		err           error
 	}{
 		{name: "ValidBatch"},
@@ -684,6 +685,7 @@ func TestLaneReadDataBatch(t *testing.T) {
 		{name: "NoncanonicalAfterReportedPrefix", kind: "integer", priorProgress: true, err: protocol.ErrInvalidDataFrame},
 		{name: "InvalidPacketAfterReportedPrefix", kind: "packet", priorProgress: true, err: ErrInvalidWireGuardPacket},
 		{name: "InvalidDeadlineAfterReportedPrefix", kind: "deadline", priorProgress: true, err: ErrInvalidPacketDeadline},
+		{name: "InvalidDuplicateDeadline", kind: "deadline", priorProgress: true, duplicate: true, err: ErrInvalidPacketDeadline},
 		{name: "CounterOverflowAfterReportedPrefix", kind: "counter", priorProgress: true, err: ErrCounterExhausted},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -720,6 +722,9 @@ func TestLaneReadDataBatch(t *testing.T) {
 				}
 				if test.priorProgress {
 					packet.PacketID++
+				}
+				if test.duplicate && index == len(frames)-1 {
+					packet.PacketID = 1
 				}
 				if test.largePacket {
 					packet.Payload = make([]byte, protocol.MaxPacketSize)

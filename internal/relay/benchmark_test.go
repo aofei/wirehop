@@ -10,6 +10,8 @@ import (
 	"github.com/aofei/wirehop/internal/carrier"
 	"github.com/aofei/wirehop/internal/clockmap"
 	"github.com/aofei/wirehop/internal/datagram"
+	"github.com/aofei/wirehop/internal/dedup"
+	"github.com/aofei/wirehop/internal/monotime"
 	"github.com/aofei/wirehop/internal/packetqueue"
 	"github.com/aofei/wirehop/internal/protocol"
 	"github.com/aofei/wirehop/internal/retention"
@@ -568,6 +570,83 @@ func BenchmarkReceiverDeliverBatch(b *testing.B) {
 					}
 				}
 				if err := receiver.deliverBatch(context.Background(), batch[:tt.count]); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkReceiverDeliverBatchProtocolClock(b *testing.B) {
+	const windowSize = 1_048_576
+	for _, tt := range []struct {
+		name      string
+		count     int
+		duplicate bool
+		expired   bool
+		reordered bool
+	}{
+		{name: "Single", count: 1},
+		{name: "Sixteen", count: datagram.MaximumBatchSize},
+		{name: "Duplicate", count: datagram.MaximumBatchSize, duplicate: true},
+		{name: "Reordered", count: datagram.MaximumBatchSize, reordered: true},
+		{name: "Expired", count: datagram.MaximumBatchSize, expired: true},
+		{name: "ExpiredReordered", count: datagram.MaximumBatchSize, expired: true, reordered: true},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			clock := monotime.New()
+			receiver, err := NewReceiver(ReceiverConfig{
+				Endpoint: benchmarkBatchEndpoint{}, Clock: clock, DeduplicationSize: windowSize,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			payload := make([]byte, 1452)
+			copy(payload, relayWireGuardPacket(wgpacket.TransportData))
+			var data [datagram.MaximumBatchSize]protocol.Data
+			var deadlines [datagram.MaximumBatchSize]uint64
+			// Allocate the complete replay bitmap before measuring the steady state.
+			receiver.deduplication.Observe(windowSize - 1)
+			deadline := clock.NowMicros() + uint64(time.Second/time.Microsecond)
+			for index := range tt.count {
+				data[index] = protocol.Data{
+					PacketID: uint64(windowSize + index + 1), DeadlineMicros: deadline, Payload: payload,
+				}
+				if tt.reordered {
+					data[index].PacketID = uint64(windowSize + tt.count - index)
+				}
+				deadlines[index] = deadline
+			}
+			// Populate the initial packet set before timing duplicate lookups.
+			if err := receiver.ValidateDeadlines(deadlines[:tt.count]); err != nil {
+				b.Fatal(err)
+			}
+			if err := receiver.deliverBatch(context.Background(), data[:tt.count]); err != nil {
+				b.Fatal(err)
+			}
+			for _, packet := range data[:tt.count] {
+				if receiver.deduplication.Classify(packet.PacketID) != dedup.Duplicate {
+					b.Fatal("warmup packet expired before delivery")
+				}
+			}
+			b.SetBytes(int64(tt.count * len(payload)))
+			b.ReportAllocs()
+			for b.Loop() {
+				deadline := clock.NowMicros()
+				if !tt.expired {
+					deadline += uint64(time.Second / time.Microsecond)
+				}
+				for index := range tt.count {
+					if !tt.duplicate {
+						data[index].PacketID += uint64(tt.count)
+					}
+					data[index].DeadlineMicros = deadline
+					deadlines[index] = deadline
+				}
+				if err := receiver.ValidateDeadlines(deadlines[:tt.count]); err != nil {
+					b.Fatal(err)
+				}
+				if err := receiver.deliverBatch(context.Background(), data[:tt.count]); err != nil {
 					b.Fatal(err)
 				}
 			}
