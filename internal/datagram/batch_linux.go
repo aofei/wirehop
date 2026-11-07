@@ -189,12 +189,11 @@ func splitLeadingDecimal(value string) (string, string) {
 	return value[:end], value[end:]
 }
 
-// newLinuxReadBatchPool creates a concurrency bound scaled down on small hosts.
+// newLinuxReadBatchPool creates the bounded staging pool shared by UDP readers.
 func newLinuxReadBatchPool() *linuxReadBatchPool {
-	capacity := min(max(runtime.GOMAXPROCS(0), 2), maximumConcurrentReadBatches)
 	return &linuxReadBatchPool{
-		permits: make(chan struct{}, capacity),
-		idle:    make(chan *linuxReadBatch, capacity),
+		permits: make(chan struct{}, maximumConcurrentReadBatches),
+		idle:    make(chan *linuxReadBatch, maximumConcurrentReadBatches),
 	}
 }
 

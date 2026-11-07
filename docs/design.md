@@ -1519,18 +1519,19 @@ Accepted UDP payloads are copied into reference-counted buffers. Queue admission
 and migration transfer or retain explicit ownership. A buffer returns to its pool only after the final owner releases
 it. Size classes retain buffers up to 32 KiB, and larger payload allocations are not pooled.
 
-Linux receive staging uses a process-wide pool of 16-datagram vectors. Its capacity is chosen from `GOMAXPROCS` at
-initialization, with a minimum of two vectors and a maximum of 16. At the maximum, payload storage occupies 16 MiB plus
-vector metadata. A reader that cannot borrow a vector continues with one pooled scalar buffer. Both vector and scalar
-staging are released before the socket poller waits, so idle Linux readers retain neither a vector nor a payload buffer.
-Successful receive staging remains owned until accepted datagrams are copied. All carriers borrow complete frames from a
-fixed 32 KiB buffered reader and use one reusable owned frame buffer for fragmented or larger frames. WebSocket
-borrowing stays within the current binary message. Only the first frame can refill the read buffer. Already-buffered
-tails require neither payload copying nor a separate allocation. Payloads remain valid until the next carrier read, and
-UDP submission consumes them synchronously. A nonempty read that passes its initial cancellation check discards
-exceptional owned first-frame capacity above 32 KiB. Larger encoding buffers are discarded after writing. WebSocket
-decoding remains incremental within a message without retaining a complete message allocation. These scratch buffers,
-size-class overhead, and kernel socket buffers are separate from the retained relay-work budget.
+Linux receive staging uses a process-wide pool of up to 16 reusable 16-datagram vectors. The slot limit is independent
+of `GOMAXPROCS`, allowing multiple readers to retain staging while copying accepted packets or completing a syscall.
+Vectors are allocated only when borrowed and remain cached for reuse. At the maximum, payload storage occupies 16 MiB
+plus vector metadata. A reader that cannot borrow a vector continues with one pooled scalar buffer. Both vector and
+scalar staging are released before the socket poller waits, so idle Linux readers retain neither a vector nor a payload
+buffer. Successful receive staging remains owned until accepted datagrams are copied. All carriers borrow complete
+frames from a fixed 32 KiB buffered reader and use one reusable owned frame buffer for fragmented or larger frames.
+WebSocket borrowing stays within the current binary message. Only the first frame can refill the read buffer.
+Already-buffered tails require neither payload copying nor a separate allocation. Payloads remain valid until the next
+carrier read, and UDP submission consumes them synchronously. A nonempty read that passes its initial cancellation check
+discards exceptional owned first-frame capacity above 32 KiB. Larger encoding buffers are discarded after writing.
+WebSocket decoding remains incremental within a message without retaining a complete message allocation. These scratch
+buffers, size-class overhead, and kernel socket buffers are separate from the retained relay-work budget.
 
 One session-wide UDP write slot serializes delivery across carrier readers and exclusively owns the deduplication window
 and delivery scratch storage. Successful UDP submissions update that window before the slot is released. Failed or

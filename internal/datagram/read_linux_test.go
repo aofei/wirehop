@@ -7,12 +7,116 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestNewLinuxReadBatchPool(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		processors int
+	}{
+		{name: "OneGoCPU", processors: 1},
+		{name: "TwoGoCPUs", processors: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			previous := runtime.GOMAXPROCS(tt.processors)
+			defer runtime.GOMAXPROCS(previous)
+			pool := newLinuxReadBatchPool()
+			var held [maximumConcurrentReadBatches]*linuxReadBatch
+			for index := range held {
+				held[index] = pool.acquire()
+				if held[index] == nil {
+					t.Fatalf("borrow %d rejected below the shared staging bound", index+1)
+				}
+			}
+			if extra := pool.acquire(); extra != nil {
+				t.Fatal("borrow exceeded the shared staging bound")
+			}
+			first := held[0]
+			pool.release(first)
+			held[0] = pool.acquire()
+			if held[0] != first {
+				t.Fatal("released staging capacity did not recycle its cached vector")
+			}
+			for _, batch := range held {
+				pool.release(batch)
+			}
+		})
+	}
+}
+
+func TestLinuxReadBatchPoolAcquire(t *testing.T) {
+	pool := newLinuxReadBatchPool()
+	var held [maximumConcurrentReadBatches]*linuxReadBatch
+	owners := make(map[*linuxReadBatch]*atomic.Bool)
+	for index := range held {
+		held[index] = pool.acquire()
+		if held[index] == nil {
+			t.Fatalf("borrow %d rejected while warming the shared pool", index+1)
+		}
+		owners[held[index]] = new(atomic.Bool)
+	}
+	for _, batch := range held {
+		pool.release(batch)
+	}
+	var workers sync.WaitGroup
+	for worker := range 2 * maximumConcurrentReadBatches {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for range 128 {
+				batch := pool.acquire()
+				if batch == nil {
+					runtime.Gosched()
+					continue
+				}
+				owner, known := owners[batch]
+				if !known {
+					t.Error("concurrent reuse allocated beyond the warmed staging bound")
+					continue
+				}
+				if !owner.CompareAndSwap(false, true) {
+					t.Error("one receive vector was borrowed by multiple readers")
+					continue
+				}
+				if batch.limit != 0 || batch.count != 0 || batch.err != 0 || batch.values[0].payload != nil {
+					t.Error("reused receive vector retained its previous borrow state")
+				}
+				batch.limit = MaximumBatchSize
+				batch.count = 1
+				batch.err = syscall.EINTR
+				batch.values[0].payload = batch.buffers[0][:1]
+				batch.buffers[0][0] = byte(worker + 1)
+				runtime.Gosched()
+				if batch.values[0].payload[0] != byte(worker+1) {
+					t.Error("another reader changed an exclusively borrowed payload")
+				}
+				owner.Store(false)
+				pool.release(batch)
+			}
+		}()
+	}
+	workers.Wait()
+	if t.Failed() {
+		return
+	}
+	for index := range held {
+		held[index] = pool.acquire()
+		if held[index] == nil {
+			t.Fatalf("borrow %d rejected after concurrent reuse", index+1)
+		}
+	}
+	for _, batch := range held {
+		pool.release(batch)
+	}
+}
 
 type observedUDPRead struct {
 	syscall.RawConn
