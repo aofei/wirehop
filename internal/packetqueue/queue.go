@@ -31,6 +31,9 @@ type Priority uint8
 // maximumRetainedDequeCapacity preserves ordinary bursts without retaining exceptional queue high-water marks.
 const maximumRetainedDequeCapacity = 256
 
+// maximumBatchReservationPackets bounds each aggregate admission scan and reservation.
+const maximumBatchReservationPackets = 16
+
 const (
 	// PriorityNormal carries ordinary WireGuard transport data.
 	PriorityNormal Priority = iota
@@ -299,7 +302,8 @@ func (q *Queue[T]) PushBatch(items []Item[T]) (int, error) {
 	defer q.mu.Unlock()
 	now := q.now()
 	written := 0
-	for _, item := range items {
+	for written < len(items) {
+		item := items[written]
 		if !q.validItem(item) {
 			q.notifyLocked(written > 0)
 			return written, ErrInvalidItem
@@ -309,9 +313,41 @@ func (q *Queue[T]) PushBatch(items []Item[T]) (int, error) {
 			return written, err
 		}
 		written++
+		if len(items)-written > 1 && q.budget != nil {
+			written += q.pushReservedBatchLocked(items[written:], now)
+		}
 	}
 	q.notifyLocked(true)
 	return written, nil
+}
+
+// pushReservedBatchLocked admits a bounded prefix of fresh normal items with one aggregate reservation.
+// The caller holds q.mu and has just admitted one item. A failed group attempt leaves scalar admission in charge of
+// partial prefixes, expiry reclamation, and control preemption.
+func (q *Queue[T]) pushReservedBatchLocked(items []Item[T], now time.Time) int {
+	remainingPackets, remainingBytes := q.budget.Remaining()
+	limit := min(len(items), maximumBatchReservationPackets, q.limits.Packets-q.packets, remainingPackets)
+	availableBytes := min(q.limits.Bytes-q.bytes, remainingBytes)
+	count, bytes := 0, 0
+	for _, item := range items[:limit] {
+		if item.Priority != PriorityNormal || item.retention != nil || !q.validItem(item) ||
+			!now.Before(item.Deadline) || item.Size > availableBytes-bytes {
+			break
+		}
+		count++
+		bytes += item.Size
+	}
+	if count < 2 || !q.budget.Reserve(count, bytes) {
+		return 0
+	}
+	for _, item := range items[:count] {
+		item.retention = q.budget
+		item.retentionBytes = item.Size
+		q.normal.push(item)
+	}
+	q.packets += count
+	q.bytes += bytes
+	return count
 }
 
 // validItem reports whether item can participate in this queue's ownership contract.

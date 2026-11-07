@@ -766,6 +766,12 @@ transmission stores, so opening more sessions or lanes cannot multiply retained 
 charged at its payload size in ingress and at its complete encoded Data-frame size after lane assignment. Moving a
 packet between those states transfers and resizes the same reservation without an unaccounted gap.
 
+Ingress admits a batch prefix under one queue lock and samples its deadline clock once. After admitting one packet
+individually, it can reserve shared capacity for up to 16 subsequent fresh, unreserved normal packets together. A
+sampled remaining-capacity hint bounds each group, and an atomic reservation still enforces both aggregate limits. Every
+accepted packet retains its own reservation. A failed group reservation falls back to individual admission, preserving
+partial acceptance, expired-capacity reclamation, and control preemption without scanning ahead on an initial rejection.
+
 Scheduler maintenance retries a held ingress packet when another session releases shared retention through feedback,
 queued expiry, or generation drain. This does not require new ingress or local lane progress. A lane whose hard byte
 limit cannot fit a capacity probe can still forward ordinary frames that fit. A normal packet held behind a preempting

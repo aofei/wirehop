@@ -97,3 +97,38 @@ func TestBudgetResizeBytes(t *testing.T) {
 	}
 	budget.Release(1, 4)
 }
+
+func TestBudgetRemaining(t *testing.T) {
+	budget, err := NewBudget(Limits{Packets: 2, Bytes: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRemaining := func(wantPackets, wantBytes int) {
+		t.Helper()
+		if packets, bytes := budget.Remaining(); packets != wantPackets || bytes != wantBytes {
+			t.Fatalf("Remaining() = %d, %d, want %d, %d", packets, bytes, wantPackets, wantBytes)
+		}
+	}
+	assertRemaining(2, 10)
+	if !budget.Reserve(1, 6) || !budget.ResizeBytes(6, 10) {
+		t.Fatal("could not consume the byte capacity")
+	}
+	assertRemaining(1, 0)
+	if budget.Reserve(1, 1) || budget.ResizeBytes(10, 11) {
+		t.Fatal("exhausted byte capacity was exceeded")
+	}
+	assertRemaining(1, 0)
+	if !budget.ResizeBytes(10, 4) {
+		t.Fatal("could not restore byte capacity")
+	}
+	packets, bytes := budget.Remaining()
+	if !budget.Reserve(packets, bytes) {
+		t.Fatal("remaining capacity could not be reserved")
+	}
+	assertRemaining(0, 0)
+	if budget.Reserve(packets, bytes) {
+		t.Fatal("a stale capacity hint permitted over-reservation")
+	}
+	budget.Release(2, 10)
+	assertRemaining(2, 10)
+}

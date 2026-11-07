@@ -81,6 +81,12 @@ func (b *Budget) Usage() Usage {
 	return Usage{Packets: int(b.packets.Load()), Bytes: int(b.bytes.Load())}
 }
 
+// Remaining samples unreserved packet and byte capacity independently. The result is an admission hint, and callers
+// must still use [Budget.Reserve] to claim capacity.
+func (b *Budget) Remaining() (packets, bytes int) {
+	return b.limits.Packets - int(b.packets.Load()), b.limits.Bytes - int(b.bytes.Load())
+}
+
 // reserve increments current without exceeding limit.
 func reserve(current *atomic.Int64, amount, limit int64) bool {
 	for used := current.Load(); ; used = current.Load() {

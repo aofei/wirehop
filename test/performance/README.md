@@ -69,6 +69,19 @@ The latency tool also supports standalone `-listen ADDRESS` and `-target ADDRESS
 brackets. `-size`, `-interval`, `-duration`, and `-drain` select the probe parameters. It uses local monotonic send and
 receive times and does not require synchronized host clocks.
 
+## Ingress queue accounting benchmark
+
+Compare queue admission, dequeue, and reservation release at fixed worker counts:
+
+```sh
+go test ./internal/packetqueue -run '^$' -bench '^BenchmarkQueuePushBatch' -benchmem -cpu=1,4 -count=5
+```
+
+The benchmarks cover one-, four-, and sixteen-packet batches with local or shared limits, exhausted aggregate budgets,
+and partial acceptance under packet or byte pressure. Completed batches report per-packet cost. Rejected and partial
+batches report cost per call, including release of any accepted prefix. Use the kernel WireGuard harness to measure
+delivered goodput and latency.
+
 ## Receiver CPU benchmark
 
 Run the receiver benchmark with the platform's protocol clock:
