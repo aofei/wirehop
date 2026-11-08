@@ -101,6 +101,7 @@ func TestIngressRunBatch(t *testing.T) {
 				packet := endpoint.packets[id]
 				if item.Value.Kind != packet.Kind || len(item.Value.Payload) != len(packet.Payload) ||
 					item.Value.Payload[4] != id || &item.Value.Payload[0] != &packet.Payload[0] ||
+					item.Value.queuedMicros != clock.NowMicros() ||
 					item.Deadline != monotime.Time(clock.NowMicros()).Add(policy.Lifetime(packet.Kind)) {
 					t.Fatalf("dequeued packet %d lost its payload, order, classification, or deadline", id)
 				}

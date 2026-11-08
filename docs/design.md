@@ -769,7 +769,26 @@ packet between those states transfers and resizes the same reservation without a
 The default ingress packet limit lets MTU-sized bursts use the byte budget while bounding small-packet occupancy. Short
 bursts can follow compressed TCP acknowledgments when path RTT falls, so packet headroom matters even when the average
 offered rate fits the path. Queue byte limits, aggregate retention, and packet deadlines still bound that headroom. A
-larger packet limit can retain more payload and increase queueing delay within those bounds.
+larger packet limit can retain more payload within those bounds.
+
+Ingress also records each packet's protocol-clock arrival time. When a healthy lane can accept transport, the scheduler
+signals persistent congestion by discarding selected normal packets before assigning packet IDs. Its delay controller
+uses the sustained-delay and inverse-square-root principles of [CoDel](https://www.rfc-editor.org/rfc/rfc8289). The
+delay target covers one unloaded feedback cycle and two maximum-observed frame serialization times at that lane's
+estimated rate. A feedback-sized burst can therefore drain without being classified as persistent congestion. The
+observation interval covers at least 100 ms, the complete committed-flight feedback horizon, two operating RTTs, and two
+delay targets. A recent larger RTT sample also extends the interval. This allows a normal feedback flight to drain
+before a startup burst can cause repeated congestion signals. Transient compressed-acknowledgment bursts retain the
+physical queue headroom, while responsive inner transports receive congestion signals instead of filling the entire
+allowance indefinitely. At least one maximum-observed frame or 4 KiB of remaining ingress backlog is preserved,
+whichever is larger.
+
+A fresh queue head, drained backlog, lane-generation change, or service interruption longer than the interval restarts
+the congestion observation. Coordinated timing pauses reset the controller and suspend its decisions. WireGuard
+handshakes and cookies retain control priority. Initial empty keepalives also bypass congestion dropping. Physical
+limits and deadline expiry still apply during outages. This controller preserves FIFO order and does not inspect inner
+flow headers, mark ECN, or provide per-flow fairness. It cannot remove earlier kernel UDP receive queueing or data
+already committed to an outer carrier.
 
 Ingress admits a batch prefix under one queue lock and samples its deadline clock once. After admitting one packet
 individually, it can reserve shared capacity for up to 16 subsequent fresh, unreserved normal packets together. A

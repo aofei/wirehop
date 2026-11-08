@@ -215,6 +215,7 @@ type Scheduler struct {
 	packetID                uint64
 	transportHoldUntil      time.Time
 	lastTransportAt         time.Time
+	transportQueue          transportQueueControl
 	lastProbeLane           protocol.LaneID
 	measurementDrain        *measurementDrain
 	pendingMeasurementDrain atomic.Bool
@@ -805,6 +806,7 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 			return
 		}
 		s.measurementStarted = now
+		s.transportQueue = transportQueueControl{}
 		pause := measurementPauseLimit
 		if drain.localRequest && target.latestRTTMicros <= target.minimumRTTMicros {
 			pause = measurementPauseDuration(max(target.rttMicros, target.latestRTTMicros))
@@ -975,6 +977,11 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 			item.Release()
 		}
 		return candidates.available, nil
+	}
+	if !paused && !control && !initialKeepalive && item.Value.queuedMicros != 0 && s.transportQueue.drop(
+		now, item.Value.queuedMicros, s.ingress.Bytes(), frameBytes, candidates.lanes[0]) {
+		item.Release()
+		return true, nil
 	}
 	scheduled := false
 	for _, lane := range candidates.lanes[:candidates.count] {

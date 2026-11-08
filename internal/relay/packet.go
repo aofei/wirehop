@@ -50,6 +50,8 @@ func (p DeadlinePolicy) Lifetime(kind wgpacket.Kind) time.Duration {
 // Packet is one ingress-owned WireGuard packet awaiting session scheduling.
 type Packet struct {
 	datagram.Packet
+	// queuedMicros records ingress arrival on the protocol clock. Zero leaves congestion timing uninitialized.
+	queuedMicros uint64
 }
 
 // newPacket transfers ownership of packet into relay scheduling metadata.

@@ -48,8 +48,9 @@ func (i *Ingress) Run(ctx context.Context) error {
 		}
 		nowMicros := i.clock.NowMicros()
 		for index := range count {
-			packet := packets[index]
+			packet := newPacket(packets[index])
 			packets[index] = datagram.Packet{}
+			packet.queuedMicros = nowMicros
 			lifetime := i.deadlines.Lifetime(packet.Kind)
 			lifetimeMicros := durationMicros(lifetime)
 			// Millisecond ceiling must remain representable before any prepared packet enters the queue.
@@ -60,7 +61,7 @@ func (i *Ingress) Run(ctx context.Context) error {
 				return fmt.Errorf("compute relay ingress deadline: %w", ErrCounterExhausted)
 			}
 			items[index] = packetqueue.Item[Packet]{
-				Value:    newPacket(packet),
+				Value:    packet,
 				Size:     len(packet.Payload),
 				Priority: packetPriority(packet.Kind.Control()),
 				Deadline: monotime.Time(nowMicros + lifetimeMicros),
