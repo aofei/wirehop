@@ -179,6 +179,11 @@ state, and ephemeral-port settings before a failing shell exits, preserving evid
 namespace. Diagnostic write failures do not prevent container and network cleanup. Collection failures are retained in
 `harness-error.txt` and make verification fail.
 
+Fault cases with separate server results keep the client's relay running for up to ten seconds after its producer exits.
+The server can still need the relay for final control messages and TCP acknowledgments. A missing completion marker or
+failed server producer fails the case. This collection allowance does not extend the traffic duration or the receiver
+measurement windows.
+
 Read process exit codes and verification errors together. An invalid or incomplete experiment is different from a
 complete receiver window below the recovery threshold. When reviewing GitHub history, count executed kernel jobs
 separately from workflows that never ran because their approval expired.

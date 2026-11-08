@@ -180,12 +180,7 @@ while :; do
     printf '%s\n' "$container_status" > "$results/$scenario/client-exit.txt"
     case "$scenario" in
       *-rtt-step*|*-capacity-change*|tcp-asymmetric-stall*|*-stall|*-outage|*-roam|*-prohibit|*-blackhole)
-        completed=false
-        for attempt in $(seq 1 100); do
-          if [ -f "$results/$scenario/server-flow-done.txt" ]; then completed=true; break; fi
-          sleep 0.1
-        done
-        if [ "$completed" != true ]; then
+        if [ ! -f "$results/$scenario/server-flow-done.txt" ]; then
           fail_case "server result collection did not complete: $scenario"
         elif [ "$(cat "$results/$scenario/server-flow-exit.txt")" != 0 ]; then
           fail_case "server iperf3 failed: $scenario"

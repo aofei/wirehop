@@ -347,6 +347,15 @@ timeout "$((duration + 60))" "$flow_tool" run /results client -c "$remote_ip" -t
 if [ -n "$latency_process" ]; then wait "$latency_process" || status=$?; fi
 touch /results/flow-done.txt
 if [ -n "$observer" ]; then wait "$observer"; fi
+case "$scenario" in
+  *-rtt-step*|*-capacity-change*|tcp-asymmetric-stall*|*-stall|*-outage|*-roam|*-prohibit|*-blackhole)
+    # Keep the relay alive while the server finishes its control exchange and emits its result.
+    for attempt in $(seq 1 100); do
+      if [ -f /results/server-flow-done.txt ]; then break; fi
+      sleep 0.1
+    done
+    ;;
+esac
 nstat -az > /results/client-after.txt
 ss -tnH state established > /results/client-tcp-sockets-after.txt
 wg show wgtest latest-handshakes > /results/client-handshake.txt
