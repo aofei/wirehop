@@ -1,0 +1,78 @@
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -616,5 +616,5 @@
+ PACKAGE_TARNAME='iperf'
+-PACKAGE_VERSION='3.18'
+-PACKAGE_STRING='iperf 3.18'
++PACKAGE_VERSION='3.18-wirehop-test'
++PACKAGE_STRING='iperf 3.18-wirehop-test'
+ PACKAGE_BUGREPORT='https://github.com/esnet/iperf'
+ PACKAGE_URL='https://software.es.net/iperf/'
+diff --git a/src/net.c b/src/net.c
+--- a/src/net.c
++++ b/src/net.c
+@@ -66,6 +66,7 @@
+ #include "timer.h"
+
+-static int nread_read_timeout = 10;
+-static int nread_overall_timeout = 30;
++/* Match the harness's 60-second control-result collection budget. */
++static int nread_read_timeout = 60;
++static int nread_overall_timeout = 60;
+
+ /*
+diff --git a/src/iperf_time.c b/src/iperf_time.c
+--- a/src/iperf_time.c
++++ b/src/iperf_time.c
+@@ -40,6 +40,6 @@
+     struct timespec ts;
+     int result;
+-    result = clock_gettime(CLOCK_MONOTONIC, &ts);
++    result = clock_gettime(CLOCK_BOOTTIME, &ts);
+     if (result == 0) {
+         time1->secs = (uint32_t) ts.tv_sec;
+         time1->usecs = (uint32_t) ts.tv_nsec / 1000;
+diff --git a/src/iperf_api.c b/src/iperf_api.c
+--- a/src/iperf_api.c
++++ b/src/iperf_api.c
+@@ -2086,6 +2086,9 @@
+     }
+
++    if (test->json_output)
++        cJSON_AddNumberToObject(test->json_start, "started_boottime", iperf_time_in_secs(&now));
++
+     if (test->on_test_start)
+         test->on_test_start(test);
+
+     return 0;
+@@ -3568,10 +3571,12 @@
+-	    if (interval_len >= test->stats_interval * 0.10 ||
+-		irp->bytes_transferred > 0) {
+-		interval_ok = 1;
+-		if (test->debug) {
+-		    printf("interval forces keep\n");
+-		}
+-	    }
+-	}
++            /* Streaming consumers need short zero-delivery intervals for complete coverage. */
++	    if ((test->json_stream && interval_len > 0) ||
++		interval_len >= test->stats_interval * 0.10 ||
++		irp->bytes_transferred > 0) {
++		interval_ok = 1;
++		if (test->debug) {
++		    printf("interval forces keep\n");
++		}
++	    }
++	}
+     }
+     if (!interval_ok) {
+@@ -3697,3 +3702,7 @@
+-            sp = SLIST_FIRST(&test->streams); /* reset back to 1st stream */
++            /* Use timing from the same direction as the summed bytes. */
++            SLIST_FOREACH(sp, &test->streams, streams) {
++                if (sp->sender == stream_must_be_sender)
++                    break;
++            }
+             /* Only do this of course if there was a first stream */
+             if (sp) {

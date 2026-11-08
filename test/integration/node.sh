@@ -5,8 +5,29 @@ umask 022
 
 role=$1
 scenario=$2
+
+diagnose_failure() {
+  node_exit_code=$?
+  trap - EXIT
+  if [ "$node_exit_code" -ne 0 ]; then
+    {
+      printf 'node_exit_code=%s\n' "$node_exit_code"
+      ip -details address show || true
+      ip route show table all || true
+      ss -lanupe || true
+      ss -lantpe || true
+      wg show || true
+      cat /proc/sys/net/ipv4/ip_local_port_range || true
+      cat /proc/sys/net/ipv4/ip_local_reserved_ports || true
+    } > "/results/$role-failure.txt" 2>&1 || true
+  fi
+  exit "$node_exit_code"
+}
+trap diagnose_failure EXIT
+
 scheme=${scenario%%-*}
 carrier_port=51822
+flow_tool=/usr/local/bin/wirehop-test-flow
 if [ "${WIREHOP_TEST_PATH:-Both}" = High ]; then carrier_port=51823; fi
 export WIREHOP_TOKEN=isolated-kernel-tcp-test-fixture
 export SSL_CERT_FILE=/results/ca.pem
@@ -17,12 +38,12 @@ if [ "$role" = server ]; then
       ip route add local 192.0.2.1/32 dev lo table 100
       ip rule add pref 100 to 192.0.2.1/32 lookup 100
       (
-        while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
-        sleep 5
+        "$flow_tool" wait /results/client-flow-start.txt 5
         ip route replace "${scenario#tcp-}" 192.0.2.1/32 table 100
-        sleep 1
+        "$flow_tool" now > /results/route-dropped.txt
+        "$flow_tool" wait /results/route-dropped.txt 1
         ip route replace local 192.0.2.1/32 dev lo table 100
-        date +%s > /results/route-recovered.txt
+        "$flow_tool" now > /results/route-recovered.txt
       ) &
       target=192.0.2.1:51820
       ;;
@@ -61,12 +82,8 @@ ip route add "$remote_ip/$prefix" dev wgtest
 observer=
 observe=${WIREHOP_TEST_OBSERVE:-false}
 case "$scenario" in
-  *-capacity-change*) observe=true ;;
+  *-capacity-change*|*-rtt-step*|*-stall*|*-outage|*-roam|*-slow32|*-slow64|*-slow128|*-prohibit|*-blackhole) observe=true ;;
 esac
-if [ "$observe" = true ]; then
-  sh /test/observe.sh "$role" /results &
-  observer=$!
-fi
 if [ "$role" = client ]; then
   case "$scenario" in
     tcp-fwmark|forward-fwmark)
@@ -86,14 +103,13 @@ case "$scenario" in
     ip -brief address show > "/results/$role-addresses.txt"
     ip route show table all > "/results/$role-routes.txt"
     (
-      while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
-      sleep 10
+      "$flow_tool" wait /results/client-flow-start.txt 10
       tc qdisc change dev eth0 root handle 10: netem delay 600ms rate 20mbit limit 10000
-      date +%s > "/results/$role-delay-raised.txt"
+      "$flow_tool" now > "/results/$role-delay-raised.txt"
       tc -s qdisc show dev eth0 > "/results/$role-qdisc-raised.txt"
-      sleep 30
+      "$flow_tool" wait "/results/$role-delay-raised.txt" 30
       tc qdisc change dev eth0 root handle 10: netem delay 5ms rate 20mbit limit 10000
-      date +%s > "/results/$role-delay-restored.txt"
+      "$flow_tool" now > "/results/$role-delay-restored.txt"
       tc -s qdisc show dev eth0 > "/results/$role-qdisc-restored.txt"
     ) &
     ;;
@@ -119,21 +135,25 @@ case "$scenario" in
     ;;
 esac
 tc -s qdisc show dev eth0 > "/results/$role-qdisc-initial.txt"
+if [ "$observe" = true ]; then
+  touch "/results/$role-observations-started"
+  sh /test/observe.sh "$role" /results &
+  observer=$!
+fi
 
 case "$scenario" in
   native-capacity-change*|tcp-multipath-capacity-change*)
     (
-      while [ ! -f /results/flow-start.txt ]; do sleep 0.1; done
-      sleep 5
+      "$flow_tool" wait /results/client-flow-start.txt 5
       tc qdisc change dev eth0 root handle 1: tbf rate 32kbit burst 4096 latency 1s
       tc qdisc change dev eth0 parent 1:1 handle 10: netem delay 100ms 20ms loss 0.2% limit 8
-      date +%s > "/results/$role-rate-dropped.txt"
-      sleep 7
+      "$flow_tool" now > "/results/$role-rate-dropped.txt"
+      "$flow_tool" wait "/results/$role-rate-dropped.txt" 7
       tc -s qdisc show dev eth0 > "/results/$role-qdisc-limited.txt"
       tc qdisc change dev eth0 root handle 1: tbf rate 1gbit burst 65536 latency 1s
       tc qdisc change dev eth0 parent 1:1 handle 10: netem delay 0ms loss 0% limit 10000
       tc -s qdisc show dev eth0 > "/results/$role-qdisc-restored.txt"
-      date +%s > "/results/$role-rate-restored.txt"
+      "$flow_tool" now > "/results/$role-rate-restored.txt"
     ) &
     ;;
 esac
@@ -142,8 +162,19 @@ if [ "$role" = server ]; then
   iperf3 --version > /results/iperf-version.txt
   uname -a > /results/kernel.txt
   case "$scenario" in
-    *-rtt-step*|*-capacity-change*) iperf3 -s -J > /results/iperf-server.log 2>&1 & ;;
-    *) iperf3 -s > /results/iperf-server.log 2>&1 & ;;
+    *-rtt-step*|*-capacity-change*|tcp-asymmetric-stall*|*-stall|*-outage|*-roam|*-prohibit|*-blackhole)
+      (
+        flow_status=0
+        set -- -s -1
+        case "$scenario" in
+          *-rtt-step*|*-capacity-change*|tcp-asymmetric-stall*) set -- "$@" -i 0.2 ;;
+        esac
+        "$flow_tool" run /results server "$@" > /results/server-flow.json || flow_status=$?
+        printf '%s\n' "$flow_status" > /results/server-flow-exit.txt
+        touch /results/server-flow-done.txt
+      ) &
+      ;;
+    *) iperf3 -s --forceflush > /results/iperf-server.log 2>&1 & ;;
   esac
   if [ "${WIREHOP_TEST_LATENCY:-false}" = true ]; then
     latency_address=$local_ip:5202
@@ -153,8 +184,7 @@ if [ "$role" = server ]; then
   case "$scheme:$scenario" in
     native:*|forward:*)
       touch /results/ready
-      wait
-      exit
+      while :; do sleep 3600; done
       ;;
     tls:*|wss:*|*:tcp-mixed)
       openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=wirehop.test \
@@ -236,48 +266,52 @@ fi
 case "$scenario" in
   tcp-asymmetric-stall*)
     (
-      sleep 5
+      "$flow_tool" wait /results/client-flow-start.txt 5
       tc qdisc replace dev eth0 parent 1:1 handle 10: netem loss 100%
-      sleep 4
+      "$flow_tool" now > /results/path-dropped.txt
+      "$flow_tool" wait /results/path-dropped.txt 4
       tc qdisc replace dev eth0 parent 1:1 handle 10: netem delay 5ms rate 100mbit limit 1000
-      date +%s > /results/path-recovered.txt
+      "$flow_tool" now > /results/path-recovered.txt
     ) &
     ;;
   *-stall|*-outage)
     outage=4
     if [ "${scenario##*-}" = outage ]; then outage=12; fi
     (
-      sleep 5
+      "$flow_tool" wait /results/client-flow-start.txt 5
       tc qdisc replace dev eth0 root netem loss 100%
-      sleep "$outage"
+      "$flow_tool" now > /results/path-dropped.txt
+      "$flow_tool" wait /results/path-dropped.txt "$outage"
       tc qdisc del dev eth0 root
-      date +%s > /results/path-recovered.txt
+      "$flow_tool" now > /results/path-recovered.txt
     ) &
     ;;
   *-roam)
     (
-      sleep 5
+      "$flow_tool" wait /results/client-flow-start.txt 5
       original=$(ip -o -4 addr show dev eth0 | awk '{print $4}')
       prefix=${original##*/}
       address=${original%/*}
       replacement=${address%.*}.250
       ip addr del "$original" dev eth0
+      "$flow_tool" now > /results/path-dropped.txt
       ip addr add "$replacement/$prefix" dev eth0
       ip -o -4 addr show dev eth0 > /results/changed-address.txt
-      date +%s > /results/path-recovered.txt
+      "$flow_tool" now > /results/path-recovered.txt
     ) &
     ;;
 esac
 case "$scenario" in
   forward-prohibit|forward-blackhole)
     (
-      sleep 5
+      "$flow_tool" wait /results/client-flow-start.txt 5
       ip route add "${scenario#forward-}" "$WIREHOP_TEST_SERVER/32" table 100
       ip rule add pref 100 to "$WIREHOP_TEST_SERVER/32" lookup 100
-      sleep 1
+      "$flow_tool" now > /results/route-dropped.txt
+      "$flow_tool" wait /results/route-dropped.txt 1
       ip rule del pref 100 to "$WIREHOP_TEST_SERVER/32" lookup 100
       ip route flush table 100
-      date +%s > /results/route-recovered.txt
+      "$flow_tool" now > /results/route-recovered.txt
     ) &
     ;;
 esac
@@ -288,10 +322,12 @@ case "$scenario" in
 esac
 case "$scenario" in
   *-udp) set -- -u -b 20M -l 1200 ;;
-  *-capacity-change*) set -- "$@" -b 20M -l 16K --get-server-output ;;
-  *-rtt-step*) set -- "$@" --get-server-output ;;
+  *-capacity-change*) set -- "$@" -b 20M -l 16K ;;
+  *-slow32|*-slow64|*-slow128) set -- "$@" -l 16K ;;
 esac
-date +%s > /results/flow-start.txt
+case "$scenario" in
+  *-rtt-step*|*-capacity-change*|tcp-asymmetric-stall*) set -- "$@" -i 0.2 ;;
+esac
 tc -s qdisc show dev eth0 > /results/client-qdisc-before.txt
 nstat -az > /results/client-before.txt
 ss -u -a -m > /results/client-sockets.txt
@@ -306,7 +342,8 @@ if [ "${WIREHOP_TEST_LATENCY:-false}" = true ]; then
   latency_process=$!
 fi
 status=0
-timeout "$((duration + 60))" iperf3 -c "$remote_ip" -t "$duration" -J "$@" > /results/flow.json || status=$?
+timeout "$((duration + 60))" "$flow_tool" run /results client -c "$remote_ip" -t "$duration" "$@" \
+  > /results/flow.json || status=$?
 if [ -n "$latency_process" ]; then wait "$latency_process" || status=$?; fi
 touch /results/flow-done.txt
 if [ -n "$observer" ]; then wait "$observer"; fi

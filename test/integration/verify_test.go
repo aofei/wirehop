@@ -31,6 +31,15 @@ func TestVerifyRTTStep(t *testing.T) {
 				}
 			}},
 		{name: "ThresholdBoundary", raised: 250_000, restored: 250_000},
+		{name: "ThresholdBoundaryWithTimerJitter", raised: 250_000, restored: 250_000,
+			mutate: func(_ *testing.T, _ string, flow *flowResult) {
+				shiftReceiverIntervals(flow.ServerOutput, 0.000043)
+			}},
+		{name: "ThresholdBoundaryWithRoundoff", raised: 250_000, restored: 250_000,
+			mutate: func(_ *testing.T, _ string, flow *flowResult) {
+				shiftReceiverIntervals(flow.ServerOutput, 0.000027)
+			}},
+		{name: "OneByteBelowThreshold", raised: 249_999, restored: 250_000, wantErr: true},
 		{name: "RaisedRTTBelowThreshold", raised: 249_000, restored: 1_000_000, wantErr: true},
 		{name: "RestoredRTTBelowThreshold", raised: 1_000_000, restored: 249_000, wantErr: true},
 		{name: "NoDeliveryDuringRaisedRTT", restored: 1_000_000, wantErr: true},
@@ -52,7 +61,7 @@ func TestVerifyRTTStep(t *testing.T) {
 		{name: "ReceiverError", raised: 1_000_000, restored: 1_000_000, wantErr: true,
 			mutate: func(_ *testing.T, _ string, flow *flowResult) { flow.ServerOutput.Error = "interrupted" }},
 		{name: "UnknownReceiverStart", raised: 1_000_000, restored: 1_000_000, wantErr: true,
-			mutate: func(_ *testing.T, _ string, flow *flowResult) { flow.ServerOutput.Start.Timestamp.Seconds = 0 }},
+			mutate: func(_ *testing.T, _ string, flow *flowResult) { flow.ServerOutput.Started = 0 }},
 		{name: "UnknownIntervalDirection", raised: 1_000_000, restored: 1_000_000, wantErr: true,
 			mutate: func(_ *testing.T, _ string, flow *flowResult) { flow.ServerOutput.Intervals[30].Sum.Sender = nil }},
 		{name: "ServerSenderIntervals", raised: 1_000_000, restored: 1_000_000, wantErr: true,
@@ -120,16 +129,17 @@ func TestVerifyRTTStep(t *testing.T) {
 				intervals = append(intervals, fmt.Sprintf(`{"sum":{"start":%d,"end":%d,"bytes":%d,"sender":false}}`,
 					index, index+1, bytes))
 			}
-			encoded := fmt.Sprintf(`{"server_output_json":{"start":{"timestamp":{"timesecs":1700000000}},"intervals":[%s]}}`,
+			encoded := fmt.Sprintf(`{"started_boottime":1700000000,"intervals":[%s]}`,
 				strings.Join(intervals, ","))
-			var flow flowResult
-			if err := json.Unmarshal([]byte(encoded), &flow); err != nil {
+			var receiver flowResult
+			if err := json.Unmarshal([]byte(encoded), &receiver); err != nil {
 				t.Fatal(err)
 			}
+			flow := flowResult{Started: receiver.Started, ServerOutput: &receiver}
 			if tt.mutate != nil {
 				tt.mutate(t, directory, &flow)
 			}
-			if err := verifyRTTStep(directory, "tcp-rtt-step", flow); (err != nil) != tt.wantErr {
+			if _, err := verifyRTTStep(directory, "tcp-rtt-step", flow); (err != nil) != tt.wantErr {
 				t.Fatalf("verifyRTTStep() = %v, want error %t", err, tt.wantErr)
 			}
 		})
@@ -178,10 +188,10 @@ func TestVerifyRTTStepDirections(t *testing.T) {
 			mutate: func(flow *flowResult) { flow.Intervals[30].Reverse.Sender = nil }},
 		{name: "ReverseIntervalsTruncated", scenario: "tcp-rtt-step-bidir", wantErr: true,
 			mutate: func(flow *flowResult) { flow.Intervals = flow.Intervals[:53] }},
-		{name: "SeparateReceiverEpochs", scenario: "tcp-rtt-step-bidir",
-			mutate: func(flow *flowResult) { flow.Start.Timestamp.Seconds-- }},
-		{name: "InvalidReverseReceiverEpoch", scenario: "tcp-rtt-step-bidir", wantErr: true,
-			mutate: func(flow *flowResult) { flow.Start.Timestamp.Seconds -= 5 }},
+		{name: "SeparateReceiverStarts", scenario: "tcp-rtt-step-bidir",
+			mutate: func(flow *flowResult) { flow.Started-- }},
+		{name: "InvalidReverseReceiverStart", scenario: "tcp-rtt-step-bidir", wantErr: true,
+			mutate: func(flow *flowResult) { flow.Started -= 5 }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			directory := t.TempDir()
@@ -198,7 +208,7 @@ func TestVerifyRTTStepDirections(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&flow)
 			}
-			if err := verifyRTTStep(directory, tt.scenario, flow); (err != nil) != tt.wantErr {
+			if _, err := verifyRTTStep(directory, tt.scenario, flow); (err != nil) != tt.wantErr {
 				t.Fatalf("verifyRTTStep(%q) = %v, want error %t", tt.scenario, err, tt.wantErr)
 			}
 		})
@@ -207,9 +217,11 @@ func TestVerifyRTTStepDirections(t *testing.T) {
 
 func rttStepDirectionalFlow() flowResult {
 	var flow flowResult
-	flow.Start.Timestamp.Seconds = 1_700_000_000
+	flow.Started = 1_700_000_000
+	flow.Start.Started = flow.Started
 	flow.ServerOutput = new(flowResult)
-	flow.ServerOutput.Start.Timestamp.Seconds = flow.Start.Timestamp.Seconds
+	flow.ServerOutput.Started = flow.Started
+	flow.ServerOutput.Start.Started = flow.Started
 	sender, receiver := true, false
 	for index := range 60 {
 		sent := flowInterval{Start: float64(index), End: float64(index + 1), Bytes: 1_000_000, Sender: &sender}
@@ -282,23 +294,23 @@ func writeRTTStepEvidence(t *testing.T, directory string) {
 func TestVerifyCapacityChangeFault(t *testing.T) {
 	for _, tt := range []struct {
 		name, role, dropped, restored, missing, wantErr string
-		missingEpoch                                    bool
+		missingStart                                    bool
 	}{
 		{name: "Scheduled"},
-		{name: "EarliestRoundedMarkers", dropped: "1700000004", restored: "1700000011"},
-		{name: "LatestRoundedMarkers", dropped: "1700000007", restored: "1700000014"},
-		{name: "RoundedShortDuration", restored: "1700000011"},
-		{name: "RoundedLongDuration", dropped: "1700000004"},
-		{name: "MissingEpoch", missingEpoch: true, wantErr: "missing flow timestamp"},
+		{name: "EarliestAllowedMarkers", dropped: "1700000004", restored: "1700000011"},
+		{name: "LatestAllowedMarkers", dropped: "1700000006", restored: "1700000013"},
+		{name: "MinimumFaultDuration", restored: "1700000011"},
+		{name: "MaximumFaultDuration", dropped: "1700000004"},
+		{name: "MissingStart", missingStart: true, wantErr: "missing flow timestamp"},
 		{name: "MissingClientMarker", missing: "client-rate-dropped.txt", wantErr: "client-rate-dropped.txt"},
 		{name: "MissingServerMarker", missing: "server-rate-restored.txt", wantErr: "server-rate-restored.txt"},
 		{name: "InvalidMarker", dropped: "not a timestamp", wantErr: "invalid syntax"},
-		{name: "FaultTooEarly", dropped: "1700000003", wantErr: "changed at 3 seconds"},
-		{name: "FaultTooLate", dropped: "1700000008", wantErr: "changed at 8 seconds"},
-		{name: "ClientRestoredTooLate", restored: "1700000038", wantErr: "changed at 38 seconds"},
+		{name: "FaultTooEarly", dropped: "1700000003", wantErr: "changed at 3.000000 seconds"},
+		{name: "FaultTooLate", dropped: "1700000008", wantErr: "changed at 8.000000 seconds"},
+		{name: "ClientRestoredTooLate", restored: "1700000038", wantErr: "changed at 38.000000 seconds"},
 		{name: "ServerRestoredTooLate", role: "server", restored: "1700000038", wantErr: "server-rate-restored.txt"},
-		{name: "FaultTooShort", dropped: "1700000007", restored: "1700000011", wantErr: "fault lasted 4 seconds"},
-		{name: "FaultTooLong", dropped: "1700000004", restored: "1700000014", wantErr: "fault lasted 10 seconds"},
+		{name: "FaultTooShort", dropped: "1700000006", restored: "1700000011", wantErr: "fault lasted 5.000000 seconds"},
+		{name: "FaultTooLong", dropped: "1700000004", restored: "1700000013", wantErr: "fault lasted 9.000000 seconds"},
 		{name: "MissingQueueEvidence", missing: "server-qdisc-restored.txt", wantErr: "server-qdisc-restored.txt"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -320,8 +332,8 @@ func TestVerifyCapacityChangeFault(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			started := int64(1700000000)
-			if tt.missingEpoch {
+			started := float64(1700000000)
+			if tt.missingStart {
 				started = 0
 			}
 			err := verifyCapacityChangeFault(directory, started)
@@ -433,7 +445,7 @@ func writeCapacityChangeEvidence(t *testing.T, directory string) {
 	}
 }
 
-func TestVerifyCapacityChange(t *testing.T) {
+func TestVerifyRecoveryCapacityChange(t *testing.T) {
 	for _, tt := range []struct {
 		name, scenario string
 		mutate         func(*flowResult)
@@ -449,8 +461,8 @@ func TestVerifyCapacityChange(t *testing.T) {
 			mutate: func(flow *flowResult) { flow.ServerOutput = nil }},
 		{name: "ReceiverError", wantErr: "missing completed receiver",
 			mutate: func(flow *flowResult) { flow.ServerOutput.Error = "interrupted" }},
-		{name: "MissingReceiverEpoch", wantErr: "missing completed receiver",
-			mutate: func(flow *flowResult) { flow.ServerOutput.Start.Timestamp.Seconds = 0 }},
+		{name: "MissingReceiverStart", wantErr: "missing completed receiver",
+			mutate: func(flow *flowResult) { flow.ServerOutput.Started = 0 }},
 		{name: "SenderBufferedWithoutDelivery", wantErr: "require at least 25 percent",
 			mutate: func(flow *flowResult) {
 				for index := 35; index < 40; index++ {
@@ -525,7 +537,7 @@ func TestVerifyCapacityChange(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&flow)
 			}
-			err := verifyCapacityChange(tt.scenario, flow)
+			_, err := verifyRecovery(tt.scenario, flow, 40, 5e6)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -537,7 +549,7 @@ func TestVerifyCapacityChange(t *testing.T) {
 	}
 }
 
-func TestVerifyThroughputRecovery(t *testing.T) {
+func TestVerifyRecovery(t *testing.T) {
 	for _, tt := range []struct {
 		name          string
 		duration      int
@@ -567,7 +579,8 @@ func TestVerifyThroughputRecovery(t *testing.T) {
 		{name: "LongReverseStalled", duration: 40, intervals: 40, recovered: 100, reverse: 1, bidirectional: true, wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			var flow flowResult
+			flow := flowResult{Started: 1_700_000_000}
+			receiver := false
 			recoveryStart := tt.duration - 5
 			if tt.earlyRecovery {
 				recoveryStart = 15
@@ -577,8 +590,8 @@ func TestVerifyThroughputRecovery(t *testing.T) {
 			}
 			for index := range tt.intervals {
 				interval := flowIntervalResult{
-					Sum:     flowInterval{Start: float64(index), End: float64(index + 1)},
-					Reverse: flowInterval{Start: float64(index), End: float64(index + 1)},
+					Sum:     flowInterval{Start: float64(index), End: float64(index + 1), Sender: &receiver},
+					Reverse: flowInterval{Start: float64(index), End: float64(index + 1), Sender: &receiver},
 				}
 				if index < 4 {
 					interval.Sum.Bytes = 100
@@ -590,7 +603,13 @@ func TestVerifyThroughputRecovery(t *testing.T) {
 				}
 				flow.Intervals = append(flow.Intervals, interval)
 			}
-			if err := verifyThroughputRecovery(flow, tt.bidirectional, float64(tt.duration), 0); (err != nil) != tt.wantErr {
+			server := flow
+			flow.ServerOutput = &server
+			scenario := "tcp-asymmetric-stall"
+			if tt.bidirectional {
+				scenario += "-bidir"
+			}
+			if _, err := verifyRecovery(scenario, flow, float64(tt.duration), 0); (err != nil) != tt.wantErr {
 				t.Fatalf("recovery validation = %v, want error %t", err, tt.wantErr)
 			}
 		})

@@ -53,9 +53,10 @@ WIREHOP_TEST_DURATION=60 WIREHOP_TEST_OBSERVE=true \
 ```
 
 `WIREHOP_TEST_DURATION` accepts an integer of at least 20 seconds. `WIREHOP_TEST_OBSERVE=true` records established
-socket details, socket memory, interface counters, and container CPU counters every 250 milliseconds on both endpoints
-and the router. Environment files preserve kernel TCP buffer limits, congestion control, interface details, and qdisc
-settings. These observations consume CPU and must be enabled for both candidates in a comparison.
+socket details, socket memory, interface counters, container and VM CPU counters, and available CPU pressure data every
+250 milliseconds on both endpoints and the router. Sampling includes endpoint startup. Environment files preserve kernel
+TCP buffer limits, congestion control, CPU quotas, interface details, and qdisc settings. These observations consume CPU
+and must be enabled for both candidates in a comparison.
 
 `WIREHOP_TEST_LATENCY_BINARY` enables a separate 64-byte UDP echo flow inside WireGuard. Its sender runs independently
 of replies at a requested 10-millisecond cadence, so missing or delayed replies do not reduce the offered probe rate.

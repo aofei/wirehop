@@ -3,7 +3,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,15 +16,14 @@ import (
 
 // flowResult contains the iperf3 fields needed to distinguish completed transfers from nominal test completion.
 type flowResult struct {
-	Error     string
-	Intervals []flowIntervalResult
-	Start     struct {
-		Timestamp struct {
-			Seconds int64 `json:"timesecs"`
-		}
+	Error        string
+	Intervals    []flowIntervalResult
+	Started      float64     `json:"started_boottime"`
+	ServerOutput *flowResult `json:"-"`
+	Start        struct {
+		Started float64 `json:"started_boottime"`
 	}
-	ServerOutput *flowResult `json:"server_output_json"`
-	End          struct {
+	End struct {
 		Received struct {
 			Bytes         uint64
 			BitsPerSecond float64 `json:"bits_per_second"`
@@ -51,6 +52,35 @@ type flowInterval struct {
 	Sender *bool
 }
 
+// flowDirection selects interval evidence from the endpoint receiving one direction of traffic.
+type flowDirection struct {
+	name     string
+	receiver *flowResult
+	reverse  bool
+}
+
+// throughputWindow identifies a phase relative to the client's shared measurement origin.
+type throughputWindow struct {
+	name       string
+	start, end float64
+}
+
+// throughputMeasurement preserves estimated delivery and coverage for one explicitly bounded phase.
+type throughputMeasurement struct {
+	Direction     string   `json:"direction"`
+	Phase         string   `json:"phase"`
+	Start         float64  `json:"start_seconds"`
+	End           float64  `json:"end_seconds"`
+	Covered       float64  `json:"covered_seconds"`
+	Bytes         float64  `json:"estimated_received_bytes"`
+	BitsPerSecond float64  `json:"bits_per_second"`
+	Fraction      *float64 `json:"baseline_fraction,omitempty"`
+	Status        string   `json:"status"`
+}
+
+// throughputRoundoff permits float64 summation noise at exact throughput-ratio boundaries.
+const throughputRoundoff = 1e-12
+
 // rttStepQdiscPattern extracts the configured root netem and its cumulative traffic and drop counters.
 var rttStepQdiscPattern = regexp.MustCompile(`(?m)^qdisc netem 10: root ([^\n]*)\n Sent ([0-9]+) bytes [0-9]+ pkt \(dropped ([0-9]+),`)
 
@@ -69,56 +99,30 @@ func main() {
 	failed := false
 	for _, scenario := range os.Args[2:] {
 		directory := filepath.Join(os.Args[1], scenario)
-		data, err := os.ReadFile(filepath.Join(directory, "flow.json"))
-		var flow flowResult
-		if err == nil {
-			err = json.Unmarshal(data, &flow)
-		}
-		if err == nil && (flow.Error != "" || flow.End.Received.Bytes == 0) {
-			err = fmt.Errorf("transfer did not complete with data: %s", flow.Error)
-		}
-		if err == nil && strings.HasSuffix(scenario, "-bidir") && flow.End.ReverseReceived.Bytes == 0 {
-			err = fmt.Errorf("reverse TCP flow made no progress")
-		}
-		if err == nil && strings.HasSuffix(scenario, "-rekey") {
-			err = verifyRekey(directory)
-		}
+		flow, measurements, err := verifyResult(directory, scenario)
 		udp := strings.HasSuffix(scenario, "-udp")
-		if err == nil && udp && (flow.End.Sent.Bytes == 0 || flow.End.Received.Bytes < flow.End.Sent.Bytes-flow.End.Sent.Bytes/20) {
-			err = fmt.Errorf("UDP delivery lost more than five percent of the controlled offered load")
-		}
-		if err == nil && (strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") ||
-			strings.HasPrefix(scenario, "tcp-asymmetric-stall") || strings.HasSuffix(scenario, "-stall") ||
-			strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam")) {
-			marker := "path-recovered.txt"
-			if strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") {
-				marker = "route-recovered.txt"
+		for _, measurement := range measurements {
+			reference := ""
+			if measurement.Fraction != nil {
+				reference = fmt.Sprintf(" baseline=%.4f%%", *measurement.Fraction*100)
 			}
-			_, err = os.Stat(filepath.Join(directory, marker))
-			if err == nil && (len(flow.Intervals) == 0 || flow.Intervals[len(flow.Intervals)-1].Sum.Bytes == 0) {
-				err = fmt.Errorf("TCP flow made no progress in the final interval after path recovery")
-			}
+			fmt.Printf("%s: %s %s window=[%.6f,%.6f] coverage=%.6fs receiver=%.6f Mbit/s%s status=%s\n",
+				scenario, measurement.Direction, measurement.Phase, measurement.Start, measurement.End,
+				measurement.Covered, measurement.BitsPerSecond/1e6, reference, measurement.Status)
 		}
-		capacityChange := strings.HasPrefix(scenario, "native-capacity-change") ||
-			strings.HasPrefix(scenario, "tcp-multipath-capacity-change")
-		if err == nil && capacityChange {
-			err = verifyCapacityChangeFault(directory, flow.Start.Timestamp.Seconds)
+		report := struct {
+			Scenario     string                  `json:"scenario"`
+			Measurements []throughputMeasurement `json:"measurements"`
+			Error        string                  `json:"error,omitempty"`
+		}{Scenario: scenario, Measurements: measurements}
+		if err != nil {
+			report.Error = err.Error()
 		}
-		if err == nil && capacityChange {
-			err = verifyCapacityChange(scenario, flow)
+		encoded, reportError := json.MarshalIndent(report, "", "  ")
+		if reportError == nil {
+			reportError = os.WriteFile(filepath.Join(directory, "verification.json"), append(encoded, '\n'), 0644)
 		}
-		if err == nil && strings.HasPrefix(scenario, "tcp-asymmetric-stall") {
-			err = verifyThroughputRecovery(flow, strings.HasSuffix(scenario, "-bidir"), 20, 0)
-		}
-		if err == nil && strings.Contains(scenario, "-rtt-step") {
-			err = verifyRTTStep(directory, scenario, flow)
-		}
-		if err == nil {
-			err = verifyCarrier(directory, scenario)
-		}
-		if err == nil && strings.HasSuffix(scenario, "-fwmark") {
-			err = verifyRouteExclusion(directory)
-		}
+		err = errors.Join(err, reportError)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", scenario, err)
 			failed = true
@@ -137,27 +141,176 @@ func main() {
 	}
 }
 
-// verifyRTTStep checks each exercised direction using intervals measured at its receiving endpoint.
-func verifyRTTStep(directory, scenario string, flow flowResult) error {
+// verifyResult loads endpoint evidence and process results without hiding independent carrier failures.
+func verifyResult(directory, scenario string) (flowResult, []throughputMeasurement, error) {
+	flow, readError := loadFlow(filepath.Join(directory, "flow.json"))
+	monitored := strings.Contains(scenario, "-rtt-step") || strings.Contains(scenario, "-capacity-change") ||
+		strings.HasPrefix(scenario, "tcp-asymmetric-stall") || hasPathFault(scenario)
+	failures := []error{readError}
+	if monitored {
+		server, err := loadFlow(filepath.Join(directory, "server-flow.json"))
+		failures = append(failures, err)
+		if err == nil {
+			flow.ServerOutput = &server
+			if !validTimestamp(server.Started) {
+				failures = append(failures, fmt.Errorf("server-flow.json: missing valid data-start timestamp"))
+			}
+			bytes := server.End.Received.Bytes
+			if strings.HasSuffix(scenario, "-reverse") {
+				bytes = server.End.Sent.Bytes
+			}
+			if server.Error != "" || bytes == 0 {
+				failures = append(failures, fmt.Errorf("server-flow.json: transfer did not complete with data: %s", server.Error))
+			}
+		}
+	}
+	var measurements []throughputMeasurement
+	if readError == nil {
+		var err error
+		measurements, err = verifyScenario(directory, scenario, flow)
+		failures = append(failures, err)
+	} else {
+		failures = append(failures, verifyCarrier(directory, scenario))
+		if strings.HasSuffix(scenario, "-fwmark") {
+			failures = append(failures, verifyRouteExclusion(directory))
+		}
+	}
+	exitFiles := []string{"client-exit.txt"}
+	if monitored {
+		exitFiles = append(exitFiles, "server-flow-exit.txt")
+	}
+	for _, name := range exitFiles {
+		data, err := os.ReadFile(filepath.Join(directory, name))
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		status, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", name, err))
+		} else if status != 0 {
+			failures = append(failures, fmt.Errorf("%s records process exit %d", name, status))
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "harness-error.txt"))
+	if err == nil {
+		failures = append(failures, fmt.Errorf("test harness: %s", strings.TrimSpace(string(data))))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		failures = append(failures, err)
+	}
+	return flow, measurements, errors.Join(failures...)
+}
+
+// loadFlow decodes a result and requires producer-clock provenance unless the producer reported failure.
+func loadFlow(path string) (flowResult, error) {
+	var flow flowResult
+	data, err := os.ReadFile(path)
+	if err == nil {
+		err = json.Unmarshal(data, &flow)
+	}
+	if err == nil && flow.Error == "" && (!validTimestamp(flow.Started) || flow.Started != flow.Start.Started) {
+		err = fmt.Errorf("missing or inconsistent producer measurement origin")
+	}
+	if err != nil {
+		return flow, fmt.Errorf("%s: %w", filepath.Base(path), err)
+	}
+	return flow, nil
+}
+
+// verifyScenario checks independent assertions even when another assertion has already failed.
+func verifyScenario(directory, scenario string, flow flowResult) ([]throughputMeasurement, error) {
+	var failures []error
+	var measurements []throughputMeasurement
+	if !validTimestamp(flow.Started) {
+		failures = append(failures, fmt.Errorf("missing valid client data-start timestamp"))
+	}
+	if flow.Error != "" || flow.End.Received.Bytes == 0 {
+		failures = append(failures, fmt.Errorf("transfer did not complete with data: %s", flow.Error))
+	}
+	if strings.HasSuffix(scenario, "-bidir") && flow.End.ReverseReceived.Bytes == 0 {
+		failures = append(failures, fmt.Errorf("reverse TCP flow made no progress"))
+	}
+	if strings.HasSuffix(scenario, "-rekey") {
+		failures = append(failures, verifyRekey(directory))
+	}
+	if strings.HasSuffix(scenario, "-udp") &&
+		(flow.End.Sent.Bytes == 0 || flow.End.Received.Bytes < flow.End.Sent.Bytes-flow.End.Sent.Bytes/20) {
+		failures = append(failures, fmt.Errorf("UDP delivery lost more than five percent of the controlled offered load"))
+	}
+	if strings.HasPrefix(scenario, "tcp-asymmetric-stall") {
+		measured, err := verifyRecovery(scenario, flow, 20, 0)
+		measurements = append(measurements, measured...)
+		failures = append(failures, err)
+		failures = append(failures, verifyFaultTimes(directory, flow.Started, "path", 5, 9))
+	} else if hasPathFault(scenario) {
+		prefix, recovered, duration := "path", 9.0, 20.0
+		if strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") {
+			prefix, recovered = "route", 6
+		} else if strings.HasSuffix(scenario, "-outage") {
+			recovered, duration = 17, 40
+		} else if strings.HasSuffix(scenario, "-roam") {
+			recovered, duration = 5, 40
+		}
+		failures = append(failures, verifyFaultTimes(directory, flow.Started, prefix, 5, recovered))
+		measured, err := verifyProgress(scenario, flow, duration)
+		measurements = append(measurements, measured...)
+		failures = append(failures, err)
+	}
+	if strings.Contains(scenario, "-capacity-change") {
+		failures = append(failures, verifyCapacityChangeFault(directory, flow.Started))
+		measured, err := verifyRecovery(scenario, flow, 40, 5e6)
+		measurements = append(measurements, measured...)
+		failures = append(failures, err)
+	}
+	if strings.Contains(scenario, "-rtt-step") {
+		measured, err := verifyRTTStep(directory, scenario, flow)
+		measurements = append(measurements, measured...)
+		failures = append(failures, err)
+	}
+	failures = append(failures, verifyCarrier(directory, scenario))
+	if strings.HasSuffix(scenario, "-fwmark") {
+		failures = append(failures, verifyRouteExclusion(directory))
+	}
+	return measurements, errors.Join(failures...)
+}
+
+// receiverDirections selects the receiver for every exercised direction, including reverse-only ordinary sums.
+func receiverDirections(scenario string, flow flowResult) []flowDirection {
+	var directions []flowDirection
 	if !strings.HasSuffix(scenario, "-reverse") {
-		if err := verifyRTTStepDirection(directory, flow.ServerOutput, false); err != nil {
-			return fmt.Errorf("forward direction: %w", err)
+		directions = append(directions, flowDirection{name: "forward", receiver: flow.ServerOutput})
+	}
+	if strings.HasSuffix(scenario, "-reverse") || strings.HasSuffix(scenario, "-bidir") {
+		directions = append(directions, flowDirection{
+			name: "reverse", receiver: &flow, reverse: strings.HasSuffix(scenario, "-bidir"),
+		})
+	}
+	return directions
+}
+
+// verifyRTTStep checks each exercised direction using intervals measured at its receiving endpoint.
+func verifyRTTStep(directory, scenario string, flow flowResult) ([]throughputMeasurement, error) {
+	var measurements []throughputMeasurement
+	var failures []error
+	for _, direction := range receiverDirections(scenario, flow) {
+		measured, err := verifyRTTStepDirection(directory, direction.receiver, flow.Started, direction.reverse)
+		for index := range measured {
+			measured[index].Direction = direction.name
+		}
+		measurements = append(measurements, measured...)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s direction: %w", direction.name, err))
 		}
 	}
-	bidirectional := strings.HasSuffix(scenario, "-bidir")
-	if bidirectional || strings.HasSuffix(scenario, "-reverse") {
-		if err := verifyRTTStepDirection(directory, &flow, bidirectional); err != nil {
-			return fmt.Errorf("reverse direction: %w", err)
-		}
-	}
-	return nil
+	return measurements, errors.Join(failures...)
 }
 
 // verifyRTTStepDirection checks receiver throughput after a persistent RTT increase and its reversal at fixed capacity.
 // Reverse intervals are selected only from the client's bidirectional result. Reverse-only flows use their ordinary sum.
-func verifyRTTStepDirection(directory string, receiver *flowResult, reverseIntervals bool) error {
-	if receiver == nil || receiver.Error != "" || receiver.Start.Timestamp.Seconds == 0 {
-		return fmt.Errorf("missing completed receiver interval evidence")
+func verifyRTTStepDirection(directory string, receiver *flowResult, origin float64, reverseIntervals bool) ([]throughputMeasurement, error) {
+	samples, err := receiverIntervals(receiver, origin, reverseIntervals)
+	if err != nil {
+		return nil, err
 	}
 	var raised, restored [2]float64
 	for index, role := range []string{"client", "server"} {
@@ -170,70 +323,208 @@ func verifyRTTStepDirection(directory string, receiver *flowResult, reverseInter
 			{name: "restored", at: &restored[index], want: 40},
 		} {
 			name := role + "-delay-" + change.name + ".txt"
-			data, err := os.ReadFile(filepath.Join(directory, name))
+			at, err := readTimestamp(filepath.Join(directory, name))
 			if err != nil {
-				return err
+				return nil, err
 			}
-			at, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-			if err != nil {
-				return fmt.Errorf("%s: %w", name, err)
+			*change.at = at - origin
+			if math.Abs(*change.at-change.want) > 1 {
+				return nil, fmt.Errorf("%s changed at %.6f seconds, expected %.0f +/- 1", name, *change.at, change.want)
 			}
-			*change.at = float64(at - receiver.Start.Timestamp.Seconds)
-			if *change.at < change.want-1 || *change.at > change.want+2 {
-				return fmt.Errorf("%s changed at %.0f seconds, expected approximately %.0f", name, *change.at, change.want)
-			}
+		}
+		if math.Abs(restored[index]-raised[index]-30) > 1 {
+			return nil, fmt.Errorf("%s RTT fault lasted %.6f seconds, expected 30 +/- 1", role, restored[index]-raised[index])
 		}
 		if err := verifyRTTStepQdiscs(directory, role); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	return measureThroughput(samples, []throughputWindow{
+		{name: "baseline", start: 2, end: min(raised[0], raised[1]) - 2},
+		{name: "raised RTT", start: max(raised[0], raised[1]) + 18, end: min(restored[0], restored[1]) - 2},
+		{name: "restored RTT", start: max(restored[0], restored[1]) + 10, end: 58},
+	}, 5e6)
+}
+
+// receiverIntervals validates receiver evidence and translates it to the client's measurement origin.
+func receiverIntervals(receiver *flowResult, origin float64, reverse bool) ([]flowInterval, error) {
+	if receiver == nil || receiver.Error != "" || !validTimestamp(receiver.Started) || !validTimestamp(origin) {
+		return nil, fmt.Errorf("missing completed receiver interval evidence")
+	}
+	samples := make([]flowInterval, 0, len(receiver.Intervals)+1)
+	offset := receiver.Started - origin
+	if offset > 0 {
+		// Iperf3 initializes counters before starting workers, so delivery before that origin is known to be zero.
+		samples = append(samples, flowInterval{End: offset, Sender: new(bool)})
 	}
 	previousEnd := 0.0
 	for _, interval := range receiver.Intervals {
 		sample := interval.Sum
-		if reverseIntervals {
+		if reverse {
 			sample = interval.Reverse
 		}
-		if sample.Sender == nil || *sample.Sender || sample.Start < previousEnd || sample.End <= sample.Start {
-			return fmt.Errorf("invalid receiver interval evidence")
+		if sample.Sender == nil || *sample.Sender || sample.Start < previousEnd || sample.End <= sample.Start ||
+			math.IsNaN(sample.Start) || math.IsInf(sample.Start, 0) || math.IsNaN(sample.End) || math.IsInf(sample.End, 0) {
+			return nil, fmt.Errorf("invalid receiver interval evidence")
 		}
 		previousEnd = sample.End
+		sample.Start += offset
+		sample.End += offset
+		samples = append(samples, sample)
 	}
-	var rates [3]float64
-	for index, window := range []struct {
-		name       string
-		start, end float64
+	return samples, nil
+}
+
+// measureThroughput estimates bytes by overlap, preserving zero-delivery intervals and the full window denominator.
+// Interpolation assumes a constant rate within each reporting interval. Missing time is invalid evidence, not idle time.
+func measureThroughput(samples []flowInterval, windows []throughputWindow, minimumBaseline float64) ([]throughputMeasurement, error) {
+	var measurements []throughputMeasurement
+	var failures []error
+	var baseline float64
+	baselineValid := false
+	for index, window := range windows {
+		measurement, err := measureWindow(samples, window)
+		if err != nil {
+			failures = append(failures, err)
+		} else {
+			if index == 0 {
+				baseline = measurement.BitsPerSecond
+				baselineValid = baseline > 0 && (minimumBaseline == 0 || baseline/minimumBaseline+throughputRoundoff >= 1)
+				if !baselineValid {
+					measurement.Status = "invalid"
+					failures = append(failures, fmt.Errorf("baseline receiver throughput is %.6f Mbit/s, require at least %.3f Mbit/s and positive delivery",
+						baseline/1e6, minimumBaseline/1e6))
+				}
+			}
+			if baseline > 0 {
+				fraction := measurement.BitsPerSecond / baseline
+				measurement.Fraction = &fraction
+			}
+			if index > 0 {
+				if !baselineValid {
+					measurement.Status = "invalid"
+				} else if *measurement.Fraction+throughputRoundoff < 0.25 {
+					measurement.Status = "below-threshold"
+					failures = append(failures, fmt.Errorf("%s receiver throughput is %.4f percent of baseline, require at least 25 percent",
+						window.name, *measurement.Fraction*100))
+				}
+			}
+		}
+		measurements = append(measurements, measurement)
+	}
+	return measurements, errors.Join(failures...)
+}
+
+// measureWindow integrates receiver delivery over one fully covered measurement window.
+func measureWindow(samples []flowInterval, window throughputWindow) (throughputMeasurement, error) {
+	measurement := throughputMeasurement{Phase: window.name, Start: window.start, End: window.end, Status: "pass"}
+	cursor := window.start
+	complete := window.end > window.start
+	for _, sample := range samples {
+		start, end := max(sample.Start, window.start), min(sample.End, window.end)
+		if end <= start {
+			continue
+		}
+		if start > cursor+1e-6 {
+			complete = false
+		}
+		measurement.Covered += end - start
+		measurement.Bytes += float64(sample.Bytes) * ((end - start) / (sample.End - sample.Start))
+		cursor = end
+	}
+	// Allow one serialized microsecond of timestamp rounding across the entire window.
+	if !complete || cursor < window.end-1e-6 || measurement.Covered < window.end-window.start-1e-6 {
+		measurement.Status = "invalid"
+		return measurement, fmt.Errorf("%s lacks complete receiver intervals: covered %.6f of %.6f seconds",
+			window.name, measurement.Covered, window.end-window.start)
+	}
+	measurement.BitsPerSecond = measurement.Bytes * 8 / (window.end - window.start)
+	return measurement, nil
+}
+
+// hasPathFault identifies ordinary interruption, address-change, and route-failure scenarios.
+func hasPathFault(scenario string) bool {
+	return strings.HasSuffix(scenario, "-prohibit") || strings.HasSuffix(scenario, "-blackhole") ||
+		strings.HasSuffix(scenario, "-stall") || strings.HasSuffix(scenario, "-outage") || strings.HasSuffix(scenario, "-roam")
+}
+
+// verifyProgress requires receiver delivery in the complete final second of each exercised direction.
+func verifyProgress(scenario string, flow flowResult, duration float64) ([]throughputMeasurement, error) {
+	var measurements []throughputMeasurement
+	var failures []error
+	for _, direction := range receiverDirections(scenario, flow) {
+		samples, err := receiverIntervals(direction.receiver, flow.Started, direction.reverse)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s direction: %w", direction.name, err))
+			continue
+		}
+		measurement, err := measureWindow(samples, throughputWindow{name: "final progress", start: duration - 1, end: duration})
+		measurement.Direction = direction.name
+		if err == nil && measurement.Bytes == 0 {
+			measurement.Status = "no-progress"
+			err = fmt.Errorf("no receiver progress in the final second after path recovery")
+		}
+		measurements = append(measurements, measurement)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s direction: %w", direction.name, err))
+		}
+	}
+	return measurements, errors.Join(failures...)
+}
+
+// readTimestamp reads an observed data-flow or fault event on the shared Linux boot clock.
+func readTimestamp(path string) (float64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	at, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", filepath.Base(path), err)
+	}
+	if !validTimestamp(at) {
+		return 0, fmt.Errorf("%s: invalid event timestamp", filepath.Base(path))
+	}
+	return at, nil
+}
+
+// validTimestamp identifies a finite, positive observation on the Linux boot clock.
+func validTimestamp(at float64) bool {
+	return at > 0 && !math.IsNaN(at) && !math.IsInf(at, 0)
+}
+
+// verifyFaultTimes requires both fault events to follow the actual client data-flow start within one second.
+func verifyFaultTimes(directory string, started float64, prefix string, dropped, recovered float64) error {
+	if !validTimestamp(started) {
+		return fmt.Errorf("missing flow timestamp for %s fault", prefix)
+	}
+	var failures []error
+	var observed [2]float64
+	for index, event := range []struct {
+		name string
+		want float64
 	}{
-		{name: "baseline", start: 2, end: min(raised[0], raised[1]) - 2},
-		{name: "raised RTT", start: max(raised[0], raised[1]) + 18, end: min(restored[0], restored[1]) - 2},
-		{name: "restored RTT", start: max(restored[0], restored[1]) + 10, end: 58},
+		{name: "dropped", want: dropped},
+		{name: "recovered", want: recovered},
 	} {
-		var bytes uint64
-		var seconds float64
-		for _, interval := range receiver.Intervals {
-			sample := interval.Sum
-			if reverseIntervals {
-				sample = interval.Reverse
-			}
-			if sample.Start >= window.start && sample.End <= window.end {
-				bytes += sample.Bytes
-				seconds += sample.End - sample.Start
-			}
+		name := prefix + "-" + event.name + ".txt"
+		at, err := readTimestamp(filepath.Join(directory, name))
+		if err != nil {
+			failures = append(failures, err)
+		} else if math.Abs(at-started-event.want) > 1 {
+			failures = append(failures, fmt.Errorf("%s changed at %.6f seconds, expected %.0f +/- 1",
+				name, at-started, event.want))
 		}
-		// Whole intervals can omit at most one second at either edge of a window.
-		if seconds < window.end-window.start-2.1 || bytes == 0 {
-			return fmt.Errorf("%s lacks complete useful receiver intervals", window.name)
-		}
-		rates[index] = float64(bytes) / seconds
-		if index == 0 && rates[0]*8 < 5e6 {
-			return fmt.Errorf("baseline receiver throughput is %.3f Mbit/s, require at least 5 Mbit/s on the 20 Mbit/s link",
-				rates[0]*8/1e6)
-		}
-		if index > 0 && rates[index] < rates[0]/4 {
-			return fmt.Errorf("%s receiver throughput is %.1f percent of baseline, require at least 25 percent",
-				window.name, rates[index]/rates[0]*100)
+		observed[index] = at
+	}
+	if len(failures) == 0 {
+		duration := observed[1] - observed[0]
+		if duration < 0 || math.Abs(duration-(recovered-dropped)) > 1 {
+			failures = append(failures, fmt.Errorf("%s fault lasted %.6f seconds, expected %.0f +/- 1",
+				prefix, duration, recovered-dropped))
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // verifyRTTStepQdiscs verifies successful impairment changes without queue replacement, packet drops, or bypass.
@@ -273,35 +564,31 @@ func verifyRTTStepQdiscs(directory, role string) error {
 }
 
 // verifyCapacityChangeFault requires the prescribed fault timing and retained queues on both endpoints.
-func verifyCapacityChangeFault(directory string, started int64) error {
-	if started == 0 {
+func verifyCapacityChangeFault(directory string, started float64) error {
+	if !validTimestamp(started) {
 		return fmt.Errorf("missing flow timestamp for capacity change")
 	}
 	for _, role := range []string{"client", "server"} {
-		var changed [2]int64
+		var changed [2]float64
 		for index, change := range []struct {
 			name string
-			at   int64
+			at   float64
 		}{
 			{name: "dropped", at: 5},
 			{name: "restored", at: 12},
 		} {
 			name := role + "-rate-" + change.name + ".txt"
-			data, err := os.ReadFile(filepath.Join(directory, name))
+			at, err := readTimestamp(filepath.Join(directory, name))
 			if err != nil {
 				return err
 			}
-			at, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-			if err != nil {
-				return fmt.Errorf("%s: %w", name, err)
-			}
 			changed[index] = at - started
-			if changed[index] < change.at-1 || changed[index] > change.at+2 {
-				return fmt.Errorf("%s changed at %d seconds, expected approximately %d", name, changed[index], change.at)
+			if math.Abs(changed[index]-change.at) > 1 {
+				return fmt.Errorf("%s changed at %.6f seconds, expected %.0f +/- 1", name, changed[index], change.at)
 			}
 		}
 		if changed[1]-changed[0] < 6 || changed[1]-changed[0] > 8 {
-			return fmt.Errorf("%s capacity fault lasted %d seconds, expected approximately 7", role, changed[1]-changed[0])
+			return fmt.Errorf("%s capacity fault lasted %.6f seconds, expected approximately 7", role, changed[1]-changed[0])
 		}
 		if err := verifyCapacityChangeQdiscs(directory, role); err != nil {
 			return err
@@ -370,89 +657,29 @@ func verifyCapacityChangeQdiscs(directory, role string) error {
 	return nil
 }
 
-// verifyCapacityChange checks useful delivery in each exercised direction under a controlled offered load.
-func verifyCapacityChange(scenario string, flow flowResult) error {
-	if !strings.HasSuffix(scenario, "-reverse") {
-		if err := verifyCapacityChangeDirection(flow.ServerOutput, false); err != nil {
-			return fmt.Errorf("forward direction: %w", err)
+// verifyRecovery checks every exercised receiver against its own pre-fault delivery and the prescribed flow deadline.
+func verifyRecovery(scenario string, flow flowResult, duration, minimumBaseline float64) ([]throughputMeasurement, error) {
+	var measurements []throughputMeasurement
+	var failures []error
+	for _, direction := range receiverDirections(scenario, flow) {
+		samples, err := receiverIntervals(direction.receiver, flow.Started, direction.reverse)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s direction: %w", direction.name, err))
+			continue
+		}
+		measured, err := measureThroughput(samples, []throughputWindow{
+			{name: "baseline", start: 0, end: 4},
+			{name: "recovered", start: duration - 5, end: duration},
+		}, minimumBaseline)
+		for index := range measured {
+			measured[index].Direction = direction.name
+		}
+		measurements = append(measurements, measured...)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s direction: %w", direction.name, err))
 		}
 	}
-	bidirectional := strings.HasSuffix(scenario, "-bidir")
-	if bidirectional || strings.HasSuffix(scenario, "-reverse") {
-		if err := verifyCapacityChangeDirection(&flow, bidirectional); err != nil {
-			return fmt.Errorf("reverse direction: %w", err)
-		}
-	}
-	return nil
-}
-
-// verifyCapacityChangeDirection requires receiver evidence from a sustained 40-second flow.
-func verifyCapacityChangeDirection(receiver *flowResult, reverseIntervals bool) error {
-	if receiver == nil || receiver.Error != "" || receiver.Start.Timestamp.Seconds == 0 {
-		return fmt.Errorf("missing completed receiver interval evidence")
-	}
-	var flow flowResult
-	previousEnd := 0.0
-	for _, interval := range receiver.Intervals {
-		sample := interval.Sum
-		if reverseIntervals {
-			sample = interval.Reverse
-		}
-		if sample.Sender == nil || *sample.Sender || sample.Start < previousEnd || sample.End <= sample.Start {
-			return fmt.Errorf("invalid receiver interval evidence")
-		}
-		previousEnd = sample.End
-		flow.Intervals = append(flow.Intervals, flowIntervalResult{Sum: sample})
-	}
-	return verifyThroughputRecovery(flow, false, 40, 5e6)
-}
-
-// verifyThroughputRecovery requires a complete flow and substantial final-five-second throughput in each direction,
-// relative to its own throughput before fault injection at five seconds. duration is the prescribed flow time in seconds.
-// minimumBaseline is the required pre-fault throughput in bits per second.
-func verifyThroughputRecovery(flow flowResult, bidirectional bool, duration, minimumBaseline float64) error {
-	directions := 1
-	if bidirectional {
-		directions = 2
-	}
-	for direction := range directions {
-		var baselineBytes, recoveredBytes uint64
-		var baselineSeconds, recoveredSeconds float64
-		var finalEnd float64
-		for _, interval := range flow.Intervals {
-			sample := interval.Sum
-			if direction == 1 {
-				sample = interval.Reverse
-			}
-			seconds := sample.End - sample.Start
-			if seconds <= 0 {
-				continue
-			}
-			finalEnd = max(finalEnd, sample.End)
-			if sample.End <= 4.5 {
-				baselineBytes += sample.Bytes
-				baselineSeconds += seconds
-			}
-			if sample.Start >= duration-5.5 && sample.End <= duration+0.5 {
-				recoveredBytes += sample.Bytes
-				recoveredSeconds += seconds
-			}
-		}
-		if finalEnd < duration-0.5 || baselineSeconds < 2 || recoveredSeconds < 4 || baselineBytes == 0 {
-			return fmt.Errorf("direction %d lacks complete pre-fault or post-fault throughput intervals", direction)
-		}
-		baseline := float64(baselineBytes) / baselineSeconds
-		recovered := float64(recoveredBytes) / recoveredSeconds
-		if baseline*8 < minimumBaseline {
-			return fmt.Errorf("direction %d baseline throughput is %.3f Mbit/s, require at least %.3f Mbit/s",
-				direction, baseline*8/1e6, minimumBaseline/1e6)
-		}
-		if recovered < baseline/4 {
-			return fmt.Errorf("direction %d recovered %.1f percent of pre-fault throughput, require at least 25 percent",
-				direction, recovered/baseline*100)
-		}
-	}
-	return nil
+	return measurements, errors.Join(failures...)
 }
 
 // verifyCarrier detects unexpected reconnects in scenarios that should retain one admitted carrier.

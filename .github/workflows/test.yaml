@@ -68,7 +68,7 @@ jobs:
           disable_search: true
           files: coverage.out
   kernel-wireguard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out code
         uses: actions/checkout@v7
@@ -77,7 +77,7 @@ jobs:
         with:
           go-version: 1.27.x
       - name: Build kernel test tools
-        run: docker build -t wirehop-integration test/integration
+        run: docker build -f test/integration/Dockerfile -t wirehop-integration .
       - name: Test UDP socket recovery
         run: |
           CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/datagram.test" ./internal/datagram
@@ -85,18 +85,31 @@ jobs:
             -e WIREHOP_TEST_ROUTES=1 -v "$RUNNER_TEMP/datagram.test:/datagram.test:ro" \
             wirehop-integration /datagram.test \
             -test.run 'TestUDPRouteRecovery|TestLinuxUDPBatch.*Interrupted' -test.v
+      - name: Validate kernel test tools
+        run: |
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/flow.test" ./test/integration/flow
+          docker run --rm --network none --read-only --tmpfs /tmp:exec \
+            -e WIREHOP_TEST_TOOLS=1 -v "$RUNNER_TEMP/flow.test:/flow.test:ro" \
+            wirehop-integration /flow.test \
+            -test.run '^TestIPerf(ControlReadBudget|MeasurementClock|IntervalCoverage|IntervalDirections)$' -test.v
       - name: Test kernel WireGuard stability
         run: |
           CGO_ENABLED=0 go build -o "$RUNNER_TEMP/wirehop" ./cmd/wirehop
+          status=0
           sh test/integration/run.sh "$RUNNER_TEMP/wirehop" "$RUNNER_TEMP/kernel-results" \
             native forward tcp-latency tcp-loss tcp-stall wss forward-prohibit tcp-blackhole tcp-udp \
             tcp-ipv6 tcp-fwmark forward-fwmark tcp-mixed \
             tcp-asymmetric-stall tcp-asymmetric-stall-reverse tcp-asymmetric-stall-bidir \
-            tcp-slow32 tcp-multipath-slow32 tcp-multipath-distinct-slow32 \
+            tcp-slow32 tcp-multipath-slow32 \
             native-capacity-change-bidir tcp-multipath-capacity-change tcp-multipath-capacity-change-bidir \
-            tcp-rtt-step tcp-rtt-step-reverse tcp-rtt-step-bidir \
-            tcp-multipath-rtt-step tcp-multipath-rtt-step-reverse tcp-multipath-rtt-step-bidir \
-            wss-slow32 tcp-outage wss-roam
+            tcp-rtt-step tcp-rtt-step-reverse \
+            tcp-multipath-rtt-step tcp-multipath-rtt-step-reverse \
+            wss-slow32 tcp-outage wss-roam || status=1
+          WIREHOP_TEST_REPETITIONS=3 sh test/integration/run.sh "$RUNNER_TEMP/wirehop" \
+            "$RUNNER_TEMP/kernel-results/recovery-repetitions" \
+            native-rtt-step-bidir tcp-rtt-step-bidir tcp-multipath-rtt-step-bidir \
+            native-slow32 tcp-multipath-distinct-slow32 || status=1
+          exit "$status"
       - name: Preserve kernel WireGuard results
         if: always()
         uses: actions/upload-artifact@v7

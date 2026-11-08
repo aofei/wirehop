@@ -5,10 +5,16 @@ umask 022
 role=$1
 results=$2
 
-while [ ! -f "$results/flow-start.txt" ]; do sleep 0.1; done
-
 {
   uname -a
+  iperf3 --version
+  tc -Version
+  for setting in cpu.max cpuset.cpus.effective; do
+    if [ -r "/sys/fs/cgroup/$setting" ]; then
+      printf '%s=' "$setting"
+      cat "/sys/fs/cgroup/$setting"
+    fi
+  done
   for setting in net/core/rmem_max net/core/wmem_max net/ipv4/tcp_rmem net/ipv4/tcp_wmem \
     net/ipv4/tcp_congestion_control net/ipv4/tcp_moderate_rcvbuf; do
     printf '%s=' "$setting"
@@ -21,8 +27,11 @@ while [ ! -f "$results/flow-start.txt" ]; do sleep 0.1; done
 while [ ! -f "$results/flow-done.txt" ]; do
   {
     date +%s.%N
+    /usr/local/bin/wirehop-test-flow now
     ss -toinm state established
     cat /proc/net/dev
+    cat /proc/stat
+    if [ -r /proc/pressure/cpu ]; then cat /proc/pressure/cpu; fi
     if [ -r /sys/fs/cgroup/cpu.stat ]; then cat /sys/fs/cgroup/cpu.stat; fi
     tc -s qdisc show dev eth0
   } >> "$results/$role-observations.txt"
