@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -60,54 +61,72 @@ func main() {
 		fmt.Fprintln(os.Stderr, "repetitions must be positive")
 		os.Exit(2)
 	}
-	if err := verify(os.Args[1], repetitions); err != nil {
+	err = verify(os.Args[1], repetitions)
+	if len(os.Args) == 4 {
+		err = errors.Join(err, compareBaseline(os.Args[1], os.Args[3], repetitions))
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
-	}
-	if len(os.Args) == 4 {
-		if err := compareBaseline(os.Args[1], os.Args[3], repetitions); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
 	}
 }
 
 // verify validates fresh flows and compares medians separately for each capacity profile.
 func verify(root string, repetitions int) error {
+	var result error
 	for _, profile := range []string{"HighCapacity", "LowCapacity"} {
-		medians := make(map[string]float64)
-		minimumCombined := math.Inf(1)
-		for _, path := range []string{"Low", "High", "Both"} {
-			var rates []float64
-			for repetition := 1; repetition <= repetitions; repetition++ {
-				directory := filepath.Join(root, fmt.Sprintf("%s-%d-%s", profile, repetition, path))
-				flow, err := readFlow(directory)
-				if err != nil {
-					return err
-				}
-				rate := flow.End.Received.BitsPerSecond
-				if err := verifyEvidence(directory, path, flow.End.Received.Bytes, false); err != nil {
-					return fmt.Errorf("%s: %w", directory, err)
-				}
-				fmt.Printf("%s repetition=%d path=%s goodput=%.3f Mbit/s retransmits=%d\n",
-					profile, repetition, path, rate/1e6, flow.End.Sent.Retransmits)
-				rates = append(rates, rate)
-				if path == "Both" {
-					minimumCombined = min(minimumCombined, rate)
-				}
+		result = errors.Join(result, verifyProfile(root, profile, repetitions))
+	}
+	return result
+}
+
+// verifyProfile checks one independent profile without concealing evidence from the other profile.
+func verifyProfile(root, profile string, repetitions int) error {
+	medians := make(map[string]float64)
+	minimumCombined := math.Inf(1)
+	minimumRepetition := 0
+	var evidenceErrors error
+	for _, path := range []string{"Low", "High", "Both"} {
+		var rates []float64
+		for repetition := 1; repetition <= repetitions; repetition++ {
+			directory := filepath.Join(root, fmt.Sprintf("%s-%d-%s", profile, repetition, path))
+			flow, err := readFlow(directory)
+			if err != nil {
+				evidenceErrors = errors.Join(evidenceErrors, err)
+				continue
 			}
+			rate := flow.End.Received.BitsPerSecond
+			if err := verifyEvidence(directory, path, flow.End.Received.Bytes, false); err != nil {
+				evidenceErrors = errors.Join(evidenceErrors, fmt.Errorf("%s: %w", directory, err))
+				continue
+			}
+			fmt.Printf("%s repetition=%d path=%s goodput=%.3f Mbit/s retransmits=%d\n",
+				profile, repetition, path, rate/1e6, flow.End.Sent.Retransmits)
+			rates = append(rates, rate)
+			if path == "Both" && rate < minimumCombined {
+				minimumCombined, minimumRepetition = rate, repetition
+			}
+		}
+		if len(rates) == repetitions {
 			medians[path] = median(rates)
 		}
-		best := max(medians["Low"], medians["High"])
-		fmt.Printf("%s combined/best=%.3f\n", profile, medians["Both"]/best)
-		if medians["Both"] < 0.85*best {
-			return fmt.Errorf("%s: combined goodput retains less than 85 percent of the best standalone path", profile)
-		}
-		if minimumCombined < 0.85*best {
-			return fmt.Errorf("%s: a combined flow retains less than 85 percent of the best standalone median", profile)
-		}
 	}
-	return nil
+	if evidenceErrors != nil {
+		return evidenceErrors
+	}
+	best := max(medians["Low"], medians["High"])
+	fmt.Printf("%s combined/best=%.3f minimum/best=%.3f minimum-repetition=%d minimum=%.3f best=%.3f Mbit/s\n",
+		profile, medians["Both"]/best, minimumCombined/best, minimumRepetition, minimumCombined/1e6, best/1e6)
+	var result error
+	if medians["Both"] < 0.85*best {
+		result = fmt.Errorf("%s: combined goodput retains less than 85 percent of the best standalone path", profile)
+	}
+	if minimumCombined < 0.85*best {
+		result = errors.Join(result, fmt.Errorf(
+			"%s: a combined flow retains less than 85 percent of the best standalone median (repetition %d, ratio %.6f)",
+			profile, minimumRepetition, minimumCombined/best))
+	}
+	return result
 }
 
 // verifyEvidence rejects carrier churn, router bypass, and unexpected drops in a healthy comparison.
@@ -248,28 +267,41 @@ func median(rates []float64) float64 {
 
 // compareBaseline rejects regressions concealed by comparing only paths within the candidate.
 func compareBaseline(candidate, baseline string, repetitions int) error {
+	var result error
 	for _, profile := range []string{"HighCapacity", "LowCapacity"} {
 		for _, path := range []string{"Low", "High", "Both"} {
-			var rates [2][]float64
-			for index, root := range []string{candidate, baseline} {
-				for repetition := 1; repetition <= repetitions; repetition++ {
-					directory := filepath.Join(root, fmt.Sprintf("%s-%d-%s", profile, repetition, path))
-					flow, err := readFlow(directory)
-					if err != nil {
-						return err
-					}
-					if err := verifyEvidence(directory, path, flow.End.Received.Bytes, index == 1); err != nil {
-						return fmt.Errorf("%s: %w", directory, err)
-					}
-					rates[index] = append(rates[index], flow.End.Received.BitsPerSecond)
-				}
-			}
-			current, previous := median(rates[0]), median(rates[1])
-			fmt.Printf("%s path=%s candidate/baseline=%.3f\n", profile, path, current/previous)
-			if current < 0.85*previous {
-				return fmt.Errorf("%s path=%s: candidate retains less than 85 percent of baseline median", profile, path)
-			}
+			result = errors.Join(result, comparePathBaseline(candidate, baseline, profile, path, repetitions))
 		}
+	}
+	return result
+}
+
+// comparePathBaseline validates and compares one path independently of other path failures.
+func comparePathBaseline(candidate, baseline, profile, path string, repetitions int) error {
+	var rates [2][]float64
+	var evidenceErrors error
+	for index, root := range []string{candidate, baseline} {
+		for repetition := 1; repetition <= repetitions; repetition++ {
+			directory := filepath.Join(root, fmt.Sprintf("%s-%d-%s", profile, repetition, path))
+			flow, err := readFlow(directory)
+			if err != nil {
+				evidenceErrors = errors.Join(evidenceErrors, err)
+				continue
+			}
+			if err := verifyEvidence(directory, path, flow.End.Received.Bytes, index == 1); err != nil {
+				evidenceErrors = errors.Join(evidenceErrors, fmt.Errorf("%s: %w", directory, err))
+				continue
+			}
+			rates[index] = append(rates[index], flow.End.Received.BitsPerSecond)
+		}
+	}
+	if evidenceErrors != nil {
+		return evidenceErrors
+	}
+	current, previous := median(rates[0]), median(rates[1])
+	fmt.Printf("%s path=%s candidate/baseline=%.3f\n", profile, path, current/previous)
+	if current < 0.85*previous {
+		return fmt.Errorf("%s path=%s: candidate retains less than 85 percent of baseline median", profile, path)
 	}
 	return nil
 }

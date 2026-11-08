@@ -79,8 +79,9 @@ for profile in HighCapacity LowCapacity; do
 set -eu
 tc qdisc del dev eth0 root 2>/dev/null || true
 tc qdisc add dev eth0 root handle 1: prio bands 3
-tc qdisc add dev eth0 parent 1:1 handle 10: netem delay 5ms rate "$1" limit 1000
-tc qdisc add dev eth0 parent 1:2 handle 20: netem delay 150ms rate "$2" limit 1000
+# Retain delayed flights and return traffic without introducing an unintended loss impairment.
+tc qdisc add dev eth0 parent 1:1 handle 10: netem delay 5ms rate "$1" limit 8192
+tc qdisc add dev eth0 parent 1:2 handle 20: netem delay 150ms rate "$2" limit 8192
 for field in sport dport; do
   tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51822 0xffff flowid 1:1
   tc filter add dev eth0 protocol ip parent 1: prio 1 u32 match ip "$field" 51823 0xffff flowid 1:2

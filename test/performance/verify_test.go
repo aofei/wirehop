@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,6 +49,8 @@ func TestVerifyComparison(t *testing.T) {
 		wantError     string
 	}{
 		{name: "RetainsBestPath", combined: 95, seconds: 20},
+		{name: "ExactThreshold", combined: 85, seconds: 20},
+		{name: "BelowThreshold", combined: 84.999, seconds: 20, wantError: "less than 85 percent"},
 		{name: "ReintroducesSpillover", combined: 20, seconds: 20, wantError: "less than 85 percent"},
 		{name: "IncompleteFlow", combined: 95, seconds: 10, wantError: "incomplete flow"},
 		{name: "MedianConcealsCollapse", combined: 95, seconds: 20, badRepetition: true, wantError: "a combined flow retains less"},
@@ -81,6 +84,12 @@ func TestVerifyComparison(t *testing.T) {
 				}
 			} else if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 				t.Fatalf("verification = %v, want %q", err, tt.wantError)
+			} else {
+				for _, profile := range []string{"HighCapacity", "LowCapacity"} {
+					if !strings.Contains(err.Error(), profile) {
+						t.Fatalf("verification concealed the %s failure: %v", profile, err)
+					}
+				}
 			}
 		})
 	}
@@ -127,6 +136,91 @@ func TestCompareBaseline(t *testing.T) {
 			err := compareBaseline(candidate, baseline, 1)
 			if (err != nil) != tt.wantError {
 				t.Fatalf("baseline comparison = %v, want error %t", err, tt.wantError)
+			}
+			if tt.name == "AllPathsRegressTogether" {
+				for _, profile := range []string{"HighCapacity", "LowCapacity"} {
+					for _, path := range []string{"Low", "High", "Both"} {
+						if !strings.Contains(err.Error(), profile+" path="+path) {
+							t.Fatalf("baseline comparison concealed %s/%s: %v", profile, path, err)
+						}
+					}
+				}
+				writeFixture(t, filepath.Join(candidate, "HighCapacity-1-Both"), "flow.json",
+					`{"end":{"sum_received":{"bytes":100,"bits_per_second":1,"seconds":20}}}`+"\n")
+				command := exec.Command(os.Args[0], "-test.run=^TestPerformanceVerifierChild$")
+				command.Env = append(os.Environ(), "WIREHOP_TEST_PERFORMANCE_CANDIDATE="+candidate,
+					"WIREHOP_TEST_PERFORMANCE_BASELINE="+baseline)
+				output, err := command.CombinedOutput()
+				if failure, ok := err.(*exec.ExitError); !ok || failure.ExitCode() != 1 {
+					t.Fatalf("verifier exit = %v, output: %s", err, output)
+				}
+				for _, profile := range []string{"HighCapacity", "LowCapacity"} {
+					if !strings.Contains(string(output), profile+" combined/best=") {
+						t.Fatalf("verifier concealed profile summary: %s", output)
+					}
+					for _, path := range []string{"Low", "High", "Both"} {
+						if !strings.Contains(string(output), profile+" path="+path+" candidate/baseline=") {
+							t.Fatalf("verifier concealed baseline comparison: %s", output)
+						}
+					}
+				}
+				if !strings.Contains(string(output), "minimum-repetition=1") ||
+					!strings.Contains(string(output), "a combined flow retains less than 85 percent") {
+					t.Fatalf("verifier concealed the original failure: %s", output)
+				}
+			}
+		})
+	}
+}
+
+func TestPerformanceVerifierChild(t *testing.T) {
+	candidate := os.Getenv("WIREHOP_TEST_PERFORMANCE_CANDIDATE")
+	if candidate == "" {
+		return
+	}
+	os.Args = []string{"verify", candidate, "1", os.Getenv("WIREHOP_TEST_PERFORMANCE_BASELINE")}
+	main()
+	t.Fatal("failed verification returned without a failure exit status")
+}
+
+func TestVerifyCollectsEvidenceFailures(t *testing.T) {
+	root := t.TempDir()
+	for _, profile := range []string{"HighCapacity", "LowCapacity"} {
+		for _, path := range []string{"Low", "High", "Both"} {
+			for repetition := 1; repetition <= 3; repetition++ {
+				directory := filepath.Join(root, fmt.Sprintf("%s-%d-%s", profile, repetition, path))
+				if err := os.Mkdir(directory, 0700); err != nil {
+					t.Fatal(err)
+				}
+				writeEvidence(t, directory, path)
+				writeFixture(t, directory, "flow.json",
+					`{"end":{"sum_received":{"bytes":100,"bits_per_second":100,"seconds":20}}}`+"\n")
+			}
+		}
+	}
+	writeFixture(t, filepath.Join(root, "HighCapacity-1-Low"), "flow.json", "{}\n")
+	writeFixture(t, filepath.Join(root, "HighCapacity-2-Low"), "client-after.txt", "TcpActiveOpens 6 0\n")
+	writeFixture(t, filepath.Join(root, "HighCapacity-1-Both"), "router-qdisc.txt",
+		"qdisc prio 1:\n dropped 1\n dropped 0\n dropped 0\n")
+	writeFixture(t, filepath.Join(root, "LowCapacity-3-High"), "flow.json", "{}\n")
+	for _, check := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "WithinCandidate", run: func() error { return verify(root, 3) }},
+		{name: "AgainstBaseline", run: func() error { return compareBaseline(root, root, 3) }},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			err := check.run()
+			if err == nil {
+				t.Fatal("invalid repetitions passed verification")
+			}
+			for _, name := range []string{
+				"HighCapacity-1-Low", "HighCapacity-2-Low", "HighCapacity-1-Both", "LowCapacity-3-High",
+			} {
+				if !strings.Contains(err.Error(), name) {
+					t.Fatalf("verification concealed %s: %v", name, err)
+				}
 			}
 		})
 	}
