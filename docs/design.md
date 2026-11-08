@@ -766,6 +766,11 @@ transmission stores, so opening more sessions or lanes cannot multiply retained 
 charged at its payload size in ingress and at its complete encoded Data-frame size after lane assignment. Moving a
 packet between those states transfers and resizes the same reservation without an unaccounted gap.
 
+The default ingress packet limit lets MTU-sized bursts use the byte budget while bounding small-packet occupancy. Short
+bursts can follow compressed TCP acknowledgments when path RTT falls, so packet headroom matters even when the average
+offered rate fits the path. Queue byte limits, aggregate retention, and packet deadlines still bound that headroom. A
+larger packet limit can retain more payload and increase queueing delay within those bounds.
+
 Ingress admits a batch prefix under one queue lock and samples its deadline clock once. After admitting one packet
 individually, it can reserve shared capacity for up to 16 subsequent fresh, unreserved normal packets together. A
 sampled remaining-capacity hint bounds each group, and an atomic reservation still enforces both aggregate limits. Every
@@ -877,7 +882,7 @@ The command uses these packet and resource limits:
 | Retained plus in-progress server sessions | 1024 |
 | Pending unauthenticated admissions across all listeners | 512 |
 | Creation replay nonces | 65,536 |
-| Session ingress queue per direction | 1024 packets and 4 MiB |
+| Session ingress queue per direction | 4096 packets and 4 MiB |
 | Combined transmission store per lane direction | 65,536 packets and 32 MiB |
 | Ordinary unsent admission per lane direction | 50 ms of estimated parsing-delivery rate, with a 16 KiB floor and one empty-queue large-frame allowance |
 | Aggregate retained relay work per client process | 131,072 packets and 256 MiB |

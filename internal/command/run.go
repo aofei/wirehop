@@ -58,8 +58,8 @@ const (
 	defaultTransportDeadline = 5 * time.Second
 	// defaultDeduplicationWindow bounds received packet sequence retention.
 	defaultDeduplicationWindow = 1_048_576
-	// defaultIngressPackets bounds one session ingress queue by packet count.
-	defaultIngressPackets = 1024
+	// defaultIngressPackets lets MTU-sized bursts use the byte budget while bounding small-packet occupancy.
+	defaultIngressPackets = 4096
 	// defaultIngressBytes bounds one session ingress queue by byte count.
 	defaultIngressBytes = 4 * 1024 * 1024
 	// defaultLanePackets bounds one lane queue by packet count.
