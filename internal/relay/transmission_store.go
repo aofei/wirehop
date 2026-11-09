@@ -431,34 +431,34 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 	count := 0
 	bytes := 0
 	for count < len(destination) && bytes < targetBytes {
-		source, transmission, ok := s.nextQueuedLocked(sentMicros)
-		if !ok {
+		source, size, padding := s.nextQueuedLocked(sentMicros)
+		if source == nil {
 			break
 		}
-		if recordBytes > 0 && count > 0 && int(transmission.size) > recordBytes-bytes {
+		if recordBytes > 0 && count > 0 && size > recordBytes-bytes {
 			if bytes <= recordBytes && s.preferRecordPrefixLocked(len(destination)-count, targetBytes, recordBytes, bytes, sentMicros) {
 				break
 			}
 			recordBytes = 0
 		}
-		if s.sentPackets == math.MaxUint64 || uint64(transmission.size) > math.MaxUint64-s.sentBytes {
+		if s.sentPackets == math.MaxUint64 || uint64(size) > math.MaxUint64-s.sentBytes {
 			if count == 0 {
 				return 0, ErrCounterExhausted
 			}
 			break
 		}
 		window := s.deliveryWindow
-		if transmission.packetID == 0 {
+		if padding {
 			window = s.probeWindow
 		}
 		if s.measurementSupplyPaused {
 			window = max(window, s.measurementWindow)
 		}
 		committed := s.sentBytes - s.reportedBytes
-		if committed != 0 && (committed >= window || uint64(transmission.size) > window-committed) {
+		if committed != 0 && (committed >= window || uint64(size) > window-committed) {
 			break
 		}
-		transmission = source.pop()
+		transmission := source.pop()
 		if s.sent.len() == 0 {
 			s.unreportedSince = now
 			s.firstSentMicros = sentMicros
@@ -522,24 +522,23 @@ preview:
 	return prefixBytes*records > bytes
 }
 
-// nextQueuedLocked returns the next live transmission in carrier priority order.
-func (s *TransmissionStore) nextQueuedLocked(nowMicros uint64) (*transmissionDeque, retainedTransmission, bool) {
+// nextQueuedLocked returns the next live queue with its encoded frame size and padding status.
+func (s *TransmissionStore) nextQueuedLocked(nowMicros uint64) (*transmissionDeque, int, bool) {
 	for {
 		source := &s.control
-		transmission, ok := source.peek()
-		if !ok {
+		if source.len() == 0 {
 			source = &s.normal
-			transmission, ok = source.peek()
 		}
-		if !ok {
-			return nil, retainedTransmission{}, false
+		if source.len() == 0 {
+			return nil, 0, false
 		}
-		if nowMicros < transmission.deadlineMicros {
-			return source, transmission, true
+		queued := &source.items[source.head]
+		if nowMicros < queued.deadlineMicros {
+			return source, int(queued.size), queued.packetID == 0
 		}
-		transmission = source.pop()
-		transmission.releasePacket()
-		s.releaseBacklogLocked(1, int(transmission.size))
+		expired := source.pop()
+		expired.releasePacket()
+		s.releaseBacklogLocked(1, int(expired.size))
 	}
 }
 
@@ -874,11 +873,15 @@ func (s *TransmissionStore) notifyLocked() {
 }
 
 // beginMeasurementSupplyPause preserves finite-supply provenance while the accepted ingress cut drains.
+// Publishing drain credit wakes a writer that has already exhausted ordinary flight credit.
 func (s *TransmissionStore) beginMeasurementSupplyPause(window uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.measurementWindow = window
 	s.markMeasurementLimitedLocked()
+	if s.control.len()+s.normal.len() > 0 {
+		s.notifyLocked()
+	}
 }
 
 // markMeasurementLimitedLocked protects capacity samples from intentional admission pauses.

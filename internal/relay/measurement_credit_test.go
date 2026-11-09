@@ -1,12 +1,16 @@
 package relay
 
 import (
+	"context"
+	"errors"
 	"math"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aofei/wirehop/internal/datagram"
 	"github.com/aofei/wirehop/internal/protocol"
+	"github.com/aofei/wirehop/internal/wgpacket"
 )
 
 func TestScheduledLaneDrainWindowBytes(t *testing.T) {
@@ -77,5 +81,84 @@ func TestTransmissionStoreMeasurementSupplyPause(t *testing.T) {
 	}
 	if err != nil || count != 4 {
 		t.Fatalf("ordinary post-measurement credit was not restored: count=%d, error=%v", count, err)
+	}
+}
+
+func TestLaneWriteMeasurementSupplyPause(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		kind    wgpacket.Kind
+		padding bool
+	}{
+		{name: "Transport", kind: wgpacket.TransportData},
+		{name: "Control", kind: wgpacket.HandshakeInitiation},
+		{name: "Padding", padding: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				connection := newTestCarrier()
+				lane := newTestLane(t, connection, newTestEndpoint())
+				store := lane.store
+				t.Cleanup(func() { releaseTransmissions(store.drain()) })
+				store.setDeliveryWindows(minimumDeliveryWindow, minimumDeliveryWindow, 0)
+				deadline := time.Now().Add(time.Second)
+				initial := schedulerTransmission(1, wgpacket.TransportData, deadline)
+				initial.packet.Payload = make([]byte, minimumDeliveryWindow-32)
+				initial.packet.Payload[0] = 4
+				if err := store.push(initial); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				result := make(chan error, 1)
+				go func() { result <- lane.write(ctx) }()
+				defer func() {
+					cancel()
+					if err := <-result; !errors.Is(err, context.Canceled) {
+						t.Errorf("write() error = %v, want cancellation", err)
+					}
+				}()
+				synctest.Wait()
+				select {
+				case batch := <-connection.writes:
+					if len(batch) != 1 || batch[0].Type != protocol.FrameData {
+						t.Fatal("initial flight did not exhaust ordinary credit")
+					}
+				default:
+					t.Fatal("initial flight was not written")
+				}
+				var queued retainedTransmission
+				if tt.padding {
+					queued = retainedTransmission{
+						deadlineMicros: uint64(deadline.UnixMicro()),
+						packet:         datagram.Packet{Payload: make([]byte, protocol.ProbePayloadSize)},
+					}
+				} else {
+					queued = schedulerTransmission(2, tt.kind, deadline)
+				}
+				if err := store.push(queued); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				select {
+				case <-connection.writes:
+					t.Fatal("queued work bypassed exhausted credit")
+				default:
+				}
+				store.beginMeasurementSupplyPause(uint64(store.limits.Bytes))
+				synctest.Wait()
+				select {
+				case batch := <-connection.writes:
+					if len(batch) != 1 || batch[0].Type != protocol.FrameData {
+						t.Fatal("measurement drain did not write the queued frame")
+					}
+					data, err := protocol.ParseData(batch[0])
+					if err != nil || data.PacketID != queued.packetID {
+						t.Fatalf("drained frame = %+v, %v, want packet ID %d", data, err, queued.packetID)
+					}
+				default:
+					t.Fatal("measurement drain waited for unrelated feedback to wake its writer")
+				}
+			})
+		})
 	}
 }

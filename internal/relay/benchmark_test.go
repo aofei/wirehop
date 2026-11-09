@@ -459,43 +459,62 @@ func benchmarkTransmissionStoreCycle(b *testing.B, budget *retention.Budget) {
 }
 
 func BenchmarkTransmissionStoreBacklogCycle(b *testing.B) {
-	const backlogPackets = 1024
-	now := time.UnixMicro(1000)
-	store, err := newTransmissionStore(
-		packetqueue.Limits{Packets: backlogPackets, Bytes: 16 * 1024 * 1024}, func() time.Time { return now },
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
-	transmission := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Hour))
-	packetID := uint64(0)
-	for range backlogPackets {
-		packetID++
-		transmission.packetID = packetID
-		if err := store.push(transmission); err != nil {
-			b.Fatal(err)
-		}
-	}
-	var batch [maximumDataBatchFrames]protocol.Data
-	var ownership [maximumDataBatchFrames]datagram.Packet
-	b.ReportAllocs()
-	b.SetBytes(int64(len(transmission.packet.Payload) * len(batch)))
-	for b.Loop() {
-		count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes, 0)
-		if err != nil || count != len(batch) {
-			b.Fatalf("takeBatch() = %d, %v", count, err)
-		}
-		releaseBatchOwnership(ownership[:count])
-		if _, _, err := store.acknowledge(store.sentPackets, uint64(store.now().UnixMicro())); err != nil {
-			b.Fatal(err)
-		}
-		for range count {
-			packetID++
-			transmission.packetID = packetID
-			if err := store.push(transmission); err != nil {
+	for _, tt := range []struct {
+		name    string
+		kind    wgpacket.Kind
+		payload int
+		frames  int
+	}{
+		{name: "Small", kind: wgpacket.TransportData, payload: 32, frames: 16},
+		{name: "MTU", kind: wgpacket.TransportData, payload: 1452, frames: 16},
+		{name: "Jumbo", kind: wgpacket.TransportData, payload: 8192, frames: 8},
+		{name: "Control", kind: wgpacket.HandshakeInitiation, payload: 148, frames: 16},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			const backlogPackets = 1024
+			now := time.UnixMicro(1000)
+			store, err := newTransmissionStore(
+				packetqueue.Limits{Packets: backlogPackets, Bytes: 16 * 1024 * 1024}, func() time.Time { return now },
+			)
+			if err != nil {
 				b.Fatal(err)
 			}
-		}
+			store.setDeliveryWindows(1<<20, 1<<20, 0)
+			transmission := schedulerTransmission(1, tt.kind, now.Add(time.Hour))
+			payload := make([]byte, tt.payload)
+			copy(payload, transmission.packet.Payload)
+			transmission.packet.Payload = payload
+			packetID := uint64(0)
+			for range backlogPackets {
+				packetID++
+				transmission.packetID = packetID
+				if err := store.push(transmission); err != nil {
+					b.Fatal(err)
+				}
+			}
+			var batch [maximumDataBatchFrames]protocol.Data
+			var ownership [maximumDataBatchFrames]datagram.Packet
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload) * tt.frames))
+			for b.Loop() {
+				count, err := store.takeBatch(batch[:], ownership[:], targetDataBatchBytes, 0)
+				if err != nil || count != tt.frames {
+					b.Fatalf("takeBatch() = %d, %v, want %d", count, err, tt.frames)
+				}
+				releaseBatchOwnership(ownership[:count])
+				if _, _, err := store.acknowledge(store.sentPackets, uint64(store.now().UnixMicro())); err != nil {
+					b.Fatal(err)
+				}
+				for range count {
+					packetID++
+					transmission.packetID = packetID
+					if err := store.push(transmission); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+			b.ReportMetric(float64(tt.frames), "packets/op")
+		})
 	}
 }
 

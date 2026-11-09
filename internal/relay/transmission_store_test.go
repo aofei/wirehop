@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -158,6 +159,103 @@ func TestTransmissionStoreTakeBatchRecordPacking(t *testing.T) {
 			if packets, _ := store.backlog(); packets != len(tt.sizes) {
 				t.Fatalf("retained %d packets after expiry, want %d unacknowledged frames", packets, len(tt.sizes))
 			}
+		})
+	}
+}
+
+func TestTransmissionStoreTakeBatchDequeChanges(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		kind          wgpacket.Kind
+		queued        int
+		prefix        int
+		recordBytes   int
+		wantCount     int
+		wantShrinking bool
+	}{
+		{name: "TransportCompaction", kind: wgpacket.TransportData, queued: 128, prefix: 63, wantCount: 16},
+		{name: "ControlCompaction", kind: wgpacket.HandshakeInitiation, queued: 128, prefix: 63, wantCount: 16},
+		{name: "TransportShrink", kind: wgpacket.TransportData, queued: 2048, prefix: 1535, wantCount: 16, wantShrinking: true},
+		{name: "ControlShrink", kind: wgpacket.HandshakeInitiation, queued: 2048, prefix: 1535, wantCount: 16, wantShrinking: true},
+		{name: "TLSCompaction", kind: wgpacket.TransportData, queued: 128, prefix: 63, recordBytes: 16 * 1024, wantCount: 11},
+		{name: "TLSShrink", kind: wgpacket.TransportData, queued: 2048, prefix: 1535, recordBytes: 16 * 1024, wantCount: 11, wantShrinking: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			deadline := now.Add(time.Second)
+			limits := packetqueue.Limits{Packets: tt.queued, Bytes: 8 << 20}
+			budget, err := retention.NewBudget(retention.Limits{Packets: limits.Packets, Bytes: limits.Bytes})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if got := budget.Usage(); got != (retention.Usage{}) {
+					t.Fatalf("completed store retained aggregate ownership: %+v", got)
+				}
+			})
+			store, err := NewTransmissionStoreWithBudget(limits, budget, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { releaseTransmissions(store.drain()) })
+			store.setDeliveryWindows(1<<20, 1<<20, 0)
+			for index := range tt.queued {
+				transmission := schedulerTransmission(uint64(index+1), tt.kind, deadline)
+				if tt.kind == wgpacket.TransportData {
+					transmission.packet.Payload = make([]byte, 1452)
+					transmission.packet.Payload[0] = 4
+				}
+				binary.LittleEndian.PutUint64(transmission.packet.Payload[len(transmission.packet.Payload)-8:], transmission.packetID)
+				if err := store.push(transmission); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var frames [maximumDataBatchFrames]protocol.Data
+			var ownership [maximumDataBatchFrames]datagram.Packet
+			for consumed := 0; consumed < tt.prefix; {
+				want := min(len(frames), tt.prefix-consumed)
+				count, err := store.takeBatch(frames[:want], ownership[:want], targetDataBatchBytes, 0)
+				releaseBatchOwnership(ownership[:count])
+				if err != nil || count != want {
+					t.Fatalf("prefix batch = %d, %v, want %d", count, err, want)
+				}
+				if _, stale, err := store.acknowledge(store.sentPackets, uint64(now.UnixMicro())); err != nil || stale {
+					t.Fatalf("prefix acknowledgement = stale %t, %v", stale, err)
+				}
+				consumed += count
+			}
+			queue := &store.normal
+			if tt.kind.Control() {
+				queue = &store.control
+			}
+			previousHead, previousCapacity := queue.head, cap(queue.items)
+			previousUsage := budget.Usage()
+			count, err := store.takeBatch(frames[:], ownership[:], targetDataBatchBytes, tt.recordBytes)
+			defer releaseBatchOwnership(ownership[:count])
+			if err != nil || count != tt.wantCount {
+				t.Fatalf("batch across deque change = %d, %v, want %d", count, err, tt.wantCount)
+			}
+			if queue.head >= previousHead {
+				t.Fatal("batch did not cross the deque compaction boundary")
+			}
+			if tt.wantShrinking && cap(queue.items) >= previousCapacity {
+				t.Fatal("batch did not cross the deque shrinking boundary")
+			}
+			for index, frame := range frames[:count] {
+				wantID := uint64(tt.prefix + index + 1)
+				payloadID := binary.LittleEndian.Uint64(frame.Payload[len(frame.Payload)-8:])
+				if frame.PacketID != wantID || payloadID != wantID || frame.DeadlineMicros != uint64(deadline.UnixMicro()) {
+					t.Fatalf("frame %d lost its identity, payload, or deadline", index)
+				}
+			}
+			if got := budget.Usage(); got != previousUsage {
+				t.Fatalf("commit changed aggregate ownership: %+v, want %+v", got, previousUsage)
+			}
+			assertTransmissionStoreInvariants(t, store)
+			if _, stale, err := store.acknowledge(store.sentPackets, uint64(now.UnixMicro())); err != nil || stale {
+				t.Fatalf("batch acknowledgement = stale %t, %v", stale, err)
+			}
+			assertTransmissionStoreInvariants(t, store)
 		})
 	}
 }

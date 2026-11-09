@@ -2477,12 +2477,29 @@ session secrets, packet payloads, and identifying target metadata by default.
 
 ## Protocol design tradeoffs
 
+### Transport and relay responsibilities
+
+The kernel TCP implementation controls congestion, retransmission, and ordered stream delivery. WireHop controls
+application retention, packet freshness, lane selection, and bounded recovery across streams. Its parsing-delivery
+window bounds committed application work while the kernel independently enforces its congestion and receive windows.
+These controls observe different boundaries, particularly when a reverse proxy terminates TCP between the relay peers.
+
+Hard lane and process retention limits can constrain goodput when a path's bandwidth-delay product exceeds the allowed
+unreported work. Increasing those limits also increases retained memory and the amount of stale work that a failed
+generation can leave behind. Increasing the configured lane count does not enlarge the shared process budget or combine
+the capacity of paths used by the single transport primary.
+
 ### Frame identity and expiry
 
 The common header packs type and length into a two-byte base with one optional extension byte. Ordinary MTU-sized frames
 need only the base. Tiny control contents use the same two-byte base, trading one byte against a uniform common read and
 the smaller MTU envelope. Data metadata remains stateless across frames and carrier generations, allowing duplicate and
 migrated packets to keep their original identities and deadlines without resetting a decoder dictionary.
+
+Fixed-width 64-bit metadata would remove variable-integer decoding at the cost of larger ordinary packets and
+keepalives. Deltas against the previous frame would require carrier-local predecessor state and separate encoding when a
+packet moves to another lane. Stateless bounded metadata keeps loss recovery, generation replacement, and cross-lane
+copies independent of an earlier frame's decoded values.
 
 Direction-local packet IDs identify duplicates independently of WireGuard receiver indices, counters, and key lifetimes.
 The same identity scheme covers transport data, handshakes, and cookie replies. A lane-local implicit sequence cannot
@@ -2505,6 +2522,12 @@ return propagation when scoring retained work. Reports may travel over an altern
 the lane generation whose parsing progress they report. The flight window covers feedback return time and reporting
 allowance as well as forward delivery. It is separate from the kernel TCP congestion window and remains bounded by store
 and process retention limits.
+
+Delivery-rate sampling preserves whether the application supplied enough work to exercise the path. Idle traffic and
+intentional measurement pauses can produce lower observed rates without establishing lower path capacity. The same
+application-limited sampling principle is described in the
+[BBR congestion-control draft](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-07#section-4.1.1).
+WireHop bounds each rate sample by its corresponding send interval to limit feedback-compression artifacts.
 
 A Ping identifies one outstanding lane-local request. Its sender retains the writer's send time locally, and Pong
 carries only the matching ID and the peer's receive and send times. This supplies the four timestamps needed for RTT and

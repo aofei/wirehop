@@ -134,6 +134,19 @@ and partial acceptance under packet or byte pressure. Completed batches report p
 batches report cost per call, including release of any accepted prefix. Use the kernel WireGuard harness to measure
 delivered goodput and latency.
 
+## Transmission store CPU benchmark
+
+Compare queued admission, batch commitment, and cumulative feedback with a persistent 1024-packet backlog:
+
+```sh
+go test ./internal/relay -run '^$' -bench '^BenchmarkTransmissionStoreBacklogCycle$' -benchmem -count=6 -cpu=1
+```
+
+The cases cover small transport packets, MTU-sized packets, jumbo packets, and handshake controls. Each operation commits
+the reported number of packets, acknowledges that prefix, and replaces it. The store runs entirely in memory, and packet
+buffers are shared without pool ownership. These measurements isolate metadata processing and exclude carrier writes,
+UDP I/O, and payload copying. Use the kernel WireGuard harness to evaluate delivered goodput and latency.
+
 ## Receiver CPU benchmark
 
 Run the receiver benchmark with the platform's protocol clock:
