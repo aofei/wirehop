@@ -28,6 +28,11 @@ trap diagnose_failure EXIT
 scheme=${scenario%%-*}
 carrier_port=51822
 flow_tool=/usr/local/bin/wirehop-test-flow
+case "$scenario" in
+  *-rtt-step*|*-capacity-change*|tcp-asymmetric-stall*|*-stall|*-outage|*-roam|*-prohibit|*-blackhole)
+    export WIREHOP_TEST_RECEIVER_TRACE="/results/$role-receiver"
+    ;;
+esac
 if [ "${WIREHOP_TEST_PATH:-Both}" = High ]; then carrier_port=51823; fi
 export WIREHOP_TOKEN=isolated-kernel-tcp-test-fixture
 export SSL_CERT_FILE=/results/ca.pem

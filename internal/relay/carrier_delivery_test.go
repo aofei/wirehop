@@ -113,7 +113,7 @@ func TestLaneWriteDataBatchTLS(t *testing.T) {
 					now := time.Unix(100, 0)
 					store := schedulerStore(t, packetqueue.Limits{Packets: 32, Bytes: 256 * 1024})
 					store.now = func() time.Time { return now }
-					store.setDeliveryWindows(256*1024, 256*1024)
+					store.setDeliveryWindows(256*1024, 256*1024, 0)
 					store.writeBudget.Store(64 * 1024)
 					t.Cleanup(func() { releaseTransmissions(store.drain()) })
 					clock := &testClock{now: uint64(now.UnixMicro())}

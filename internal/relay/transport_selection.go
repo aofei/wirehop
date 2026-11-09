@@ -37,7 +37,7 @@ func (s *Scheduler) selectTransportCandidates(lanes map[protocol.LaneID]*schedul
 	frameBytes, maximumScore uint64, now time.Time) laneCandidates {
 	primary := lanes[preferred]
 	healthyPreferred := primary != nil && !primary.degraded && !primary.abandoning
-	if !s.measurementStarted.IsZero() {
+	if !s.measurementStarted.IsZero() && (healthyPreferred || s.measurementQuiet) {
 		if !healthyPreferred || !primary.canAcceptTransport(frameBytes) {
 			return laneCandidates{}
 		}
@@ -357,11 +357,26 @@ func (l *scheduledLane) probeWindowBytes(reserveBytes uint64) uint64 {
 
 // deliveryWindowBytes bounds committed-unreported flight by four recent feedback cycles and a small sampling allowance.
 func (l *scheduledLane) deliveryWindowBytes() uint64 {
+	return l.windowBytes(l.deliveryWindowHorizonMicros())
+}
+
+// drainWindowBytes allows the finite accepted cut to drain using the observed feedback cycle without validating it.
+// New admission stays paused, the ordinary propagation floor is unchanged, and all retention limits still apply.
+func (l *scheduledLane) drainWindowBytes() uint64 {
+	cycle := l.deliveryFeedbackCycleMicros(max(l.minimumRTTMicros, l.rttMicros, l.latestRTTMicros))
+	horizon := uint64(math.MaxUint64)
+	if cycle <= math.MaxUint64/4 {
+		horizon = cycle * 4
+	}
+	return l.windowBytes(horizon)
+}
+
+// windowBytes converts a bounded flight horizon to bytes without exceeding the lane's retention limit.
+func (l *scheduledLane) windowBytes(interval uint64) uint64 {
 	maximum := uint64(l.registration.Store.limits.Bytes)
 	if !l.rateObserved {
 		return min(maximum, initialDeliveryWindow)
 	}
-	interval := l.deliveryWindowHorizonMicros()
 	if interval == math.MaxUint64 || l.deliveryRate > math.MaxUint64/interval {
 		return maximum
 	}

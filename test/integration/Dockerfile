@@ -2,14 +2,16 @@ FROM golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f09
 
 WORKDIR /src
 COPY test/integration/iperf3-test.patch ./
+COPY test/integration/fixtures/iperf-stats-delay.c ./
 RUN curl --fail --location --silent --show-error \
       https://downloads.es.net/pub/iperf/iperf-3.18.tar.gz -o /tmp/iperf.tar.gz && \
     echo 'c0618175514331e766522500e20c94bfb293b4424eb27d7207fb427b88d20bab  /tmp/iperf.tar.gz' | sha256sum -c - && \
     tar -xzf /tmp/iperf.tar.gz -C /tmp && \
     cd /tmp/iperf-3.18 && \
-    git apply /src/iperf3-test.patch && \
+    git apply --unidiff-zero /src/iperf3-test.patch && \
     ./configure --disable-shared --without-openssl && \
-    make -j2
+    make -j2 && \
+    cc -shared -fPIC -o /iperf-stats-delay.so /src/iperf-stats-delay.c -ldl
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -19,6 +21,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /wirehop-test-flow ./test/integration/fl
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 COPY --from=tools /wirehop-test-flow /tmp/iperf-3.18/src/iperf3 /usr/local/bin/
+COPY --from=tools /iperf-stats-delay.so /usr/local/lib/
 COPY --from=tools /tmp/iperf-3.18/LICENSE /usr/local/share/licenses/iperf3/LICENSE
 
 RUN apt-get update && \

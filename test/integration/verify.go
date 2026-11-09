@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -18,8 +19,9 @@ import (
 type flowResult struct {
 	Error        string
 	Intervals    []flowIntervalResult
-	Started      float64     `json:"started_boottime"`
-	ServerOutput *flowResult `json:"-"`
+	Started      float64        `json:"started_boottime"`
+	ServerOutput *flowResult    `json:"-"`
+	Receiver     *receiverTrace `json:"-"`
 	Start        struct {
 		Started float64 `json:"started_boottime"`
 	}
@@ -27,13 +29,15 @@ type flowResult struct {
 		Received struct {
 			Bytes         uint64
 			BitsPerSecond float64 `json:"bits_per_second"`
+			Sender        *bool
 		} `json:"sum_received"`
 		Sent struct {
 			Bytes       uint64
 			Retransmits uint64
 		} `json:"sum_sent"`
 		ReverseReceived struct {
-			Bytes uint64
+			Bytes  uint64
+			Sender *bool
 		} `json:"sum_received_bidir_reverse"`
 	}
 }
@@ -52,11 +56,29 @@ type flowInterval struct {
 	Sender *bool
 }
 
-// flowDirection selects interval evidence from the endpoint receiving one direction of traffic.
+// flowDirection selects counter evidence from the endpoint receiving one direction of traffic.
 type flowDirection struct {
 	name     string
 	receiver *flowResult
-	reverse  bool
+}
+
+// receiverTrace records bounded application counter updates on the shared boot clock.
+type receiverTrace struct {
+	Type    string          `json:"type"`
+	Stream  int             `json:"stream_id"`
+	Started int64           `json:"started_boottime_ns"`
+	Ended   int64           `json:"ended_boottime_ns"`
+	Total   uint64          `json:"total_bytes"`
+	Count   int             `json:"count"`
+	Error   *bool           `json:"error"`
+	Events  []receiverEvent `json:"-"`
+}
+
+// receiverEvent brackets the actual byte-counter update without assuming uniform delivery in a reporting bin.
+type receiverEvent struct {
+	Began int64  `json:"began_boottime_ns"`
+	Ended int64  `json:"ended_boottime_ns"`
+	Bytes uint64 `json:"bytes"`
 }
 
 // throughputWindow identifies a phase relative to the client's shared measurement origin.
@@ -65,20 +87,23 @@ type throughputWindow struct {
 	start, end float64
 }
 
-// throughputMeasurement preserves estimated delivery and coverage for one explicitly bounded phase.
+// throughputMeasurement preserves conservative delivery bounds for one explicitly bounded phase.
 type throughputMeasurement struct {
 	Direction     string   `json:"direction"`
 	Phase         string   `json:"phase"`
 	Start         float64  `json:"start_seconds"`
 	End           float64  `json:"end_seconds"`
 	Covered       float64  `json:"covered_seconds"`
-	Bytes         float64  `json:"estimated_received_bytes"`
-	BitsPerSecond float64  `json:"bits_per_second"`
-	Fraction      *float64 `json:"baseline_fraction,omitempty"`
+	LowerBytes    uint64   `json:"received_bytes_lower"`
+	UpperBytes    uint64   `json:"received_bytes_upper"`
+	LowerRate     float64  `json:"bits_per_second_lower"`
+	UpperRate     float64  `json:"bits_per_second_upper"`
+	LowerFraction *float64 `json:"baseline_fraction_lower,omitempty"`
+	UpperFraction *float64 `json:"baseline_fraction_upper,omitempty"`
 	Status        string   `json:"status"`
 }
 
-// throughputRoundoff permits float64 summation noise at exact throughput-ratio boundaries.
+// throughputRoundoff permits float64 roundoff at exact throughput-ratio boundaries.
 const throughputRoundoff = 1e-12
 
 // rttStepQdiscPattern extracts the configured root netem and its cumulative traffic and drop counters.
@@ -103,12 +128,12 @@ func main() {
 		udp := strings.HasSuffix(scenario, "-udp")
 		for _, measurement := range measurements {
 			reference := ""
-			if measurement.Fraction != nil {
-				reference = fmt.Sprintf(" baseline=%.4f%%", *measurement.Fraction*100)
+			if measurement.LowerFraction != nil {
+				reference = fmt.Sprintf(" baseline=[%.4f,%.4f]%%", *measurement.LowerFraction*100, *measurement.UpperFraction*100)
 			}
-			fmt.Printf("%s: %s %s window=[%.6f,%.6f] coverage=%.6fs receiver=%.6f Mbit/s%s status=%s\n",
+			fmt.Printf("%s: %s %s window=[%.6f,%.6f] coverage=%.6fs receiver=[%.6f,%.6f] Mbit/s%s status=%s\n",
 				scenario, measurement.Direction, measurement.Phase, measurement.Start, measurement.End,
-				measurement.Covered, measurement.BitsPerSecond/1e6, reference, measurement.Status)
+				measurement.Covered, measurement.LowerRate/1e6, measurement.UpperRate/1e6, reference, measurement.Status)
 		}
 		report := struct {
 			Scenario     string                  `json:"scenario"`
@@ -161,6 +186,17 @@ func verifyResult(directory, scenario string) (flowResult, []throughputMeasureme
 			}
 			if server.Error != "" || bytes == 0 {
 				failures = append(failures, fmt.Errorf("server-flow.json: transfer did not complete with data: %s", server.Error))
+			}
+		}
+		for _, direction := range receiverDirections(scenario, &flow) {
+			role := "server"
+			if direction.name == "reverse" {
+				role = "client"
+			}
+			if direction.receiver != nil {
+				trace, err := loadReceiverTrace(directory, role, direction.receiver)
+				failures = append(failures, err)
+				direction.receiver.Receiver = trace
 			}
 		}
 	}
@@ -274,26 +310,26 @@ func verifyScenario(directory, scenario string, flow flowResult) ([]throughputMe
 	return measurements, errors.Join(failures...)
 }
 
-// receiverDirections selects the receiver for every exercised direction, including reverse-only ordinary sums.
-func receiverDirections(scenario string, flow flowResult) []flowDirection {
+// receiverDirections selects the receiving endpoint for every exercised traffic direction.
+func receiverDirections(scenario string, flow *flowResult) []flowDirection {
 	var directions []flowDirection
 	if !strings.HasSuffix(scenario, "-reverse") {
 		directions = append(directions, flowDirection{name: "forward", receiver: flow.ServerOutput})
 	}
 	if strings.HasSuffix(scenario, "-reverse") || strings.HasSuffix(scenario, "-bidir") {
 		directions = append(directions, flowDirection{
-			name: "reverse", receiver: &flow, reverse: strings.HasSuffix(scenario, "-bidir"),
+			name: "reverse", receiver: flow,
 		})
 	}
 	return directions
 }
 
-// verifyRTTStep checks each exercised direction using intervals measured at its receiving endpoint.
+// verifyRTTStep checks each exercised direction using its receiving endpoint's counter updates.
 func verifyRTTStep(directory, scenario string, flow flowResult) ([]throughputMeasurement, error) {
 	var measurements []throughputMeasurement
 	var failures []error
-	for _, direction := range receiverDirections(scenario, flow) {
-		measured, err := verifyRTTStepDirection(directory, direction.receiver, flow.Started, direction.reverse)
+	for _, direction := range receiverDirections(scenario, &flow) {
+		measured, err := verifyRTTStepDirection(directory, direction.receiver, flow.Started)
 		for index := range measured {
 			measured[index].Direction = direction.name
 		}
@@ -306,9 +342,8 @@ func verifyRTTStep(directory, scenario string, flow flowResult) ([]throughputMea
 }
 
 // verifyRTTStepDirection checks receiver throughput after a persistent RTT increase and its reversal at fixed capacity.
-// Reverse intervals are selected only from the client's bidirectional result. Reverse-only flows use their ordinary sum.
-func verifyRTTStepDirection(directory string, receiver *flowResult, origin float64, reverseIntervals bool) ([]throughputMeasurement, error) {
-	samples, err := receiverIntervals(receiver, origin, reverseIntervals)
+func verifyRTTStepDirection(directory string, receiver *flowResult, origin float64) ([]throughputMeasurement, error) {
+	trace, err := receiverEvidence(receiver, origin)
 	if err != nil {
 		return nil, err
 	}
@@ -339,74 +374,134 @@ func verifyRTTStepDirection(directory string, receiver *flowResult, origin float
 			return nil, err
 		}
 	}
-	return measureThroughput(samples, []throughputWindow{
+	return measureThroughput(trace, origin, []throughputWindow{
 		{name: "baseline", start: 2, end: min(raised[0], raised[1]) - 2},
 		{name: "raised RTT", start: max(raised[0], raised[1]) + 18, end: min(restored[0], restored[1]) - 2},
 		{name: "restored RTT", start: max(restored[0], restored[1]) + 10, end: 58},
 	}, 5e6)
 }
 
-// receiverIntervals validates receiver evidence and translates it to the client's measurement origin.
-func receiverIntervals(receiver *flowResult, origin float64, reverse bool) ([]flowInterval, error) {
-	if receiver == nil || receiver.Error != "" || !validTimestamp(receiver.Started) || !validTimestamp(origin) {
-		return nil, fmt.Errorf("missing completed receiver interval evidence")
+// loadReceiverTrace rejects incomplete evidence and checks conservation against the local receiver, including
+// bidirectional sums.
+func loadReceiverTrace(directory, role string, receiver *flowResult) (*receiverTrace, error) {
+	paths, err := filepath.Glob(filepath.Join(directory, role+"-receiver-*.jsonl"))
+	if err != nil {
+		return nil, err
 	}
-	samples := make([]flowInterval, 0, len(receiver.Intervals)+1)
-	offset := receiver.Started - origin
-	if offset > 0 {
-		// Iperf3 initializes counters before starting workers, so delivery before that origin is known to be zero.
-		samples = append(samples, flowInterval{End: offset, Sender: new(bool)})
+	if len(paths) != 1 {
+		return nil, fmt.Errorf("%s: require exactly one receiver counter trace, found %d", role, len(paths))
 	}
-	previousEnd := 0.0
+	file, err := os.Open(paths[0])
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	var trace receiverTrace
+	if err := decoder.Decode(&trace); err != nil {
+		return nil, fmt.Errorf("%s receiver header: %w", role, err)
+	}
+	if trace.Type != "receiver_reads" || trace.Stream <= 0 || trace.Count < 0 || trace.Count > 1048576 ||
+		trace.Error == nil || *trace.Error || trace.Started <= 0 || trace.Ended <= trace.Started ||
+		!validTimestamp(receiver.Started) || math.Abs(float64(trace.Started)/1e9-receiver.Started) > 1e-6 {
+		return nil, fmt.Errorf("%s: invalid receiver counter header", role)
+	}
+	var total uint64
+	previous := trace.Started
+	for range trace.Count {
+		var event receiverEvent
+		if err := decoder.Decode(&event); err != nil {
+			return nil, fmt.Errorf("%s receiver event: %w", role, err)
+		}
+		if event.Began < previous || event.Ended < event.Began || event.Ended > trace.Ended ||
+			event.Bytes == 0 || event.Bytes > math.MaxUint64-total {
+			return nil, fmt.Errorf("%s: invalid receiver counter event", role)
+		}
+		previous = event.Ended
+		total += event.Bytes
+		trace.Events = append(trace.Events, event)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("%s: receiver counter trace has trailing or malformed records", role)
+	}
+	var localTotals []uint64
+	for _, sum := range []struct {
+		bytes  uint64
+		sender *bool
+	}{
+		{receiver.End.Received.Bytes, receiver.End.Received.Sender},
+		{receiver.End.ReverseReceived.Bytes, receiver.End.ReverseReceived.Sender},
+	} {
+		if sum.sender != nil && !*sum.sender {
+			localTotals = append(localTotals, sum.bytes)
+		}
+	}
+	var intervalTotal uint64
 	for _, interval := range receiver.Intervals {
-		sample := interval.Sum
-		if reverse {
-			sample = interval.Reverse
+		found := 0
+		for _, sum := range []flowInterval{interval.Sum, interval.Reverse} {
+			if sum.Sender != nil && !*sum.Sender {
+				if sum.Bytes > math.MaxUint64-intervalTotal {
+					return nil, fmt.Errorf("%s: receiver interval counter overflow", role)
+				}
+				intervalTotal += sum.Bytes
+				found++
+			}
 		}
-		if sample.Sender == nil || *sample.Sender || sample.Start < previousEnd || sample.End <= sample.Start ||
-			math.IsNaN(sample.Start) || math.IsInf(sample.Start, 0) || math.IsNaN(sample.End) || math.IsInf(sample.End, 0) {
-			return nil, fmt.Errorf("invalid receiver interval evidence")
+		if found != 1 {
+			return nil, fmt.Errorf("%s: ambiguous local receiver intervals", role)
 		}
-		previousEnd = sample.End
-		sample.Start += offset
-		sample.End += offset
-		samples = append(samples, sample)
 	}
-	return samples, nil
+	if len(localTotals) != 1 || total != trace.Total || total != localTotals[0] || intervalTotal != total {
+		return nil, fmt.Errorf("%s: receiver events, intervals, and local final total do not conserve bytes", role)
+	}
+	return &trace, nil
 }
 
-// measureThroughput estimates bytes by overlap, preserving zero-delivery intervals and the full window denominator.
-// Interpolation assumes a constant rate within each reporting interval. Missing time is invalid evidence, not idle time.
-func measureThroughput(samples []flowInterval, windows []throughputWindow, minimumBaseline float64) ([]throughputMeasurement, error) {
+// receiverEvidence requires completed counter evidence. Reporting intervals cannot reconstruct within-bin timing.
+func receiverEvidence(receiver *flowResult, origin float64) (*receiverTrace, error) {
+	if receiver == nil || receiver.Error != "" || !validTimestamp(receiver.Started) || !validTimestamp(origin) ||
+		receiver.Receiver == nil {
+		return nil, fmt.Errorf("missing completed receiver counter evidence")
+	}
+	return receiver.Receiver, nil
+}
+
+// measureThroughput passes only when the entire observed ratio range satisfies the unchanged 25 percent requirement.
+func measureThroughput(trace *receiverTrace, origin float64, windows []throughputWindow, minimumBaseline float64) ([]throughputMeasurement, error) {
 	var measurements []throughputMeasurement
 	var failures []error
-	var baseline float64
+	var baseline throughputMeasurement
 	baselineValid := false
 	for index, window := range windows {
-		measurement, err := measureWindow(samples, window)
+		measurement, err := measureWindow(trace, origin, window)
 		if err != nil {
 			failures = append(failures, err)
 		} else {
 			if index == 0 {
-				baseline = measurement.BitsPerSecond
-				baselineValid = baseline > 0 && (minimumBaseline == 0 || baseline/minimumBaseline+throughputRoundoff >= 1)
+				baseline = measurement
+				baselineValid = baseline.LowerRate > 0 &&
+					(minimumBaseline == 0 || baseline.LowerRate/minimumBaseline+throughputRoundoff >= 1)
 				if !baselineValid {
 					measurement.Status = "invalid"
-					failures = append(failures, fmt.Errorf("baseline receiver throughput is %.6f Mbit/s, require at least %.3f Mbit/s and positive delivery",
-						baseline/1e6, minimumBaseline/1e6))
+					failures = append(failures, fmt.Errorf("baseline receiver throughput lower bound is %.6f Mbit/s, require at least %.3f Mbit/s and positive delivery",
+						baseline.LowerRate/1e6, minimumBaseline/1e6))
 				}
-			}
-			if baseline > 0 {
-				fraction := measurement.BitsPerSecond / baseline
-				measurement.Fraction = &fraction
-			}
-			if index > 0 {
-				if !baselineValid {
-					measurement.Status = "invalid"
-				} else if *measurement.Fraction+throughputRoundoff < 0.25 {
+			} else if !baselineValid {
+				measurement.Status = "invalid"
+			} else {
+				lower := measurement.LowerRate / baseline.UpperRate
+				upper := measurement.UpperRate / baseline.LowerRate
+				measurement.LowerFraction, measurement.UpperFraction = &lower, &upper
+				if upper+throughputRoundoff < 0.25 {
 					measurement.Status = "below-threshold"
-					failures = append(failures, fmt.Errorf("%s receiver throughput is %.4f percent of baseline, require at least 25 percent",
-						window.name, *measurement.Fraction*100))
+					failures = append(failures, fmt.Errorf("%s receiver throughput is at most %.4f percent of baseline, require at least 25 percent",
+						window.name, upper*100))
+				} else if lower+throughputRoundoff < 0.25 {
+					measurement.Status = "inconclusive"
+					failures = append(failures, fmt.Errorf("%s receiver counter bounds straddle the 25 percent threshold: [%.4f,%.4f] percent",
+						window.name, lower*100, upper*100))
 				}
 			}
 		}
@@ -415,30 +510,34 @@ func measureThroughput(samples []flowInterval, windows []throughputWindow, minim
 	return measurements, errors.Join(failures...)
 }
 
-// measureWindow integrates receiver delivery over one fully covered measurement window.
-func measureWindow(samples []flowInterval, window throughputWindow) (throughputMeasurement, error) {
-	measurement := throughputMeasurement{Phase: window.name, Start: window.start, End: window.end, Status: "pass"}
-	cursor := window.start
-	complete := window.end > window.start
-	for _, sample := range samples {
-		start, end := max(sample.Start, window.start), min(sample.End, window.end)
-		if end <= start {
-			continue
-		}
-		if start > cursor+1e-6 {
-			complete = false
-		}
-		measurement.Covered += end - start
-		measurement.Bytes += float64(sample.Bytes) * ((end - start) / (sample.End - sample.Start))
-		cursor = end
+// measureWindow counts definite and possible application deliveries in [start,end), preserving boundary uncertainty.
+func measureWindow(trace *receiverTrace, origin float64, window throughputWindow) (throughputMeasurement, error) {
+	measurement := throughputMeasurement{Phase: window.name, Start: window.start, End: window.end, Status: "invalid"}
+	if trace == nil || !validTimestamp(origin) || window.start < 0 || !(window.end > window.start) ||
+		math.IsInf(window.end, 0) || origin+window.end >= float64(math.MaxInt64)/1e9 {
+		return measurement, fmt.Errorf("%s has invalid receiver window or missing counter evidence", window.name)
 	}
-	// Allow one serialized microsecond of timestamp rounding across the entire window.
-	if !complete || cursor < window.end-1e-6 || measurement.Covered < window.end-window.start-1e-6 {
-		measurement.Status = "invalid"
-		return measurement, fmt.Errorf("%s lacks complete receiver intervals: covered %.6f of %.6f seconds",
-			window.name, measurement.Covered, window.end-window.start)
+	start := int64(math.Round(origin*1e9)) + int64(math.Round(window.start*1e9))
+	end := int64(math.Round(origin*1e9)) + int64(math.Round(window.end*1e9))
+	// Before receiver initialization all counters are zero. After its final snapshot no coverage is invented.
+	if end > trace.Ended {
+		return measurement, fmt.Errorf("%s lacks complete receiver counter coverage", window.name)
 	}
-	measurement.BitsPerSecond = measurement.Bytes * 8 / (window.end - window.start)
+	for _, event := range trace.Events {
+		if event.Began >= end {
+			break
+		}
+		if event.Ended >= start {
+			measurement.UpperBytes += event.Bytes
+			if event.Began >= start && event.Ended < end {
+				measurement.LowerBytes += event.Bytes
+			}
+		}
+	}
+	measurement.Covered = window.end - window.start
+	measurement.LowerRate = float64(measurement.LowerBytes) * 8 / measurement.Covered
+	measurement.UpperRate = float64(measurement.UpperBytes) * 8 / measurement.Covered
+	measurement.Status = "pass"
 	return measurement, nil
 }
 
@@ -452,17 +551,21 @@ func hasPathFault(scenario string) bool {
 func verifyProgress(scenario string, flow flowResult, duration float64) ([]throughputMeasurement, error) {
 	var measurements []throughputMeasurement
 	var failures []error
-	for _, direction := range receiverDirections(scenario, flow) {
-		samples, err := receiverIntervals(direction.receiver, flow.Started, direction.reverse)
+	for _, direction := range receiverDirections(scenario, &flow) {
+		trace, err := receiverEvidence(direction.receiver, flow.Started)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s direction: %w", direction.name, err))
 			continue
 		}
-		measurement, err := measureWindow(samples, throughputWindow{name: "final progress", start: duration - 1, end: duration})
+		measurement, err := measureWindow(trace, flow.Started, throughputWindow{name: "final progress", start: duration - 1, end: duration})
 		measurement.Direction = direction.name
-		if err == nil && measurement.Bytes == 0 {
+		if err == nil && measurement.LowerBytes == 0 {
 			measurement.Status = "no-progress"
 			err = fmt.Errorf("no receiver progress in the final second after path recovery")
+			if measurement.UpperBytes > 0 {
+				measurement.Status = "inconclusive"
+				err = fmt.Errorf("receiver counter bounds do not establish progress in the final second")
+			}
 		}
 		measurements = append(measurements, measurement)
 		if err != nil {
@@ -661,13 +764,13 @@ func verifyCapacityChangeQdiscs(directory, role string) error {
 func verifyRecovery(scenario string, flow flowResult, duration, minimumBaseline float64) ([]throughputMeasurement, error) {
 	var measurements []throughputMeasurement
 	var failures []error
-	for _, direction := range receiverDirections(scenario, flow) {
-		samples, err := receiverIntervals(direction.receiver, flow.Started, direction.reverse)
+	for _, direction := range receiverDirections(scenario, &flow) {
+		trace, err := receiverEvidence(direction.receiver, flow.Started)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s direction: %w", direction.name, err))
 			continue
 		}
-		measured, err := measureThroughput(samples, []throughputWindow{
+		measured, err := measureThroughput(trace, flow.Started, []throughputWindow{
 			{name: "baseline", start: 0, end: 4},
 			{name: "recovered", start: duration - 5, end: duration},
 		}, minimumBaseline)

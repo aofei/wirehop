@@ -464,7 +464,7 @@ func TestSchedulerRunIdleAndDetachedExpiry(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer queue.Close()
-		scheduler, err := NewScheduler(queue)
+		scheduler, err := NewScheduler(&Ingress{queue: queue})
 		if err != nil {
 			t.Fatal(err)
 		}

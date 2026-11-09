@@ -170,7 +170,7 @@ func feedbackScheduler(t *testing.T) (*packetqueue.Queue[Packet], *Scheduler) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}

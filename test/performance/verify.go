@@ -14,16 +14,35 @@ import (
 	"strings"
 )
 
-// flowResult contains the measured receiver rate and inner TCP retransmissions.
+// flowWorkload identifies the single-stream, forward TCP workload used by the harness.
+type flowWorkload struct {
+	Protocol  string
+	Streams   int `json:"num_streams"`
+	BlockSize int `json:"blksize"`
+	Duration  int
+	Omit      int
+	Reverse   int
+	Bidir     int
+	Bytes     uint64
+	Blocks    uint64
+	Bitrate   uint64 `json:"target_bitrate"`
+	Pacing    uint64 `json:"fqrate"`
+}
+
+// flowResult contains the completed receiver counters and inner TCP retransmissions.
 type flowResult struct {
 	Error string
-	End   struct {
+	Start struct {
+		Workload flowWorkload `json:"test_start"`
+	}
+	End struct {
 		Received struct {
 			Bytes         uint64
-			BitsPerSecond float64 `json:"bits_per_second"`
+			BitsPerSecond float64 `json:"-"` // Derived from receiver bytes and seconds.
 			Seconds       float64
 		} `json:"sum_received"`
 		Sent struct {
+			Seconds     float64
 			Retransmits uint64
 		} `json:"sum_sent"`
 	}
@@ -85,6 +104,7 @@ func verifyProfile(root, profile string, repetitions int) error {
 	medians := make(map[string]float64)
 	minimumCombined := math.Inf(1)
 	minimumRepetition := 0
+	var workload flowWorkload
 	var evidenceErrors error
 	for _, path := range []string{"Low", "High", "Both"} {
 		var rates []float64
@@ -93,6 +113,13 @@ func verifyProfile(root, profile string, repetitions int) error {
 			flow, err := readFlow(directory)
 			if err != nil {
 				evidenceErrors = errors.Join(evidenceErrors, err)
+				continue
+			}
+			if workload.Duration == 0 {
+				workload = flow.Start.Workload
+			} else if flow.Start.Workload != workload {
+				evidenceErrors = errors.Join(evidenceErrors, fmt.Errorf(
+					"%s: different flow workload: %+v, want %+v", directory, flow.Start.Workload, workload))
 				continue
 			}
 			rate := flow.End.Received.BitsPerSecond
@@ -131,6 +158,11 @@ func verifyProfile(root, profile string, repetitions int) error {
 
 // verifyEvidence rejects carrier churn, router bypass, and unexpected drops in a healthy comparison.
 func verifyEvidence(directory, path string, minimumBytes uint64, allowDrops bool) error {
+	if failure, err := os.ReadFile(filepath.Join(directory, "harness-error.txt")); err == nil {
+		return fmt.Errorf("test harness: %s", strings.TrimSpace(string(failure)))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	var sockets [2][]string
 	for index, name := range []string{"client-tcp-sockets.txt", "client-tcp-sockets-after.txt"} {
 		encoded, err := os.ReadFile(filepath.Join(directory, name))
@@ -238,7 +270,7 @@ func verifyLatency(directory string) error {
 	return nil
 }
 
-// readFlow requires a complete iperf3 receiver result before using it in either comparison.
+// readFlow checks the requested workload and completion before deriving receiver goodput.
 func readFlow(directory string) (flowResult, error) {
 	var flow flowResult
 	encoded, err := os.ReadFile(filepath.Join(directory, "flow.json"))
@@ -248,10 +280,22 @@ func readFlow(directory string) (flowResult, error) {
 	if err := json.Unmarshal(encoded, &flow); err != nil {
 		return flow, fmt.Errorf("%s: %w", directory, err)
 	}
-	rate := flow.End.Received.BitsPerSecond
-	if flow.Error != "" || flow.End.Received.Seconds < 19 || flow.End.Received.Bytes == 0 || rate <= 0 {
+	if flow.Error != "" {
 		return flow, fmt.Errorf("%s: incomplete flow: %s", directory, flow.Error)
 	}
+	workload := flow.Start.Workload
+	if workload.Protocol != "TCP" || workload.Streams != 1 || workload.BlockSize <= 0 ||
+		workload.Duration < 20 || workload.Duration > 86400 || workload.Omit != 0 || workload.Reverse != 0 ||
+		workload.Bidir != 0 || workload.Bytes != 0 || workload.Blocks != 0 || workload.Bitrate != 0 || workload.Pacing != 0 {
+		return flow, fmt.Errorf("%s: unsupported flow workload: %+v", directory, workload)
+	}
+	// Retain the one-second completion allowance for every requested duration.
+	minimumSeconds := float64(workload.Duration) - 1
+	if flow.End.Sent.Seconds < minimumSeconds ||
+		flow.End.Received.Seconds < minimumSeconds || flow.End.Received.Bytes == 0 {
+		return flow, fmt.Errorf("%s: incomplete flow", directory)
+	}
+	flow.End.Received.BitsPerSecond = float64(flow.End.Received.Bytes) * 8 / flow.End.Received.Seconds
 	return flow, nil
 }
 
@@ -279,6 +323,7 @@ func compareBaseline(candidate, baseline string, repetitions int) error {
 // comparePathBaseline validates and compares one path independently of other path failures.
 func comparePathBaseline(candidate, baseline, profile, path string, repetitions int) error {
 	var rates [2][]float64
+	var workload flowWorkload
 	var evidenceErrors error
 	for index, root := range []string{candidate, baseline} {
 		for repetition := 1; repetition <= repetitions; repetition++ {
@@ -286,6 +331,13 @@ func comparePathBaseline(candidate, baseline, profile, path string, repetitions 
 			flow, err := readFlow(directory)
 			if err != nil {
 				evidenceErrors = errors.Join(evidenceErrors, err)
+				continue
+			}
+			if workload.Duration == 0 {
+				workload = flow.Start.Workload
+			} else if flow.Start.Workload != workload {
+				evidenceErrors = errors.Join(evidenceErrors, fmt.Errorf(
+					"%s: different flow workload: %+v, want %+v", directory, flow.Start.Workload, workload))
 				continue
 			}
 			if err := verifyEvidence(directory, path, flow.End.Received.Bytes, index == 1); err != nil {

@@ -279,6 +279,8 @@ type TransmissionStore struct {
 	probeWindow             uint64
 	admissionBlocked        bool
 	measurementDrain        atomic.Bool
+	measurementSupplyPaused bool
+	measurementWindow       uint64
 	// transportReported saturates at minimumTransportProofBytes and excludes capacity padding.
 	transportReported atomic.Uint64
 	writeBudget       atomic.Uint64
@@ -327,17 +329,20 @@ func newTransmissionStoreWithBudget(limits packetqueue.Limits, now func() time.T
 	return store, nil
 }
 
-// setDeliveryWindows publishes normal and padding send credit under the committed-prefix lock.
-func (s *TransmissionStore) setDeliveryWindows(normal, probe uint64) {
+// setDeliveryWindows publishes normal, padding, and measurement credit under the committed-prefix lock.
+func (s *TransmissionStore) setDeliveryWindows(normal, probe, measurement uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.setDeliveryWindowsLocked(normal, probe)
+	s.setDeliveryWindowsLocked(normal, probe, measurement)
 }
 
-// setDeliveryWindowsLocked publishes both windows while the caller holds s.mu.
-func (s *TransmissionStore) setDeliveryWindowsLocked(normal, probe uint64) {
+// setDeliveryWindowsLocked refreshes all windows while the caller holds s.mu.
+func (s *TransmissionStore) setDeliveryWindowsLocked(normal, probe, measurement uint64) {
 	s.deliveryWindow = normal
 	s.probeWindow = probe
+	if s.measurementSupplyPaused && !s.measurementDrain.Load() {
+		s.measurementWindow = max(s.measurementWindow, measurement)
+	}
 	if s.control.len()+s.normal.len() > 0 {
 		s.notifyLocked()
 	}
@@ -446,6 +451,9 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 		if transmission.packetID == 0 {
 			window = s.probeWindow
 		}
+		if s.measurementSupplyPaused {
+			window = max(window, s.measurementWindow)
+		}
 		committed := s.sentBytes - s.reportedBytes
 		if committed != 0 && (committed >= window || uint64(transmission.size) > window-committed) {
 			break
@@ -481,7 +489,7 @@ func (s *TransmissionStore) takeBatch(destination []protocol.Data, ownership []d
 	if !constrained {
 		s.applicationLimitedUntil = s.sentPackets
 	}
-	limited := s.reportedPackets < s.applicationLimitedUntil
+	limited := s.measurementSupplyPaused || s.reportedPackets < s.applicationLimitedUntil
 	for index := len(s.sent.items) - count; index < len(s.sent.items); index++ {
 		s.sent.items[index].applicationLimited = limited
 	}
@@ -865,27 +873,57 @@ func (s *TransmissionStore) notifyLocked() {
 	}
 }
 
-// beginMeasurementPause closes the Data gate while committed prefixes are reported.
-func (s *TransmissionStore) beginMeasurementPause() {
+// beginMeasurementSupplyPause preserves finite-supply provenance while the accepted ingress cut drains.
+func (s *TransmissionStore) beginMeasurementSupplyPause(window uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.measurementDrain.Store(true)
-	// Quiescence limits supply for every outstanding sample, including reports received after this gate reopens.
+	s.measurementWindow = window
+	s.markMeasurementLimitedLocked()
+}
+
+// markMeasurementLimitedLocked protects capacity samples from intentional admission pauses.
+func (s *TransmissionStore) markMeasurementLimitedLocked() {
+	s.measurementSupplyPaused = true
 	for index := s.sent.head; index < len(s.sent.items); index++ {
 		s.sent.items[index].applicationLimited = true
 	}
 }
 
-// endMeasurementPause resumes Data while preserving pause provenance until the first post-resume packet is reported.
+// beginMeasurementPause closes the DATA gate after all previously accepted queued work has been written.
+func (s *TransmissionStore) beginMeasurementPause() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.measurementDrain.Store(true)
+	s.markMeasurementLimitedLocked()
+}
+
+// endMeasurementPause resumes supply and preserves provenance through the first post-resume report.
 func (s *TransmissionStore) endMeasurementPause() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.measurementDrain.Swap(false) {
+	s.measurementDrain.Store(false)
+	if s.measurementSupplyPaused {
+		s.measurementSupplyPaused = false
+		s.measurementWindow = 0
 		s.applicationLimitedUntil = saturatingAdd(s.sentPackets, 1)
 	}
 	if s.control.len()+s.normal.len() > 0 {
 		s.notifyLocked()
 	}
+}
+
+// hasQueuedData reports accepted application work without treating padding probes as user packets.
+func (s *TransmissionStore) hasQueuedData() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, queue := range []*transmissionDeque{&s.control, &s.normal} {
+		for index := queue.head; index < len(queue.items); index++ {
+			if queue.items[index].packetID != 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // sentEmpty reports whether every data frame committed before the timing pause has been parsed by the peer.

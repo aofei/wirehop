@@ -409,7 +409,7 @@ func (c *Client) run() error {
 	retryAttempt := 0
 	notice := netsetup.NewRetryNotice(c.config.Logger, "relay session")
 	for {
-		activeFor, err := c.runSession(ctx, ingressResult, notice)
+		activeFor, err := c.runSession(ctx, ingressResult, notice, ingress)
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
 		}
@@ -428,8 +428,8 @@ func (c *Client) run() error {
 
 // runSession creates one session, supervises its lanes, and reports established uptime.
 func (c *Client) runSession(ctx context.Context, ingressResult <-chan error,
-	notice *netsetup.RetryNotice) (time.Duration, error) {
-	scheduler, err := relay.NewScheduler(c.queue)
+	notice *netsetup.RetryNotice, input *relay.Ingress) (time.Duration, error) {
+	scheduler, err := relay.NewScheduler(input)
 	if err != nil {
 		return 0, err
 	}

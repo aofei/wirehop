@@ -174,7 +174,7 @@ func TestSchedulerApplyEventObservedCycleInvalidProofGuards(t *testing.T) {
 			lane.registration.RequestMeasurement = func() { calls++ }
 			var scheduler Scheduler
 			var preferred protocol.LaneID
-			scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{1: lane}, &preferred, tt.event, now)
+			scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{1: lane}, &preferred, tt.event, now, false)
 			if lane.minimumRTTMicros != 10_000 || lane.rttMicros != 100_000 || lane.timingReferenceRTT != 100_000 ||
 				lane.timingReferenceRate != 1_000_000 || !lane.nextTimingRefresh.Equal(now.Add(time.Second)) || calls != 0 {
 				t.Fatal("invalid or stale proof changed timing, references, retry, or requests")

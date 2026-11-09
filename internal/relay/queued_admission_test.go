@@ -40,7 +40,7 @@ func TestScheduledLaneCanAcceptTransport(t *testing.T) {
 	t.Run("CommittedFlightIsSeparate", func(t *testing.T) {
 		now := time.Unix(100, 0)
 		store := newFlightCreditStore(t, &now, 2*1024*1024)
-		store.setDeliveryWindows(256*1024, 256*1024)
+		store.setDeliveryWindows(256*1024, 256*1024, 0)
 		lane := scheduledLane{registration: LaneRegistration{Store: store}, deliveryRate: 1000}
 		for id := uint64(1); id <= 8; id++ {
 			pushFlightCreditPacket(t, store, id, 4096, now.Add(time.Second))
@@ -103,7 +103,7 @@ func TestSchedulerScheduleQueuedTransport(t *testing.T) {
 			alternate := schedulerLane(t, 2, 2, 100_000, 250_000)
 			for _, lane := range []*scheduledLane{primary, alternate} {
 				lane.registration.Store.now = func() time.Time { return now }
-				lane.registration.Store.setDeliveryWindows(64*1024, 64*1024)
+				lane.registration.Store.setDeliveryWindows(64*1024, 64*1024, 0)
 				t.Cleanup(func() { releaseTransmissions(lane.registration.Store.drain()) })
 			}
 			lanes := map[protocol.LaneID]*scheduledLane{1: primary, 2: alternate}

@@ -105,7 +105,7 @@ func TestTransmissionStoreCapturesSupplyPressureAtSend(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.UnixMicro(1000)
 			store := newDeliverySampleStore(t, &now)
-			store.setDeliveryWindows(test.window, test.window)
+			store.setDeliveryWindows(test.window, test.window, 0)
 			store.limits.Packets = test.packetCap
 			for id := uint64(1); id <= 2; id++ {
 				if id == 2 && !test.queued {
@@ -138,7 +138,7 @@ func TestScheduledLanePartialBurstPreservesCapacity(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.UnixMicro(1000)
 			store := newDeliverySampleStore(t, &now)
-			store.setDeliveryWindows(test.window, test.window)
+			store.setDeliveryWindows(test.window, test.window, 0)
 			store.limits.Packets = test.packetCap
 			lane := &scheduledLane{
 				registration: schedulerRegistration(1, 1, store),
@@ -210,7 +210,7 @@ func TestScheduledLaneTimingResumePreservesCapacity(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { releaseTransmissions(store.drain()) })
-			store.setDeliveryWindows(65_536, 65_536)
+			store.setDeliveryWindows(65_536, 65_536, 0)
 			lane := &scheduledLane{
 				registration: schedulerRegistration(1, 1, store),
 				rttMicros:    400_000, minimumRTTMicros: 300_000,
@@ -314,7 +314,7 @@ func TestTransmissionStorePreservesApplicationLimitedFlight(t *testing.T) {
 	now := time.UnixMicro(1000)
 	store := newDeliverySampleStore(t, &now)
 	sendDeliverySamplePacket(t, store, 1)
-	store.setDeliveryWindows(32_768, 32_768)
+	store.setDeliveryWindows(32_768, 32_768, 0)
 	var data [8]protocol.Data
 	var ownership [8]datagram.Packet
 	for flight := uint64(0); flight < 2; flight++ {
@@ -381,7 +381,7 @@ func TestScheduledLaneTimingPausePreservesCapacity(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			now := time.UnixMicro(3_000_000)
 			store := newDeliverySampleStore(t, &now)
-			store.setDeliveryWindows(16_384, 16_384)
+			store.setDeliveryWindows(16_384, 16_384, 0)
 			lane := &scheduledLane{
 				registration: schedulerRegistration(1, 1, store),
 				rttMicros:    10_000, minimumRTTMicros: 10_000,

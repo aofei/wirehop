@@ -64,6 +64,7 @@ func TestVerifyRecoveryOrigins(t *testing.T) {
 					flow.Intervals[index].Sum = flow.Intervals[index].Reverse
 				}
 			}
+			attachReceiverCounters(&flow, scenario)
 			measurements, err := verifyRecovery(scenario, flow, 20, 0)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
@@ -71,8 +72,8 @@ func TestVerifyRecoveryOrigins(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatal(err)
-			} else if len(measurements) != 2 || measurements[1].Fraction == nil ||
-				math.Abs(*measurements[1].Fraction-tt.wantFraction) > 1e-12 {
+			} else if len(measurements) != 2 || measurements[1].LowerFraction == nil ||
+				math.Abs(*measurements[1].LowerFraction-tt.wantFraction) > 1e-12 {
 				t.Fatalf("wrong common-clock recovery: %+v", measurements)
 			}
 		})
@@ -102,6 +103,7 @@ func TestVerifyProgressOrigins(t *testing.T) {
 					flow.Intervals[index].Sum = flow.Intervals[index].Reverse
 				}
 			}
+			attachReceiverCounters(&flow, scenario)
 			measurements, err := verifyProgress(scenario, flow, 20)
 			if tt.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "no receiver progress") {
@@ -109,30 +111,6 @@ func TestVerifyProgressOrigins(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func TestVerifyRecoveryOriginGaps(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		offset int
-	}{
-		{name: "Earlier", offset: -3},
-		{name: "Later", offset: 3},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			flow := originFlow(tt.offset, 20)
-			// Missing reporting intervals after initialization remain missing evidence.
-			if tt.offset > 0 {
-				flow.ServerOutput.Intervals = flow.ServerOutput.Intervals[1:]
-			} else {
-				flow.ServerOutput.Intervals = append(flow.ServerOutput.Intervals[:4], flow.ServerOutput.Intervals[5:]...)
-			}
-			measurements, err := verifyRecovery("tcp-asymmetric-stall", flow, 20, 0)
-			if err == nil || measurements[0].Status != "invalid" || !strings.Contains(err.Error(), "lacks complete") {
-				t.Fatalf("invented delivery evidence after initialization: %+v, %v", measurements, err)
 			}
 		})
 	}
@@ -168,6 +146,7 @@ func TestVerifyRTTStepOrigins(t *testing.T) {
 			for index := 10; index < len(flow.Intervals); index++ {
 				flow.Intervals[index].Reverse.Bytes = 250_000
 			}
+			attachReceiverCounters(&flow, "tcp-rtt-step-bidir")
 			measurements, err := verifyRTTStep(directory, "tcp-rtt-step-bidir", flow)
 			if err != nil {
 				t.Fatal(err)
@@ -178,7 +157,7 @@ func TestVerifyRTTStepOrigins(t *testing.T) {
 					if measurement.Direction == "reverse" {
 						want = 0.25
 					}
-					if measurement.Fraction == nil || math.Abs(*measurement.Fraction-want) > 1e-12 {
+					if measurement.LowerFraction == nil || math.Abs(*measurement.LowerFraction-want) > 1e-12 {
 						t.Fatalf("wrong common-clock RTT measurement: %+v", measurement)
 					}
 				}
@@ -193,6 +172,7 @@ func TestVerifyRTTStepOrigins(t *testing.T) {
 func TestVerifyRecoveryOriginTimestamp(t *testing.T) {
 	flow := originFlow(-3, 20)
 	flow.Started = 0
+	attachReceiverCounters(&flow, "tcp-asymmetric-stall")
 	if _, err := verifyRecovery("tcp-asymmetric-stall", flow, 20, 0); err == nil {
 		t.Fatal("accepted receiver data without a common origin")
 	}
@@ -202,14 +182,15 @@ func TestVerifyRecoveryOriginRounding(t *testing.T) {
 	flow := originFlow(0, 20)
 	flow.ServerOutput.Started += 0.00002
 	flow.ServerOutput.Intervals[len(flow.ServerOutput.Intervals)-1].Sum.End -= 0.00002
+	attachReceiverCounters(&flow, "tcp-asymmetric-stall")
 	measurements, err := verifyRecovery("tcp-asymmetric-stall", flow, 20, 0)
 	if err != nil || math.Abs(measurements[0].Covered-4) > 1e-12 || math.Abs(measurements[1].Covered-5) > 1e-12 {
 		t.Fatalf("small initialization skew invalidated measured coverage: %+v, %v", measurements, err)
 	}
-	// A missing interval after producer initialization must not be treated as zero delivery.
-	flow.ServerOutput.Intervals[0].Sum.Start = 0.00002
+	// Complete reporting intervals cannot replace missing counter evidence.
+	flow.ServerOutput.Receiver = nil
 	if _, err := verifyRecovery("tcp-asymmetric-stall", flow, 20, 0); err == nil {
-		t.Fatal("accepted a reporting gap after the known zero prefix")
+		t.Fatal("accepted reporting intervals without receiver counter evidence")
 	}
 }
 

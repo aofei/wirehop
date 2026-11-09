@@ -129,6 +129,7 @@ type schedulerEvent struct {
 // measurementDrain holds the sole measurement operation's session-wide Data pause.
 type measurementDrain struct {
 	released     func(time.Duration)
+	changed      func()
 	ctx          context.Context
 	target       protocol.LaneGeneration
 	ready        chan struct{}
@@ -204,6 +205,7 @@ func scoredLaneBetter(left, right scoredLane) bool {
 
 // Scheduler assigns session packets to dynamically registered lanes.
 type Scheduler struct {
+	input        *Ingress
 	measurements *measurementCoordinator
 	ingress      *packetqueue.Queue[Packet]
 	events       chan schedulerEvent
@@ -221,17 +223,19 @@ type Scheduler struct {
 	pendingMeasurementDrain atomic.Bool
 	measurementChanged      chan struct{}
 	measurementStarted      time.Time
+	measurementQuiet        bool
 	measurementDeadline     time.Time
 	measurementTimer        *time.Timer
 }
 
 // NewScheduler validates resources and returns an empty multipath scheduler.
-func NewScheduler(ingress *packetqueue.Queue[Packet]) (*Scheduler, error) {
-	if ingress == nil {
+func NewScheduler(input *Ingress) (*Scheduler, error) {
+	if input == nil || input.queue == nil {
 		return nil, ErrInvalidScheduler
 	}
 	s := &Scheduler{
-		ingress:            ingress,
+		input:              input,
+		ingress:            input.queue,
 		events:             make(chan schedulerEvent, schedulerEventCapacity),
 		transportReady:     make(chan struct{}, 1),
 		measurementChanged: make(chan struct{}, 1),
@@ -250,7 +254,8 @@ func (s *Scheduler) beginMeasurementDrain(ctx context.Context, target protocol.L
 	if ctx.Err() != nil || !s.pendingMeasurementDrain.CompareAndSwap(false, true) {
 		return nil, nil
 	}
-	drain := &measurementDrain{ctx: ctx, target: target, localRequest: localRequest, ready: make(chan struct{}), released: released}
+	drain := &measurementDrain{ctx: ctx, target: target, localRequest: localRequest, ready: make(chan struct{}),
+		released: released, changed: s.notifyMeasurementChanged}
 	stop := context.AfterFunc(ctx, s.notifyMeasurementChanged)
 	select {
 	case s.events <- schedulerEvent{kind: schedulerDrainData, drain: drain}:
@@ -413,6 +418,9 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 	lanes := make(map[protocol.LaneID]*scheduledLane)
 	defer s.invalidateLaneOrders()
 	defer func() {
+		if s.measurementDrain != nil {
+			s.input.resumeAfterMeasurement(s.measurementDrain)
+		}
 		if s.measurements != nil {
 			s.measurements.close()
 		}
@@ -570,6 +578,7 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 				check = nil
 			}
 		}
+		s.updateMeasurementDrain(lanes, hasPending || hasPreempted)
 		if next := s.ingress.NextDeadline(now); !next.Equal(expiryAt) {
 			expiryAt = next
 			if next.IsZero() {
@@ -585,10 +594,10 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 			case <-ctx.Done():
 				return ctx.Err()
 			case event := <-s.events:
-				s.applyEvent(lanes, &preferred, event, s.ingress.Now())
+				s.applyEvent(lanes, &preferred, event, s.ingress.Now(), hasPending || hasPreempted)
 			case <-s.transportReady:
 			case <-s.measurementChanged:
-				s.updateMeasurementDrain(lanes)
+				s.updateMeasurementDrain(lanes, hasPending || hasPreempted)
 			case <-check:
 				s.checkAbandonment(lanes, &preferred, s.ingress.Now())
 			case <-expiryReady:
@@ -602,10 +611,10 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 		case <-ctx.Done():
 			return ctx.Err()
 		case event := <-s.events:
-			s.applyEvent(lanes, &preferred, event, s.ingress.Now())
+			s.applyEvent(lanes, &preferred, event, s.ingress.Now(), hasPending || hasPreempted)
 		case <-s.transportReady:
 		case <-s.measurementChanged:
-			s.updateMeasurementDrain(lanes)
+			s.updateMeasurementDrain(lanes, hasPending || hasPreempted)
 		case <-s.ingress.Ready():
 		case <-check:
 			s.checkAbandonment(lanes, &preferred, s.ingress.Now())
@@ -618,8 +627,8 @@ func (s *Scheduler) Run(parent context.Context) (result error) {
 
 // applyEvent mutates lane state for one serialized event.
 func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferred *protocol.LaneID,
-	event schedulerEvent, now time.Time) {
-	defer s.updateMeasurementDrain(lanes)
+	event schedulerEvent, now time.Time, unassigned bool) {
+	defer s.updateMeasurementDrain(lanes, unassigned)
 	switch event.kind {
 	case schedulerRegister:
 		current := lanes[event.registration.LaneID]
@@ -639,7 +648,10 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		replacement.registration.Store.mu.Unlock()
 		if !s.measurementStarted.IsZero() {
 			s.invalidateMeasurementDrain()
-			replacement.registration.Store.beginMeasurementPause()
+			replacement.registration.Store.beginMeasurementSupplyPause(replacement.drainWindowBytes())
+			if s.measurementQuiet {
+				replacement.registration.Store.beginMeasurementPause()
+			}
 		}
 		lanes[event.registration.LaneID] = replacement
 		s.invalidateLaneOrders()
@@ -685,7 +697,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 		lane := lanes[event.laneID]
 		if lane != nil && lane.registration.Generation == event.generation {
 			roundTrip := lane.applyTiming(event.timing, false)
-			lane.registration.Store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+			lane.registration.Store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0), lane.drainWindowBytes())
 			if roundTrip != 0 {
 				lane.maybeRefreshTiming(now, roundTrip)
 			}
@@ -698,7 +710,7 @@ func (s *Scheduler) applyEvent(lanes map[protocol.LaneID]*scheduledLane, preferr
 			lane := lanes[event.laneID]
 			if event.rttMicros != 0 && lane != nil && lane.registration.Generation == event.generation && m.usableLocked(event.measurement) {
 				lane.applyRoundTrip(event.rttMicros, true)
-				lane.registration.Store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+				lane.registration.Store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0), lane.drainWindowBytes())
 				applied = true
 			}
 			m.mu.Unlock()
@@ -758,7 +770,7 @@ func (s *Scheduler) invalidateMeasurementDrain() {
 }
 
 // updateMeasurementDrain admits the sole session pause after active discovery and expires its fixed deadline.
-func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledLane) {
+func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledLane, unassigned bool) {
 	drain := s.measurementDrain
 	if drain == nil {
 		return
@@ -773,9 +785,11 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 		s.measurementDrain = nil
 		s.pendingMeasurementDrain.Store(false)
 		s.measurementStarted = time.Time{}
+		s.measurementQuiet = false
 		for _, lane := range lanes {
 			lane.registration.Store.endMeasurementPause()
 		}
+		s.input.resumeAfterMeasurement(drain)
 		if s.measurementTimer != nil {
 			s.measurementTimer.Stop()
 			s.measurementTimer = nil
@@ -805,6 +819,15 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 			}
 			return
 		}
+		if !s.input.pauseForMeasurement(drain) {
+			drain.finish(false)
+			s.measurementDrain = nil
+			s.pendingMeasurementDrain.Store(false)
+			if drain.released != nil {
+				drain.released(0)
+			}
+			return
+		}
 		s.measurementStarted = now
 		s.transportQueue = transportQueueControl{}
 		pause := measurementPauseLimit
@@ -823,8 +846,22 @@ func (s *Scheduler) updateMeasurementDrain(lanes map[protocol.LaneID]*scheduledL
 		s.measurementTimer = time.AfterFunc(time.Until(s.measurementDeadline), s.notifyMeasurementChanged)
 		drain.deadline = s.measurementDeadline
 		for _, lane := range lanes {
+			lane.registration.Store.beginMeasurementSupplyPause(lane.drainWindowBytes())
+		}
+	}
+	if !s.measurementQuiet {
+		if !s.input.measurementReadComplete(drain) || unassigned || s.ingress.Len() != 0 {
+			return
+		}
+		for _, lane := range lanes {
+			if lane.registration.Store.hasQueuedData() {
+				return
+			}
+		}
+		for _, lane := range lanes {
 			lane.registration.Store.beginMeasurementPause()
 		}
+		s.measurementQuiet = true
 	}
 	for _, lane := range lanes {
 		if !lane.registration.Store.sentEmpty() {
@@ -954,7 +991,7 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 	frameBytes := uint64(size)
 	control := item.Value.Kind.Control()
 	initialKeepalive := !control && preferred.IsZero() && len(item.Value.Payload) == wgpacket.TransportKeepaliveLength
-	paused := !s.measurementStarted.IsZero()
+	paused := s.measurementQuiet
 	var candidates laneCandidates
 	if control {
 		if paused {
@@ -978,7 +1015,7 @@ func (s *Scheduler) schedule(lanes map[protocol.LaneID]*scheduledLane, preferred
 		}
 		return candidates.available, nil
 	}
-	if !paused && !control && !initialKeepalive && item.Value.queuedMicros != 0 && s.transportQueue.drop(
+	if s.measurementStarted.IsZero() && !control && !initialKeepalive && item.Value.queuedMicros != 0 && s.transportQueue.drop(
 		now, item.Value.queuedMicros, s.ingress.Bytes(), frameBytes, candidates.lanes[0]) {
 		item.Release()
 		return true, nil
@@ -1209,7 +1246,7 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	}
 	store.writeBudget.Store(quantum)
 	l.feedbackDelayMicros = report.DelayMicros
-	store.setDeliveryWindowsLocked(l.deliveryWindowBytes(), l.probeWindowBytes(0))
+	store.setDeliveryWindowsLocked(l.deliveryWindowBytes(), l.probeWindowBytes(0), l.drainWindowBytes())
 	l.lastDataPackets = report.DataPackets
 	l.lastPingID = report.PingID
 	l.lastProgressAt = receiveTime
@@ -1444,11 +1481,13 @@ func laneProgressStalled(lane *scheduledLane, now, unreportedSince time.Time, fi
 
 // progressGuardMicros allows the longer of two feedback cycles or a startup flight, plus the first frame's serialization.
 // The flight allowance keeps low-rate carriers from looking stalled between small-frame reports.
+// A recent RTT increase takes effect before the operating average catches up.
 func progressGuardMicros(lane *scheduledLane, firstBytes uint64) uint64 {
-	if lane.rttMicros > math.MaxUint64/2 || lane.deliveryRate == 0 || firstBytes > math.MaxUint64/1_000_000 {
+	rtt := max(lane.rttMicros, lane.latestRTTMicros)
+	if rtt > math.MaxUint64/2 || lane.deliveryRate == 0 || firstBytes > math.MaxUint64/1_000_000 {
 		return math.MaxUint64
 	}
-	cycle := max(lane.rttMicros, saturatingAdd(lane.rttMicros/2, lane.feedbackDelayMicros))
+	cycle := max(rtt, saturatingAdd(rtt/2, lane.feedbackDelayMicros))
 	if cycle > math.MaxUint64/2 {
 		return math.MaxUint64
 	}

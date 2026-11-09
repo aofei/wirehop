@@ -192,7 +192,7 @@ func TestScheduledLaneRefreshTimingAfterCapacityAndDelayIncrease(t *testing.T) {
 			// Report complete flights over a path whose capacity and RTT have both increased.
 			// This exercises the real store's application-limited classification and rate samples.
 			for range 400 {
-				store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+				store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0), 0)
 				queued := 0
 				for uint64(queued+1)*4096 <= lane.deliveryWindowBytes() && lane.canAccept(4096) {
 					if err := store.push(deliverySampleTransmission(t, store, store.sentPackets+uint64(queued)+1)); err != nil {
@@ -237,17 +237,17 @@ func TestSchedulerApplyMeasurementUpdatesRoutedFeedback(t *testing.T) {
 		event := <-f.scheduler.events
 		event.generation = 2
 		var preferred protocol.LaneID
-		f.scheduler.applyEvent(f.lanes, &preferred, event, time.Now())
+		f.scheduler.applyEvent(f.lanes, &preferred, event, time.Now(), false)
 		if f.lanes[2].minimumRTTMicros != 10_000 {
 			t.Fatal("another generation changed the minimum")
 		}
 		event.generation = 1
-		f.scheduler.applyEvent(f.lanes, &preferred, event, time.Now())
+		f.scheduler.applyEvent(f.lanes, &preferred, event, time.Now(), false)
 		result := make(chan error, 1)
 		f.scheduler.applyEvent(f.lanes, &preferred, schedulerEvent{
 			kind: schedulerReport, laneID: 2, generation: 1, result: result,
 			report: protocol.DeliveryReport{LaneID: 1, Generation: 1, PingID: 1, DelayMicros: 25_000},
-		}, time.Now())
+		}, time.Now(), false)
 		if err := <-result; err != nil {
 			t.Fatal(err)
 		}
@@ -330,7 +330,7 @@ func runRTTWindowStorePhase(t *testing.T, lane *scheduledLane, now *time.Time, c
 	constrained := 0
 	packetID := store.sentPackets
 	for {
-		store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+		store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0), 0)
 		for now.Before(end) && lane.canAccept(4096) {
 			packetID++
 			transmission := schedulerTransmission(packetID, wgpacket.TransportData, now.Add(5*time.Second))

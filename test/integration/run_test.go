@@ -50,7 +50,13 @@ func TestIntegrationRunner(t *testing.T) {
 				"docker": `#!/bin/sh
 printf '%s\n' "$*" >> "$WIREHOP_MOCK_DOCKER_LOG"
 case "$1:$2" in
+  network:create) printf 'fixture-network\n' ;;
   run:*)
+    previous=
+    for argument in "$@"; do
+      if [ "$previous" = --cidfile ]; then printf 'fixture-container\n' > "$argument"; fi
+      previous=$argument
+    done
     if [ "$WIREHOP_MOCK_CAPTURE_FAILURE" = StartupCaptureFailure ]; then
       mkdir "$WIREHOP_MOCK_RESULTS/native/harness-error.txt"
     fi
@@ -148,8 +154,12 @@ exit 0
 `,
 		"docker": `#!/bin/sh
 case "$1:$2" in
+  network:create) printf 'fixture-network\n' ;;
   run:*)
+    previous=
     for argument in "$@"; do
+      if [ "$previous" = --cidfile ]; then printf 'fixture-container\n' > "$argument"; fi
+      previous=$argument
       case "$argument" in
         *:/results) touch "${argument%:/results}/ready" ;;
       esac

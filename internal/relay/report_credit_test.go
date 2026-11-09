@@ -37,7 +37,7 @@ func TestScheduledLaneApplyReportCredit(t *testing.T) {
 				store.mu.Unlock()
 				return true
 			}
-			store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+			store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0), 0)
 			for id := uint64(1); id <= 16; id++ {
 				if err := store.push(deliverySampleTransmission(t, store, id)); err != nil {
 					t.Fatal(err)
@@ -160,7 +160,7 @@ func TestSchedulerApplyReportRoutedCredit(t *testing.T) {
 			var preferred protocol.LaneID
 			scheduler.applyEvent(lanes, &preferred, schedulerEvent{
 				kind: schedulerReport, laneID: 2, generation: 1, report: report, result: result,
-			}, now)
+			}, now, false)
 			if err := <-result; err != nil {
 				t.Fatal(err)
 			}

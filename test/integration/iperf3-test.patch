@@ -33,46 +33,224 @@ diff --git a/src/iperf_time.c b/src/iperf_time.c
      if (result == 0) {
          time1->secs = (uint32_t) ts.tv_sec;
          time1->usecs = (uint32_t) ts.tv_nsec / 1000;
+diff --git a/src/iperf.h b/src/iperf.h
+--- a/src/iperf.h
++++ b/src/iperf.h
+@@ -130,0 +131,7 @@
++/* Bounded diagnostic records are collected in memory and written after the data flow. */
++struct wirehop_receive_event {
++    uint64_t began_boottime_ns;
++    uint64_t ended_boottime_ns;
++    uint64_t bytes;
++};
++
+@@ -132,0 +140,4 @@
++    struct wirehop_receive_event *wirehop_receive_events;
++    size_t wirehop_receive_count;
++    int wirehop_receive_error;
++    uint64_t wirehop_receive_ended_ns;
+diff --git a/src/iperf_api.h b/src/iperf_api.h
+--- a/src/iperf_api.h
++++ b/src/iperf_api.h
+@@ -334,0 +335 @@
++int iperf_stop_stream_threads(struct iperf_test *);
 diff --git a/src/iperf_api.c b/src/iperf_api.c
 --- a/src/iperf_api.c
 +++ b/src/iperf_api.c
-@@ -2086,6 +2086,9 @@
-     }
-
+@@ -2067,0 +2068,39 @@
++/* Join data workers before final statistics without closing their TCP_INFO sockets. */
++int
++iperf_stop_stream_threads(struct iperf_test *test)
++{
++    struct iperf_stream *sp;
++    SLIST_FOREACH(sp, &test->streams, streams) {
++        int rc;
++        sp->done = 1;
++        if (!sp->thread_created)
++            continue;
++        rc = pthread_cancel(sp->thr);
++        if (rc != 0 && rc != ESRCH) {
++            i_errno = IEPTHREADCANCEL;
++            errno = rc;
++            return -1;
++        }
++        rc = pthread_join(sp->thr, NULL);
++        if (rc != 0 && rc != ESRCH) {
++            i_errno = IEPTHREADJOIN;
++            errno = rc;
++            return -1;
++        }
++        sp->thread_created = 0;
++    }
++    /* Preserve nanosecond coverage after every worker has stopped. */
++    SLIST_FOREACH(sp, &test->streams, streams) {
++        if (sp->result->wirehop_receive_events) {
++            struct timespec finished;
++            if (clock_gettime(CLOCK_BOOTTIME, &finished) != 0) {
++                sp->result->wirehop_receive_error = 1;
++            } else {
++                sp->result->wirehop_receive_ended_ns =
++                    (uint64_t)finished.tv_sec * 1000000000 + (uint64_t)finished.tv_nsec;
++            }
++        }
++    }
++    return 0;
++}
++
+@@ -2076,0 +2116,13 @@
++    }
++
++    /* Allocate before the producer clock starts. No trace writes occur in the data path. */
++    if (getenv("WIREHOP_TEST_RECEIVER_TRACE")) {
++        SLIST_FOREACH(sp, &test->streams, streams) {
++            if (!sp->sender && test->protocol->id == Ptcp) {
++                sp->result->wirehop_receive_events = calloc(1048576, sizeof(struct wirehop_receive_event));
++                if (!sp->result->wirehop_receive_events) {
++                    i_errno = IEINITTEST;
++                    return -1;
++                }
++            }
++        }
+@@ -2086,0 +2139,3 @@
++
 +    if (test->json_output)
 +        cJSON_AddNumberToObject(test->json_start, "started_boottime", iperf_time_in_secs(&now));
+@@ -3416,4 +3471,6 @@
+-	temp.bytes_transferred = sp->sender ? rp->bytes_sent_this_interval : rp->bytes_received_this_interval;
+-
+-        // Total bytes transferred this interval
+-	total_interval_bytes_transferred += rp->bytes_sent_this_interval + rp->bytes_received_this_interval;
++        /* Reset each interval counter at the same instant its value is captured. */
++        iperf_size_t interval_sent = atomic_exchange(&rp->bytes_sent_this_interval, 0);
++        iperf_size_t interval_received = atomic_exchange(&rp->bytes_received_this_interval, 0);
++        temp.bytes_transferred = sp->sender ? interval_sent : interval_received;
 +
-     if (test->on_test_start)
-         test->on_test_start(test);
-
-     return 0;
-@@ -3568,10 +3571,12 @@
++        total_interval_bytes_transferred += interval_sent + interval_received;
+@@ -3512 +3568,0 @@
+-        rp->bytes_sent_this_interval = rp->bytes_received_this_interval = 0;
+@@ -3568 +3624,3 @@
 -	    if (interval_len >= test->stats_interval * 0.10 ||
--		irp->bytes_transferred > 0) {
--		interval_ok = 1;
--		if (test->debug) {
--		    printf("interval forces keep\n");
--		}
--	    }
--	}
 +            /* Streaming consumers need short zero-delivery intervals for complete coverage. */
 +	    if ((test->json_stream && interval_len > 0) ||
 +		interval_len >= test->stats_interval * 0.10 ||
-+		irp->bytes_transferred > 0) {
-+		interval_ok = 1;
-+		if (test->debug) {
-+		    printf("interval forces keep\n");
-+		}
-+	    }
-+	}
-     }
-     if (!interval_ok) {
-@@ -3697,3 +3702,7 @@
+@@ -3697 +3755,5 @@
 -            sp = SLIST_FIRST(&test->streams); /* reset back to 1st stream */
 +            /* Use timing from the same direction as the summed bytes. */
 +            SLIST_FOREACH(sp, &test->streams, streams) {
 +                if (sp->sender == stream_must_be_sender)
 +                    break;
 +            }
-             /* Only do this of course if there was a first stream */
-             if (sp) {
+@@ -4457,0 +4520,29 @@
++    if (sp->result->wirehop_receive_events) {
++        char path[1024];
++        FILE *output;
++        size_t index;
++        int length = snprintf(path, sizeof(path), "%s-%d.jsonl", getenv("WIREHOP_TEST_RECEIVER_TRACE"), sp->id);
++        if (length < 0 || (size_t)length >= sizeof(path) || !(output = fopen(path, "w"))) {
++            perror("write receiver trace");
++            exit(EXIT_FAILURE);
++        }
++        fprintf(output, "{\"type\":\"receiver_reads\",\"stream_id\":%d,"
++                "\"started_boottime_ns\":%" PRIu64 ",\"ended_boottime_ns\":%" PRIu64 ","
++                "\"total_bytes\":%" PRIu64 ",\"count\":%zu,\"error\":%s}\n",
++                sp->id,
++                (uint64_t)sp->result->start_time_fixed.secs * 1000000000 +
++                    (uint64_t)sp->result->start_time_fixed.usecs * 1000,
++                sp->result->wirehop_receive_ended_ns,
++                (uint64_t)sp->result->bytes_received, sp->result->wirehop_receive_count,
++                sp->result->wirehop_receive_error ? "true" : "false");
++        for (index = 0; index < sp->result->wirehop_receive_count; index++) {
++            struct wirehop_receive_event *event = &sp->result->wirehop_receive_events[index];
++            fprintf(output, "{\"began_boottime_ns\":%" PRIu64 ",\"ended_boottime_ns\":%" PRIu64 ",\"bytes\":%" PRIu64 "}\n",
++                    event->began_boottime_ns, event->ended_boottime_ns, event->bytes);
++        }
++        if (ferror(output) || fclose(output) != 0) {
++            perror("finish receiver trace");
++            exit(EXIT_FAILURE);
++        }
++        free(sp->result->wirehop_receive_events);
++    }
+diff --git a/src/iperf_tcp.c b/src/iperf_tcp.c
+--- a/src/iperf_tcp.c
++++ b/src/iperf_tcp.c
+@@ -39,0 +40 @@
++#include <time.h>
+@@ -59,0 +61 @@
++    int previous_cancel_state;
+@@ -65,0 +68,2 @@
++    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_cancel_state);
++
+@@ -68,2 +72,19 @@
+-	sp->result->bytes_received += r;
+-	sp->result->bytes_received_this_interval += r;
++        struct timespec before, after;
++        int trace = r > 0 && sp->result->wirehop_receive_events;
++        if (trace && clock_gettime(CLOCK_BOOTTIME, &before) != 0) {
++            sp->result->wirehop_receive_error = 1;
++            trace = 0;
++        }
++        sp->result->bytes_received += r;
++        sp->result->bytes_received_this_interval += r;
++        if (trace) {
++            if (sp->result->wirehop_receive_count == 1048576 || clock_gettime(CLOCK_BOOTTIME, &after) != 0) {
++                sp->result->wirehop_receive_error = 1;
++            } else {
++                struct wirehop_receive_event *event =
++                    &sp->result->wirehop_receive_events[sp->result->wirehop_receive_count++];
++                event->began_boottime_ns = (uint64_t)before.tv_sec * 1000000000 + (uint64_t)before.tv_nsec;
++                event->ended_boottime_ns = (uint64_t)after.tv_sec * 1000000000 + (uint64_t)after.tv_nsec;
++                event->bytes = (uint64_t)r;
++            }
++        }
+@@ -74,0 +96,2 @@
++
++    pthread_setcancelstate(previous_cancel_state, NULL);
+@@ -87,0 +111 @@
++    int previous_cancel_state;
+@@ -99,0 +124 @@
++    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_cancel_state);
+@@ -102,0 +128 @@
++    pthread_setcancelstate(previous_cancel_state, NULL);
+diff --git a/src/iperf_client_api.c b/src/iperf_client_api.c
+--- a/src/iperf_client_api.c
++++ b/src/iperf_client_api.c
+@@ -752,30 +752,3 @@
+-                /* Cancel outstanding sender threads */
+-                SLIST_FOREACH(sp, &test->streams, streams) {
+-                    if (sp->sender) {
+-                        int rc;
+-                        sp->done = 1;
+-                        if (sp->thread_created == 1) {
+-                            rc = pthread_cancel(sp->thr);
+-                            if (rc != 0 && rc != ESRCH) {
+-                                i_errno = IEPTHREADCANCEL;
+-                                errno = rc;
+-                                iperf_err(test, "sender cancel in pthread_cancel - %s", iperf_strerror(i_errno));
+-                                goto cleanup_and_fail;
+-                            }
+-                            rc = pthread_join(sp->thr, NULL);
+-                            if (rc != 0 && rc != ESRCH) {
+-                                i_errno = IEPTHREADJOIN;
+-                                errno = rc;
+-                                iperf_err(test, "sender cancel in pthread_join - %s", iperf_strerror(i_errno));
+-                                goto cleanup_and_fail;
+-                            }
+-                            if (test->debug_level >= DEBUG_LEVEL_INFO) {
+-                                iperf_printf(test, "Thread FD %d stopped\n", sp->socket);
+-                            }
+-                            sp->thread_created = 0;
+-                        }
+-                    }
+-                }
+-                if (test->debug_level >= DEBUG_LEVEL_INFO) {
+-                    iperf_printf(test, "Sender threads stopped\n");
+-                }
++                /* Include completed receive accounting in the final snapshot. */
++                if (iperf_stop_stream_threads(test) < 0)
++                    goto cleanup_and_fail;
+diff --git a/src/iperf_server_api.c b/src/iperf_server_api.c
+--- a/src/iperf_server_api.c
++++ b/src/iperf_server_api.c
+@@ -265,0 +266,2 @@
++            if (iperf_stop_stream_threads(test) < 0)
++                return -1;

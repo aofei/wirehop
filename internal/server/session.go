@@ -84,7 +84,7 @@ func newServerSession(parent context.Context, owner *Server, id protocol.Session
 	if err != nil {
 		return nil, err
 	}
-	scheduler, err := relay.NewScheduler(ingressQueue)
+	scheduler, err := relay.NewScheduler(ingress)
 	if err != nil {
 		return nil, err
 	}

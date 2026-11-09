@@ -152,7 +152,7 @@ func newIngressProbeFixture(t *testing.T) *ingressProbeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}

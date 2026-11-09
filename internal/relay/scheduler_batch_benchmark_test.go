@@ -31,7 +31,7 @@ func BenchmarkSchedulerRun(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer queue.Close()
-			scheduler, err := NewScheduler(queue)
+			scheduler, err := NewScheduler(&Ingress{queue: queue})
 			if err != nil {
 				b.Fatal(err)
 			}

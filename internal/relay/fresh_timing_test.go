@@ -214,7 +214,7 @@ func (f *freshTimingFixture) ordinary(roundTrip uint64) {
 }
 
 func (f *freshTimingFixture) apply(event schedulerEvent) {
-	f.scheduler.applyEvent(f.lanes, &f.preferred, event, f.now)
+	f.scheduler.applyEvent(f.lanes, &f.preferred, event, f.now, false)
 }
 
 func (f *freshTimingFixture) report(t *testing.T, packets, delay uint64) {
@@ -223,7 +223,7 @@ func (f *freshTimingFixture) report(t *testing.T, packets, delay uint64) {
 	f.scheduler.applyEvent(f.lanes, &f.preferred, schedulerEvent{
 		kind: schedulerReport, laneID: 1, generation: 1, receiveMicros: uint64(f.now.UnixMicro()), result: result,
 		report: protocol.DeliveryReport{LaneID: 1, Generation: 1, PingID: f.lane.lastPingID + 1, DataPackets: packets, DelayMicros: delay},
-	}, f.now)
+	}, f.now, false)
 	if err := <-result; err != nil {
 		t.Fatal(err)
 	}
@@ -231,5 +231,5 @@ func (f *freshTimingFixture) report(t *testing.T, packets, delay uint64) {
 
 func (f *freshTimingFixture) measured(roundTrip uint64) {
 	f.lane.applyRoundTrip(roundTrip, true)
-	f.lane.registration.Store.setDeliveryWindows(f.lane.deliveryWindowBytes(), f.lane.probeWindowBytes(0))
+	f.lane.registration.Store.setDeliveryWindows(f.lane.deliveryWindowBytes(), f.lane.probeWindowBytes(0), 0)
 }

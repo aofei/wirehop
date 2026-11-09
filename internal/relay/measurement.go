@@ -411,7 +411,7 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 		a.sample.RemoteReceiveMicros = now
 		a.probeBudget = value.HoldMicros
 		a.stage = protocol.MeasurementProbe
-		peer.SendMeasurement(MeasurementWrite{Build: func(send uint64) (protocol.Measurement, bool) {
+		if !peer.SendMeasurement(MeasurementWrite{Build: func(send uint64) (protocol.Measurement, bool) {
 			m.mu.Lock()
 			defer m.mu.Unlock()
 			if !m.ownsLocked(a) || a.ctx.Err() != nil {
@@ -425,7 +425,10 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 			return protocol.Measurement{Kind: protocol.MeasurementReply, ID: a.id,
 				ReceiveMicros: a.sample.RemoteReceiveMicros,
 				ReplyMicros:   send, HoldMicros: a.replyBudget}, true
-		}})
+		}}) {
+			// No Reply reached the writer, so this target has not exposed a hold promise.
+			m.finishLocked(a)
+		}
 	case protocol.MeasurementReply:
 		if a.stage != protocol.MeasurementProbe {
 			return ErrUnexpectedFrame

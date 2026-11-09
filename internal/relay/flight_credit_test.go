@@ -31,7 +31,7 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		for id := uint64(1); id <= 6; id++ {
 			size = pushFlightCreditPacket(t, store, id, 32, now.Add(time.Second))
 		}
-		store.setDeliveryWindows(2*size, 2*size)
+		store.setDeliveryWindows(2*size, 2*size, 0)
 		consumeFlightCreditReady(store)
 		assertFlightCreditTake(t, store, 1, 2)
 		assertTransmissionStoreInvariants(t, store)
@@ -61,16 +61,16 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		for id := uint64(1); id <= 5; id++ {
 			size = pushFlightCreditPacket(t, store, id, 32, now.Add(time.Second))
 		}
-		store.setDeliveryWindows(3*size, 3*size)
+		store.setDeliveryWindows(3*size, 3*size, 0)
 		assertFlightCreditTake(t, store, 1, 2, 3)
-		store.setDeliveryWindows(size, size)
+		store.setDeliveryWindows(size, size, 0)
 		consumeFlightCreditReady(store)
 		assertFlightCreditTake(t, store)
 		acknowledgeFlightCredit(t, store, 2, now.Add(time.Millisecond))
 		assertFlightCreditReady(t, store)
 		assertFlightCreditTake(t, store)
 		assertFlightCreditSilent(t, store)
-		store.setDeliveryWindows(2*size, 2*size)
+		store.setDeliveryWindows(2*size, 2*size, 0)
 		assertFlightCreditReady(t, store)
 		assertFlightCreditTake(t, store, 4)
 		consumeFlightCreditReady(store)
@@ -85,7 +85,7 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		normal := pushFlightCreditPacket(t, store, 1, 32, now.Add(time.Second))
 		probe := pushFlightCreditPacket(t, store, 0, protocol.ProbePayloadSize, now.Add(time.Second))
 		pushFlightCreditPacket(t, store, 2, 32, now.Add(time.Second))
-		store.setDeliveryWindows(normal, normal+probe)
+		store.setDeliveryWindows(normal, normal+probe, 0)
 		assertFlightCreditTake(t, store, 1, 0)
 		consumeFlightCreditReady(store)
 		assertFlightCreditTake(t, store)
@@ -115,7 +115,7 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		}
 		// The control and ten transport frames fit one record. Four probes exceed the normal window by 20 bytes.
 		prefixBytes := uint64(control.size) + 10*normalBytes
-		store.setDeliveryWindows(16*1024, prefixBytes+4*probeBytes)
+		store.setDeliveryWindows(16*1024, prefixBytes+4*probeBytes, 0)
 		take := func(ids ...uint64) {
 			t.Helper()
 			var data [16]protocol.Data
@@ -162,7 +162,7 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		now := time.UnixMicro(1000)
 		store := newFlightCreditStore(t, &now, 65536)
 		size := pushFlightCreditPacket(t, store, 1, 32, now.Add(time.Second))
-		store.setDeliveryWindows(size, 65536)
+		store.setDeliveryWindows(size, 65536, 0)
 		assertFlightCreditTake(t, store, 1)
 		control := schedulerTransmission(2, wgpacket.HandshakeInitiation, now.Add(time.Second))
 		if err := store.push(control); err != nil {
@@ -180,7 +180,7 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		store := newFlightCreditStore(t, &now, 3*protocol.MaxPacketSize)
 		pushFlightCreditPacket(t, store, 1, protocol.MaxPacketSize, now.Add(time.Second))
 		pushFlightCreditPacket(t, store, 2, protocol.MaxPacketSize, now.Add(time.Second))
-		store.setDeliveryWindows(1, 1)
+		store.setDeliveryWindows(1, 1, 0)
 		assertFlightCreditTake(t, store, 1)
 		consumeFlightCreditReady(store)
 		assertFlightCreditTake(t, store)
@@ -196,7 +196,7 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 		size := pushFlightCreditPacket(t, store, 1, 32, now.Add(time.Second))
 		pushFlightCreditPacket(t, store, 2, 32, now.Add(time.Second))
 		pushFlightCreditPacket(t, store, 3, 32, now.Add(time.Second))
-		store.setDeliveryWindows(size, size)
+		store.setDeliveryWindows(size, size, 0)
 		assertFlightCreditTake(t, store, 1)
 		store.beginMeasurementPause()
 		acknowledgeFlightCredit(t, store, 1, now.Add(time.Millisecond))
@@ -222,7 +222,7 @@ func TestTransmissionStoreFlightCredit(t *testing.T) {
 			now := time.UnixMicro(1000)
 			store := newFlightCreditStore(t, &now, 65536)
 			size := pushFlightCreditPacket(t, store, 1, 32, now.Add(time.Second))
-			store.setDeliveryWindows(2*size, 2*size)
+			store.setDeliveryWindows(2*size, 2*size, 0)
 			assertFlightCreditTake(t, store, 1)
 			pushFlightCreditPacket(t, store, 2, 200, now.Add(time.Millisecond))
 			pushFlightCreditPacket(t, store, 3, 32, now.Add(time.Second))

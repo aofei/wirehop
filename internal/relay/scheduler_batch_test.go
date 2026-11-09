@@ -87,7 +87,7 @@ func TestSchedulerRunBatchBoundaries(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
-				scheduler, err = NewScheduler(ingress)
+				scheduler, err = NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -178,7 +178,7 @@ func TestSchedulerRunBatchFailure(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
-				scheduler, err = NewScheduler(ingress)
+				scheduler, err = NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -260,7 +260,7 @@ func TestSchedulerRunBatchIdleWake(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer ingress.Close()
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -353,7 +353,7 @@ func TestSchedulerRunBatchTransitions(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
-				scheduler, err := NewScheduler(ingress)
+				scheduler, err := NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -399,13 +399,13 @@ func TestSchedulerRunBatchTransitions(t *testing.T) {
 					scheduler.RequestMeasurement(protocol.LaneGeneration{LaneID: 1, Generation: 1})
 					synctest.Wait()
 					attempt := scheduler.measurements.active
-					if attempt == nil || !measurementDrainValid(attempt.proof) || !store.measurementDrain.Load() || scheduler.measurementTimer == nil {
-						t.Fatal("measurement did not pause the full store and arm its fixed deadline")
+					if attempt == nil || measurementDrainValid(attempt.proof) || !store.measurementSupplyPaused || store.measurementDrain.Load() || scheduler.measurementTimer == nil {
+						t.Fatal("measurement did not drain the full store within its fixed deadline")
 					}
 					cancel()
 					<-done
 					synctest.Wait()
-					if attempt.ctx.Err() == nil || measurementDrainValid(attempt.proof) || store.measurementDrain.Load() {
+					if attempt.ctx.Err() == nil || measurementDrainValid(attempt.proof) || store.measurementDrain.Load() || store.measurementSupplyPaused {
 						t.Fatal("shutdown retained a measurement operation, prefix proof, or writer pause")
 					}
 					if count, _ := store.backlog(); count != 0 || ingress.Len() != packets-admitted {
@@ -576,7 +576,7 @@ func TestSchedulerRunPreemptedExpiryActiveLane(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
-				scheduler, err := NewScheduler(ingress)
+				scheduler, err := NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -715,7 +715,7 @@ func TestSchedulerRunRestoresUnderPressure(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer other.Close()
-				scheduler, err := NewScheduler(ingress)
+				scheduler, err := NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -810,7 +810,7 @@ func TestSchedulerRunRestoresUnderPressure(t *testing.T) {
 					t.Fatalf("restored aggregate ownership = %+v, want %+v", actual, usage)
 				}
 				if len(want) > 0 {
-					next, err := NewScheduler(ingress)
+					next, err := NewScheduler(&Ingress{queue: ingress})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -985,7 +985,7 @@ func TestSchedulerRunFeedbackGenerationOrder(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
-				scheduler, err = NewScheduler(ingress)
+				scheduler, err = NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}

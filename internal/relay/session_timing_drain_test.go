@@ -30,7 +30,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			defer cancel()
 			ready, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 			var preferred protocol.LaneID
-			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, time.Now())
+			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, time.Now(), false)
 			for _, lane := range lanes {
 				if !lane.registration.Store.measurementDrain.Load() || measurementDrainValid(proof) {
 					t.Fatal("pause did not close every Data gate before checking prefixes")
@@ -38,7 +38,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 				if _, _, err := lane.registration.Store.acknowledge(1, uint64(time.Now().UnixMicro())); err != nil {
 					t.Fatal(err)
 				}
-				scheduler.updateMeasurementDrain(lanes)
+				scheduler.updateMeasurementDrain(lanes, false)
 			}
 			select {
 			case <-ready:
@@ -52,7 +52,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 				t.Fatal("a second transaction acquired the session pause")
 			}
 			cancel()
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
 			for _, lane := range lanes {
 				if lane.registration.Store.measurementDrain.Load() {
 					t.Fatal("completion did not reopen Data")
@@ -72,17 +72,17 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			defer cancel()
 			_, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 			var preferred protocol.LaneID
-			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, time.Now())
+			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, time.Now(), false)
 			if !measurementDrainValid(proof) {
 				t.Fatal("empty prefix was not prepared")
 			}
 			scheduler.invalidateMeasurementDrain()
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
 			if measurementDrainValid(proof) || !lane.registration.Store.measurementDrain.Load() {
 				t.Fatal("invalidation retracted an exposed quiet promise")
 			}
 			time.Sleep(time.Until(scheduler.measurementDeadline))
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
 			if lane.registration.Store.measurementDrain.Load() || scheduler.measurementDrain != nil {
 				t.Fatal("invalidated promise outlived its fixed deadline")
 			}
@@ -105,7 +105,7 @@ func TestSchedulerBeginMeasurementDrain(t *testing.T) {
 			ready, proof := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 			cancel()
 			var preferred protocol.LaneID
-			scheduler.applyEvent(nil, &preferred, <-scheduler.events, time.Now())
+			scheduler.applyEvent(nil, &preferred, <-scheduler.events, time.Now(), false)
 			select {
 			case <-ready:
 			default:

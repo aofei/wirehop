@@ -201,7 +201,7 @@ func BenchmarkSchedulerApplyEvent(b *testing.B) {
 					now = now.Add(time.Microsecond)
 					event.receiveMicros = uint64(now.UnixMicro())
 				}
-				scheduler.applyEvent(lanes, &preferred, event, now)
+				scheduler.applyEvent(lanes, &preferred, event, now, false)
 				if kind == schedulerReport {
 					if err := <-event.result; err != nil {
 						b.Fatal(err)

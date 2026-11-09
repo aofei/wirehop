@@ -219,7 +219,7 @@ func TestScheduledLaneFeedbackDelayIncludesReportWait(t *testing.T) {
 	result := make(chan error, 1)
 	scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{1: lane, 2: source}, &preferred, schedulerEvent{
 		kind: schedulerReport, laneID: 2, generation: 1, report: protocol.DeliveryReport{LaneID: 1, Generation: 1, PingID: 1, DelayMicros: 25_000}, result: result,
-	}, time.Now())
+	}, time.Now(), false)
 	if err := <-result; err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestScheduledLaneFeedbackDelayIncludesReportWait(t *testing.T) {
 	scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{1: lane}, &preferred, schedulerEvent{
 		kind: schedulerTiming, laneID: 1, generation: 1,
 		timing: clockmap.Sample{LocalSendMicros: 1000, RemoteReceiveMicros: 2000, RemoteSendMicros: 2000, LocalReceiveMicros: 11_000},
-	}, time.Now())
+	}, time.Now(), false)
 	if window := lane.registration.Store.deliveryWindow; window != lane.deliveryWindowBytes() {
 		t.Fatalf("sampling window = %d, want %d after timing", window, lane.deliveryWindowBytes())
 	}

@@ -477,7 +477,7 @@ func newMeasurementFixture(t *testing.T, client bool, count int) *measurementFix
 	}
 	t.Cleanup(func() {
 		scheduler.measurements.close()
-		scheduler.updateMeasurementDrain(f.lanes)
+		scheduler.updateMeasurementDrain(f.lanes, false)
 		if scheduler.measurementTimer != nil {
 			scheduler.measurementTimer.Stop()
 		}
@@ -495,9 +495,9 @@ func (f *measurementFixture) apply(t *testing.T) {
 		synctest.Wait()
 		select {
 		case event := <-f.scheduler.events:
-			f.scheduler.applyEvent(f.lanes, &f.preferred, event, time.Now())
+			f.scheduler.applyEvent(f.lanes, &f.preferred, event, time.Now(), false)
 		default:
-			f.scheduler.updateMeasurementDrain(f.lanes)
+			f.scheduler.updateMeasurementDrain(f.lanes, false)
 			synctest.Wait()
 			if len(f.scheduler.events) == 0 {
 				return

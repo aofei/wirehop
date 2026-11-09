@@ -22,7 +22,7 @@ func TestSchedulerTransportLaneOrderMembership(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer ingress.Close()
-			scheduler, err := NewScheduler(ingress)
+			scheduler, err := NewScheduler(&Ingress{queue: ingress})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -67,7 +67,7 @@ func TestSchedulerTransportLaneOrderMembership(t *testing.T) {
 				wantErr = ErrStaleLane
 			}
 			preferred := protocol.LaneID(1)
-			scheduler.applyEvent(lanes, &preferred, event, now)
+			scheduler.applyEvent(lanes, &preferred, event, now, false)
 			if err := <-result; !errors.Is(err, wantErr) {
 				t.Fatalf("membership event = %v, want %v", err, wantErr)
 			}
@@ -207,7 +207,7 @@ func TestSchedulerRunReleasesTransportOrder(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
-				scheduler, err := NewScheduler(ingress)
+				scheduler, err := NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}

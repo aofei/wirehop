@@ -82,12 +82,15 @@ image=${WIREHOP_TEST_IMAGE:-wirehop-integration}
   docker info --format 'cpus={{.NCPU}} memory={{.MemTotal}} kernel={{.KernelVersion}} architecture={{.Architecture}}'
   docker image inspect "$image" --format 'image={{.Id}} digests={{json .RepoDigests}}'
   if [ -r /proc/cpuinfo ]; then cat /proc/cpuinfo; fi
-} > "$result_root/runner.txt"
+} > "$result_root/runner.txt" 2>&1
 network=wirehop-tcp-$$
 server=$network-server
 client=$network-client
 
 case_results=
+network_id=
+client_cid=
+server_cid=
 
 fail_case() {
   printf '%s\n' "$1" >> "$case_results/harness-error.txt"
@@ -97,18 +100,30 @@ fail_case() {
 
 capture_case() {
   for role in client server; do
-    container=$network-$role
+    cid_file=$case_results/$role.cid
+    if [ ! -s "$cid_file" ]; then
+      printf 'container was not created\n' > "$case_results/$role-container.log"
+      : > "$case_results/$role-container.json"
+      : > "$case_results/$role-processes.txt"
+      continue
+    fi
+    container=$(cat "$cid_file")
     docker logs "$container" > "$case_results/$role-container.log" 2>&1 || true
     docker inspect "$container" > "$case_results/$role-container.json" 2>> "$case_results/capture-errors.log" || true
     docker top "$container" > "$case_results/$role-processes.txt" 2>> "$case_results/capture-errors.log" || true
   done
-  docker exec "$server" ss -taoinm > "$case_results/server-tcp-sockets-final.txt" \
+  if [ ! -s "$server_cid" ]; then
+    fail_case "server container was not created"
+    return
+  fi
+  container=$(cat "$server_cid")
+  docker exec "$container" ss -taoinm > "$case_results/server-tcp-sockets-final.txt" \
     2>> "$case_results/capture-errors.log" || true
-  docker exec "$server" nstat -az > "$case_results/server-nstat.txt" \
+  docker exec "$container" nstat -az > "$case_results/server-nstat.txt" \
     2>> "$case_results/capture-errors.log" || fail_case "server counter collection failed"
-  docker exec "$server" wg show wgtest latest-handshakes > "$case_results/server-handshake.txt" \
+  docker exec "$container" wg show wgtest latest-handshakes > "$case_results/server-handshake.txt" \
     2>> "$case_results/capture-errors.log" || fail_case "server handshake collection failed"
-  docker exec "$server" tc -s qdisc show dev eth0 > "$case_results/server-qdisc-final.txt" \
+  docker exec "$container" tc -s qdisc show dev eth0 > "$case_results/server-qdisc-final.txt" \
     2>> "$case_results/capture-errors.log" || fail_case "server queue collection failed"
 }
 
@@ -118,20 +133,24 @@ cleanup() {
   if [ -n "$case_results" ]; then
     printf 'runner exited with status %s before completing the case\n' "$runner_exit_code" \
       >> "$case_results/harness-error.txt" || true
-    capture_case || true
+    # Isolate fatal shell redirection errors so diagnostics cannot bypass resource cleanup.
+    (capture_case) || true
   fi
-  docker rm -f "$client" "$server" > /dev/null 2>&1 || true
-  docker network rm "$network" > /dev/null 2>&1 || true
+  for cid_file in "$client_cid" "$server_cid"; do
+    if [ -s "$cid_file" ]; then docker rm -f "$(cat "$cid_file")" > /dev/null 2>&1 || true; fi
+  done
+  if [ -n "$network_id" ]; then docker network rm "$network_id" > /dev/null 2>&1 || true; fi
   exit "$runner_exit_code"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if [ "$ipv6" = true ]; then
-  docker network create --internal --ipv6 "$network" > /dev/null
+  network_id=$(docker network create --internal --ipv6 "$network")
 else
-  docker network create --internal "$network" > /dev/null
+  network_id=$(docker network create --internal "$network")
 fi
+printf '%s\n' "$network_id" > "$result_root/network.id"
 status=0
 repetition=1
 while :; do
@@ -144,28 +163,31 @@ while :; do
     echo "$scenario repetition=$repetition"
     mkdir "$results/$scenario"
     case_results=$results/$scenario
-    docker run -d --name "$server" --network "$network" --read-only --cap-add NET_ADMIN --tmpfs /tmp \
+    client_cid=$case_results/client.cid
+    server_cid=$case_results/server.cid
+    docker run -d --cidfile "$server_cid" --name "$server" --network "$network_id" --read-only --cap-add NET_ADMIN --tmpfs /tmp \
       -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$results/$scenario:/results" \
       --entrypoint sh "$image" /test/node.sh server "$scenario" > /dev/null
+    server_id=$(cat "$server_cid")
     ready=false
     for _attempt in $(seq 1 30); do
       if [ -f "$results/$scenario/ready" ]; then
         ready=true
         break
       fi
-      if [ "$(docker inspect -f '{{.State.Running}}' "$server")" != true ]; then
+      if [ "$(docker inspect -f '{{.State.Running}}' "$server_id")" != true ]; then
         break
       fi
       sleep 1
     done
     if [ "$ready" != true ]; then
-      docker logs "$server" >&2
+      docker logs "$server_id" >&2
       exit 1
     fi
-    server_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$server")
+    server_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$server_id")
     case "$scenario" in
       tcp-ipv6|wss-ipv6|forward-ipv6)
-        server_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' "$server")
+        server_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' "$server_id")
         if [ -z "$server_ip" ]; then
           echo "case requires an IPv6 container address: $scenario" >&2
           exit 1
@@ -173,10 +195,11 @@ while :; do
         server_ip="[$server_ip]"
         ;;
     esac
-    docker run -d --name "$client" --network "$network" --read-only --cap-add NET_ADMIN --tmpfs /tmp \
+    docker run -d --cidfile "$client_cid" --name "$client" --network "$network_id" --read-only --cap-add NET_ADMIN --tmpfs /tmp \
       -v "$binary:/wirehop:ro" -v "$scripts:/test:ro" -v "$results/$scenario:/results" \
       -e "WIREHOP_TEST_SERVER=$server_ip" --entrypoint sh "$image" /test/node.sh client "$scenario" > /dev/null
-    container_status=$(docker wait "$client")
+    client_id=$(cat "$client_cid")
+    container_status=$(docker wait "$client_id")
     printf '%s\n' "$container_status" > "$results/$scenario/client-exit.txt"
     case "$scenario" in
       *-rtt-step*|*-capacity-change*|tcp-asymmetric-stall*|*-stall|*-outage|*-roam|*-prohibit|*-blackhole)
@@ -199,7 +222,9 @@ while :; do
     fi
     capture_case
     case_results=
-    docker rm -f "$client" "$server" > /dev/null
+    docker rm -f "$client_id" "$server_id" > /dev/null
+    client_cid=
+    server_cid=
     if [ "$container_status" != 0 ]; then
       echo "case failed: $scenario (container exit $container_status), inspect $results/$scenario" >&2
       status=1

@@ -88,6 +88,7 @@ func TestSchedulerSelectTransportCandidatesHealthyPrimary(t *testing.T) {
 			scheduler := Scheduler{transportHoldUntil: now.Add(time.Second)}
 			if tt.paused {
 				scheduler.measurementStarted = now
+				scheduler.measurementQuiet = true
 				scheduler.transportHoldUntil = time.Time{}
 			}
 			// The primary cannot meet this predicted deadline. A healthy established

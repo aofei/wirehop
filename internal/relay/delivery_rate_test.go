@@ -120,7 +120,7 @@ func TestTransmissionStoreDeliverySampleMigratedPacket(t *testing.T) {
 			}
 			now = time.UnixMicro(11_000)
 			destination := newDeliverySampleStore(t, &now)
-			destination.setDeliveryWindows(test.window, test.window)
+			destination.setDeliveryWindows(test.window, test.window, 0)
 			transmission := retained[0]
 			transmission.migrated = true
 			if err := destination.push(transmission); err != nil {
@@ -143,7 +143,7 @@ func newDeliverySampleStore(t *testing.T, now *time.Time) *TransmissionStore {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.setDeliveryWindows(uint64(store.limits.Bytes), uint64(store.limits.Bytes))
+	store.setDeliveryWindows(uint64(store.limits.Bytes), uint64(store.limits.Bytes), 0)
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
 	return store
 }

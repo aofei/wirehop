@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ import (
 func TestIPerfIntervalCoverage(t *testing.T) {
 	// A one-bit/s sender cannot complete a second byte before the one-second deadline.
 	// The reporter is scheduled at 0.995 seconds, allowing a short zero-delivery tail before completion.
-	client, server := runIPerfIntervals(t, "-b", "1", "-l", "1")
+	client, server, _ := runIPerfIntervals(t, "-b", "1", "-l", "1")
 	for _, tt := range []struct {
 		name, role string
 		result     streamResult
@@ -69,7 +70,7 @@ func TestIPerfIntervalDirections(t *testing.T) {
 		{name: "Bidirectional", arguments: []string{"--bidir"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			client, server := runIPerfIntervals(t, append([]string{"-b", "1M", "-l", "1024"}, tt.arguments...)...)
+			client, server, _ := runIPerfIntervals(t, append([]string{"-b", "1M", "-l", "1024"}, tt.arguments...)...)
 			for _, endpoint := range []struct {
 				name   string
 				result streamResult
@@ -116,7 +117,7 @@ func TestIPerfIntervalDirections(t *testing.T) {
 	}
 }
 
-func runIPerfIntervals(t *testing.T, arguments ...string) (streamResult, streamResult) {
+func runIPerfIntervals(t *testing.T, arguments ...string) (streamResult, streamResult, string) {
 	t.Helper()
 	if os.Getenv("WIREHOP_TEST_TOOLS") != "1" {
 		t.Skip("requires the kernel test image's iperf3")
@@ -132,7 +133,9 @@ func runIPerfIntervals(t *testing.T, arguments ...string) (streamResult, streamR
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var serverOutput, serverError bytes.Buffer
+	directory := t.TempDir()
 	server := exec.CommandContext(ctx, "iperf3", "--json-stream", "--forceflush", "-s", "-1", "-B", "127.0.0.1", "-p", strconv.Itoa(port), "-i", "0.199")
+	server.Env = append(os.Environ(), "WIREHOP_TEST_RECEIVER_TRACE="+filepath.Join(directory, "server-receiver"))
 	server.Stdout, server.Stderr = &serverOutput, &serverError
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
@@ -149,6 +152,7 @@ func runIPerfIntervals(t *testing.T, arguments ...string) (streamResult, streamR
 	waitForIPerfListener(t, ctx, port)
 	clientArguments := []string{"--json-stream", "--forceflush", "-c", "127.0.0.1", "-p", strconv.Itoa(port), "-t", "1", "-i", "0.199"}
 	client := exec.CommandContext(ctx, "iperf3", append(clientArguments, arguments...)...)
+	client.Env = append(os.Environ(), "WIREHOP_TEST_RECEIVER_TRACE="+filepath.Join(directory, "client-receiver"))
 	clientOutput, err := client.CombinedOutput()
 	if err != nil {
 		t.Fatalf("iperf3 client: %v: %s", err, clientOutput)
@@ -164,5 +168,5 @@ func runIPerfIntervals(t *testing.T, arguments ...string) (streamResult, streamR
 	if err != nil {
 		t.Fatal(err)
 	}
-	return clientResult, serverResult
+	return clientResult, serverResult, directory
 }

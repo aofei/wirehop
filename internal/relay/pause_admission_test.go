@@ -35,7 +35,7 @@ func TestSchedulerScheduleTimingPause(t *testing.T) {
 				lane.registration.Store.beginMeasurementPause()
 				t.Cleanup(func() { releaseTransmissions(lane.registration.Store.drain()) })
 			}
-			scheduler := &Scheduler{measurementStarted: now, packetID: 7}
+			scheduler := &Scheduler{measurementStarted: now, measurementQuiet: true, packetID: 7}
 			preferred := protocol.LaneID(1)
 			payload := relayWireGuardPacket(tt.kind)
 			item := packetqueue.Item[Packet]{Value: newPacket(datagram.Packet{Kind: tt.kind, Payload: payload}), Size: len(payload), Deadline: now.Add(40 * time.Millisecond)}
@@ -89,7 +89,7 @@ func TestSchedulerRunTimingPauseKeepsControlProgress(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer ingress.Close()
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}

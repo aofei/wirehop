@@ -315,7 +315,7 @@ func TestSchedulerRecoversThroughHealthyLastLaneInGroup(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer ingress.Close()
-			scheduler, err := NewScheduler(ingress)
+			scheduler, err := NewScheduler(&Ingress{queue: ingress})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -372,7 +372,7 @@ func TestSchedulerRecoversThroughHealthyLastLaneInGroup(t *testing.T) {
 					event.kind = schedulerRegister
 					event.registration = replacement.registration
 				}
-				scheduler.applyEvent(lanes, &preferred, event, now)
+				scheduler.applyEvent(lanes, &preferred, event, now, false)
 				if err := <-event.result; err != nil {
 					t.Fatal(err)
 				}
@@ -476,7 +476,7 @@ func TestSchedulerMigrateTransmissionsChecksCurrentProgress(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer ingress.Close()
-			scheduler, err := NewScheduler(ingress)
+			scheduler, err := NewScheduler(&Ingress{queue: ingress})
 			if err != nil {
 				t.Fatal(err)
 			}

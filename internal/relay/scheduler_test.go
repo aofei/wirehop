@@ -50,7 +50,7 @@ func TestSchedulerCloseSession(t *testing.T) {
 			result := make(chan error, 1)
 			var preferred protocol.LaneID
 			new(Scheduler).applyEvent(lanes, &preferred,
-				schedulerEvent{kind: schedulerCloseSession, frame: frame, result: result}, time.Now())
+				schedulerEvent{kind: schedulerCloseSession, frame: frame, result: result}, time.Now(), false)
 			if err := <-result; !errors.Is(err, ErrNoActiveLane) {
 				t.Fatalf("close error = %v, want no active lane", err)
 			}
@@ -79,7 +79,7 @@ func TestSchedulerCloseSession(t *testing.T) {
 		for index := range results {
 			results[index] = make(chan error, 1)
 			new(Scheduler).applyEvent(lanes, &preferred,
-				schedulerEvent{kind: schedulerCloseSession, frame: frame, result: results[index]}, time.Now())
+				schedulerEvent{kind: schedulerCloseSession, frame: frame, result: results[index]}, time.Now(), false)
 			select {
 			case <-results[index]:
 				t.Fatal("close completed before the carrier write callback")
@@ -114,7 +114,7 @@ func TestSchedulerCloseSession(t *testing.T) {
 		result := make(chan error, 1)
 		var preferred protocol.LaneID
 		new(Scheduler).applyEvent(map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane}, &preferred,
-			schedulerEvent{kind: schedulerCloseSession, frame: frame, result: result}, time.Now())
+			schedulerEvent{kind: schedulerCloseSession, frame: frame, result: result}, time.Now(), false)
 		if err := <-result; err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +127,7 @@ func TestSchedulerCloseSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer ingress.Close()
-			scheduler, err := NewScheduler(ingress)
+			scheduler, err := NewScheduler(&Ingress{queue: ingress})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -148,7 +148,7 @@ func TestSchedulerCloseSession(t *testing.T) {
 			synctest.Wait()
 			var preferred protocol.LaneID
 			scheduler.applyEvent(map[protocol.LaneID]*scheduledLane{lane.registration.LaneID: lane},
-				&preferred, <-scheduler.events, time.Now())
+				&preferred, <-scheduler.events, time.Now(), false)
 			cancel()
 			synctest.Wait()
 			if err := <-result; !errors.Is(err, context.Canceled) {
@@ -457,7 +457,7 @@ func TestSchedulerDuplicatesControlAcrossPathGroups(t *testing.T) {
 	lanes := map[protocol.LaneID]*scheduledLane{
 		first.registration.LaneID: first, second.registration.LaneID: second,
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -590,7 +590,7 @@ func TestSchedulerWaitsForPrimaryProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +623,7 @@ func TestSchedulerQueuesUntilLane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,7 +686,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -767,7 +767,7 @@ func TestSchedulerRestoresHeldPackets(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer ingress.Close()
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -834,7 +834,7 @@ func TestSchedulerCommitsPacketIDAfterAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,7 +874,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1011,7 +1011,7 @@ func TestSchedulerDeliveryReportUsesFeedbackCarrierDelay(t *testing.T) {
 			}
 			var scheduler Scheduler
 			var preferred protocol.LaneID
-			scheduler.applyEvent(lanes, &preferred, event, time.Now())
+			scheduler.applyEvent(lanes, &preferred, event, time.Now(), false)
 			err := <-result
 			if test.invalidReport {
 				if !errors.Is(err, ErrInvalidDeliveryReport) {
@@ -1092,7 +1092,7 @@ func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 			result := make(chan error, 1)
 			scheduler.applyEvent(lanes, &preferred, schedulerEvent{
 				kind: schedulerRegister, registration: registration, result: result,
-			}, time.Unix(1, 0))
+			}, time.Unix(1, 0), false)
 			if err := <-result; err != nil {
 				t.Fatal(err)
 			}
@@ -1111,7 +1111,7 @@ func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 			scheduler.applyEvent(lanes, &preferred, schedulerEvent{
 				kind: schedulerTiming, laneID: registration.LaneID, generation: registration.Generation + 1,
 				timing: clockmap.Sample{LocalReceiveMicros: 999},
-			}, time.Unix(2, 0))
+			}, time.Unix(2, 0), false)
 			if lane.rttMicros != before {
 				t.Fatal("timing from another generation changed the lane")
 			}
@@ -1123,7 +1123,7 @@ func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(ingress.Close)
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1139,7 +1139,7 @@ func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 		var preferred protocol.LaneID
 		scheduler.applyEvent(lanes, &preferred, schedulerEvent{
 			kind: schedulerRegister, registration: registration, result: result,
-		}, time.Unix(2, 0))
+		}, time.Unix(2, 0), false)
 		if err := <-result; err != nil {
 			t.Fatal(err)
 		}
@@ -1209,7 +1209,7 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 			}
 			var scheduler Scheduler
 			var preferred protocol.LaneID
-			scheduler.applyEvent(lanes, &preferred, event, time.Unix(2, 0))
+			scheduler.applyEvent(lanes, &preferred, event, time.Unix(2, 0), false)
 			if err := <-result; err != nil {
 				t.Fatal(err)
 			}
@@ -1224,7 +1224,7 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 				event.report.DataPackets = 0
 				event.report.PingID = 0
 			}
-			scheduler.applyEvent(lanes, &preferred, event, time.Unix(9, 0))
+			scheduler.applyEvent(lanes, &preferred, event, time.Unix(9, 0), false)
 			if err := <-result; err != nil {
 				t.Fatal(err)
 			}
@@ -1439,7 +1439,7 @@ func TestSchedulerPacketIDExhaustion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1481,7 +1481,7 @@ func TestSchedulerPendingPacketRetainsAggregateCapacity(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1582,7 +1582,7 @@ func TestSchedulerMigratesTransportOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1658,7 +1658,7 @@ func TestSchedulerMigrateTransmissions(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer ingress.Close()
-			scheduler, err := NewScheduler(ingress)
+			scheduler, err := NewScheduler(&Ingress{queue: ingress})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1795,7 +1795,7 @@ func TestSchedulerRunReleasesAggregateBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1968,7 +1968,7 @@ func TestSchedulerRequiresProgressStallForEarlyAbandonment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2041,7 +2041,7 @@ func TestSchedulerRecoversAfterQueuedExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2076,7 +2076,7 @@ func TestSchedulerDuplicatesReportAcrossLanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2223,7 +2223,7 @@ func schedulerLaneWithLimits(t *testing.T, id, group byte, rtt, rate uint64,
 		rttMicros:    rtt, deliveryRate: rate, rttObserved: true, rateObserved: true,
 		probeByteLimit: baseTransportProbeBytes,
 	}
-	store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0))
+	store.setDeliveryWindows(lane.deliveryWindowBytes(), lane.probeWindowBytes(0), 0)
 	lane.registration.SendDeliveryReport = func(report protocol.DeliveryReport, _ time.Time, sent func()) bool {
 		frame, err := protocol.MarshalDeliveryReport(report)
 		return err == nil && lane.registration.SendControl(frame, sent)
@@ -2339,7 +2339,7 @@ func TestSchedulerScheduleVariableFrameSize(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ingress.Close()
-				scheduler, err := NewScheduler(ingress)
+				scheduler, err := NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2425,7 +2425,7 @@ func TestSchedulerObserveDeliveryReport(t *testing.T) {
 				t.Fatalf("canceled report = %v", err)
 			}
 			var preferred protocol.LaneID
-			scheduler.applyEvent(nil, &preferred, event, time.Now())
+			scheduler.applyEvent(nil, &preferred, event, time.Now(), false)
 			if len(oldResult) != 1 {
 				t.Fatal("late completion did not remain in the retired reader's channel")
 			}

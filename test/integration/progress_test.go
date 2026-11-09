@@ -46,6 +46,7 @@ func TestVerifyScenarioOrdinaryReceiverProgress(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
+					attachReceiverCounters(&flow, tt.scenario)
 					_, err := verifyScenario(directory, tt.scenario, flow)
 					if delivery.stalled {
 						if err == nil || !strings.Contains(err.Error(), "receiver") {
@@ -73,7 +74,7 @@ func TestVerifyProgress(t *testing.T) {
 			flow.ServerOutput = nil
 		}},
 		{name: "Bidirectional", scenario: "tcp-stall-bidir", wantStatus: "pass"},
-		{name: "FinalPartialIntervalIdle", scenario: "tcp-stall", wantStatus: "pass", mutate: func(flow *flowResult) {
+		{name: "DeliveryBeforeFinalWindow", scenario: "tcp-stall", wantStatus: "no-progress", mutate: func(flow *flowResult) {
 			flow.ServerOutput.Intervals[18].Sum.End = 19.8
 			flow.ServerOutput.Intervals[19].Sum.Start = 19.8
 			flow.ServerOutput.Intervals[19].Sum.End = 20.0001
@@ -89,12 +90,13 @@ func TestVerifyProgress(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&flow)
 			}
+			attachReceiverCounters(&flow, tt.scenario)
 			measurements, err := verifyProgress(tt.scenario, flow, 20)
 			if (err != nil) != (tt.wantStatus != "pass") {
 				t.Fatalf("verifyProgress() = %v", err)
 			}
 			last := measurements[len(measurements)-1]
-			if last.Status != tt.wantStatus || last.Fraction != nil {
+			if last.Status != tt.wantStatus || last.LowerFraction != nil {
 				t.Fatalf("incorrect progress measurement: %+v", last)
 			}
 		})

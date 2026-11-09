@@ -34,7 +34,7 @@ func TestSchedulerPrioritizesRealTrafficOverProbeBudget(t *testing.T) {
 			Payload: payload}), Size: len(payload), Deadline: time.Now().Add(time.Second)}); err != nil {
 			t.Fatal(err)
 		}
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -120,7 +120,7 @@ func TestSchedulerRunRetriesSharedBudgetAfterRelease(t *testing.T) {
 				}), Size: len(payload), Deadline: deadline}); err != nil {
 					t.Fatal(err)
 				}
-				scheduler, err := NewScheduler(ingress)
+				scheduler, err := NewScheduler(&Ingress{queue: ingress})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -430,7 +430,7 @@ func TestSchedulerFillTransportProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +567,7 @@ func TestSchedulerSelectTransportCandidatesCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -635,7 +635,7 @@ func TestTransmissionStoreAcknowledgeMixedProbePrefix(t *testing.T) {
 	}
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
 	// This prefix-accounting fixture needs its entire mixed batch committed before feedback.
-	store.setDeliveryWindows(128*1024, 128*1024)
+	store.setDeliveryWindows(128*1024, 128*1024, 0)
 	first := schedulerTransmission(1, wgpacket.TransportData, now.Add(time.Second))
 	first.packet.Payload = make([]byte, 2048)
 	first.packet.Payload[0] = 4
@@ -862,7 +862,7 @@ func TestSchedulerDiscoveryPreservesQueuedControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +897,7 @@ func TestSchedulerInitialKeepaliveStartsDiscoveryWithoutPrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1045,7 +1045,7 @@ func TestLaneWriteDataBatchBudget(t *testing.T) {
 			lane := newTestLane(t, connection, newTestEndpoint())
 			lane.dataRecordBytes = tt.limit
 			lane.store = schedulerStore(t, packetqueue.Limits{Packets: 32, Bytes: 128 * 1024})
-			lane.store.setDeliveryWindows(128*1024, 128*1024)
+			lane.store.setDeliveryWindows(128*1024, 128*1024, 0)
 			lane.store.writeBudget.Store(tt.budget)
 			t.Cleanup(func() { releaseTransmissions(lane.store.drain()) })
 			for id := uint64(1); id <= maximumDataBatchFrames; id++ {
@@ -1080,7 +1080,7 @@ func TestLaneWriteDataBatchBudget(t *testing.T) {
 		lane.dataRecordBytes = 16 * 1024
 		lane.store = schedulerStore(t, packetqueue.Limits{Packets: 64, Bytes: 128 * 1024})
 		lane.store.now = func() time.Time { return now }
-		lane.store.setDeliveryWindows(128*1024, 128*1024)
+		lane.store.setDeliveryWindows(128*1024, 128*1024, 0)
 		t.Cleanup(func() { releaseTransmissions(lane.store.drain()) })
 		for id := uint64(1); id <= 64; id++ {
 			pushFlightCreditPacket(t, lane.store, id, 1452, now.Add(time.Second))
@@ -1152,7 +1152,7 @@ func TestSchedulerMigrateDiscardsCapacityProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1181,7 +1181,7 @@ func TestSchedulerReplacementResetsTransportHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1191,7 +1191,7 @@ func TestSchedulerReplacementResetsTransportHold(t *testing.T) {
 	registration.Store = schedulerStore(t, packetqueue.Limits{Packets: 8, Bytes: 16 * 1024})
 	t.Cleanup(func() { releaseTransmissions(registration.Store.drain()) })
 	result := make(chan error, 1)
-	scheduler.applyEvent(lanes, &preferred, schedulerEvent{kind: schedulerRegister, registration: registration, result: result}, now)
+	scheduler.applyEvent(lanes, &preferred, schedulerEvent{kind: schedulerRegister, registration: registration, result: result}, now, false)
 	if err := <-result; err != nil || preferred != 0 {
 		t.Fatalf("replacement = %v, preferred %d", err, preferred)
 	}
@@ -1253,7 +1253,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ingress.Close()
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1261,7 +1261,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	registration.Generation = 2
 	registration.Abandon = func() { abandonments++ }
 	result := make(chan error, 1)
-	scheduler.applyEvent(lanes, &preferred, schedulerEvent{kind: schedulerRegister, registration: registration, result: result}, now)
+	scheduler.applyEvent(lanes, &preferred, schedulerEvent{kind: schedulerRegister, registration: registration, result: result}, now, false)
 	if err := <-result; err != nil || preferred != 0 || abandonments != 1 {
 		t.Fatalf("replacement = %v, preferred %d, abandonments %d", err, preferred, abandonments)
 	}
@@ -1298,7 +1298,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.event.result = result
-			scheduler.applyEvent(lanes, &preferred, tt.event, now.Add(time.Second))
+			scheduler.applyEvent(lanes, &preferred, tt.event, now.Add(time.Second), false)
 			if tt.event.kind != schedulerTiming {
 				if err := <-result; err != nil {
 					t.Fatalf("old generation's late event = %v", err)
@@ -1316,7 +1316,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	now = now.Add(time.Millisecond)
 	scheduler.applyEvent(lanes, &preferred, schedulerEvent{kind: schedulerReport, laneID: 1, generation: 2,
 		report:        protocol.DeliveryReport{LaneID: 1, Generation: 2, DataPackets: 1},
-		receiveMicros: uint64(now.UnixMicro()), result: result}, now)
+		receiveMicros: uint64(now.UnixMicro()), result: result}, now, false)
 	if err := <-result; err != nil {
 		t.Fatalf("fresh generation's real feedback = %v", err)
 	}

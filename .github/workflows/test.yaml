@@ -91,7 +91,7 @@ jobs:
           docker run --rm --network none --read-only --tmpfs /tmp:exec \
             -e WIREHOP_TEST_TOOLS=1 -v "$RUNNER_TEMP/flow.test:/flow.test:ro" \
             wirehop-integration /flow.test \
-            -test.run '^TestIPerf(ControlReadBudget|MeasurementClock|IntervalCoverage|IntervalDirections)$' -test.v
+            -test.run '^TestIPerf(ControlReadBudget|MeasurementClock|IntervalCoverage|IntervalDirections|ReceiverAccounting)$' -test.v
       - name: Test kernel WireGuard stability
         run: |
           CGO_ENABLED=0 go build -o "$RUNNER_TEMP/wirehop" ./cmd/wirehop

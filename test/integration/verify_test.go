@@ -62,25 +62,9 @@ func TestVerifyRTTStep(t *testing.T) {
 			mutate: func(_ *testing.T, _ string, flow *flowResult) { flow.ServerOutput.Error = "interrupted" }},
 		{name: "UnknownReceiverStart", raised: 1_000_000, restored: 1_000_000, wantErr: true,
 			mutate: func(_ *testing.T, _ string, flow *flowResult) { flow.ServerOutput.Started = 0 }},
-		{name: "UnknownIntervalDirection", raised: 1_000_000, restored: 1_000_000, wantErr: true,
-			mutate: func(_ *testing.T, _ string, flow *flowResult) { flow.ServerOutput.Intervals[30].Sum.Sender = nil }},
-		{name: "ServerSenderIntervals", raised: 1_000_000, restored: 1_000_000, wantErr: true,
-			mutate: func(_ *testing.T, _ string, flow *flowResult) { *flow.ServerOutput.Intervals[30].Sum.Sender = true }},
 		{name: "TruncatedReceiver", raised: 1_000_000, restored: 1_000_000, wantErr: true,
 			mutate: func(_ *testing.T, _ string, flow *flowResult) {
 				flow.ServerOutput.Intervals = flow.ServerOutput.Intervals[:53]
-			}},
-		{name: "MissingRaisedRTTIntervals", raised: 1_000_000, restored: 1_000_000, wantErr: true,
-			mutate: func(_ *testing.T, _ string, flow *flowResult) {
-				flow.ServerOutput.Intervals = append(flow.ServerOutput.Intervals[:28], flow.ServerOutput.Intervals[35:]...)
-			}},
-		{name: "DuplicatedIntervals", raised: 1_000_000, restored: 1_000_000, wantErr: true,
-			mutate: func(_ *testing.T, _ string, flow *flowResult) {
-				flow.ServerOutput.Intervals[31] = flow.ServerOutput.Intervals[30]
-			}},
-		{name: "ZeroDuration", raised: 1_000_000, restored: 1_000_000, wantErr: true,
-			mutate: func(_ *testing.T, _ string, flow *flowResult) {
-				flow.ServerOutput.Intervals[30].Sum.End = flow.ServerOutput.Intervals[30].Sum.Start
 			}},
 		{name: "IntervalTimerJitter", raised: 1_000_000, restored: 1_000_000,
 			mutate: func(_ *testing.T, _ string, flow *flowResult) {
@@ -139,6 +123,7 @@ func TestVerifyRTTStep(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(t, directory, &flow)
 			}
+			attachReceiverCounters(&flow, "tcp-rtt-step")
 			if _, err := verifyRTTStep(directory, "tcp-rtt-step", flow); (err != nil) != tt.wantErr {
 				t.Fatalf("verifyRTTStep() = %v, want error %t", err, tt.wantErr)
 			}
@@ -158,8 +143,6 @@ func TestVerifyRTTStepDirections(t *testing.T) {
 		{name: "SameGroupForward", scenario: "tcp-multipath-rtt-step"},
 		{name: "SameGroupReverse", scenario: "tcp-multipath-rtt-step-reverse"},
 		{name: "SameGroupBidirectional", scenario: "tcp-multipath-rtt-step-bidir"},
-		{name: "ReverseSenderEvidence", scenario: "tcp-rtt-step-reverse", wantErr: true,
-			mutate: func(flow *flowResult) { flow.Intervals = flow.ServerOutput.Intervals }},
 		{name: "ForwardRaisedRTTStalled", scenario: "tcp-rtt-step-bidir", wantErr: true,
 			mutate: func(flow *flowResult) {
 				for index := 10; index < 40; index++ {
@@ -184,8 +167,6 @@ func TestVerifyRTTStepDirections(t *testing.T) {
 					flow.Intervals[index].Reverse.Bytes = 624_999
 				}
 			}},
-		{name: "ReverseDirectionUnknown", scenario: "tcp-rtt-step-bidir", wantErr: true,
-			mutate: func(flow *flowResult) { flow.Intervals[30].Reverse.Sender = nil }},
 		{name: "ReverseIntervalsTruncated", scenario: "tcp-rtt-step-bidir", wantErr: true,
 			mutate: func(flow *flowResult) { flow.Intervals = flow.Intervals[:53] }},
 		{name: "SeparateReceiverStarts", scenario: "tcp-rtt-step-bidir",
@@ -208,6 +189,7 @@ func TestVerifyRTTStepDirections(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&flow)
 			}
+			attachReceiverCounters(&flow, tt.scenario)
 			if _, err := verifyRTTStep(directory, tt.scenario, flow); (err != nil) != tt.wantErr {
 				t.Fatalf("verifyRTTStep(%q) = %v, want error %t", tt.scenario, err, tt.wantErr)
 			}
@@ -230,6 +212,7 @@ func rttStepDirectionalFlow() flowResult {
 		flow.Intervals = append(flow.Intervals, flowIntervalResult{Sum: sent, Reverse: received})
 		flow.ServerOutput.Intervals = append(flow.ServerOutput.Intervals, flowIntervalResult{Sum: received, Reverse: sent})
 	}
+	attachReceiverCounters(&flow, "tcp-rtt-step-bidir")
 	return flow
 }
 
@@ -500,20 +483,8 @@ func TestVerifyRecoveryCapacityChange(t *testing.T) {
 					flow.Intervals[index].Reverse.Bytes = 624_999
 				}
 			}},
-		{name: "UnknownIntervalDirection", wantErr: "invalid receiver interval",
-			mutate: func(flow *flowResult) { flow.ServerOutput.Intervals[35].Sum.Sender = nil }},
-		{name: "SenderIntervals", wantErr: "invalid receiver interval",
-			mutate: func(flow *flowResult) { *flow.ServerOutput.Intervals[35].Sum.Sender = true }},
-		{name: "DuplicateIntervals", wantErr: "invalid receiver interval",
-			mutate: func(flow *flowResult) { flow.ServerOutput.Intervals[36] = flow.ServerOutput.Intervals[35] }},
-		{name: "ZeroDuration", wantErr: "invalid receiver interval",
-			mutate: func(flow *flowResult) { flow.ServerOutput.Intervals[35].Sum.End = 35 }},
 		{name: "TruncatedReceiver", wantErr: "lacks complete",
 			mutate: func(flow *flowResult) { flow.ServerOutput.Intervals = flow.ServerOutput.Intervals[:39] }},
-		{name: "ReverseSenderEvidence", scenario: "native-capacity-change-reverse", wantErr: "reverse direction:",
-			mutate: func(flow *flowResult) {
-				flow.Intervals[35].Sum = flow.ServerOutput.Intervals[35].Reverse
-			}},
 		{name: "ReverseDoesNotNeedServerOutput", scenario: "native-capacity-change-reverse",
 			mutate: func(flow *flowResult) { flow.ServerOutput = nil }},
 	} {
@@ -537,6 +508,7 @@ func TestVerifyRecoveryCapacityChange(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&flow)
 			}
+			attachReceiverCounters(&flow, tt.scenario)
 			_, err := verifyRecovery(tt.scenario, flow, 40, 5e6)
 			if tt.wantErr == "" {
 				if err != nil {
@@ -609,6 +581,7 @@ func TestVerifyRecovery(t *testing.T) {
 			if tt.bidirectional {
 				scenario += "-bidir"
 			}
+			attachReceiverCounters(&flow, scenario)
 			if _, err := verifyRecovery(scenario, flow, float64(tt.duration), 0); (err != nil) != tt.wantErr {
 				t.Fatalf("recovery validation = %v, want error %t", err, tt.wantErr)
 			}

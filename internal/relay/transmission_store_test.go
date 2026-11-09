@@ -109,7 +109,7 @@ func TestTransmissionStoreTakeBatchRecordPacking(t *testing.T) {
 			current := now
 			store := schedulerStore(t, packetqueue.Limits{Packets: 32, Bytes: 256 * 1024})
 			store.now = func() time.Time { return current }
-			store.setDeliveryWindows(256*1024, 256*1024)
+			store.setDeliveryWindows(256*1024, 256*1024, 0)
 			t.Cleanup(func() { releaseTransmissions(store.drain()) })
 			for index, size := range tt.sizes {
 				if index == tt.expiredAfter {
@@ -332,7 +332,7 @@ func testTransmissionStoreSentPayloadExpiryAfterCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
-	store.setDeliveryWindows(1024*1024, 1024*1024)
+	store.setDeliveryWindows(1024*1024, 1024*1024, 0)
 	for packetID := uint64(1); packetID <= total; packetID++ {
 		deadline := now.Add(time.Second)
 		if packetID%2 == 0 {
@@ -482,7 +482,7 @@ func testTransmissionStoreSentPayloadExpiryLateFeedbackAtCounterLimits(t *testin
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { releaseTransmissions(store.drain()) })
-	store.setDeliveryWindows(uint64(limits.Bytes), uint64(limits.Bytes))
+	store.setDeliveryWindows(uint64(limits.Bytes), uint64(limits.Bytes), 0)
 	var sizes [3]int
 	for index, kind := range []wgpacket.Kind{wgpacket.TransportData, wgpacket.TransportData, wgpacket.HandshakeInitiation} {
 		transmission := schedulerTransmission(math.MaxUint64-uint64(2-index), kind, now.Add(time.Second))

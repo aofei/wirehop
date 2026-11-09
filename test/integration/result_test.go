@@ -52,10 +52,27 @@ func TestVerifyResult(t *testing.T) {
 			if strings.HasSuffix(scenario, "-reverse") {
 				for index := range flow.Intervals {
 					flow.Intervals[index].Sum = flow.Intervals[index].Reverse
+					flow.Intervals[index].Reverse = flowInterval{}
 					flow.ServerOutput.Intervals[index].Sum = flow.ServerOutput.Intervals[index].Reverse
+					flow.ServerOutput.Intervals[index].Reverse = flowInterval{}
 				}
 				flow.ServerOutput.End.Received.Bytes = 0
 				after = "TcpActiveOpens 5\n"
+			}
+			attachReceiverCounters(&flow, scenario)
+			for _, direction := range receiverDirections(scenario, &flow) {
+				role := "server"
+				receiver := direction.receiver
+				if direction.name == "reverse" {
+					role, receiver = "client", &flow
+				}
+				if direction.name == "reverse" && strings.HasSuffix(scenario, "-bidir") {
+					receiver.End.Received.Sender = new(true)
+					receiver.End.ReverseReceived.Sender = new(false)
+				} else {
+					receiver.End.Received.Sender = new(false)
+				}
+				writeReceiverTrace(t, directory, role, receiver.Receiver)
 			}
 			if tt.missingEnd {
 				flow.ServerOutput.End.Received.Bytes = 0

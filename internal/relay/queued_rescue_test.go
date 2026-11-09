@@ -250,7 +250,7 @@ func TestTransmissionStoreTransferQueuedToWakesExposedPadding(t *testing.T) {
 	if err := source.push(padding); err != nil {
 		t.Fatal(err)
 	}
-	source.setDeliveryWindows(source.sentBytes+uint64(dataFrameSize(padding.data())), source.sentBytes+uint64(dataFrameSize(padding.data())))
+	source.setDeliveryWindows(source.sentBytes+uint64(dataFrameSize(padding.data())), source.sentBytes+uint64(dataFrameSize(padding.data())), 0)
 	<-source.Ready()
 	var frames [1]protocol.Data
 	var ownership [1]datagram.Packet
@@ -432,7 +432,7 @@ func TestSchedulerQueuedRescueSkipsUntimelyHead(t *testing.T) {
 func TestTransmissionStoreTransferQueuedToSkipsOversizedHead(t *testing.T) {
 	now := time.Unix(100, 0)
 	source, target, _ := queuedRescueStores(t, &now)
-	source.setDeliveryWindows(uint64(source.limits.Bytes), uint64(source.limits.Bytes))
+	source.setDeliveryWindows(uint64(source.limits.Bytes), uint64(source.limits.Bytes), 0)
 	for id := uint64(1); id <= 4; id++ {
 		packet := schedulerTransmission(id, wgpacket.TransportData, now.Add(time.Second))
 		if id%2 != 0 {

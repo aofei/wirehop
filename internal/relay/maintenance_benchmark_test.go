@@ -164,7 +164,7 @@ func BenchmarkExpiredSentAssessment(b *testing.B) {
 				b.Fatal(err)
 			}
 			b.Cleanup(func() { releaseTransmissions(store.drain()) })
-			store.setDeliveryWindows(uint64(limits.Bytes), uint64(limits.Bytes))
+			store.setDeliveryWindows(uint64(limits.Bytes), uint64(limits.Bytes), 0)
 			for index := range packets {
 				if err := store.push(schedulerTransmission(uint64(index+1), wgpacket.TransportData, now.Add(time.Second))); err != nil {
 					b.Fatal(err)

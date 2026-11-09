@@ -74,7 +74,7 @@ func TestSchedulerHighBDPTransportProbe(t *testing.T) {
 			}
 			store.budget = budget
 			store.now = func() time.Time { return now }
-			store.setDeliveryWindows(candidate.deliveryWindowBytes(), candidate.probeWindowBytes(0))
+			store.setDeliveryWindows(candidate.deliveryWindowBytes(), candidate.probeWindowBytes(0), 0)
 			t.Cleanup(func() { releaseTransmissions(primary.registration.Store.drain()) })
 			t.Cleanup(func() { releaseTransmissions(store.drain()) })
 			lanes := map[protocol.LaneID]*scheduledLane{1: primary, 2: candidate}
@@ -149,7 +149,7 @@ func TestSchedulerHighBDPMultiLaneProbe(t *testing.T) {
 					packetqueue.Limits{Packets: 8192, Bytes: 32 * 1024 * 1024})
 				candidate.rateObserved = false
 				candidate.registration.Store.now = func() time.Time { return now }
-				candidate.registration.Store.setDeliveryWindows(candidate.deliveryWindowBytes(), candidate.probeWindowBytes(0))
+				candidate.registration.Store.setDeliveryWindows(candidate.deliveryWindowBytes(), candidate.probeWindowBytes(0), 0)
 				lanes[candidate.registration.LaneID] = candidate
 				candidates = append(candidates, candidate)
 				t.Cleanup(func() { releaseTransmissions(candidate.registration.Store.drain()) })

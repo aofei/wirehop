@@ -29,6 +29,9 @@ while [ ! -f "$results/flow-done.txt" ]; do
     date +%s.%N
     /usr/local/bin/wirehop-test-flow now
     ss -toinm state established
+    ss -uanm
+    cat /proc/net/snmp /proc/net/udp
+    if [ -r /proc/net/udp6 ]; then cat /proc/net/udp6; fi
     cat /proc/net/dev
     cat /proc/stat
     if [ -r /proc/pressure/cpu ]; then cat /proc/pressure/cpu; fi

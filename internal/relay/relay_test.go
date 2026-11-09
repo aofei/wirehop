@@ -148,7 +148,7 @@ func TestLaneReadDeliveryReports(t *testing.T) {
 						cancel()
 						synctest.Wait()
 					}
-					scheduler.applyEvent(lanes, &preferred, event, time.Now())
+					scheduler.applyEvent(lanes, &preferred, event, time.Now(), false)
 				}
 				synctest.Wait()
 				if len(done) != 1 {
@@ -817,7 +817,7 @@ func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
 			sender := schedulerLaneWithLimits(t, 1, 1, 1000, 1_000_000,
 				packetqueue.Limits{Packets: packetCount, Bytes: 1024 * 1024})
 			store := sender.registration.Store
-			store.setDeliveryWindows(1024*1024, 1024*1024)
+			store.setDeliveryWindows(1024*1024, 1024*1024, 0)
 			now := time.UnixMicro(1000)
 			store.now = func() time.Time { return now }
 			t.Cleanup(func() { releaseTransmissions(store.drain()) })
@@ -2400,7 +2400,7 @@ func TestLaneDataWriteFailureRetainsSentPrefix(t *testing.T) {
 					t.Errorf("failed generation retained aggregate ownership: %+v", got)
 				}
 			})
-			store.setDeliveryWindows(64*1024, 64*1024)
+			store.setDeliveryWindows(64*1024, 64*1024, 0)
 			store.writeBudget.Store(tt.budget)
 			writeErr := errors.New("scripted data write failure")
 			connection := newTestCarrier()

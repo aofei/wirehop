@@ -79,7 +79,7 @@ func testMeasurementLiveTargets(t *testing.T, targets int) {
 				t.Fatal(err)
 			}
 			t.Cleanup(e.ingress.Close)
-			e.scheduler, err = NewScheduler(e.ingress)
+			e.scheduler, err = NewScheduler(&Ingress{queue: e.ingress})
 			if err != nil {
 				t.Fatal(err)
 			}

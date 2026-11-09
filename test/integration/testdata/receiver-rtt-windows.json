@@ -1,0 +1,17 @@
+[
+  {
+    "phase": "baseline",
+    "start_seconds": 2,
+    "end_seconds": 8.003083158982918
+  },
+  {
+    "phase": "raised RTT",
+    "start_seconds": 28.003466491936706,
+    "end_seconds": 38.025627380935475
+  },
+  {
+    "phase": "restored RTT",
+    "start_seconds": 50.027888880926184,
+    "end_seconds": 58
+  }
+]

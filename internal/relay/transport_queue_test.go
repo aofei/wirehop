@@ -207,6 +207,7 @@ func TestSchedulerScheduleTransportQueue(t *testing.T) {
 				size, preferred = wgpacket.TransportKeepaliveLength, 0
 			case "Paused":
 				scheduler.measurementStarted = now
+				scheduler.measurementQuiet = true
 				store.beginMeasurementPause()
 			case "NoLaneCredit":
 				store.limits.Packets = 1
@@ -264,10 +265,15 @@ func TestSchedulerUpdateMeasurementDrainResetsCongestion(t *testing.T) {
 	drain := &measurementDrain{ctx: t.Context(), target: protocol.LaneGeneration{
 		LaneID: 1, Generation: lane.registration.Generation,
 	}, ready: make(chan struct{})}
-	scheduler := Scheduler{measurementDrain: drain, transportQueue: transportQueueControl{
+	ingress, err := packetqueue.New[Packet](packetqueue.Limits{Packets: 8, Bytes: 8192})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ingress.Close()
+	scheduler := Scheduler{input: &Ingress{queue: ingress}, ingress: ingress, measurementDrain: drain, transportQueue: transportQueueControl{
 		aboveSince: now.Add(-time.Second), dropNext: now, dropping: true, count: 100,
 	}}
-	scheduler.updateMeasurementDrain(map[protocol.LaneID]*scheduledLane{1: lane})
+	scheduler.updateMeasurementDrain(map[protocol.LaneID]*scheduledLane{1: lane}, false)
 	if scheduler.measurementTimer != nil {
 		scheduler.measurementTimer.Stop()
 	}

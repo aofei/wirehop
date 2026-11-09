@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,8 +73,7 @@ func TestVerifyComparison(t *testing.T) {
 								rate = 20
 							}
 						}
-						writeFixture(t, directory, "flow.json", fmt.Sprintf(
-							`{"end":{"sum_received":{"bytes":100,"bits_per_second":%f,"seconds":%f}}}`+"\n", rate, tt.seconds))
+						writeFlowFixture(t, directory, rate, tt.seconds)
 					}
 				}
 			}
@@ -128,8 +128,7 @@ func TestCompareBaseline(t *testing.T) {
 						if root == candidate {
 							rate = tt.rate
 						}
-						writeFixture(t, directory, "flow.json", fmt.Sprintf(
-							`{"end":{"sum_received":{"bytes":100,"bits_per_second":%f,"seconds":20}}}`+"\n", rate))
+						writeFlowFixture(t, directory, rate, 20)
 					}
 				}
 			}
@@ -145,8 +144,7 @@ func TestCompareBaseline(t *testing.T) {
 						}
 					}
 				}
-				writeFixture(t, filepath.Join(candidate, "HighCapacity-1-Both"), "flow.json",
-					`{"end":{"sum_received":{"bytes":100,"bits_per_second":1,"seconds":20}}}`+"\n")
+				writeFlowFixture(t, filepath.Join(candidate, "HighCapacity-1-Both"), 1, 20)
 				command := exec.Command(os.Args[0], "-test.run=^TestPerformanceVerifierChild$")
 				command.Env = append(os.Environ(), "WIREHOP_TEST_PERFORMANCE_CANDIDATE="+candidate,
 					"WIREHOP_TEST_PERFORMANCE_BASELINE="+baseline)
@@ -178,9 +176,11 @@ func TestPerformanceVerifierChild(t *testing.T) {
 	if candidate == "" {
 		return
 	}
-	os.Args = []string{"verify", candidate, "1", os.Getenv("WIREHOP_TEST_PERFORMANCE_BASELINE")}
+	os.Args = []string{"verify", candidate, "1"}
+	if baseline := os.Getenv("WIREHOP_TEST_PERFORMANCE_BASELINE"); baseline != "" {
+		os.Args = append(os.Args, baseline)
+	}
 	main()
-	t.Fatal("failed verification returned without a failure exit status")
 }
 
 func TestVerifyCollectsEvidenceFailures(t *testing.T) {
@@ -193,8 +193,7 @@ func TestVerifyCollectsEvidenceFailures(t *testing.T) {
 					t.Fatal(err)
 				}
 				writeEvidence(t, directory, path)
-				writeFixture(t, directory, "flow.json",
-					`{"end":{"sum_received":{"bytes":100,"bits_per_second":100,"seconds":20}}}`+"\n")
+				writeFlowFixture(t, directory, 100, 20)
 			}
 		}
 	}
@@ -202,6 +201,9 @@ func TestVerifyCollectsEvidenceFailures(t *testing.T) {
 	writeFixture(t, filepath.Join(root, "HighCapacity-2-Low"), "client-after.txt", "TcpActiveOpens 6 0\n")
 	writeFixture(t, filepath.Join(root, "HighCapacity-1-Both"), "router-qdisc.txt",
 		"qdisc prio 1:\n dropped 1\n dropped 0\n dropped 0\n")
+	writeFixture(t, filepath.Join(root, "HighCapacity-2-High"), "harness-error.txt", "observer interrupted\n")
+	replaceFlowFixture(t, filepath.Join(root, "HighCapacity-3-Both"), `"blksize":131072`, `"blksize":16384`)
+	replaceFlowFixture(t, filepath.Join(root, "LowCapacity-2-Low"), `"duration":20`, `"duration":21`)
 	writeFixture(t, filepath.Join(root, "LowCapacity-3-High"), "flow.json", "{}\n")
 	for _, check := range []struct {
 		name string
@@ -216,7 +218,8 @@ func TestVerifyCollectsEvidenceFailures(t *testing.T) {
 				t.Fatal("invalid repetitions passed verification")
 			}
 			for _, name := range []string{
-				"HighCapacity-1-Low", "HighCapacity-2-Low", "HighCapacity-1-Both", "LowCapacity-3-High",
+				"HighCapacity-1-Low", "HighCapacity-2-Low", "HighCapacity-1-Both", "HighCapacity-2-High",
+				"HighCapacity-3-Both", "LowCapacity-2-Low", "LowCapacity-3-High",
 			} {
 				if !strings.Contains(err.Error(), name) {
 					t.Fatalf("verification concealed %s: %v", name, err)
@@ -271,19 +274,34 @@ func TestVerifyLatency(t *testing.T) {
 func writeEvidence(t *testing.T, directory, path string) {
 	t.Helper()
 	var sockets string
+	var lowBytes, highBytes uint64
 	if path != "High" {
 		sockets += "0 0 192.0.2.1:40000 192.0.2.2:51822\n"
+		lowBytes = 1000000000
 	}
 	if path != "Low" {
 		sockets += "0 0 192.0.2.1:40001 192.0.2.2:51823\n"
+		highBytes = 1000000000
 	}
 	writeFixture(t, directory, "client-tcp-sockets.txt", sockets)
 	writeFixture(t, directory, "client-tcp-sockets-after.txt", sockets)
 	writeFixture(t, directory, "client-before.txt", "TcpActiveOpens 3 0\n")
 	writeFixture(t, directory, "client-after.txt", "TcpActiveOpens 5 0\n")
-	writeFixture(t, directory, "router-qdisc.txt", "qdisc prio 1:\n Sent 200 bytes (dropped 0)\n"+
-		"qdisc netem 10: parent 1:1\n Sent 100 bytes (dropped 0)\n"+
-		"qdisc netem 20: parent 1:2\n Sent 100 bytes (dropped 0)\n")
+	writeFixture(t, directory, "router-qdisc.txt", fmt.Sprintf("qdisc prio 1:\n Sent %d bytes (dropped 0)\n"+
+		"qdisc netem 10: parent 1:1\n Sent %d bytes (dropped 0)\n"+
+		"qdisc netem 20: parent 1:2\n Sent %d bytes (dropped 0)\n", lowBytes+highBytes, lowBytes, highBytes))
+}
+
+// writeFlowFixture writes a forward TCP flow with consistent receiver bytes, duration, and Mbit/s.
+func writeFlowFixture(t *testing.T, directory string, rate, seconds float64) {
+	t.Helper()
+	bytes := uint64(math.Round(rate * 1e6 * seconds / 8))
+	writeFixture(t, directory, "flow.json", fmt.Sprintf(
+		`{"start":{"test_start":{"protocol":"TCP","num_streams":1,"blksize":131072,"duration":20,`+
+			`"omit":0,"reverse":0,"bidir":0,"bytes":0,"blocks":0,"target_bitrate":0,"fqrate":0}},`+
+			`"end":{"sum_sent":{"seconds":%g},`+
+			`"sum_received":{"bytes":%d,"bits_per_second":%.9f,"seconds":%g}}}`+"\n",
+		seconds, bytes, rate*1e6, seconds))
 }
 
 // writeFixture writes one verifier input and fails the test on any filesystem error.

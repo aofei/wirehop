@@ -32,10 +32,10 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer func() {
 				cancel()
-				scheduler.updateMeasurementDrain(lanes)
+				scheduler.updateMeasurementDrain(lanes, false)
 			}()
 			ready, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
-			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
+			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow(), false)
 			if measurementDrainValid(valid) {
 				t.Error("pending refresh published a pause proof during active discovery")
 			}
@@ -73,11 +73,24 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			default:
 			}
 			time.Sleep(until.Sub(protocolNow()))
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
+			select {
+			case <-ready:
+				t.Fatal("measurement became quiet before the accepted real packet drained")
+			default:
+			}
+			realPacket := takeOneTransmission(t, lanes[1].registration.Store)
+			if realPacket.PacketID != 99 || realPacket.DeadlineMicros != uint64(realDeadline.UnixMicro()) {
+				t.Fatal("draining changed a real packet's identity or deadline")
+			}
+			if _, stale, err := lanes[1].registration.Store.acknowledge(1, uint64(protocolNow().UnixMicro())+1); err != nil || stale {
+				t.Fatalf("real packet drain acknowledgement: stale %t, error %v", stale, err)
+			}
+			scheduler.updateMeasurementDrain(lanes, false)
 			select {
 			case <-ready:
 			default:
-				t.Fatal("finished discovery did not permit the already empty session to pause")
+				t.Fatal("draining discovery and accepted real data did not permit the empty session to pause")
 			}
 			if !measurementDrainValid(valid) {
 				t.Fatal("completed discovery did not permit an ordinary validated drain")
@@ -91,11 +104,8 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 				t.Fatal("drain admission restarted or extended the completed discovery period")
 			}
 			cancel()
-			scheduler.updateMeasurementDrain(lanes)
-			realPacket := takeOneTransmission(t, lanes[1].registration.Store)
-			if realPacket.PacketID != 99 || realPacket.DeadlineMicros != uint64(realDeadline.UnixMicro()) {
-				t.Fatal("waiting for discovery or pausing changed a real packet's identity or deadline")
-			}
+			scheduler.updateMeasurementDrain(lanes, false)
+
 		})
 	})
 	t.Run("PausedSessionDoesNotStartDiscovery", func(t *testing.T) {
@@ -105,10 +115,10 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer func() {
 				cancel()
-				scheduler.updateMeasurementDrain(lanes)
+				scheduler.updateMeasurementDrain(lanes, false)
 			}()
 			_, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
-			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
+			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow(), false)
 			if !measurementDrainValid(valid) {
 				t.Fatal("empty session did not enter a validated timing pause")
 			}
@@ -142,7 +152,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			ready, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
 			for _, applied := range []bool{false, true} {
 				if applied {
-					scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
+					scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow(), false)
 				}
 				if scheduler.fillTransportProbe(lanes, preferred, protocolNow(), 0) {
 					t.Fatalf("waiting refresh admitted a fresh discovery period: applied %t", applied)
@@ -152,7 +162,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 				}
 			}
 			cancel()
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
 			select {
 			case <-ready:
 			default:
@@ -168,7 +178,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 				t.Fatal("request cancellation changed an existing discovery period")
 			}
 			time.Sleep(until.Sub(protocolNow()))
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
 			for _, lane := range lanes {
 				if lane.registration.Store.measurementDrain.Load() {
 					t.Fatal("canceled waiting request acquired a later pause")
@@ -186,10 +196,10 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer func() {
 				cancel()
-				scheduler.updateMeasurementDrain(lanes)
+				scheduler.updateMeasurementDrain(lanes, false)
 			}()
 			ready, valid := scheduler.beginMeasurementDrain(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, true, nil)
-			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow())
+			scheduler.applyEvent(lanes, &preferred, <-scheduler.events, protocolNow(), false)
 			if measurementDrainValid(valid) || scheduler.measurementDrain == nil || scheduler.measurementTimer == nil {
 				t.Fatal("active discovery did not retain an applied timing waiter and its timer")
 			}
@@ -214,7 +224,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			if remaining := lanes[2].probeUntil.Sub(protocolNow()); remaining != time.Microsecond {
 				t.Fatalf("protocol discovery time remaining = %s, want one microsecond", remaining)
 			}
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
 			select {
 			case <-ready:
 				t.Fatal("completed runtime timer bypassed the remaining protocol discovery duration")
@@ -227,7 +237,7 @@ func TestSchedulerTimingDrainPreservesDiscovery(t *testing.T) {
 			default:
 				t.Fatal("completed timer was not rearmed for the remaining protocol duration")
 			}
-			scheduler.updateMeasurementDrain(lanes)
+			scheduler.updateMeasurementDrain(lanes, false)
 			select {
 			case <-ready:
 			default:
@@ -251,7 +261,7 @@ func newProbeDrainRegressionState(t *testing.T) (*Scheduler, map[protocol.LaneID
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ingress.Close() })
-	scheduler, err := NewScheduler(ingress)
+	scheduler, err := NewScheduler(&Ingress{queue: ingress})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,137 +10,6 @@ import (
 	"testing"
 )
 
-func TestMeasureThroughput(t *testing.T) {
-	for _, tt := range []struct {
-		name       string
-		samples    []flowInterval
-		windows    []throughputWindow
-		wantBytes  float64
-		wantStatus string
-	}{
-		{name: "PartialBoundaryIntervals", samples: []flowInterval{
-			{Start: 0, End: 1, Bytes: 1000},
-			{Start: 1, End: 3, Bytes: 4000},
-			{Start: 3, End: 4, Bytes: 1000},
-		}, windows: []throughputWindow{
-			{name: "baseline", start: 0, end: 4},
-			{name: "clipped", start: 0.5, end: 3.5},
-		}, wantBytes: 5000, wantStatus: "pass"},
-		{name: "MissingInteriorInterval", samples: []flowInterval{
-			{Start: 0, End: 1, Bytes: 1000},
-			{Start: 2, End: 4, Bytes: 2000},
-		}, windows: []throughputWindow{{name: "baseline", start: 0, end: 4}}, wantBytes: 3000, wantStatus: "invalid"},
-		{name: "ZeroDeliveryIsMeasured", samples: []flowInterval{
-			{Start: 0, End: 4, Bytes: 4000},
-			{Start: 4, End: 9},
-		}, windows: []throughputWindow{
-			{name: "baseline", start: 0, end: 4},
-			{name: "recovered", start: 4, end: 9},
-		}, wantStatus: "below-threshold"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			measurements, err := measureThroughput(tt.samples, tt.windows, 0)
-			if (err != nil) != (tt.wantStatus != "pass") {
-				t.Fatalf("measureThroughput() error = %v", err)
-			}
-			last := measurements[len(measurements)-1]
-			if last.Bytes != tt.wantBytes || last.Status != tt.wantStatus {
-				t.Fatalf("measurement = %+v, want bytes=%f status=%s", last, tt.wantBytes, tt.wantStatus)
-			}
-			if tt.wantStatus == "pass" && last.BitsPerSecond != tt.wantBytes*8/(last.End-last.Start) {
-				t.Fatalf("rate did not use the full window: %+v", last)
-			}
-		})
-	}
-}
-
-func TestMeasureThroughputInvalidBaseline(t *testing.T) {
-	measurements, err := measureThroughput([]flowInterval{
-		{Start: 0, End: 4, Bytes: 4000},
-		{Start: 4, End: 9, Bytes: 5000},
-	}, []throughputWindow{
-		{name: "baseline", start: 0, end: 4},
-		{name: "recovered", start: 4, end: 9},
-	}, 16_000)
-	if err == nil {
-		t.Fatal("accepted a baseline below the required rate")
-	}
-	for _, measurement := range measurements {
-		if measurement.Status != "invalid" {
-			t.Fatalf("unusable baseline produced a valid recovery status: %+v", measurement)
-		}
-	}
-}
-
-func TestMeasureThroughputJitter(t *testing.T) {
-	for _, tt := range []struct {
-		name       string
-		bytes      uint64
-		wantStatus string
-	}{
-		{name: "ExactlyThreshold", bytes: 50_000, wantStatus: "pass"},
-		{name: "AboveThreshold", bytes: 52_000, wantStatus: "pass"},
-		{name: "BelowThreshold", bytes: 49_999, wantStatus: "below-threshold"},
-		{name: "Stalled", wantStatus: "below-threshold"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			for microseconds := -1000; microseconds <= 1000; microseconds++ {
-				offset := float64(microseconds) / 1e6
-				samples := make([]flowInterval, 300)
-				for index := range samples {
-					bytes := tt.bytes
-					if index < 50 {
-						bytes = 200_000
-					}
-					samples[index] = flowInterval{
-						Start: float64(index)/5 + offset,
-						End:   float64(index+1)/5 + offset,
-						Bytes: bytes,
-					}
-				}
-				measurements, err := measureThroughput(samples, []throughputWindow{
-					{name: "baseline", start: 2, end: 8},
-					{name: "raised", start: 28, end: 38},
-					{name: "restored", start: 50, end: 58},
-				}, 0)
-				if (err != nil) != (tt.wantStatus != "pass") {
-					t.Fatalf("offset %d microseconds: unexpected error %v", microseconds, err)
-				}
-				for _, measurement := range measurements[1:] {
-					if measurement.Status != tt.wantStatus || math.Abs(*measurement.Fraction-float64(tt.bytes)/200_000) > 1e-12 {
-						t.Fatalf("offset %d microseconds: unstable measurement %+v", microseconds, measurement)
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestMeasureThroughputBaselineBoundary(t *testing.T) {
-	for _, tt := range []struct {
-		name    string
-		bytes   uint64
-		wantErr bool
-	}{
-		{name: "ExactlyMinimum", bytes: 125_000},
-		{name: "BelowMinimum", bytes: 124_999, wantErr: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			for microseconds := -1000; microseconds <= 1000; microseconds++ {
-				offset := float64(microseconds) / 1e6
-				samples := make([]flowInterval, 300)
-				for index := range samples {
-					samples[index] = flowInterval{Start: float64(index)/5 + offset, End: float64(index+1)/5 + offset, Bytes: tt.bytes}
-				}
-				_, err := measureThroughput(samples, []throughputWindow{{name: "baseline", start: 2, end: 8}}, 5e6)
-				if (err != nil) != tt.wantErr {
-					t.Fatalf("offset %d microseconds: minimum-baseline error = %v, want error %v", microseconds, err, tt.wantErr)
-				}
-			}
-		})
-	}
-}
-
 func TestVerifyFaultTimes(t *testing.T) {
 	for _, tt := range []struct {
 		name                      string
@@ -207,51 +76,33 @@ func TestVerifyRTTStepBoundaryJitter(t *testing.T) {
 			}
 			flow.ServerOutput.Intervals[57].Sum.Bytes = 400_000
 			shiftReceiverIntervals(flow.ServerOutput, tt.offset)
+			attachReceiverCounters(&flow, "tcp-rtt-step")
 			measurements, err := verifyRTTStep(directory, "tcp-rtt-step", flow)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if math.Abs(*measurements[2].Fraction-0.26) > 0.001 {
+			if math.Abs(*measurements[2].LowerFraction-0.26) > 0.001 {
 				t.Fatalf("boundary jitter changed the measured recovery: %+v", measurements[2])
 			}
 		})
 	}
 }
 
-func TestVerifyRTTStepHistoricalRun77(t *testing.T) {
+func TestVerifyRTTStepHistoricalRun77NeedsCounterEvidence(t *testing.T) {
 	data, err := os.ReadFile("testdata/rtt-step-run77-forward.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tt := range []struct {
-		name   string
-		offset float64
-	}{
-		{name: "EarlierMillisecond", offset: -0.001},
-		{name: "Earlier43Microseconds", offset: -0.000043},
-		{name: "Original"},
-		{name: "Later43Microseconds", offset: 0.000043},
-		{name: "LaterMillisecond", offset: 0.001},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			directory := t.TempDir()
-			writeRTTStepEvidence(t, directory)
-			receiver := flowResult{Started: 1_700_000_000}
-			if err := json.Unmarshal(data, &receiver); err != nil {
-				t.Fatal(err)
-			}
-			shiftReceiverIntervals(&receiver, tt.offset)
-			measurements, err := verifyRTTStep(directory, "tcp-multipath-rtt-step", flowResult{
-				Started: receiver.Started, ServerOutput: &receiver,
-			})
-			if err == nil || !strings.Contains(err.Error(), "require at least 25 percent") {
-				t.Fatalf("historical failure was incorrectly accepted: %v", err)
-			}
-			if len(measurements) != 3 || measurements[2].Status != "below-threshold" ||
-				math.Abs(*measurements[2].Fraction-0.21799306198233836) > 0.001 {
-				t.Fatalf("incorrect historical recovery measurements: %+v", measurements)
-			}
-		})
+	var receiver flowResult
+	if err := json.Unmarshal(data, &receiver); err != nil {
+		t.Fatal(err)
+	}
+	receiver.Started = 1_700_000_000
+	directory := t.TempDir()
+	writeRTTStepEvidence(t, directory)
+	_, err = verifyRTTStep(directory, "tcp-multipath-rtt-step", flowResult{Started: receiver.Started, ServerOutput: &receiver})
+	if err == nil || !strings.Contains(err.Error(), "counter evidence") {
+		t.Fatalf("accepted historical intervals as exact counter evidence: %v", err)
 	}
 }
 
@@ -281,7 +132,7 @@ func TestVerifyRecoveryDirections(t *testing.T) {
 		{name: "Bidirectional", scenario: "tcp-asymmetric-stall-bidir"},
 		{name: "ForwardSenderOnly", scenario: "tcp-asymmetric-stall", wantErr: "missing completed receiver",
 			mutate: func(flow *flowResult) { flow.ServerOutput = nil }},
-		{name: "ReverseSenderOnly", scenario: "tcp-asymmetric-stall-reverse", wantErr: "invalid receiver interval"},
+		{name: "ReverseSenderOnly", scenario: "tcp-asymmetric-stall-reverse", wantErr: "missing completed receiver"},
 		{name: "BidirectionalReverseStalled", scenario: "tcp-asymmetric-stall-bidir", wantErr: "reverse direction",
 			mutate: func(flow *flowResult) {
 				for index := 15; index < 20; index++ {
@@ -296,6 +147,7 @@ func TestVerifyRecoveryDirections(t *testing.T) {
 			if tt.mutate != nil {
 				tt.mutate(&flow)
 			}
+			attachReceiverCounters(&flow, tt.scenario)
 			_, err := verifyRecovery(tt.scenario, flow, 20, 0)
 			if tt.wantErr == "" && err != nil || tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
 				t.Fatalf("verifyRecovery() = %v, want %q", err, tt.wantErr)
@@ -327,11 +179,12 @@ func TestVerifyScenarioBufferedSender(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			attachReceiverCounters(&flow, tt.scenario)
 			measurements, err := verifyScenario(directory, tt.scenario, flow)
 			if err == nil || !strings.Contains(err.Error(), "forward direction") {
 				t.Fatalf("sender buffering satisfied recovery: %v", err)
 			}
-			if measurements[1].Bytes != 0 || measurements[1].Status != "below-threshold" {
+			if measurements[1].LowerBytes != 0 || measurements[1].Status != "below-threshold" {
 				t.Fatalf("zero receiver progress was not reported: %+v", measurements)
 			}
 		})
@@ -357,6 +210,7 @@ func TestVerifyScenarioIndependentFailures(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	attachReceiverCounters(&flow, "tcp-multipath-rtt-step-bidir")
 	measurements, err := verifyScenario(directory, "tcp-multipath-rtt-step-bidir", flow)
 	for _, want := range []string{"forward direction", "reverse direction", "carrier socket identities changed"} {
 		if err == nil || !strings.Contains(err.Error(), want) {

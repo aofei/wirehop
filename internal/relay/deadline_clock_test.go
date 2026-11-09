@@ -21,7 +21,7 @@ func TestSchedulerExpiryUsesIngressClock(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer ingress.Close()
-		scheduler, err := NewScheduler(ingress)
+		scheduler, err := NewScheduler(&Ingress{queue: ingress})
 		if err != nil {
 			t.Fatal(err)
 		}

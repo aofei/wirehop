@@ -19,10 +19,11 @@ sh test/integration/run.sh /tmp/wirehop-linux /tmp/wirehop-kernel-results
 Use `GOARCH=amd64` for an x86-64 engine. The results directory must not already exist. To reuse an equivalent tool
 image, set `WIREHOP_TEST_IMAGE`. It must provide `sh`, `ip`, `wg`, `tc`, `nstat`, `openssl`, `timeout`, iperf3 with JSON
 streaming that retains positive-duration zero-delivery intervals and uses each direction's own interval timing, a
-60-second control-read budget, and a producer-recorded `started_boottime` measurement origin, plus the
-`wirehop-test-flow` collector built from this repository. The provided image builds iperf3 3.18 from a checksum-pinned
-source archive and identifies its adaptations as `3.18-wirehop-test`. It also pins the Go builder and Debian base image
-digests. Tool versions and the resulting image identity are retained with each run.
+60-second control-read budget, a producer-recorded `started_boottime` measurement origin, conserved interval counters,
+and the receiver counter tracing described below, plus the `wirehop-test-flow` collector built from this repository. The
+provided image builds iperf3 3.18 from a checksum-pinned source archive and identifies its adaptations as
+`3.18-wirehop-test`. It also pins the Go builder and Debian base image digests. Tool versions and the resulting image
+identity are retained with each run.
 
 The collector reads flushed iperf3 JSON events. Recovery checks use 200 ms reporting intervals, while ordinary cases
 retain one-second intervals. The test build makes iperf3 use Linux `CLOCK_BOOTTIME` for its measurement clock and emits
@@ -53,9 +54,9 @@ seconds and require transfer progress after recovery. Address replacement change
 address, forcing recovery from an obsolete TCP connection.
 
 Ordinary interruption, address-change, and route-failure checks require positive receiver delivery during the complete
-final second of the prescribed flow. They use the same overlap integration and coverage validation as recovery gates.
-Sender buffering cannot satisfy this check. A final partial reporting interval with zero bytes does not conceal delivery
-earlier in that same final second. These progress checks have no baseline fraction or percentage threshold.
+final second of the prescribed flow. They use the same receiver counter evidence and coverage validation as recovery
+gates. Sender buffering cannot satisfy this check. A final partial reporting interval with zero bytes does not conceal
+delivery earlier in that same final second. These progress checks have no baseline fraction or percentage threshold.
 
 The rate-limited cases add 100 ms one-way delay, 20 ms jitter, and 0.2% loss with an eight-packet netem queue. They test
 continued connectivity at low capacity, not comparative mobile throughput or battery consumption.
@@ -86,7 +87,11 @@ direction. Stock 3.18 instead uses the first stream for both bidirectional sums,
 statistics at different times. A regression compares sums with their corresponding stream in forward, reverse, and
 bidirectional transfers at both endpoints. CI runs these tool regressions before the kernel matrix. Comparing streamed
 and plain output at the same version does not isolate the effect of upgrading iperf3. Retain the version and control
-errors when assessing low-rate failures.
+errors when assessing low-rate failures. A receive-accounting regression delays reporter `TCP_INFO` calls while data
+workers continue, then checks interval, final, and event totals in forward, reverse, and bidirectional flows. The delay
+interposer is enabled only by this fixture and is not loaded during the kernel matrix or performance measurements. The
+requested direction determines which endpoints must supply local receiver totals and traces. Endpoints that only send
+must have neither local receiver totals nor receiver traces.
 
 The `tcp-asymmetric` case uses distinct TCP path groups with 5 ms one-way delay at 100 Mbit/s and 150 ms one-way delay
 at 20 Mbit/s. `tcp-asymmetric-stall` additionally interrupts only the faster path for four seconds. Its `-reverse` and
@@ -128,7 +133,7 @@ large native TCP congestion window before the 32 kbit/s queue drops hundreds of 
 postpone useful recovery beyond a 40-second flow even after capacity returns. The controlled offered load and smaller
 application writes bound the workload independently of runner speed. Preserving the queues also avoids an additional
 packet purge when the fault ends. The original impairment settings and 40-second recovery deadline remain unchanged.
-Both directions use receiver intervals, so buffered sender writes cannot satisfy the recovery check. These cases
+Both directions use receiver counters, so buffered sender writes cannot satisfy the recovery check. These cases
 automatically retain TCP timer, socket, and qdisc samples throughout the flow, plus queue counters immediately before
 and after restoring capacity. The native controls help distinguish inner TCP recovery limits from relay-specific
 regressions.
@@ -136,35 +141,48 @@ regressions.
 The `native-rtt-step`, `tcp-rtt-step`, and `tcp-multipath-rtt-step` cases keep a 20 Mbit/s bottleneck throughout a
 60-second transfer. Both endpoint delays rise from 5 to 600 milliseconds after ten seconds and return to 5 milliseconds
 thirty seconds later. The multipath case uses two lanes in one path group. Their `-reverse` and `-bidir` variants
-exercise the reverse direction and simultaneous bidirectional traffic. Receiver interval data in each direction must
-show at least 5 Mbit/s before the change and retain at least 25 percent of its own baseline during the settled
-high-delay and restored phases. Both endpoints record the actual change times. Every phase must exercise the configured
-queue without drops, and the carrier connections must remain unchanged. Sender-side buffered bytes do not satisfy the
-delivery checks.
+exercise the reverse direction and simultaneous bidirectional traffic. Receiver counter data in each direction must show
+at least 5 Mbit/s before the change and retain at least 25 percent of its own baseline during the settled high-delay and
+restored phases. Both endpoints record the actual change times. Every phase must exercise the configured queue without
+drops, and the carrier connections must remain unchanged. Sender-side buffered bytes do not satisfy the delivery checks.
 
 Recovery throughput gates select the receiving endpoint in each direction. All window boundaries use the client's
-producer-recorded measurement origin, matching fault scheduling and the prescribed flow deadline. Receiver intervals are
-translated by the difference between the endpoint origins before integration. Sharing a boot clock does not mean that
-both endpoints initialize their measurements simultaneously. A control-message or scheduling delay must not move the
-receiving endpoint's final window earlier or later in the experiment.
+producer-recorded measurement origin, matching fault scheduling and the prescribed flow deadline. Counter updates use
+absolute `CLOCK_BOOTTIME` nanoseconds. Sharing a boot clock does not mean that both endpoints initialize their
+measurements simultaneously. A control-message or scheduling delay must not move the receiving endpoint's final window
+earlier or later in the experiment.
 
 If the receiver initializes later, delivery before its producer origin is known to be zero because iperf3 initializes
-its counters before starting the data workers. Only that pre-initialization prefix is supplied as zero evidence. Gaps
-after initialization remain missing evidence and fail coverage validation. The initial baseline includes actual startup
-delays within its prescribed client-time window.
+its counters before starting the data workers. The initial baseline includes actual startup delays within its prescribed
+client-time window. A window extending beyond the receiver's final snapshot is incomplete and fails.
 
-Window bytes are estimated from each interval's overlap with the requested window, using a constant rate within that
-interval. The denominator is the full window duration. This avoids discarding a reporting interval because it ends
-slightly beyond a boundary. Missing window coverage, overlaps, unknown directions, and incomplete windows are rejected.
-Coverage permits at most one serialized microsecond of timestamp rounding across a window. Recovery-fraction and
-minimum-baseline comparisons allow a normalized ratio roundoff of `1e-12` to avoid rejecting exact boundary values
-because of float64 summation. A complete zero-byte interval remains evidence of zero delivery. Recovery uses exactly the
-final five seconds of the prescribed flow, with a four-second pre-fault baseline. RTT-step windows follow the observed
-changes and keep their original 60-second deadline. The 25 percent threshold detects substantial recovery and is not a
-statistical calibration of GitHub-hosted runner performance.
+The test-only iperf3 patch brackets every receiving TCP counter update with two boot-clock reads. It stores at most
+1,048,576 records per receiving stream in 24 MiB allocated before the producer origin, then writes
+`client-receiver-*.jsonl` or `server-receiver-*.jsonl` after traffic. These records measure completed application-read
+accounting. They retain the workload's block size and cannot reconstruct individual packet arrival or bytes in an
+unfinished read. The receive helper can combine several socket reads into one configured block before updating the
+counter. Matching completed-counter totals does not establish how many bytes an unfinished block held at cancellation.
+Recording does not write files in the data path. Unmonitored cases leave tracing disabled.
+
+For each half-open window, definitely contained updates determine the lower byte bound. Updates whose timing could
+overlap the window determine the upper bound. The denominator remains the full prescribed duration. The recovery ratio
+range is `[phase_lower / baseline_upper, phase_upper / baseline_lower]`. A case passes only if its lower bound reaches
+25 percent. An upper bound below 25 percent fails throughput. Bounds straddling the threshold fail as inconclusive
+measurement evidence. Final progress likewise requires definite delivery inside its window. Missing, malformed,
+overflowed, nonmonotonic, or truncated traces fail without an interval-estimate fallback. Complete records with no
+updates in a window establish zero delivery.
+
+The producer captures and resets interval counters atomically and joins data workers before final statistics. Worker
+cancellation cannot split TCP counter bookkeeping. The verifier requires the event sum, interval sum, header total, and
+local receiver's final total to agree. For bidirectional results the summary's `sender` flag identifies the local
+receiver. The ordinary client `sum_received` can describe its peer and must not substitute for the reverse receiver.
+Origin comparisons allow one serialized microsecond of timestamp rounding. Ratio comparisons allow normalized float64
+roundoff of `1e-12`. Recovery still uses the final five seconds of the prescribed flow with a four-second baseline.
+RTT-step windows follow observed changes and retain the 60-second deadline. The unchanged 25 percent threshold detects
+substantial recovery and is not a statistical calibration of GitHub-hosted runner performance.
 
 Each verified case writes `verification.json` and prints every measured direction and phase, including failures. The
-report contains window boundaries, covered time, estimated received bytes, receiver bitrate, baseline fraction when
+report contains window boundaries, covered time, receiver byte and bitrate bounds, baseline fraction bounds when
 defined, and status. Independent throughput and carrier assertions are all reported. The runner retains container exit
 codes and continues through the remaining cases and repetitions after a completed case fails verification.
 
@@ -178,6 +196,14 @@ startup failures use the same capture path. A node also records its addresses, r
 state, and ephemeral-port settings before a failing shell exits, preserving evidence that disappears with its network
 namespace. Diagnostic write failures do not prevent container and network cleanup. Collection failures are retained in
 `harness-error.txt` and make verification fail.
+
+Docker-written `.cid` files identify each created endpoint, and `network.id` records the created test bridge.
+Diagnostics and cleanup use those IDs. A name collision preserves the existing resource, including when creation fails
+before an endpoint starts.
+
+Periodic observations retain UDP socket queue occupancy and per-socket drops alongside namespace UDP counters. Read
+these timestamped snapshots with calibration and fault events when attributing receive-buffer loss. Final namespace
+totals alone do not identify the affected socket or the time of a drop.
 
 Fault cases with separate server results keep the client's relay running for up to ten seconds after its producer exits.
 The server can still need the relay for final control messages and TCP acknowledgments. A missing completion marker or
@@ -236,6 +262,16 @@ the GitHub run and commit, executable build metadata, runner image version, Dock
 and test image identity. Observations consume CPU and must be enabled consistently when comparing binaries. A carrier
 identity change is a stability assertion failure. Its cause still requires the socket, queue, and timing evidence. Short
 transient reconnects can fall inside the product's initial quiet logging period.
+
+For packet attribution, keep captures at both endpoints through both producers' completion and retain capture counters
+and wall-to-monotonic clock brackets.
+[UDP segmentation offloads](https://www.kernel.org/doc/html/latest/networking/segmentation-offloads.html) can expose
+several datagrams as one capture record. Match visible WireGuard receiver indices, counters, and ciphertext prefixes
+without treating the aggregate length as an individual datagram length. A truncated record can hide later datagram
+headers. Missing matches and zero reported capture drops do not establish a complete packet-loss count.
+[Software packet timestamps](https://www.kernel.org/doc/html/latest/networking/timestamping.html) are not application
+read times. Record socket-read and ingress handoff times separately. The remote endpoint uses a background UDP reader,
+so data can wait after the socket read and before ingress accepts it.
 
 These cases establish connectivity and recovery under the specified faults. Their endpoint-egress netem settings and
 short flows do not establish comparative WAN throughput or multipath capacity aggregation. For performance comparisons,

@@ -239,7 +239,7 @@ correctly configured lane.
 
 After validation, the client binds the local UDP listener before dialing carrier lanes. A bind failure is terminal. Once
 bound, the listener starts receiving WireGuard datagrams immediately, including while the first carrier is still being
-established. These datagrams enter the bounded session ingress queue with deadlines derived from their arrival times.
+established. These datagrams enter the bounded session ingress queue with deadlines derived from UDP read completion.
 
 ### Session bootstrap coordination
 
@@ -616,16 +616,16 @@ measured capacity nor evict its history. Higher samples remain useful evidence. 
 provisional 1 MB/s estimate, including when it is lower. Duplicate, stale, and invalid reports do not alter the sampling
 anchors. Earlier receive timestamps release valid prefixes without moving the time anchor backwards.
 
-A timing pause also interrupts application supply. Closing the Data gate marks every outstanding committed descriptor as
-application-limited, including reports that arrive after resumption. Feedback draining the old constrained prefix can
-still prove progress and higher capacity, but cannot lower capacity or evict an aged peak while supply is intentionally
-interrupted. When the Data gate actually reopens, the existing limited-flight marker advances to the next cumulative
-packet number, saturating at the counter limit. All descriptors committed before the first post-resume acknowledgment
-capture limited provenance even when queued demand fills the window. A late pre-pause acknowledgment cannot reach that
-boundary. The first acknowledgment covering resumed Data permits later constrained commits to measure capacity loss,
-while previously committed descriptors retain their captured provenance. Repeated cleanup without another pause does not
-rearm the marker. This requires no additional state and prevents early partial feedback from treating an intentionally
-restarted flight as evidence of lower capacity.
+A timing pause also interrupts application supply. Pausing ingress admission marks every outstanding committed
+descriptor as application-limited, including reports that arrive after resumption. Feedback draining the old constrained
+prefix can still prove progress and higher capacity, but cannot lower capacity or evict an aged peak while supply is
+intentionally interrupted. When ingress admission resumes, the existing limited-flight marker advances to the next
+cumulative packet number, saturating at the counter limit. All descriptors committed before the first post-resume
+acknowledgment capture limited provenance even when queued demand fills the window. A late pre-pause acknowledgment
+cannot reach that boundary. The first acknowledgment covering resumed Data permits later constrained commits to measure
+capacity loss, while previously committed descriptors retain their captured provenance. Repeated cleanup without another
+pause does not rearm the marker. This prevents early partial feedback from treating an intentionally restarted flight as
+evidence of lower capacity.
 
 A session with at least two healthy distinct path groups becomes eligible for bounded discovery at admission without
 waiting for real transport traffic. Active or pending timing drains defer fresh discovery, and useful traffic keeps
@@ -771,17 +771,17 @@ bursts can follow compressed TCP acknowledgments when path RTT falls, so packet 
 offered rate fits the path. Queue byte limits, aggregate retention, and packet deadlines still bound that headroom. A
 larger packet limit can retain more payload within those bounds.
 
-Ingress also records each packet's protocol-clock arrival time. When a healthy lane can accept transport, the scheduler
-signals persistent congestion by discarding selected normal packets before assigning packet IDs. Its delay controller
-uses the sustained-delay and inverse-square-root principles of [CoDel](https://www.rfc-editor.org/rfc/rfc8289). The
-delay target covers one unloaded feedback cycle and two maximum-observed frame serialization times at that lane's
-estimated rate. A feedback-sized burst can therefore drain without being classified as persistent congestion. The
-observation interval covers at least 100 ms, the complete committed-flight feedback horizon, two operating RTTs, and two
-delay targets. A recent larger RTT sample also extends the interval. This allows a normal feedback flight to drain
-before a startup burst can cause repeated congestion signals. Transient compressed-acknowledgment bursts retain the
-physical queue headroom, while responsive inner transports receive congestion signals instead of filling the entire
-allowance indefinitely. At least one maximum-observed frame or 4 KiB of remaining ingress backlog is preserved,
-whichever is larger.
+Ingress also records each packet's protocol-clock read-completion time. When a healthy lane can accept transport, the
+scheduler signals persistent congestion by discarding selected normal packets before assigning packet IDs. Its delay
+controller uses the sustained-delay and inverse-square-root principles of
+[CoDel](https://www.rfc-editor.org/rfc/rfc8289). The delay target covers one unloaded feedback cycle and two
+maximum-observed frame serialization times at that lane's estimated rate. A feedback-sized burst can therefore drain
+without being classified as persistent congestion. The observation interval covers at least 100 ms, the complete
+committed-flight feedback horizon, two operating RTTs, and two delay targets. A recent larger RTT sample also extends
+the interval. This allows a normal feedback flight to drain before a startup burst can cause repeated congestion
+signals. Transient compressed-acknowledgment bursts retain the physical queue headroom, while responsive inner
+transports receive congestion signals instead of filling the entire allowance indefinitely. At least one
+maximum-observed frame or 4 KiB of remaining ingress backlog is preserved, whichever is larger.
 
 A fresh queue head, drained backlog, lane-generation change, or service interruption longer than the interval restarts
 the congestion observation. Coordinated timing pauses reset the controller and suspend its decisions. WireGuard
@@ -868,6 +868,16 @@ datagram when the hard limits permit it. Progress, window updates, queued expiry
 writer without a polling loop. Ordinary Data and WireGuard controls share normal credit. Padding uses its existing
 discovery allowance, and all types count against the same committed prefix. The packet ceiling protects small-packet
 workloads, and the shared process budget also charges every padding transmission.
+
+Coordinated measurement first stops new ingress admission and drains the finite accepted work before closing Data gates.
+During that drain, each store captures temporary credit for four feedback cycles using the greatest of its lane's
+validated minimum, operating RTT, and latest observed RTT. The same capacity estimate, sampling allowance, and hard byte
+ceiling apply. This prevents a stale low-RTT window from trapping the accepted cut while calibration waits for its
+completion. Later timing or delivery reports can increase this credit until the Data gate closes, including when a peer
+requests calibration before the local RTT observation arrives. This also lets queued padding ahead of application Data
+finish without blocking the cut. Ordinary and discovery window settings retain their values, and the temporary credit
+does not validate a higher propagation minimum. Closing the Data gate prevents its further use, and completing or
+expiring the operation clears it. All drain samples retain application-limited provenance.
 
 An emptied transmission deque retains at most 512 metadata slots. This accommodates one 256-packet report batch plus
 in-flight progress without repeated allocation and copying under steady traffic. Larger historical capacities still
@@ -992,9 +1002,11 @@ the stream, the only way to discard all bytes trapped behind that loss is to clo
 WireHop first requires cumulative parsing progress to stall for a path-aware guard. The guard is the greater of 250
 milliseconds or the longer of two estimated feedback cycles and serialization of a 16 KiB startup flight, plus two
 delivery report intervals and serialization of the first unreported frame. A feedback cycle is the greater of the lane
-RTT or half its RTT plus the observed report return delay. Including the flight time protects healthy low-rate carriers
-even when their first unreported frame is small. Sent-but-unreported packets may already be at their destination, so
-their age alone cannot establish a stall. A valid advancing report immediately restores scheduling.
+RTT or half its RTT plus the observed report return delay. This calculation uses the greater of the operating average
+and the latest RTT, so a fresh delay increase does not look stalled while the average catches up. Including the flight
+time protects healthy low-rate carriers even when their first unreported frame is small. Sent-but-unreported packets may
+already be at their destination, so their age alone cannot establish a stall. A valid advancing report immediately
+restores scheduling.
 
 Once progress stalls, a lane becomes `degraded` when retained work is at deadline risk or a useful recovery alternative
 exists. Prediction follows the sent FIFO, queued WireGuard control packets, and queued WireGuard transport packets in
@@ -1958,11 +1970,12 @@ bottlenecks.
 
 The measurement exchange proceeds as follows:
 
-1. The client reserves the session operation, requests its local Data pause, and sends Measurement Begin immediately on
+1. The client reserves the session operation, requests its local ingress cut, and sends Measurement Begin immediately on
    each enrolled carrier. Begin requests preparation without asserting that the client's prefix has already drained
-2. The server closes its session Data gates, requests any different directional primary, and waits for Begin on every
-   enrolled carrier and cumulative DeliveryReports covering every committed prefix. It then sends Measurement Ready on
-   each target's actual carrier. Client preparation proceeds concurrently
+2. Each endpoint pauses new ingress admission and drains accepted ingress, scheduler-held packets, and queued
+   application Data. It then closes its Data gates and awaits cumulative DeliveryReports covering every committed
+   prefix. The server also requests any different directional primary and waits for Begin on every enrolled carrier
+   before sending Measurement Ready on each target's actual carrier. Client preparation proceeds concurrently
 3. Only after its local prefix proof and every target's Ready arrive does the client seal the cohort and queue each
    target's Probe. Each target's writer samples `t1` and sends Measurement Probe on that actual carrier
 4. The server samples `t2` when parsing Probe and `t3` when its writer builds the corresponding Reply. A positive Reply
@@ -1984,16 +1997,20 @@ the captured deadline or bypassing the local prefix proof. If the server cannot 
 removes that unannounced member so the other carriers can still prepare. The client can still enroll that carrier with
 its own Begin before timing starts.
 
+If the server cannot enqueue a Reply, it retires only that target. No Reply reached the carrier writer, so that target
+has not exposed a hold promise. Other targets retain their existing promises, and the client's independent Probe promise
+remains in force. A Reply that reached the writer still retains its fixed promise after an ambiguous write failure.
+
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as Server
-    C->>C: Reserve operation and request Data pause
+    C->>C: Reserve operation and pause new ingress admission
     C->>S: Begin(id) on each enrolled carrier
     par Client preparation
-        C->>C: Close Data gates and await parsed prefixes
+        C->>C: Drain accepted work, close Data gates, await parsed prefixes
     and Server preparation
-        S->>S: Close Data gates and enroll directional primary
+        S->>S: Pause admission, drain accepted work, enroll directional primary
         opt Another directional primary needs enrollment
             S->>C: Request on that carrier
             C->>S: Begin(id) on that carrier
@@ -2049,10 +2066,12 @@ errors still follow normal lane teardown.
 
 A server that wants a refresh sends a throttled Measurement Request without pausing Data. The client decides when to
 start. Every local attempt is followed by at least five seconds without another attempt and a quiet interval of at least
-49 times its actual Data pause duration, measured from closing the gates until every current store reopens. Waiting for
-discovery does not incur pause cost. This bounds recurring pause cost to at most two percent in the runtime clock. This
-is a local controller policy, not a wire requirement. Natural low RTT observations can still lower the minimum without
-any measurement transaction.
+49 times its actual supply pause duration, measured from pausing ingress admission until every current store and ingress
+reopen. Waiting for discovery does not incur pause cost. This bounds recurring pause cost to at most two percent in the
+runtime clock. This bounds explicit supply pause time, not end-to-end throughput loss. An inner transport can time out
+while feedback waits behind the pause and may need additional time to rebuild its congestion window after Data resumes.
+This is a local controller policy, not a wire requirement. Natural low RTT observations can still lower the minimum
+without any measurement transaction.
 
 Requests for another carrier can join during preparation without acquiring another pause or consuming another operation
 ID. Including both directional primaries lets them calibrate independently before the shared cost governor starts its
@@ -2061,24 +2080,41 @@ cooldown coalesce without a pending-target queue. Unrequested carriers receive n
 still requires its own valid timestamps, unchanged generation, and live prefix proof. Late requests and targets that
 cannot finish within the original pause must wait for fresh eligible evidence after cooldown.
 
-During preparation, new transport may remain on the existing healthy primary within hard memory limits. Queued unsent
-Data does not participate in the committed-prefix proof. Every retained packet keeps its original deadline. An active
-capacity-discovery period finishes before a pause begins. Pending admission prevents fresh discovery periods, while
-existing periods retain their duration, padding allowance, and cooldown. Preparation can expire while waiting for
-discovery. Begin may already be queued or sent, but no timed Probe can start until both preparations finish. The
-endpoint waiting for discovery does not pause Data prematurely. Once paused, capacity padding cannot start.
+During preparation, already accepted work drains on the existing healthy primary within hard memory limits. An absent or
+unhealthy primary permits ordinary selection of a usable lane. Scheduler-held pending and preempted packets belong to
+the cut, as do accepted control and transport packets in ingress and transmission queues. Only queued padding can remain
+outside the prefix proof behind a closed Data gate. Every retained packet keeps its original deadline. An active
+capacity-discovery period finishes before the admission pause begins. Pending admission prevents fresh discovery
+periods, while existing periods retain their duration, padding allowance, and cooldown. Preparation can expire while
+waiting for discovery. Begin may already be queued or sent, but no timed Probe can start until both preparations finish.
+The endpoint waiting for discovery does not pause Data prematurely. Once paused, capacity padding cannot start.
 
-Data commitment and pause admission use the same store mutex. A carrier registered during a pause is gated before
-becoming eligible. Replacing, removing, or abandoning any generation revokes prefix proof because discarding a prefix
+Ingress reads and acceptance register under the pause mutex. The pause interrupts the current read through its own
+context without canceling ingress. Every returned packet, including a successful prefix returned with cancellation,
+joins the accepted cut before the scheduler can close Data gates. Finishing the read wakes the scheduler even when no
+packet arrived. New reads wait until the matching operation resumes admission. The reader reuses one context between
+pauses and replaces it after interruption. Every completed ingress read retains its original lifetime and queue
+residence. No deadline is renewed. The local endpoint reads UDP directly. The remote endpoint's per-family background
+reader can complete one vector of at most sixteen datagrams before blocking on its unbuffered handoff to ingress. Those
+datagrams remain outside the accepted cut until that handoff completes. Other unread datagrams can accumulate in the
+existing kernel UDP receive queue, whose capacity is unchanged. That queue can overflow during a supply pause. Both
+kernel residence and a remote reader's blocked handoff precede ingress acceptance and are not included in the relay
+packet lifetime. Relay deadlines therefore do not bound total packet age from kernel arrival. The client retains the
+same ingress owner across session replacements.
+
+Data commitment and Data gate closure use the same store mutex. A carrier registered during preparation inherits supply
+provenance and drain credit before becoming eligible. Once the operation is quiet, a new carrier also inherits its
+closed Data gate. Replacing, removing, or abandoning any generation revokes prefix proof because discarding a prefix
 does not prove that the peer parsed it. Revocation does not retract an exposed quiet promise. Expiry maintenance,
 DeliveryReports, Ping/Pong, and other controls continue independently. Drain preparation runs outside the carrier
 writer, so it cannot prevent control progress. Measurement phases use the ordinary bounded control queue. Saturation
 before exposure drops the attempt. Saturation after a promise leaves expiry responsible for bounded recovery.
 
-WireGuard handshake and cookie packets use Data frames and therefore share this bounded pause. No packet lifetime is
-extended. A packet can expire during the pause, including a fresh packet when preparation and completion exceed its
-default five-second lifetime. Expiry maintenance continues and reclaims queued work. Resume provenance protects
-delivery-rate sampling from the artificial pause.
+WireGuard handshake and cookie packets use Data frames and therefore share this bounded supply pause. No packet lifetime
+is extended. A packet can still expire during draining on a slow or failed path. Completed reads and accepted queued
+application Data drain before intentional Data quiescence instead of being held throughout the clock exchange. Expiry
+maintenance continues and reclaims queued work. Resume provenance protects delivery-rate sampling from the artificial
+pause.
 
 Locally triggered refresh requests require measured delivery capacity and a newly accepted ordinary timing sample. Both
 its processing-adjusted RTT and the operating RTT average must yield feedback cycles longer than the four-cycle time
