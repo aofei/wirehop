@@ -47,7 +47,7 @@ func TestLaneReport(t *testing.T) {
 			}
 			synctest.Wait()
 			first := <-observer.reports
-			if first.report.DataPackets != 1 {
+			if first.report.DataFrames != 1 {
 				t.Fatalf("first report = %+v", first.report)
 			}
 			if err := lane.progress.addData(1, 20); err != nil {
@@ -61,7 +61,7 @@ func TestLaneReport(t *testing.T) {
 			synctest.Sleep(time.Nanosecond)
 			synctest.Wait()
 			retry := <-observer.reports
-			if retry.report.DataPackets != 2 {
+			if retry.report.DataFrames != 2 {
 				t.Fatalf("retry = %+v", retry.report)
 			}
 			retry.complete(true)
@@ -119,7 +119,7 @@ func TestSchedulerRouteReportWriteCompletion(t *testing.T) {
 				now := time.Now()
 				const retryAfter = 100 * time.Millisecond
 				snapshot, changed := own.progress.claim(own.laneID, own.generation, now, retryAfter)
-				if !changed || snapshot.report.DataPackets != 16 {
+				if !changed || snapshot.report.DataFrames != 16 {
 					t.Fatal("initial progress was not claimed")
 				}
 				if err := own.progress.addData(1, 64); err != nil {
@@ -208,13 +208,13 @@ func TestSchedulerRouteReportWriteCompletion(t *testing.T) {
 					now = now.Add(retryAfter)
 				}
 				next, changed := own.progress.claim(own.laneID, own.generation, now, retryAfter)
-				if !changed || next.report.DataPackets != 17 || next.dataBytes != 16_064 {
+				if !changed || next.report.DataFrames != 17 || next.dataBytes != 16_064 {
 					t.Fatalf("next progress = %+v, changed %t", next, changed)
 				}
 				own.progress.complete(next, true)
 				own.progress.complete(snapshot, true)
 				if _, changed := own.progress.claim(own.laneID, own.generation, now.Add(retryAfter), retryAfter); changed ||
-					own.progress.reportedDataPackets != 17 || own.progress.reportedDataBytes != 16_064 {
+					own.progress.reportedDataFrames != 17 || own.progress.reportedDataBytes != 16_064 {
 					t.Fatal("late completion repeated or rolled back completed progress")
 				}
 			})
@@ -255,7 +255,7 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 			t.Fatal(err)
 		}
 		first := readReport()
-		if first.report.DataPackets != 16 {
+		if first.report.DataFrames != 16 {
 			t.Fatal("first feedback was not immediate")
 		}
 		if err := lane.progress.addPing(1); err != nil {
@@ -276,7 +276,7 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 		}
 		retry.complete(true)
 		next := readReport()
-		if next.report.DataPackets != 17 {
+		if next.report.DataFrames != 17 {
 			t.Fatal("pending changes were lost")
 		}
 		next.complete(true)
@@ -292,13 +292,13 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 		}
 		ping.complete(true)
 		assertNoReport()
-		for range reportPacketThreshold / 16 {
+		for range reportFrameThreshold / 16 {
 			if err := lane.progress.addData(16, 16); err != nil {
 				t.Fatal(err)
 			}
 		}
 		threshold := readReport()
-		if threshold.report.DataPackets != reportPacketThreshold+17 {
+		if threshold.report.DataFrames != reportFrameThreshold+17 {
 			t.Fatal("packet threshold lost progress")
 		}
 		threshold.complete(true)
@@ -313,11 +313,11 @@ func testLaneReportCompletionAndIdle(t *testing.T) {
 		assertNoReport()
 		byteThreshold.complete(true)
 		pending := readReport()
-		if pending.report.DataPackets != reportPacketThreshold+49 {
+		if pending.report.DataFrames != reportFrameThreshold+49 {
 			t.Fatal("pending byte threshold was delayed")
 		}
 		pending.complete(true)
-		if lane.progress.reportedDataBytes != 180+reportPacketThreshold+2*reportByteThreshold {
+		if lane.progress.reportedDataBytes != 180+reportFrameThreshold+2*reportByteThreshold {
 			t.Fatal("completion lost exact byte threshold accounting")
 		}
 		assertNoReport()

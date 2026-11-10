@@ -184,7 +184,7 @@ func TestSchedulerRunRetriesSharedBudgetAfterRelease(t *testing.T) {
 					t.Fatalf("resumed packet retention = %+v", got)
 				}
 				if err := scheduler.ObserveDeliveryReport(ctx, protocol.LaneGeneration{LaneID: 2, Generation: 1},
-					protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}, uint64(time.Now().UnixMicro()), make(chan error, 1)); err != nil {
+					protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 1}, uint64(time.Now().UnixMicro()), make(chan error, 1)); err != nil {
 					t.Fatal(err)
 				}
 				synctest.Wait()
@@ -246,8 +246,8 @@ func TestLaneReadDataBatchCapacityProbe(t *testing.T) {
 			if tt.position == "Only" {
 				want = 0
 			}
-			if len(endpoint.writes) != want || lane.progress.dataPackets != uint64(len(frames)) {
-				t.Fatalf("probe delivery = %d UDP writes, %d parsed frames", len(endpoint.writes), lane.progress.dataPackets)
+			if len(endpoint.writes) != want || lane.progress.dataFrames != uint64(len(frames)) {
+				t.Fatalf("probe delivery = %d UDP writes, %d parsed frames", len(endpoint.writes), lane.progress.dataFrames)
 			}
 			for range want {
 				if payload := <-endpoint.writes; len(payload) != tt.realSize {
@@ -265,7 +265,7 @@ func TestLaneReadDataBatchCapacityProbe(t *testing.T) {
 			if err := lane.readDataBatch(t.Context(), []protocol.Frame{probe}); !errors.Is(err, protocol.ErrInvalidDataFrame) {
 				t.Fatalf("malformed probe = %v", err)
 			}
-			if lane.progress.dataPackets != uint64(len(frames)) {
+			if lane.progress.dataFrames != uint64(len(frames)) {
 				t.Fatal("malformed probe advanced parsing feedback")
 			}
 		})
@@ -295,7 +295,7 @@ func TestLaneReadDataBatchCapacityProbe(t *testing.T) {
 			if err := second.readDataBatch(t.Context(), []protocol.Frame{probe}); err != nil {
 				t.Fatal(err)
 			}
-			if time.Now() != started || second.progress.dataPackets != 1 || first.progress.dataPackets != 1 {
+			if time.Now() != started || second.progress.dataFrames != 1 || first.progress.dataFrames != 1 {
 				t.Fatal("padding acknowledgement waited for another lane's UDP write")
 			}
 			close(endpoint.release)
@@ -387,19 +387,19 @@ func FuzzLaneReadDataBatch(f *testing.F) {
 		}
 		switch overflow % 3 {
 		case 1:
-			lane.progress.dataPackets = math.MaxUint64 - uint64(len(frames)) + 1
+			lane.progress.dataFrames = math.MaxUint64 - uint64(len(frames)) + 1
 		case 2:
 			lane.progress.dataBytes = math.MaxUint64 - encodedBytes + 1
 		}
 		if wantError == nil && overflow%3 != 0 {
 			wantError = ErrCounterExhausted
 		}
-		beforePackets, beforeBytes := lane.progress.dataPackets, lane.progress.dataBytes
+		beforePackets, beforeBytes := lane.progress.dataFrames, lane.progress.dataBytes
 		if err := lane.readDataBatch(t.Context(), frames); !errors.Is(err, wantError) {
 			t.Fatalf("mixed batch error = %v, want %v", err, wantError)
 		}
 		if wantError != nil {
-			if lane.progress.dataPackets != beforePackets || lane.progress.dataBytes != beforeBytes ||
+			if lane.progress.dataFrames != beforePackets || lane.progress.dataBytes != beforeBytes ||
 				lane.progress.revision != 0 || len(lane.progress.notify) != 0 || len(endpoint.writes) != 0 ||
 				lane.receiver.deduplication.Highest() != 0 {
 				t.Fatal("rejected mixed batch changed progress, UDP delivery, or deduplication")
@@ -416,7 +416,7 @@ func FuzzLaneReadDataBatch(f *testing.F) {
 		if err := lane.readDataBatch(t.Context(), frames); err != nil {
 			t.Fatal(err)
 		}
-		if len(endpoint.writes) != 0 || lane.progress.dataPackets != 2*uint64(len(frames)) ||
+		if len(endpoint.writes) != 0 || lane.progress.dataFrames != 2*uint64(len(frames)) ||
 			lane.progress.dataBytes != 2*encodedBytes {
 			t.Fatal("repeated mixed batch changed exactly-once delivery or cumulative frame accounting")
 		}
@@ -982,7 +982,7 @@ func TestScheduledLaneDeliveryRateAcceptsFasterFeedbackCarrier(t *testing.T) {
 	}
 	takeOneTransmission(t, lane.registration.Store)
 	now = now.Add(150 * time.Millisecond)
-	if progressed, err := lane.applyReport(protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+	if progressed, err := lane.applyReport(protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 		t.Fatalf("cross-carrier report = %t, %v", progressed, err)
 	}
 	if !lane.rateObserved || lane.deliveryRate == 0 || lane.deliveryRate >= defaultInitialRateBytesPerSecond {
@@ -1018,7 +1018,7 @@ func TestSchedulerStalledProbePermitsInitialFailover(t *testing.T) {
 	if got.count != 1 || got.lanes[0] != second {
 		t.Fatal("unmeasured stalled path blocked a measured lower-rate alternative")
 	}
-	if progressed, err := first.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed || first.degraded {
+	if progressed, err := first.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed || first.degraded {
 		t.Fatalf("resumed parsing did not restore probe path: %t, %v", progressed, err)
 	}
 }
@@ -1238,7 +1238,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	}
 	takeOneTransmission(t, oldStore)
 	now = now.Add(10 * time.Millisecond)
-	if progressed, err := old.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+	if progressed, err := old.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 		t.Fatalf("old generation's real feedback = %t, %v", progressed, err)
 	}
 	if !old.rateObserved || oldStore.transportReported.Load() != minimumTransportProofBytes {
@@ -1288,9 +1288,9 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 		event schedulerEvent
 	}{
 		{name: "ProbeReport", event: schedulerEvent{kind: schedulerReport,
-			report: protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 2, DelayMicros: 1000}}},
+			report: protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 2, DelayMicros: 1000}}},
 		{name: "ImpossibleOldReport", event: schedulerEvent{kind: schedulerReport,
-			report: protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 99}}},
+			report: protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 99}}},
 		{name: "Timing", event: schedulerEvent{kind: schedulerTiming, laneID: 1, generation: 1,
 			timing: clockmap.Sample{LocalSendMicros: 1000, RemoteReceiveMicros: 2000, RemoteSendMicros: 3000, LocalReceiveMicros: 9000}}},
 		{name: "Remove", event: schedulerEvent{kind: schedulerRemove, laneID: 1, generation: 1}},
@@ -1307,7 +1307,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 			if lanes[1] != fresh || abandonments != 1 || fresh.abandoning || fresh.degraded || fresh.rateObserved || fresh.rttObserved ||
 				fresh.rttMicros != defaultInitialRTTMicros || fresh.minimumRTTMicros != 0 ||
 				fresh.deliveryRate != defaultInitialRateBytesPerSecond || fresh.feedbackDelayMicros != 0 ||
-				fresh.lastDataPackets != 0 || fresh.lastPingID != 0 || fresh.lastProgressAt != now ||
+				fresh.lastDataFrames != 0 || fresh.lastPingID != 0 || fresh.lastProgressAt != now ||
 				freshStore.transportReported.Load() != 0 || freshStore.reportedPackets != 0 || budget.Usage() != usage {
 				t.Fatal("old generation's late event changed fresh capacity, liveness, or retained ownership")
 			}
@@ -1315,7 +1315,7 @@ func TestSchedulerReplacementDiscardsProbeState(t *testing.T) {
 	}
 	now = now.Add(time.Millisecond)
 	scheduler.applyEvent(lanes, &preferred, schedulerEvent{kind: schedulerReport, laneID: 1, generation: 2,
-		report:        protocol.DeliveryReport{LaneID: 1, Generation: 2, DataPackets: 1},
+		report:        protocol.DeliveryReport{LaneID: 1, Generation: 2, DataFrames: 1},
 		receiveMicros: uint64(now.UnixMicro()), result: result}, now, false)
 	if err := <-result; err != nil {
 		t.Fatalf("fresh generation's real feedback = %v", err)
@@ -1387,7 +1387,7 @@ func TestSchedulerSmallRateIdleProbe(t *testing.T) {
 			}
 			assertFlightCreditTake(t, store, 1)
 			now = now.Add(1250 * time.Millisecond)
-			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 				t.Fatalf("seed report = %t, %v", progressed, err)
 			}
 			if !lane.rateObserved || lane.deliveryRate != 30 || lane.deliveryWindowBytes() != 4100 || probeSize != 4101 {
@@ -1415,7 +1415,7 @@ func TestSchedulerSmallRateIdleProbe(t *testing.T) {
 			}
 			assertFlightCreditTake(t, store, 0)
 			now = now.Add(time.Duration(uint64(probeSize)+35_000) * time.Microsecond)
-			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 2}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 2}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 				t.Fatalf("probe report = %t, %v", progressed, err)
 			}
 			if lane.deliveryRate <= 100_000 || store.transportReported.Load() != wgpacket.TransportKeepaliveLength {

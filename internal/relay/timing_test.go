@@ -689,17 +689,17 @@ func (c *prefixErrorCarrier) ReadFrames(_ context.Context, frames []protocol.Fra
 func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 	for _, test := range []struct {
 		name        string
-		dataPackets int
+		dataFrames  int
 		ping        bool
 		clockSync   bool
 		invalidTail bool
 		err         error
 	}{
-		{name: "Scalar", dataPackets: 1, err: io.ErrUnexpectedEOF},
-		{name: "MaximumBatch", dataPackets: datagram.MaximumBatchSize, err: io.ErrUnexpectedEOF},
-		{name: "InterleavedPing", dataPackets: 15, ping: true, err: io.ErrUnexpectedEOF},
-		{name: "InitialClockSync", dataPackets: 15, clockSync: true, err: io.ErrUnexpectedEOF},
-		{name: "InvalidControlTail", dataPackets: 15, invalidTail: true, err: protocol.ErrInvalidControlFrame},
+		{name: "Scalar", dataFrames: 1, err: io.ErrUnexpectedEOF},
+		{name: "MaximumBatch", dataFrames: datagram.MaximumBatchSize, err: io.ErrUnexpectedEOF},
+		{name: "InterleavedPing", dataFrames: 15, ping: true, err: io.ErrUnexpectedEOF},
+		{name: "InitialClockSync", dataFrames: 15, clockSync: true, err: io.ErrUnexpectedEOF},
+		{name: "InvalidControlTail", dataFrames: 15, invalidTail: true, err: protocol.ErrInvalidControlFrame},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			connection := &prefixErrorCarrier{testCarrier: newTestCarrier()}
@@ -722,7 +722,7 @@ func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 				connection.frames = append(connection.frames, frame)
 			}
 			var dataBytes uint64
-			for index := 0; index < test.dataPackets; index++ {
+			for index := 0; index < test.dataFrames; index++ {
 				payload := relayWireGuardPacket(wgpacket.TransportData)
 				payload[4] = byte(index)
 				frame, err := protocol.MarshalData(protocol.Data{
@@ -751,8 +751,8 @@ func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 			if err := lane.read(t.Context()); !errors.Is(err, test.err) {
 				t.Fatalf("read() error = %v, want %v", err, test.err)
 			}
-			if lane.progress.dataPackets != uint64(test.dataPackets) || lane.progress.dataBytes != dataBytes ||
-				len(endpoint.writes) != test.dataPackets {
+			if lane.progress.dataFrames != uint64(test.dataFrames) || lane.progress.dataBytes != dataBytes ||
+				len(endpoint.writes) != test.dataFrames {
 				t.Fatal("trailing carrier or control error discarded a complete valid prefix")
 			}
 			if test.ping && (lane.progress.pingID != 1) {
@@ -761,7 +761,7 @@ func TestLaneReadValidPrefixBeforeError(t *testing.T) {
 			if test.clockSync && (!confirmed || observer.samples != 1) {
 				t.Fatal("initial clock synchronization did not confirm and observe the generation")
 			}
-			for index := 0; index < test.dataPackets; index++ {
+			for index := 0; index < test.dataFrames; index++ {
 				if payload := <-endpoint.writes; payload[4] != byte(index) {
 					t.Fatalf("UDP delivery marker = %d, want %d", payload[4], index)
 				}

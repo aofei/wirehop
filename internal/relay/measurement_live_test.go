@@ -202,7 +202,7 @@ func testMeasurementLiveTargets(t *testing.T, targets int) {
 						t.Fatal("live client did not publish valid timing evidence")
 					}
 					if check.server && phase.value.Kind == protocol.MeasurementReady {
-						if len(kinds) != 0 || !phase.value.Valid {
+						if len(kinds) != 0 || !phase.value.Accepted {
 							t.Fatal("session readiness followed a reply or lacked prefix proof")
 						}
 						readyCount++

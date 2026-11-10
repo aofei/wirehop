@@ -27,7 +27,7 @@ func TestControlFrameWireLayout(t *testing.T) {
 			SessionID: testSessionID(1), PathGroupID: testPathGroupID(3), ReceiveMicros: 128, SendMicros: 16384,
 		}, encoded: "6201" + id1 + "038001808001"},
 		{name: "DeliveryReport", value: DeliveryReport{
-			LaneID: testLaneID(1), Generation: 128, DataPackets: 127,
+			LaneID: testLaneID(1), Generation: 128, DataFrames: 127,
 			PingID: 1, DelayMicros: 16383,
 		}, encoded: "74000180017f01ff7f"},
 		{name: "ClockSync", value: ClockSync{
@@ -60,30 +60,30 @@ func TestControlFrameWireLayout(t *testing.T) {
 			var parsed any
 			var parseErr error
 			switch value := tt.value.(type) {
-			case TimingPing:
-				encoded, err = MarshalTimingPing(value)
-				parsed, parseErr = ParseTimingPing(frames[0])
-			case TimingPong:
-				encoded, err = MarshalTimingPong(value)
-				parsed, parseErr = ParseTimingPong(frames[0])
-			case ClockSync:
-				encoded, err = MarshalClockSync(value)
-				parsed, parseErr = ParseClockSync(frames[0])
-			case DeliveryReport:
-				encoded, err = MarshalDeliveryReport(value)
-				parsed, parseErr = ParseDeliveryReport(frames[0])
 			case SessionCreated:
 				encoded, err = MarshalSessionCreated(value)
 				parsed, parseErr = ParseSessionCreated(frames[0])
 			case LaneAccepted:
 				encoded, err = MarshalLaneAccepted(value)
 				parsed, parseErr = ParseLaneAccepted(frames[0])
-			case CloseReason:
-				encoded, err = MarshalSessionClose(value)
-				parsed, parseErr = ParseSessionClose(frames[0])
+			case DeliveryReport:
+				encoded, err = MarshalDeliveryReport(value)
+				parsed, parseErr = ParseDeliveryReport(frames[0])
+			case ClockSync:
+				encoded, err = MarshalClockSync(value)
+				parsed, parseErr = ParseClockSync(frames[0])
+			case TimingPing:
+				encoded, err = MarshalTimingPing(value)
+				parsed, parseErr = ParseTimingPing(frames[0])
+			case TimingPong:
+				encoded, err = MarshalTimingPong(value)
+				parsed, parseErr = ParseTimingPong(frames[0])
 			case LaneGeneration:
 				encoded, err = MarshalLaneAbandon(value)
 				parsed, parseErr = ParseLaneAbandon(frames[0])
+			case CloseReason:
+				encoded, err = MarshalSessionClose(value)
+				parsed, parseErr = ParseSessionClose(frames[0])
 			case ErrorFrame:
 				encoded, err = MarshalErrorFrame(value)
 				parsed, parseErr = ParseErrorFrame(frames[0])
@@ -134,7 +134,7 @@ func TestTimingFrames(t *testing.T) {
 }
 
 func TestDeliveryReport(t *testing.T) {
-	report := DeliveryReport{LaneID: 1, Generation: 2, DataPackets: 5, PingID: 7, DelayMicros: 25}
+	report := DeliveryReport{LaneID: 1, Generation: 2, DataFrames: 5, PingID: 7, DelayMicros: 25}
 	frame, err := MarshalDeliveryReport(report)
 	if err != nil {
 		t.Fatal(err)
@@ -392,7 +392,7 @@ func TestControlIntegerBoundaries(t *testing.T) {
 		},
 			parse: func(f Frame) error { _, err := ParseClockSync(f); return err }, size: 40},
 		{name: "DeliveryReport", marshal: func() (Frame, error) {
-			return MarshalDeliveryReport(DeliveryReport{LaneID: LaneID(maximum), Generation: maximum, DataPackets: maximum, PingID: maximum, DelayMicros: maximum})
+			return MarshalDeliveryReport(DeliveryReport{LaneID: LaneID(maximum), Generation: maximum, DataFrames: maximum, PingID: maximum, DelayMicros: maximum})
 		},
 			parse: func(f Frame) error { _, err := ParseDeliveryReport(f); return err }, size: 50},
 		{name: "SessionCreated", marshal: func() (Frame, error) {

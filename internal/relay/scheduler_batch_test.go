@@ -314,7 +314,7 @@ func TestSchedulerRunBatchIdleWake(t *testing.T) {
 					received++
 				}
 				source := protocol.LaneGeneration{LaneID: 1, Generation: 1}
-				report := protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: packetID}
+				report := protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: packetID}
 				if err := scheduler.ObserveDeliveryReport(ctx, source, report, uint64(now().UnixMicro()), make(chan error, 1)); err != nil {
 					t.Fatal(err)
 				}
@@ -534,7 +534,7 @@ func TestSchedulerRunBatchTransitions(t *testing.T) {
 					}
 				}
 				source := protocol.LaneGeneration{LaneID: 1, Generation: 2}
-				report := protocol.DeliveryReport{LaneID: 1, Generation: 2, DataPackets: uint64(wantQueued)}
+				report := protocol.DeliveryReport{LaneID: 1, Generation: 2, DataFrames: uint64(wantQueued)}
 				if err := scheduler.ObserveDeliveryReport(ctx, source, report, uint64(now().UnixMicro()), make(chan error, 1)); err != nil {
 					t.Fatal(err)
 				}
@@ -658,7 +658,7 @@ func TestSchedulerRunPreemptedExpiryActiveLane(t *testing.T) {
 				}
 				started := time.Now()
 				source := protocol.LaneGeneration{LaneID: 1, Generation: 1}
-				report := protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}
+				report := protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 1}
 				if err := scheduler.ObserveDeliveryReport(ctx, source, report, uint64(now().UnixMicro()), make(chan error, 1)); err != nil {
 					t.Fatal(err)
 				}
@@ -674,7 +674,7 @@ func TestSchedulerRunPreemptedExpiryActiveLane(t *testing.T) {
 				if usage := budget.Usage(); usage.Packets != 1 || ingress.Len() != 0 {
 					t.Fatalf("control admission retained unexpected ownership: %+v", usage)
 				}
-				report.DataPackets = 2
+				report.DataFrames = 2
 				if err := scheduler.ObserveDeliveryReport(ctx, source, report, uint64(now().UnixMicro()), make(chan error, 1)); err != nil {
 					t.Fatal(err)
 				}
@@ -848,7 +848,7 @@ func TestSchedulerRunRestoresUnderPressure(t *testing.T) {
 						}
 					}
 					if err := next.ObserveDeliveryReport(nextContext, protocol.LaneGeneration{LaneID: 1, Generation: 1},
-						protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: uint64(len(want))},
+						protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: uint64(len(want))},
 						uint64(now().UnixMicro()), make(chan error, 1)); err != nil {
 						t.Fatal(err)
 					}
@@ -927,7 +927,7 @@ func TestSchedulerRunFeedbackGenerationOrder(t *testing.T) {
 						}
 						report := schedulerEvent{
 							kind: schedulerReport, laneID: 1, generation: 1, result: reportResult,
-							report:        protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1},
+							report:        protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 1},
 							receiveMicros: uint64(now.UnixMicro()) + 1,
 						}
 						registration := schedulerEvent{kind: schedulerRegister, registration: next, result: registerResult}
@@ -971,7 +971,7 @@ func TestSchedulerRunFeedbackGenerationOrder(t *testing.T) {
 					collected = true
 					scheduler.events <- schedulerEvent{
 						kind: schedulerReport, laneID: 1, generation: 2, result: currentReportResult,
-						report:        protocol.DeliveryReport{LaneID: 1, Generation: 2, DataPackets: 1},
+						report:        protocol.DeliveryReport{LaneID: 1, Generation: 2, DataFrames: 1},
 						receiveMicros: uint64(now.UnixMicro()) + 2,
 					}
 					return now

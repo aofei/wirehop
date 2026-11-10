@@ -212,7 +212,7 @@ func TestScheduledLaneRefreshTimingAfterCapacityAndDelayIncrease(t *testing.T) {
 				}
 				now = now.Add(time.Duration(max(uint64(600_000), uint64(queued)*4096)) * time.Microsecond)
 				receive := uint64(now.UnixMicro())
-				progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: store.sentPackets}, receive, now)
+				progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: store.sentPackets}, receive, now)
 				if err != nil || !progressed {
 					t.Fatalf("report: progress %t, error %v", progressed, err)
 				}
@@ -383,7 +383,7 @@ func runRTTWindowStorePhase(t *testing.T, lane *scheduledLane, now *time.Time, c
 			constrained++
 		}
 		progressed, err := lane.applyReport(protocol.DeliveryReport{
-			DataPackets: store.reportedPackets + 1, DelayMicros: 1000 + lane.minimumRTTMicros/2,
+			DataFrames: store.reportedPackets + 1, DelayMicros: 1000 + lane.minimumRTTMicros/2,
 		}, uint64(now.UnixMicro()), *now)
 		if err != nil || !progressed {
 			t.Fatalf("applyReport() = %t, %v", progressed, err)

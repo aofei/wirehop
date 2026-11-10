@@ -181,7 +181,7 @@ func feedbackScheduler(t *testing.T) (*packetqueue.Queue[Packet], *Scheduler) {
 func feedbackStore(t *testing.T) *TransmissionStore {
 	t.Helper()
 	store, err := newTransmissionStore(packetqueue.Limits{
-		Packets: reportPacketThreshold,
+		Packets: reportFrameThreshold,
 		Bytes:   8 * 1024 * 1024,
 	}, func() time.Time { return time.UnixMicro(1000) })
 	if err != nil {

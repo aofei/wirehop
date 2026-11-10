@@ -6,7 +6,7 @@ const MaxMeasurementHoldMicros = 4_000_000
 // MaxMeasurementContentSize bounds a Reply with a full-width operation ID, two timestamps, and a four-byte hold.
 const MaxMeasurementContentSize = 35
 
-// MeasurementKind identifies a phase of the client-coordinated measurement transaction.
+// MeasurementKind identifies a measurement request or a phase of the client-coordinated transaction.
 type MeasurementKind uint8
 
 const (
@@ -14,7 +14,7 @@ const (
 	MeasurementRequest MeasurementKind = iota + 1
 	// MeasurementBegin requests parallel preparation of the session Data pause.
 	MeasurementBegin
-	// MeasurementReady confirms that the server has drained its committed Data prefixes.
+	// MeasurementReady reports completed server preparation or rejects the measurement.
 	MeasurementReady
 	// MeasurementProbe starts client timing after local proof and server readiness.
 	MeasurementProbe
@@ -24,7 +24,7 @@ const (
 	MeasurementResult
 )
 
-// Measurement carries one phase. Only the fields encoded for that phase may be nonzero.
+// Measurement carries one request or transaction phase. Only fields encoded for that kind may be nonzero.
 // ProbeMicros is t1 in a Probe. ReceiveMicros and ReplyMicros are t2 and t3 in a Reply. ReceiveMicros is t4 in a Result.
 type Measurement struct {
 	Kind          MeasurementKind
@@ -33,20 +33,27 @@ type Measurement struct {
 	ReceiveMicros uint64
 	ReplyMicros   uint64
 	HoldMicros    uint64
-	Valid         bool
+
+	// Accepted reports completed server preparation in Ready.
+	Accepted bool
+
+	// Valid reports a client-validated and applied timing sample in Result.
+	Valid bool
 }
 
 // MarshalMeasurement returns one canonical measurement frame.
 func MarshalMeasurement(value Measurement) (Frame, error) {
 	if value.Kind < MeasurementRequest || value.Kind > MeasurementResult ||
 		(value.Kind == MeasurementRequest) != (value.ID == 0) ||
-		value.HoldMicros > MaxMeasurementHoldMicros {
+		value.HoldMicros > MaxMeasurementHoldMicros ||
+		value.Kind != MeasurementReady && value.Accepted ||
+		value.Kind != MeasurementResult && value.Valid {
 		return Frame{}, ErrInvalidControlFrame
 	}
 	var payload []byte
 	switch value.Kind {
 	case MeasurementRequest, MeasurementBegin:
-		if value.ProbeMicros != 0 || value.ReceiveMicros != 0 || value.ReplyMicros != 0 || value.HoldMicros != 0 || value.Valid {
+		if value.ProbeMicros != 0 || value.ReceiveMicros != 0 || value.ReplyMicros != 0 || value.HoldMicros != 0 {
 			return Frame{}, ErrInvalidControlFrame
 		}
 		if value.Kind == MeasurementRequest {
@@ -58,18 +65,18 @@ func MarshalMeasurement(value Measurement) (Frame, error) {
 		if value.ProbeMicros != 0 || value.ReceiveMicros != 0 || value.ReplyMicros != 0 || value.HoldMicros != 0 {
 			return Frame{}, ErrInvalidControlFrame
 		}
-		var valid uint64
-		if value.Valid {
-			valid = 1
+		var accepted uint64
+		if value.Accepted {
+			accepted = 1
 		}
-		payload = integerPayload(0, uint64(value.Kind), value.ID, valid)
+		payload = integerPayload(0, uint64(value.Kind), value.ID, accepted)
 	case MeasurementProbe:
-		if value.ReceiveMicros != 0 || value.ReplyMicros != 0 || value.HoldMicros == 0 || value.Valid {
+		if value.ReceiveMicros != 0 || value.ReplyMicros != 0 || value.HoldMicros == 0 {
 			return Frame{}, ErrInvalidControlFrame
 		}
 		payload = integerPayload(0, uint64(value.Kind), value.ID, value.ProbeMicros, value.HoldMicros)
 	case MeasurementReply:
-		if value.ProbeMicros != 0 || value.ReplyMicros < value.ReceiveMicros || value.Valid {
+		if value.ProbeMicros != 0 || value.ReplyMicros < value.ReceiveMicros {
 			return Frame{}, ErrInvalidControlFrame
 		}
 		payload = integerPayload(0, uint64(value.Kind), value.ID, value.ReceiveMicros, value.ReplyMicros, value.HoldMicros)
@@ -97,14 +104,14 @@ func ParseMeasurement(frame Frame) (Measurement, error) {
 		return Measurement{}, ErrInvalidControlFrame
 	}
 	value := Measurement{Kind: MeasurementKind(kind)}
-	var valid uint64
+	var accepted, valid uint64
 	switch value.Kind {
 	case MeasurementRequest:
 	case MeasurementBegin:
 		remaining, err = parseIntegers(remaining, &value.ID)
 	case MeasurementReady:
-		remaining, err = parseIntegers(remaining, &value.ID, &valid)
-		value.Valid = valid == 1
+		remaining, err = parseIntegers(remaining, &value.ID, &accepted)
+		value.Accepted = accepted == 1
 	case MeasurementProbe:
 		remaining, err = parseIntegers(remaining, &value.ID, &value.ProbeMicros, &value.HoldMicros)
 	case MeasurementReply:
@@ -113,7 +120,7 @@ func ParseMeasurement(frame Frame) (Measurement, error) {
 		remaining, err = parseIntegers(remaining, &value.ID, &valid, &value.ReceiveMicros)
 		value.Valid = valid == 1
 	}
-	if err != nil || len(remaining) != 0 || valid > 1 ||
+	if err != nil || len(remaining) != 0 || accepted > 1 || valid > 1 ||
 		(value.Kind == MeasurementRequest) != (value.ID == 0) || value.HoldMicros > MaxMeasurementHoldMicros ||
 		value.Kind == MeasurementProbe && value.HoldMicros == 0 ||
 		value.Kind == MeasurementReply && value.ReplyMicros < value.ReceiveMicros ||

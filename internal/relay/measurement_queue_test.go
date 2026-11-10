@@ -295,7 +295,7 @@ func TestMeasurementCoordinatorUnexposedQueueFull(t *testing.T) {
 					begin.deliver(t, server, 1000)
 					server.apply(t)
 					declined := server.write(t, 1000)
-					if declined.value.Kind != protocol.MeasurementReady || declined.value.Valid || declined.value.ID != 2 {
+					if declined.value.Kind != protocol.MeasurementReady || declined.value.Accepted || declined.value.ID != 2 {
 						t.Fatal("a busy server did not reject the new operation independently")
 					}
 					declined.deliver(t, client, 1000)

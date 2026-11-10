@@ -188,8 +188,8 @@ func BenchmarkSchedulerApplyEvent(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				if kind == schedulerReport {
-					event.report.DataPackets++
-					transmission.packetID = event.report.DataPackets
+					event.report.DataFrames++
+					transmission.packetID = event.report.DataFrames
 					if err := store.push(transmission); err != nil {
 						b.Fatal(err)
 					}
@@ -525,10 +525,10 @@ func BenchmarkTransmissionDequeFeedbackWindow(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		for range reportPacketThreshold {
+		for range reportFrameThreshold {
 			deque.push(retainedTransmission{})
 		}
-		deque.discardPrefix(reportPacketThreshold)
+		deque.discardPrefix(reportFrameThreshold)
 	}
 }
 
@@ -733,7 +733,7 @@ func BenchmarkSchedulerObserveDeliveryReport(b *testing.B) {
 	}()
 	result := make(chan error, 1)
 	source := protocol.LaneGeneration{LaneID: 1, Generation: 1}
-	report := protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}
+	report := protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 1}
 	ctx := context.Background()
 	b.ReportAllocs()
 	for b.Loop() {

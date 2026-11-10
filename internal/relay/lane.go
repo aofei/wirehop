@@ -56,8 +56,8 @@ const (
 	defaultControlCapacity = 64
 	// defaultReportInterval bounds changed cumulative delivery-report delay.
 	defaultReportInterval = 25 * time.Millisecond
-	// reportPacketThreshold triggers feedback before the maximum delay under packet-dense load.
-	reportPacketThreshold = 256
+	// reportFrameThreshold triggers feedback before the maximum delay under frame-dense load.
+	reportFrameThreshold = 256
 	// reportByteThreshold triggers feedback before the maximum delay under byte-dense load.
 	reportByteThreshold = 256 * 1024
 	// defaultUDPWriteTimeout bounds one local UDP delivery operation.
@@ -150,20 +150,20 @@ type controlWrite struct {
 
 // deliveryProgress stores cumulative parse progress for one incoming lane generation.
 type deliveryProgress struct {
-	mu                  sync.Mutex
-	dataBytes           uint64
-	dataPackets         uint64
-	pingID              uint64
-	parsedAt            time.Time
-	firstChangedAt      time.Time
-	eager               bool
-	revision            uint64
-	reported            uint64
-	reportedDataBytes   uint64
-	reportedDataPackets uint64
-	pendingRevision     uint64
-	pendingAt           time.Time
-	notify              chan struct{}
+	mu                 sync.Mutex
+	dataBytes          uint64
+	dataFrames         uint64
+	pingID             uint64
+	parsedAt           time.Time
+	firstChangedAt     time.Time
+	eager              bool
+	revision           uint64
+	reported           uint64
+	reportedDataBytes  uint64
+	reportedDataFrames uint64
+	pendingRevision    uint64
+	pendingAt          time.Time
+	notify             chan struct{}
 }
 
 // NewLane validates config and returns one relay lane generation.
@@ -926,7 +926,7 @@ func (p *deliveryProgress) reportDelay(now time.Time, interval time.Duration) (t
 	if p.pendingRevision != 0 {
 		return max(0, 4*interval-now.Sub(p.pendingAt)), true
 	}
-	if p.eager || p.reportedDataPackets == 0 || p.thresholdReachedLocked() {
+	if p.eager || p.reportedDataFrames == 0 || p.thresholdReachedLocked() {
 		return 0, true
 	}
 	return max(0, interval-now.Sub(p.firstChangedAt)), true
@@ -945,15 +945,15 @@ func (l *Lane) queueDeliveryReport() {
 }
 
 // addData atomically records one validated batch of consecutive data frames in carrier order.
-func (p *deliveryProgress) addData(packets, bytes uint64) error {
+func (p *deliveryProgress) addData(frames, bytes uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if bytes > ^uint64(0)-p.dataBytes || packets > ^uint64(0)-p.dataPackets || p.revision == ^uint64(0) {
+	if bytes > ^uint64(0)-p.dataBytes || frames > ^uint64(0)-p.dataFrames || p.revision == ^uint64(0) {
 		return ErrCounterExhausted
 	}
 	p.noteParseLocked()
 	p.dataBytes += bytes
-	p.dataPackets += packets
+	p.dataFrames += frames
 	p.revision++
 	p.notifyProgressLocked()
 	return nil
@@ -988,7 +988,7 @@ func (p *deliveryProgress) claim(laneID protocol.LaneID, generation uint64, now 
 		return reportSnapshot{}, false
 	}
 	snapshot := reportSnapshot{
-		report:   protocol.DeliveryReport{LaneID: laneID, Generation: generation, DataPackets: p.dataPackets, PingID: p.pingID},
+		report:   protocol.DeliveryReport{LaneID: laneID, Generation: generation, DataFrames: p.dataFrames, PingID: p.pingID},
 		revision: p.revision, dataBytes: p.dataBytes, parsedAt: p.parsedAt,
 	}
 	p.pendingRevision = p.revision
@@ -1003,7 +1003,7 @@ func (p *deliveryProgress) complete(snapshot reportSnapshot, sent bool) {
 	if sent && snapshot.revision > p.reported {
 		p.reported = snapshot.revision
 		p.reportedDataBytes = snapshot.dataBytes
-		p.reportedDataPackets = snapshot.report.DataPackets
+		p.reportedDataFrames = snapshot.report.DataFrames
 	}
 	if sent && p.pendingRevision == snapshot.revision {
 		p.pendingRevision = 0
@@ -1022,7 +1022,7 @@ func (p *deliveryProgress) notifyProgressLocked() {
 
 // thresholdReachedLocked reports whether unreported data warrants feedback before the maximum delay.
 func (p *deliveryProgress) thresholdReachedLocked() bool {
-	return p.dataPackets-p.reportedDataPackets >= reportPacketThreshold ||
+	return p.dataFrames-p.reportedDataFrames >= reportFrameThreshold ||
 		p.dataBytes-p.reportedDataBytes >= reportByteThreshold
 }
 

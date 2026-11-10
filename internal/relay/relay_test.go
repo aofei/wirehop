@@ -52,7 +52,7 @@ func TestLaneReadControlDeliveryReportSource(t *testing.T) {
 		laneID: protocol.LaneID(2), generation: 7, clock: &testClock{now: 12345}, observer: observer,
 	}
 	report := protocol.DeliveryReport{
-		LaneID: protocol.LaneID(3), Generation: 9, DataPackets: 1,
+		LaneID: protocol.LaneID(3), Generation: 9, DataFrames: 1,
 	}
 	frame, err := protocol.MarshalDeliveryReport(report)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestLaneReadDeliveryReports(t *testing.T) {
 				for index := range 3 {
 					report := protocol.DeliveryReport{LaneID: lane.laneID, Generation: lane.generation}
 					if tt.invalid && index == 1 {
-						report.DataPackets = 1
+						report.DataFrames = 1
 					}
 					frame, err := protocol.MarshalDeliveryReport(report)
 					if err != nil {
@@ -514,7 +514,7 @@ func TestDeliveryProgressTracksCarrierOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot, changed := progress.claim(1, 2, time.Now(), time.Second)
-	if snapshot.dataBytes != 30 || snapshot.report.DataPackets != 17 || snapshot.revision != 2 || !changed {
+	if snapshot.dataBytes != 30 || snapshot.report.DataFrames != 17 || snapshot.revision != 2 || !changed {
 		t.Fatalf("claim() = %+v, changed %t", snapshot, changed)
 	}
 	progress.complete(snapshot, true)
@@ -529,7 +529,7 @@ func TestDeliveryProgressRetriesUnsentClaim(t *testing.T) {
 		additionalPackets int
 	}{
 		{name: "UnchangedProgress"},
-		{name: "ChangedProgress", additionalPackets: reportPacketThreshold},
+		{name: "ChangedProgress", additionalPackets: reportFrameThreshold},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			progress := deliveryProgress{notify: make(chan struct{}, 1)}
@@ -566,7 +566,7 @@ func TestDeliveryProgressRetriesUnsentClaim(t *testing.T) {
 				t.Fatal("pending progress was claimed before its retry interval")
 			}
 			retry, changed := progress.claim(protocol.LaneID(1), 1, now.Add(time.Second), time.Second)
-			if !changed || retry.report.DataPackets != uint64(1+test.additionalPackets) {
+			if !changed || retry.report.DataFrames != uint64(1+test.additionalPackets) {
 				t.Fatalf("retry = %+v, changed %t", retry, changed)
 			}
 			progress.complete(retry, true)
@@ -580,7 +580,7 @@ func TestDeliveryProgressThresholdNotification(t *testing.T) {
 		packets int
 		bytes   int
 	}{
-		{name: "Packets", packets: reportPacketThreshold, bytes: 1},
+		{name: "Packets", packets: reportFrameThreshold, bytes: 1},
 		{name: "Bytes", packets: 4, bytes: reportByteThreshold / 4},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -616,24 +616,24 @@ func TestDeliveryProgressThresholdNotification(t *testing.T) {
 
 func TestDeliveryProgressRejectsCounterOverflow(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		dataBytes   uint64
-		dataPackets uint64
-		revision    uint64
+		name       string
+		dataBytes  uint64
+		dataFrames uint64
+		revision   uint64
 	}{
 		{name: "DataBytes", dataBytes: ^uint64(0) - 15},
-		{name: "DataPackets", dataPackets: ^uint64(0) - 15},
+		{name: "DataFrames", dataFrames: ^uint64(0) - 15},
 		{name: "Revision", revision: ^uint64(0)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			progress := deliveryProgress{
-				dataBytes: test.dataBytes, dataPackets: test.dataPackets, revision: test.revision,
+				dataBytes: test.dataBytes, dataFrames: test.dataFrames, revision: test.revision,
 				notify: make(chan struct{}, 1),
 			}
 			if err := progress.addData(16, 16); !errors.Is(err, ErrCounterExhausted) {
 				t.Fatalf("addData() error = %v, want %v", err, ErrCounterExhausted)
 			}
-			if progress.dataBytes != test.dataBytes || progress.dataPackets != test.dataPackets ||
+			if progress.dataBytes != test.dataBytes || progress.dataFrames != test.dataFrames ||
 				progress.revision != test.revision || len(progress.notify) != 0 {
 				t.Fatal("rejected batch changed counters or published progress")
 			}
@@ -642,12 +642,12 @@ func TestDeliveryProgressRejectsCounterOverflow(t *testing.T) {
 
 	t.Run("ExactDataLimit", func(t *testing.T) {
 		progress := deliveryProgress{
-			dataBytes: ^uint64(0) - 16, dataPackets: ^uint64(0) - 16, revision: ^uint64(0) - 1,
+			dataBytes: ^uint64(0) - 16, dataFrames: ^uint64(0) - 16, revision: ^uint64(0) - 1,
 		}
 		if err := progress.addData(16, 16); err != nil {
 			t.Fatal(err)
 		}
-		if progress.dataBytes != ^uint64(0) || progress.dataPackets != ^uint64(0) || progress.revision != ^uint64(0) {
+		if progress.dataBytes != ^uint64(0) || progress.dataFrames != ^uint64(0) || progress.revision != ^uint64(0) {
 			t.Fatal("last representable batch was not recorded exactly")
 		}
 	})
@@ -703,7 +703,7 @@ func TestLaneReadDataBatch(t *testing.T) {
 					t.Fatal(err)
 				}
 				snapshot, changed := lane.progress.claim(lane.laneID, lane.generation, time.Now(), time.Second)
-				if !changed || snapshot.report.DataPackets != 1 {
+				if !changed || snapshot.report.DataFrames != 1 {
 					t.Fatal("accepted prefix was not available for feedback")
 				}
 				lane.progress.complete(snapshot, true)
@@ -760,9 +760,9 @@ func TestLaneReadDataBatch(t *testing.T) {
 				last.Payload = append([]byte{0x90, 0}, last.Payload[1:]...)
 			}
 			if test.kind == "counter" {
-				lane.progress.dataPackets = ^uint64(0) - uint64(len(frames)) + 1
+				lane.progress.dataFrames = ^uint64(0) - uint64(len(frames)) + 1
 			}
-			beforePackets := lane.progress.dataPackets
+			beforePackets := lane.progress.dataFrames
 			beforeBytes := lane.progress.dataBytes
 			beforeRevision := lane.progress.revision
 			err := lane.readDataBatch(t.Context(), frames[:])
@@ -770,12 +770,12 @@ func TestLaneReadDataBatch(t *testing.T) {
 				t.Fatalf("readDataBatch() error = %v, want %v", err, test.err)
 			}
 			if test.err == nil {
-				if lane.progress.dataPackets != uint64(len(frames)) || lane.progress.dataBytes != bytes ||
+				if lane.progress.dataFrames != uint64(len(frames)) || lane.progress.dataBytes != bytes ||
 					lane.progress.revision != 1 || len(endpoint.writes) != len(frames) {
 					t.Fatal("validated batch did not record and deliver its exact prefix")
 				}
 			} else {
-				if lane.progress.dataPackets != beforePackets || lane.progress.dataBytes != beforeBytes ||
+				if lane.progress.dataFrames != beforePackets || lane.progress.dataBytes != beforeBytes ||
 					lane.progress.revision != beforeRevision || len(endpoint.writes) != 0 || len(lane.progress.notify) != 0 {
 					t.Fatal("invalid batch changed parse progress or delivered UDP data")
 				}
@@ -851,7 +851,7 @@ func TestLaneReadDataBatchAcknowledgesPrefix(t *testing.T) {
 					t.Fatal(err)
 				}
 				snapshot, changed := lane.progress.claim(lane.laneID, lane.generation, now, time.Second)
-				if !changed || snapshot.report.DataPackets != uint64(end) || snapshot.dataBytes != encodedBytes[end] {
+				if !changed || snapshot.report.DataFrames != uint64(end) || snapshot.dataBytes != encodedBytes[end] {
 					t.Fatalf("received prefix report = %+v, changed %t", snapshot, changed)
 				}
 				if progressed, err := sender.applyReport(snapshot.report, uint64(now.UnixMicro()), now); err != nil || !progressed {
@@ -970,7 +970,7 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 						test.wantError != nil && !errors.Is(err, test.failure) {
 						t.Fatalf("partial delivery error = %v, want %v and %v", err, test.wantError, test.failure)
 					}
-					if lane.progress.dataPackets != uint64(len(frames)) || lane.progress.dataBytes != encodedBytes {
+					if lane.progress.dataFrames != uint64(len(frames)) || lane.progress.dataBytes != encodedBytes {
 						t.Fatal("partial UDP delivery changed the cumulative parsed prefix")
 					}
 					if len(endpoint.writes) != len(test.first) {
@@ -995,7 +995,7 @@ func TestLaneReadDataBatchPartialDelivery(t *testing.T) {
 					if err := lane.readDataBatch(t.Context(), frames[:]); err != nil {
 						t.Fatal(err)
 					}
-					if len(endpoint.writes) != 0 || lane.progress.dataPackets != 3*uint64(len(frames)) ||
+					if len(endpoint.writes) != 0 || lane.progress.dataFrames != 3*uint64(len(frames)) ||
 						lane.progress.dataBytes != 3*encodedBytes {
 						t.Fatal("repeated carrier parsing changed exactly-once UDP delivery")
 					}
@@ -1060,7 +1060,7 @@ func TestLaneReadDataBatchDelivery(t *testing.T) {
 			if err := lane.readDataBatch(ctx, frames[:]); !errors.Is(err, test.err) {
 				t.Fatalf("readDataBatch() error = %v, want %v", err, test.err)
 			}
-			if lane.progress.dataPackets != uint64(len(frames)) || lane.progress.dataBytes != encodedBytes ||
+			if lane.progress.dataFrames != uint64(len(frames)) || lane.progress.dataBytes != encodedBytes ||
 				lane.progress.revision != 1 || len(endpoint.writes) != test.wantWrites {
 				t.Fatal("UDP delivery outcome changed the fully parsed carrier prefix")
 			}
@@ -1865,10 +1865,10 @@ func TestLane(t *testing.T) {
 					sawPong = true
 				case protocol.FrameDeliveryReport:
 					report, err := protocol.ParseDeliveryReport(frame)
-					if err != nil || report.DataPackets > 2 {
+					if err != nil || report.DataFrames > 2 {
 						t.Fatalf("report = %+v, %v", report, err)
 					}
-					sawReport = report.DataPackets == 2 && report.PingID == 7
+					sawReport = report.DataFrames == 2 && report.PingID == 7
 				}
 			}
 		case <-deadline:
@@ -1988,7 +1988,7 @@ func TestLaneRequiresInitialClockSync(t *testing.T) {
 			if err := <-result; !errors.Is(err, ErrClockSyncRequired) {
 				t.Fatalf("Run() error = %v, want %v", err, ErrClockSyncRequired)
 			}
-			if synced || lane.progress.dataPackets != 0 || lane.progress.dataBytes != 0 || len(endpoint.writes) != 0 {
+			if synced || lane.progress.dataFrames != 0 || lane.progress.dataBytes != 0 || len(endpoint.writes) != 0 {
 				t.Fatal("pre-sync data changed admission, parsing progress, or UDP delivery")
 			}
 		})

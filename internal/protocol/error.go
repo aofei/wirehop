@@ -1,24 +1,5 @@
 package protocol
 
-// ErrorClass determines client retry and process-lifecycle behavior.
-type ErrorClass uint8
-
-const (
-	// ErrorRetryable identifies a temporary transport or capacity failure.
-	ErrorRetryable ErrorClass = iota + 1
-	// ErrorLaneRejected identifies a terminal rejection scoped to one lane candidate.
-	ErrorLaneRejected
-	// ErrorSessionGone identifies a session that no longer exists on the server.
-	ErrorSessionGone
-	// ErrorSessionRejected identifies a terminal rejection of the authenticated session.
-	ErrorSessionRejected
-)
-
-// Valid reports whether the error class is defined by this protocol version.
-func (c ErrorClass) Valid() bool {
-	return c >= ErrorRetryable && c <= ErrorSessionRejected
-}
-
 // ErrorCode identifies one machine-readable protocol, policy, or capacity failure.
 type ErrorCode uint16
 
@@ -56,6 +37,25 @@ const (
 // Valid reports whether the error code is defined by this protocol version.
 func (c ErrorCode) Valid() bool {
 	return c >= ErrorMalformed && c <= ErrorClockSkew
+}
+
+// ErrorClass determines client retry and process-lifecycle behavior.
+type ErrorClass uint8
+
+const (
+	// ErrorRetryable identifies a temporary transport or capacity failure.
+	ErrorRetryable ErrorClass = iota + 1
+	// ErrorLaneRejected identifies a terminal rejection scoped to one lane candidate.
+	ErrorLaneRejected
+	// ErrorSessionGone identifies a session that no longer exists on the server.
+	ErrorSessionGone
+	// ErrorSessionRejected identifies a terminal rejection of the authenticated session.
+	ErrorSessionRejected
+)
+
+// Valid reports whether the error class is defined by this protocol version.
+func (c ErrorClass) Valid() bool {
+	return c >= ErrorRetryable && c <= ErrorSessionRejected
 }
 
 // ErrorScope identifies the state affected by a protocol error.

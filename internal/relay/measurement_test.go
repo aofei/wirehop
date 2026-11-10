@@ -365,19 +365,31 @@ func TestMeasurementCoordinatorPublication(t *testing.T) {
 }
 
 func TestMeasurementCoordinatorRejectsWrongDirection(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		for _, client := range []bool{false, true} {
-			fixture := newMeasurementFixture(t, client, 1)
-			kind := protocol.MeasurementReady
-			if client {
-				kind = protocol.MeasurementBegin
-			}
-			err := fixture.scheduler.ObserveMeasurement(fixture.target, protocol.Measurement{Kind: kind, ID: 1}, 1)
-			if !errors.Is(err, ErrUnexpectedFrame) || fixture.paused() {
-				t.Fatalf("wrong direction: error %v, paused %t", err, fixture.paused())
-			}
-		}
-	})
+	for _, tt := range []struct {
+		name   string
+		client bool
+		value  protocol.Measurement
+	}{
+		{name: "ClientBegin", client: true, value: protocol.Measurement{Kind: protocol.MeasurementBegin, ID: 1}},
+		{name: "ClientProbe", client: true, value: protocol.Measurement{Kind: protocol.MeasurementProbe, ID: 1, HoldMicros: 1}},
+		{name: "ClientResult", client: true, value: protocol.Measurement{Kind: protocol.MeasurementResult, ID: 1}},
+		{name: "ServerRequest", value: protocol.Measurement{Kind: protocol.MeasurementRequest}},
+		{name: "ServerReady", value: protocol.Measurement{Kind: protocol.MeasurementReady, ID: 1, Accepted: true}},
+		{name: "ServerReply", value: protocol.Measurement{Kind: protocol.MeasurementReply, ID: 1, HoldMicros: 1}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				if _, err := protocol.MarshalMeasurement(tt.value); err != nil {
+					t.Fatalf("invalid payload for direction test: %v", err)
+				}
+				fixture := newMeasurementFixture(t, tt.client, 1)
+				err := fixture.scheduler.ObserveMeasurement(fixture.target, tt.value, 1)
+				if !errors.Is(err, ErrUnexpectedFrame) || fixture.paused() {
+					t.Fatalf("wrong direction: error %v, paused %t", err, fixture.paused())
+				}
+			})
+		})
+	}
 }
 
 func TestMeasurementCoordinatorRejectsInvalidEvidence(t *testing.T) {
@@ -616,7 +628,7 @@ func TestMeasurementCoordinatorServerPreparesFirst(t *testing.T) {
 		server.apply(t)
 		ready := server.write(t, 100)
 		ready.deliver(t, client, 100)
-		if ready.value.Kind != protocol.MeasurementReady || !ready.value.Valid || len(client.writes) != 0 {
+		if ready.value.Kind != protocol.MeasurementReady || !ready.value.Accepted || len(client.writes) != 0 {
 			t.Fatal("remote readiness bypassed the client's unparsed prefix")
 		}
 		client.acknowledge(t, 1)
@@ -707,6 +719,74 @@ func TestMeasurementCoordinatorIgnoresWrongCarrierPhases(t *testing.T) {
 			t.Fatal("actual target phases failed after unrelated late phases")
 		}
 	})
+}
+
+func TestMeasurementCoordinatorIgnoresOtherOperationPhases(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		id   uint64
+	}{
+		{name: "EarlierOperation", id: 1},
+		{name: "LaterOperation", id: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client := newMeasurementFixture(t, true, 1)
+				server := newMeasurementFixture(t, false, 1)
+				client.scheduler.measurements.nextID = 1
+				client.scheduler.RequestMeasurement(client.target)
+				client.apply(t)
+				client.write(t, 1).deliver(t, server, 1)
+				server.apply(t)
+				if client.scheduler.measurements.active.id != 2 {
+					t.Fatal("measurement did not leave room for a nonzero earlier operation ID")
+				}
+				ignore := func(destination *measurementFixture, frame measurementTransmission, now uint64) {
+					t.Helper()
+					destination.apply(t)
+					coordinator := destination.scheduler.measurements
+					attempt := coordinator.active
+					stage, sample := attempt.stage, attempt.sample
+					nextID, lastPeerID := coordinator.nextID, coordinator.lastPeerID
+					deadline := destination.scheduler.measurementDeadline
+					writes := len(destination.writes)
+					rtt := destination.lanes[1].minimumRTTMicros
+					frame.value.ID = tt.id
+					if _, err := protocol.MarshalMeasurement(frame.value); err != nil {
+						t.Fatalf("invalid payload for operation identity test: %v", err)
+					}
+					frame.deliver(t, destination, now)
+					destination.apply(t)
+					if coordinator.active != attempt || attempt.stage != stage || attempt.sample != sample ||
+						coordinator.nextID != nextID || coordinator.lastPeerID != lastPeerID ||
+						destination.scheduler.measurementDeadline != deadline || len(destination.writes) != writes ||
+						destination.lanes[1].minimumRTTMicros != rtt || !destination.paused() {
+						t.Fatalf("operation %d changed measurement %d after %v", tt.id, attempt.id, frame.value.Kind)
+					}
+				}
+				ready := server.write(t, 1)
+				ignore(client, ready, 1)
+				ready.deliver(t, client, 1)
+				probe := client.write(t, 100)
+				ignore(server, probe, 200)
+				probe.deliver(t, server, 200)
+				reply := server.write(t, 250)
+				ignore(client, reply, 400)
+				reply.deliver(t, client, 400)
+				client.apply(t)
+				result := client.write(t, 500)
+				ignore(server, result, 600)
+				result.sent()
+				client.apply(t)
+				result.deliver(t, server, 600)
+				server.apply(t)
+				if client.paused() || server.paused() || client.lanes[1].minimumRTTMicros != 250 ||
+					server.lanes[1].minimumRTTMicros != 250 {
+					t.Fatal("matching operation did not complete after unrelated phases were ignored")
+				}
+			})
+		})
+	}
 }
 
 func TestSchedulerObserveMeasurementRetainedProbe(t *testing.T) {
@@ -811,7 +891,7 @@ func TestMeasurementCoordinatorRejectsDuplicateCurrentPhases(t *testing.T) {
 				server := newMeasurementFixture(t, false, 1)
 				prepareMeasurement(t, client, server)
 				frame := measurementTransmission{source: client.target,
-					value: protocol.Measurement{Kind: protocol.MeasurementReady, ID: client.scheduler.measurements.active.id, Valid: true}}
+					value: protocol.Measurement{Kind: protocol.MeasurementReady, ID: client.scheduler.measurements.active.id, Accepted: true}}
 				destination := client
 				if tt.kind >= protocol.MeasurementProbe {
 					frame = client.write(t, 100)

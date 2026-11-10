@@ -120,7 +120,8 @@ identifier, connection generation, and reconnect backoff for each configured lan
 independently tracks the lane's smoothed round trip time, estimated delivery rate, retained byte backlog, and
 deadline-risk state.
 
-Lane states:
+Lane lifecycle states are local to each endpoint. They describe connection establishment and recovery, usable or
+impaired service, and terminal outcomes. They are not transmitted as a state enum or a flags field:
 
 | State | Meaning |
 | --- | --- |
@@ -353,7 +354,7 @@ session's viability, the terminal rejection produces one degradation warning for
 
 ### Error classification
 
-Every connection, handshake, and control-plane failure maps to one stable error class:
+Client failures are classified by their effect on startup, reconnection, and session lifetime:
 
 | Class | Examples | Behavior |
 | --- | --- | --- |
@@ -362,6 +363,9 @@ Every connection, handshake, and control-plane failure maps to one stable error 
 | `lane_rejected` | Certificate validation failure, authentication rejection, incompatible protocol | Reject that lane |
 | `session_gone` | Provisional session closes during creation or join refers to an absent session | Retry creation or coordinate session replacement |
 | `session_rejected` | All viable endpoints reject the credentials, target, or protocol | Terminate the client |
+
+The `configuration` category is local to startup validation and has no wire error-class value. The remaining four
+classes also describe local failures that lead to the same retry or rejection behavior.
 
 Carrier socket permission denials reject only the affected lane. Connection refusal, reset, and timeout remain
 retryable.
@@ -426,6 +430,9 @@ server tracks that authenticated session independently from the lifetime of any 
 | `attached` | A confirmed session has a connected lane or an accepted lane reservation is completing |
 | `detached` | No lane is connected or completing an accepted reservation, but reconnect grace has not expired |
 | `closed` | Session state, credentials, queues, resolver state, and target sockets have been released |
+
+These are server-local session states. The client's `disconnected` availability and each lane's lifecycle are separate
+scopes. None is transmitted as a session-state field.
 
 An unconfirmed creator's disconnection or clock-sync timeout releases its session without reconnect grace. Once
 confirmed, an unexpected loss of the final lane moves the session to `detached` unless an authenticated join has
@@ -1622,7 +1629,22 @@ fails before binding the local UDP socket. Operators use `NO_PROXY` to select di
 WireHop uses version 1 of its binary framing protocol inside each carrier lane.
 
 The carrier provides a byte stream or WebSocket message stream. WireHop frames provide packet boundaries and control
-messages.
+messages. Common encodings precede admission and frame layouts. Frame definitions follow numeric type order, and each
+payload lists its fields in wire order. Measurement kinds use the same numeric ordering convention.
+
+### Encoding conventions
+
+`uvarint` is shortest-form unsigned LEB128. Each byte contributes seven value bits, least-significant group first, and
+its high bit indicates another byte. Zero occupies one byte. A `uint64` occupies at most ten bytes, and the tenth byte
+can contain only bit 0. Nonminimal encodings, overflow, and values outside a field's semantic bounds are protocol
+violations. An integer cannot span admission bodies, WireHop frames, or WebSocket messages. A stream that ends partway
+through a header or payload fails with unexpected EOF. These rules apply to every `uvarint` field in an admission body
+or frame payload. Integer fields retain their full unsigned 64-bit range where their semantics permit it. Admission
+hellos use the mixed fixed-width and variable-width layouts in the next subsection.
+
+A Boolean payload field is a canonical `uvarint` containing `0` or `1`, rather than a bit in a shared flags field. Each
+message kind carries only its selected fields. The common frame header's length-extension presence bit is defined
+separately.
 
 ### Admission messages
 
@@ -1631,29 +1653,22 @@ Upgrade, the server instead sends session-created or lane-accepted as the first 
 accepted path group and clock-bootstrap timestamps defined by their layouts below. A creation response also carries the
 new session credentials. A lane carries no data before receiving its corresponding successful admission response.
 
-Session-close and lane-abandon are in-session lifecycle controls. A client-to-server session-close is bound to its
-session by the carrier context. Lane-abandon explicitly identifies the stable lane and connection generation.
-
 An error response contains a stable machine-readable code, error class, scope, and printable-ASCII diagnostic. The scope
 identifies the session or lane generation when applicable. The error class distinguishes `retryable`, `lane_rejected`,
 `session_gone`, and `session_rejected` outcomes. Free-form diagnostics never determine retry or exit behavior.
 Successful admission responses carry no diagnostic.
 
-When a lane detects a protocol violation in an in-session frame, it attempts to queue a lane-scoped protocol-violation
-error through the normal single writer. If the bounded control queue accepts it, the lane waits at most 200 milliseconds
-for the write-completion callback before closing. Transport failures and local UDP failures close through their own
-lifecycle paths and are not mislabeled as peer violations.
-
 Raw-stream admission responses use exact protocol codes and classes. WebSocket admission carries the same signed
 rejection as an unpadded base64url `WireHop-Rejection` response header because rejection occurs before the upgrade. Its
 HTTP status remains a conventional summary for intermediaries. In-session error frames carry the full code, class,
-scope, optional lane generation, and bounded diagnostic.
+scope, lane ID, generation, and bounded diagnostic. The lane ID and generation fields remain present with zero values
+for session scope.
 
 Admission messages use an eight-byte preface followed by a bounded authenticated body. The preface contains four magic
 bytes, a big-endian `u16` version, and a big-endian `u16` body length. The body length includes the HMAC tag and
 excludes the preface. Readers reject an unknown preface or an out-of-bounds body length before reading or allocating the
 body. Fixed-width timestamps use network byte order. Lane IDs, generations, and path group IDs use canonical `uvarint`
-encoding as defined below. Raw rejection error codes use one byte.
+encoding as defined above. Raw rejection error codes use one byte.
 
 The raw client hello has this layout. `V` is the combined size of its three variable integers, and `N` is the
 mode-specific suffix length:
@@ -1713,23 +1728,19 @@ time no later than server send time. Rejections omit these monotonic timestamps 
 for admission-clock recovery. An unsupported-version rejection may use a zero request nonce because the server cannot
 trust an unknown request layout. Diagnostics are optional printable ASCII and are limited to 512 bytes.
 
-### Framed messages
+### Frame format
 
 Every WireHop frame, including successful WebSocket admission responses and all post-admission traffic, uses this
 envelope:
 
 | Order | Encoding | Field |
 | ---: | --- | --- |
-| 1 | Little-endian `u16` | Type in bits 0 through 3, low 11 length bits in bits 4 through 14, extension flag in bit 15 |
-| 2 | Optional `u8` | High length bits when the extension flag is set |
+| 1 | Little-endian `u16` | Type in bits 0 through 3, low 11 length bits in bits 4 through 14, `E` (Length extension present) in bit 15 |
+| 2 | Optional `u8` | High length bits when `E` is `1` |
 | 3 | N bytes | Type-specific payload |
 
-In framed messages, `uvarint` is shortest-form unsigned LEB128. Each byte contributes seven value bits,
-least-significant group first, and its high bit indicates another byte. Zero occupies one byte. A `uint64` occupies at
-most ten bytes, and the tenth byte can contain only bit 0. Nonminimal encodings, overflow, and values outside a field's
-semantic bounds are protocol violations. Integers must be complete within their containing frame or WebSocket message. A
-stream that ends partway through a header or payload fails with unexpected EOF. These rules apply to every `uvarint`
-field in a frame payload. Admission hellos use the explicitly mixed fixed-width and variable-width layouts above.
+`E` is a one-bit presence flag. A value of `0` omits the high length byte, and `1` requires that byte. It does not
+negotiate a protocol extension or change the frame type.
 
 Types zero and 12 through 15 are invalid. The content length excludes the common header and cannot exceed 65,553 bytes.
 The common header occupies two bytes through content length 2047 and three bytes thereafter. When present, the extension
@@ -1737,6 +1748,8 @@ byte must be nonzero, and the content length is `(base >> 4 & 0x7ff) | (extensio
 zero. For example, Data content lengths 34, 1452, 2048, and 65,553 have headers `23 02`, `c3 5a`, `03 80 01`, and
 `13 81 20`. The maximum encoded frame is 65,556 bytes. A reader validates the bounded header before allocating content
 storage.
+
+### Frame types
 
 Protocol version 1 frame types are grouped by purpose: admission responses, Data and delivery feedback, clock mapping
 and timing measurements, then lane and session termination and errors. The registry and payload descriptions use the
@@ -1760,48 +1773,34 @@ Frame IDs identify message types and do not define sending order or scheduling p
 direction, no other in-session frame may precede the generation's clock-sync frame. The server-to-client direction may
 carry in-session frames immediately after admission.
 
-A valid pong must match the sole outstanding ping ID on the carrying lane after its writer has recorded the local send
-time. Session-created and lane-accepted are valid only in their first-response positions and never on an admitted lane.
 Any recognized frame used outside its allowed phase or direction is a protocol violation.
 
-Ping and Pong have no Data-pause semantics. Independent Measurement frames coordinate one session operation with an
-independent exchange on each requesting carrier generation. Request asks the client to consider a measurement. Begin,
-Probe, and Result travel from client to server. Ready and Reply travel from server to client. Only the client allocates
-operation IDs. Concurrent targets share the operation ID and session pause. A late operation or a frame on a retired
-target cannot change the active operation. Direction is checked before operation identity. Any phase used in the wrong
-direction is a protocol violation. A current operation used in the wrong phase is also a protocol violation. Correctly
-directed stale operations are ignored. Measurement fields use canonical unsigned integers and must end at the phase's
-final field.
+### Frame definitions
 
-Payload descriptions follow frame-type order. Fields within each payload appear in the listed order:
+The following payload layouts omit the shared frame header. Integers use `uvarint` unless a different encoding is
+specified. Named Boolean fields accept only `0` and `1`. Fixed field sequences end after their final field, while Data
+and Error consume their remaining content as specified below.
 
-- `Session created`: session ID (16 bytes), session secret (32 bytes), path group ID (`uvarint`), server receive time
-  (`uvarint`), and server send time (`uvarint`)
-- `Lane accepted`: session ID (16 bytes), path group ID (`uvarint`), server receive time (`uvarint`), and server send
-  time (`uvarint`)
-- `Data`: direction-local packet ID (`uvarint`), absolute deadline in sender monotonic milliseconds rounded up
-  (`uvarint`), and the remaining WireGuard packet bytes
-- `Delivery report`: lane ID, generation, cumulative Data-frame count, latest parsed Ping ID, and report delay in
-  microseconds (five `uvarint` values)
-- `Clock sync`: client send, server receive, server send, and client receive times (four `uvarint` values)
-- `Ping`: ping ID (`uvarint`)
-- `Pong`: ping ID, receive time, and send time (three `uvarint` values)
-- `Measurement Request`: kind `1`
-- `Measurement Begin`: kind `2` and operation ID. The carrying lane generation is the measurement target
-- `Measurement Ready`: kind `3`, operation ID, and acceptance flag (`0` or `1`)
-- `Measurement Probe`: kind `4`, operation ID, probe send time `t1`, and remaining hold in microseconds
-- `Measurement Reply`: kind `5`, operation ID, receive time `t2`, reply send time `t3`, and remaining hold in
-  microseconds
-- `Measurement Result`: kind `6`, operation ID, valid flag (`0` or `1`), and reply receive time `t4`. A rejected result
-  has flag `0` and timestamp `0`
-- `Lane abandon`: lane ID and generation (two `uvarint` values)
-- `Session close`: close reason (`u8`)
-- `Error`: code (`uvarint`), class (`u8`), scope (`u8`), lane ID (`uvarint`), generation (`uvarint`), and remaining
-  diagnostic bytes, limited to 512 printable-ASCII bytes
+#### Session created
 
-Integer fields retain their full unsigned 64-bit value range where their semantics permit it. Payloads with a fixed
-field sequence must end after their final field. Data and Error consume their remaining content as explicitly specified
-above. The table's Data minimum includes the shortest recognized WireGuard packet.
+Payload, in wire order: session ID (16 bytes), session secret (32 bytes), path group ID, server receive time, and server
+send time. Both times are in microseconds.
+
+This frame is the server's first WebSocket create response. The session ID, secret, and path group ID must be nonzero,
+and receive time cannot exceed send time. It is invalid on an already admitted lane.
+
+#### Lane accepted
+
+Payload, in wire order: session ID (16 bytes), path group ID, server receive time, and server send time. Both times are
+in microseconds.
+
+This frame is the server's first WebSocket join response. The session and path group IDs must be nonzero, and receive
+time cannot exceed send time. It is invalid on an already admitted lane.
+
+#### Data
+
+Payload, in wire order: direction-local packet ID, absolute deadline in sender monotonic milliseconds rounded up, and
+the remaining WireGuard packet bytes.
 
 Let `U(x)` be the shortest unsigned LEB128 length of `x`, and let `P` be the WireGuard datagram length. Data content
 length is `L = U(packet_id) + U(deadline_millis) + P`. Let `H(L)` be 2 for `L < 2048` and 3 otherwise. Its complete
@@ -1817,47 +1816,6 @@ handshake binds every frame to a session, so data frames do not repeat the sessi
 WireGuard class and duplicate or migration state are not transmitted. Both peers derive the class from the public
 WireGuard packet structure. The sender keeps migration state locally, while copies share the same packet ID.
 
-Ping and Pong IDs are nonzero. Ping counters start at 1 for each connection generation and never wrap. Exhausting the
-counter ends that generation. Measurement operation IDs are nonzero session counters, independent of Ping counters.
-Request has no operation ID. Exhausting the operation counter disables further measurements without disrupting Data.
-Measurement holds cannot exceed 4,000,000 microseconds. The maximum Measurement content is a 35-byte Reply with
-full-width operation ID and timestamps and a four-byte hold. Readers reject a larger Measurement from its frame header
-before allocating payload storage. Ready rejection acquires no pause. Probe requires a positive hold. A zero Reply hold
-rejects the measurement. Delivery reports and lane-abandon frames require a nonzero lane ID and generation.
-Session-created requires nonzero session ID, secret, and path group ID. Lane-accepted requires nonzero session and path
-group IDs. Encoded receive and send timestamp pairs must not run backward.
-
-Version 1 control enums are:
-
-| Enum | Value | Name |
-| --- | ---: | --- |
-| Error code | 1 | `malformed` |
-| Error code | 2 | `unsupported_version` |
-| Error code | 3 | `authentication` |
-| Error code | 4 | `replay` |
-| Error code | 5 | `target_denied` |
-| Error code | 6 | `session_not_found` |
-| Error code | 7 | `stale_generation` |
-| Error code | 8 | `lane_limit` |
-| Error code | 9 | `session_limit` |
-| Error code | 10 | `protocol_violation` |
-| Error code | 11 | `unavailable` |
-| Error code | 12 | `rate_limited` |
-| Error code | 13 | `internal` |
-| Error code | 14 | `clock_skew` |
-| Error class | 1 | `retryable` |
-| Error class | 2 | `lane_rejected` |
-| Error class | 3 | `session_gone` |
-| Error class | 4 | `session_rejected` |
-| Error scope | 1 | `lane` |
-| Error scope | 2 | `session` |
-| Session close reason | 1 | `client_shutdown` |
-
-Unknown enum values are protocol violations. In an Error frame, lane scope requires a nonzero lane ID and generation,
-while session scope requires both fields to be zero. After lane admission, a lane-scoped Error must identify the
-carrying lane and its current generation. The `clock_skew` code is valid only in an admission rejection and is invalid
-in an in-session Error frame.
-
 The Data codec requires two complete canonical integers. Ordinary datagrams require nonzero packet IDs and absolute
 deadlines. The relay additionally requires a recognized WireGuard packet of at least 32 bytes. ID zero is reserved for a
 capacity probe. It requires a zero deadline and exactly 4096 padding bytes. Padding contents are opaque and discarded.
@@ -1867,6 +1825,211 @@ UDP, deduplication, or transport migration. Every other zero-ID form is a protoc
 The WireHop protocol accepts at most 65,535 bytes of UDP payload for one datagram. UDP ingress reserves one additional
 receive-buffer byte and drops any larger datagram, so an unsupported IPv6 UDP jumbogram cannot be truncated into an
 apparently valid frame.
+
+#### Delivery report
+
+Payload, in wire order: lane ID, generation, cumulative parsed Data-frame count, latest parsed Ping ID, and report delay
+in microseconds.
+
+The lane ID and generation must be nonzero. The Data-frame count includes capacity padding and counts parsed frames, not
+unique WireGuard packet IDs or successful UDP writes. The Data-frame count and latest parsed Ping ID start at zero for
+each generation. The report identifies the generation being acknowledged independently of the lane carrying it.
+
+#### Clock sync
+
+Payload, in wire order: client send, server receive, server send, and client receive times, all in microseconds.
+
+Exactly one client-to-server Clock sync is required as the first in-session frame of each accepted generation. The
+server never sends this frame. Timestamp pairs cannot run backward. Clock mapping and its uncertainty determine whether
+the sample is usable.
+
+#### Ping
+
+Payload: Ping ID.
+
+Ping IDs are nonzero, start at 1 for each connection generation, and never wrap. Exhausting the counter ends that
+generation. Each lane permits one outstanding Ping in each direction. The sender retains its send time locally.
+
+#### Pong
+
+Payload, in wire order: Ping ID, receive time, and send time. Both times are in microseconds.
+
+The ID must match the sole outstanding Ping on the carrying lane after its writer has recorded the local send time.
+Receive time cannot exceed send time. Ping and Pong have no Data-pause semantics.
+
+#### Measurement
+
+Every Measurement starts with a kind. All remaining fields depend on that kind, with no unused fields on the wire:
+
+| Value | Kind | Direction | Remaining payload, in wire order |
+| ---: | --- | --- | --- |
+| 1 | Request | Server to client | None |
+| 2 | Begin | Client to server | Operation ID |
+| 3 | Ready | Server to client | Operation ID, `accepted` |
+| 4 | Probe | Client to server | Operation ID, probe send time `t1`, remaining hold in microseconds |
+| 5 | Reply | Server to client | Operation ID, receive time `t2`, reply send time `t3`, remaining hold in microseconds |
+| 6 | Result | Client to server | Operation ID, `valid`, reply receive time `t4` |
+
+Request asks the client to consider a measurement without promising a pause. Only the client allocates operation IDs.
+IDs are nonzero session counters independent of Ping IDs. Request has no operation ID. Exhausting the operation counter
+disables further measurements without disrupting Data. Concurrent targets share the operation ID and session pause,
+while each exchange uses its actual carrier generation.
+
+In Ready, `accepted = 1` confirms completed server preparation and prefix proof. A value of `0` rejects preparation
+without acquiring a pause for that request. In Result, `valid = 1` reports a client-validated and applied timing sample.
+A value of `0` rejects the result and requires `t4 = 0`. A valid result may have a zero timestamp. The server
+independently validates the sample before applying it. The readiness and result Booleans describe different facts.
+
+Measurement holds cannot exceed 4,000,000 microseconds. Probe requires a positive hold, and a zero Reply hold rejects
+the measurement. Receive time `t2` cannot exceed reply send time `t3`. The maximum content is a 35-byte Reply with
+full-width operation ID and timestamps and a four-byte hold. Readers reject larger Measurement content from its frame
+header before allocating payload storage.
+
+Frames from retired connection generations are ignored. On a current generation, direction is checked before operation
+identity, so a wrong-direction message is a protocol violation even when its operation ID is stale. Request is a
+coalescing hint. Begin can start a new operation or enroll a target during an active operation's preparation. A repeated
+Begin for a target that has already begun is ignored. A Begin outside the active operation whose ID does not exceed the
+greatest previously observed Begin ID is also ignored. For Ready, Probe, Reply, and Result, an operation ID that does
+not match the active operation is ignored, whether it is lower or higher. Messages for unenrolled or completed targets
+are also ignored after direction validation. For a live enrolled target of the matching operation, these phases must
+match its expected phase, otherwise they are protocol violations. Every payload must end at its kind's final field.
+
+#### Lane abandon
+
+Payload, in wire order: lane ID and generation. Both must be nonzero.
+
+Either endpoint can request abandonment of that exact generation. The message identifies its target explicitly rather
+than assuming it is the carrying lane.
+
+#### Session close
+
+Payload: close reason (`u8`).
+
+| Value | Close reason |
+| ---: | --- |
+| 1 | `client_shutdown` |
+
+Only the client sends Session close after admission. The carrying lane binds it to the session, so it carries no session
+ID. Unknown reasons are protocol violations.
+
+#### Error
+
+Payload, in wire order: code, class (`u8`), scope (`u8`), lane ID, generation, and the remaining diagnostic bytes. The
+diagnostic is limited to 512 printable-ASCII bytes.
+
+Error codes identify the cause independently of retry behavior and scope:
+
+| Value | Error code |
+| ---: | --- |
+| 1 | `malformed` |
+| 2 | `unsupported_version` |
+| 3 | `authentication` |
+| 4 | `replay` |
+| 5 | `target_denied` |
+| 6 | `session_not_found` |
+| 7 | `stale_generation` |
+| 8 | `lane_limit` |
+| 9 | `session_limit` |
+| 10 | `protocol_violation` |
+| 11 | `unavailable` |
+| 12 | `rate_limited` |
+| 13 | `internal` |
+| 14 | `clock_skew` |
+
+Classes determine retry and rejection behavior:
+
+| Value | Error class | Allowed scope |
+| ---: | --- | --- |
+| 1 | `retryable` | Lane or session |
+| 2 | `lane_rejected` | Lane |
+| 3 | `session_gone` | Session |
+| 4 | `session_rejected` | Session |
+
+Scopes identify the affected resource:
+
+| Value | Error scope |
+| ---: | --- |
+| 1 | `lane` |
+| 2 | `session` |
+
+Unknown enum values and invalid class/scope combinations are protocol violations. Lane scope requires a nonzero lane ID
+and generation, while session scope requires both fields to be zero. After admission, a lane-scoped Error must identify
+the carrying lane and its current generation. The `clock_skew` code is valid only in an admission rejection, not an
+in-session Error frame.
+
+When a lane detects a protocol violation in an in-session frame, it attempts to queue a lane-scoped protocol-violation
+error through the normal single writer. If the bounded control queue accepts it, the lane waits at most 200 milliseconds
+for the write-completion callback before closing. Transport failures and local UDP failures close through their own
+lifecycle paths and are not mislabeled as peer violations.
+
+### Delivery feedback and packet identity
+
+Each direction reports the lane identifier, connection generation, cumulative number of parsed Data frames, latest
+parsed Ping ID, and report-construction delay. Counts start at zero for each generation and never wrap. A parsed Ping
+requests immediate feedback, including over an alternate lane, so the same small timing request tests both carrier
+liveness and the cross-lane feedback path. Capacity padding uses the same Data counter and retained FIFO. Ping traffic
+does not estimate capacity.
+
+The receiver still accumulates exact encoded Data bytes internally for its 256 KiB trigger. It reports after 256 newly
+parsed Data frames or 256 KiB. The first change after idle is eager. Sustained smaller changes wait at most the shorter
+of 25 milliseconds and one quarter of the latest usable RTT, with a 1-millisecond minimum timer interval. The timer
+stops when all progress is reported. A pending snapshot retries after four current report intervals if no copy
+completes. The delay field measures time from the newest parse in that snapshot to its construction by the carrying
+lane's writer. It includes report timer and control queue delay, but excludes the following carrier write and network
+propagation.
+
+A consecutive received Data batch, including any capacity probes, is fully validated before its packet and encoded-byte
+totals enter the progress accumulator under one lock. Feedback can observe the previous prefix or the complete validated
+batch. Counter overflow rejects the complete batch without changing progress or submitting packets to UDP. This adds no
+batch collection wait.
+
+A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
+risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Reports
+acknowledge carrier parsing and do not promise UDP submission or WireGuard authentication. The sender reconstructs
+acknowledged bytes from its exact retained FIFO prefix, so a redundant cumulative byte field is unnecessary. A future
+Data count or a Ping ID not yet exposed to the target generation's writer is a protocol violation. Data and Ping
+progress must advance monotonically together. A mixed regression and advance is invalid, while a duplicate or wholly
+stale snapshot is ignored without changing capacity, timing, or ownership.
+
+Applying an accepted report releases the cumulative prefix and publishes its derived delivery estimate, routed feedback
+delay, and normal and probe send windows under the same store mutex. A queued writer cannot refill the preceding window
+between acknowledgment and the estimate update. Already committed bytes can exceed a newly reduced window and must drain
+before further frames fit. Invalid, duplicate, or stale reports do not change the windows.
+
+The single carrier writer gives internally generated controls priority in bursts of at most eight frames. It coalesces
+only already-queued controls by nonblocking dequeue, without a collection timer, and caps each batch by the burst's
+remaining frame budget. When WireGuard data is ready after such a burst, the writer sends one data batch before another
+control burst. Fairness counts frames rather than carrier writes. During a bounded timing drain, Data writes pause while
+ordinary controls remain eligible, so report progress can complete the drain.
+
+Ping, Pong, Measurement, Clock sync, Session close, Lane abandon, and Error end the current control batch. A boundary
+frame at the head is sent alone. A boundary frame after ordinary controls is the last frame in their batch. Ordinary
+control queue order is preserved, while the reserved Pong queue has priority at the start of a control burst. Builders
+sample timestamps at the writer, and success callbacks run in queue order only after the complete carrier write
+succeeds. Ping exposure is published before writing because feedback can return on another lane before local completion.
+A rejected queue admission does not consume a Ping ID. A builder or carrier failure ends the generation and does not
+imply per-frame transactional completion.
+
+Each control batch retains the carrier stall deadline. WebSocket receivers decode incrementally without requiring a
+message's closing fragment before returning a complete prefix. The carrier library fills each requested payload read
+within its current WebSocket frame. A 32 KiB reader refill can therefore wait for the remaining bytes of that frame, up
+to the requested length, before exposing a complete WireHop prefix. A later malformed frame cannot undo a valid prefix
+already delivered. An incomplete frame at a normal WebSocket message boundary is a protocol violation. A transport
+disconnection before that boundary is a recoverable carrier failure. TLS also must receive and authenticate a complete
+record before exposing its contents. Coalescing can therefore change receive latency even without a collection timer.
+The frame budget and timing boundaries bound the amount of coalesced work. Liveness checks still govern a blocked
+carrier. Read-ahead provides no per-packet latency guarantee.
+
+A changed report snapshot is offered to its target lane and the best alternate lane when connected and not abandoning.
+Each writer constructs its own delay value for that same cumulative snapshot. The first completed carrier write marks
+the snapshot reported, and duplicate callbacks are coalesced. If no copy completes, the snapshot becomes eligible again
+after four report intervals. Only valid matching-generation progress or complete generation drain releases the sent
+FIFO. Reports from an obsolete generation are ignored.
+
+New packet IDs start at 1 and increase strictly within each session direction. The scheduler sizes the next candidate ID
+before selecting eligible lanes and commits it only after at least one copy enters a lane transmission store. Every
+proactive duplicate or migrated copy preserves that ID. Exhausting the 64-bit identifier space requires session
+replacement rather than zero-value reuse.
 
 ### Clock mapping and liveness
 
@@ -1973,7 +2136,7 @@ The measurement exchange proceeds as follows:
 1. The client reserves the session operation, requests its local ingress cut, and sends Measurement Begin immediately on
    each enrolled carrier. Begin requests preparation without asserting that the client's prefix has already drained
 2. Each endpoint pauses new ingress admission and drains accepted ingress, scheduler-held packets, and queued
-   application Data. It then closes its Data gates and awaits cumulative DeliveryReports covering every committed
+   application Data. It then closes its Data gates and awaits cumulative Delivery reports covering every committed
    prefix. The server also requests any different directional primary and waits for Begin on every enrolled carrier
    before sending Measurement Ready on each target's actual carrier. Client preparation proceeds concurrently
 3. Only after its local prefix proof and every target's Ready arrive does the client seal the cohort and queue each
@@ -2106,7 +2269,7 @@ Data commitment and Data gate closure use the same store mutex. A carrier regist
 provenance and drain credit before becoming eligible. Once the operation is quiet, a new carrier also inherits its
 closed Data gate. Replacing, removing, or abandoning any generation revokes prefix proof because discarding a prefix
 does not prove that the peer parsed it. Revocation does not retract an exposed quiet promise. Expiry maintenance,
-DeliveryReports, Ping/Pong, and other controls continue independently. Drain preparation runs outside the carrier
+Delivery reports, Ping/Pong, and other controls continue independently. Drain preparation runs outside the carrier
 writer, so it cannot prevent control progress. Measurement phases use the ordinary bounded control queue. Saturation
 before exposure drops the attempt. Saturation after a promise leaves expiry responsible for bounded recovery.
 
@@ -2152,75 +2315,6 @@ trigger client measurement without client capacity evidence. In-flight request s
 samples do not cancel already queued requests because a peer demand can describe a different outbound condition. Failed
 or unusable exchanges preserve eligibility for a later retry. A successfully applied measurement replaces the minimum
 without pulling the ordinary RTT average down merely because the session temporarily emptied its own queues.
-
-### Delivery feedback and packet identity
-
-Each direction reports the lane identifier, connection generation, cumulative number of parsed Data frames, latest
-parsed Ping ID, and report-construction delay. Counts start at zero for each generation and never wrap. A parsed Ping
-requests immediate feedback, including over an alternate lane, so the same small timing request tests both carrier
-liveness and the cross-lane feedback path. Capacity padding uses the same Data counter and retained FIFO. Ping traffic
-does not estimate capacity.
-
-The receiver still accumulates exact encoded Data bytes internally for its 256 KiB trigger. It reports after 256 newly
-parsed Data frames or 256 KiB. The first change after idle is eager. Sustained smaller changes wait at most the shorter
-of 25 milliseconds and one quarter of the latest usable RTT, with a 1-millisecond minimum timer interval. The timer
-stops when all progress is reported. A pending snapshot retries after four current report intervals if no copy
-completes. The delay field measures time from the newest parse in that snapshot to its construction by the carrying
-lane's writer. It includes report timer and control queue delay, but excludes the following carrier write and network
-propagation.
-
-A consecutive received Data batch, including any capacity probes, is fully validated before its packet and encoded-byte
-totals enter the progress accumulator under one lock. Feedback can observe the previous prefix or the complete validated
-batch. Counter overflow rejects the complete batch without changing progress or submitting packets to UDP. This adds no
-batch collection wait.
-
-A report may travel over any connected, non-abandoning lane in the session, including a degraded lane. Outbound deadline
-risk must not suppress reverse-direction parsing feedback or prevent two degraded peers from recovering. Reports
-acknowledge carrier parsing and do not promise UDP submission or WireGuard authentication. The sender reconstructs
-acknowledged bytes from its exact retained FIFO prefix, so a redundant cumulative byte field is unnecessary. A future
-Data count or a Ping ID not yet exposed to the target generation's writer is a protocol violation. Data and Ping
-progress must advance monotonically together. A mixed regression and advance is invalid, while a duplicate or wholly
-stale snapshot is ignored without changing capacity, timing, or ownership.
-
-Applying an accepted report releases the cumulative prefix and publishes its derived delivery estimate, routed feedback
-delay, and normal and probe send windows under the same store mutex. A queued writer cannot refill the preceding window
-between acknowledgment and the estimate update. Already committed bytes can exceed a newly reduced window and must drain
-before further frames fit. Invalid, duplicate, or stale reports do not change the windows.
-
-The single carrier writer gives internally generated controls priority in bursts of at most eight frames. It coalesces
-only already-queued controls by nonblocking dequeue, without a collection timer, and caps each batch by the burst's
-remaining frame budget. When WireGuard data is ready after such a burst, the writer sends one data batch before another
-control burst. Fairness counts frames rather than carrier writes. During a bounded timing drain, Data writes pause while
-ordinary controls remain eligible, so report progress can complete the drain.
-
-Ping, Pong, Measurement, ClockSync, SessionClose, LaneAbandon, and Error end the current control batch. A boundary frame
-at the head is sent alone. A boundary frame after ordinary controls is the last frame in their batch. Ordinary control
-queue order is preserved, while the reserved Pong queue has priority at the start of a control burst. Builders sample
-timestamps at the writer, and success callbacks run in queue order only after the complete carrier write succeeds. Ping
-exposure is published before writing because feedback can return on another lane before local completion. A rejected
-queue admission does not consume a Ping ID. A builder or carrier failure ends the generation and does not imply
-per-frame transactional completion.
-
-Each control batch retains the carrier stall deadline. WebSocket receivers decode incrementally without requiring a
-message's closing fragment before returning a complete prefix. The carrier library fills each requested payload read
-within its current WebSocket frame. A 32 KiB reader refill can therefore wait for the remaining bytes of that frame, up
-to the requested length, before exposing a complete WireHop prefix. A later malformed frame cannot undo a valid prefix
-already delivered. An incomplete frame at a normal WebSocket message boundary is a protocol violation. A transport
-disconnection before that boundary is a recoverable carrier failure. TLS also must receive and authenticate a complete
-record before exposing its contents. Coalescing can therefore change receive latency even without a collection timer.
-The frame budget and timing boundaries bound the amount of coalesced work. Liveness checks still govern a blocked
-carrier. Read-ahead provides no per-packet latency guarantee.
-
-A changed report snapshot is offered to its target lane and the best alternate lane when connected and not abandoning.
-Each writer constructs its own delay value for that same cumulative snapshot. The first completed carrier write marks
-the snapshot reported, and duplicate callbacks are coalesced. If no copy completes, the snapshot becomes eligible again
-after four report intervals. Only valid matching-generation progress or complete generation drain releases the sent
-FIFO. Reports from an obsolete generation are ignored.
-
-New packet IDs start at 1 and increase strictly within each session direction. The scheduler sizes the next candidate ID
-before selecting eligible lanes and commits it only after at least one copy enters a lane transmission store. Every
-proactive duplicate or migrated copy preserves that ID. Exhausting the 64-bit identifier space requires session
-replacement rather than zero-value reuse.
 
 ### Carrier mapping
 

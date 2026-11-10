@@ -123,7 +123,7 @@ func TestMeasurementCoordinatorConcurrentTargets(t *testing.T) {
 					ready, rejected = rejected, ready
 				}
 				accept := func() {
-					client.receive(t, ready, protocol.Measurement{Kind: protocol.MeasurementReady, ID: begin.value.ID, Valid: true}, 2)
+					client.receive(t, ready, protocol.Measurement{Kind: protocol.MeasurementReady, ID: begin.value.ID, Accepted: true}, 2)
 				}
 				decline := func() {
 					client.receive(t, rejected, protocol.Measurement{Kind: protocol.MeasurementReady, ID: begin.value.ID}, 2)

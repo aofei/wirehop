@@ -10,133 +10,6 @@ var (
 	ErrInvalidControlFrame = errors.New("invalid control frame")
 )
 
-// TimingPing requests one lane-local timing observation.
-type TimingPing struct {
-	ID uint64
-}
-
-// MarshalTimingPing returns a timing ping frame.
-func MarshalTimingPing(ping TimingPing) (Frame, error) {
-	if ping.ID == 0 {
-		return Frame{}, ErrInvalidControlFrame
-	}
-	payload := integerPayload(0, ping.ID)
-	return Frame{Type: FramePing, Payload: payload}, nil
-}
-
-// ParseTimingPing parses a timing ping frame.
-func ParseTimingPing(frame Frame) (TimingPing, error) {
-	if frame.Type != FramePing {
-		return TimingPing{}, ErrInvalidControlFrame
-	}
-	var ping TimingPing
-	remaining, err := parseIntegers(frame.Payload, &ping.ID)
-	if err != nil || len(remaining) != 0 {
-		return TimingPing{}, ErrInvalidControlFrame
-	}
-	if ping.ID == 0 {
-		return TimingPing{}, ErrInvalidControlFrame
-	}
-	return ping, nil
-}
-
-// TimingPong responds with receiver timing for a prior ping.
-type TimingPong struct {
-	ID            uint64
-	ReceiveMicros uint64
-	SendMicros    uint64
-}
-
-// MarshalTimingPong returns a timing pong frame.
-func MarshalTimingPong(pong TimingPong) (Frame, error) {
-	if pong.ID == 0 || pong.ReceiveMicros > pong.SendMicros {
-		return Frame{}, ErrInvalidControlFrame
-	}
-	payload := integerPayload(0, pong.ID, pong.ReceiveMicros, pong.SendMicros)
-	return Frame{Type: FramePong, Payload: payload}, nil
-}
-
-// ParseTimingPong parses a timing pong frame.
-func ParseTimingPong(frame Frame) (TimingPong, error) {
-	if frame.Type != FramePong {
-		return TimingPong{}, ErrInvalidControlFrame
-	}
-	var pong TimingPong
-	remaining, err := parseIntegers(frame.Payload, &pong.ID, &pong.ReceiveMicros, &pong.SendMicros)
-	if err != nil || len(remaining) != 0 {
-		return TimingPong{}, ErrInvalidControlFrame
-	}
-	if pong.ID == 0 || pong.ReceiveMicros > pong.SendMicros {
-		return TimingPong{}, ErrInvalidControlFrame
-	}
-	return pong, nil
-}
-
-// ClockSync carries one complete four-timestamp clock sample.
-type ClockSync struct {
-	ClientSendMicros    uint64
-	ServerReceiveMicros uint64
-	ServerSendMicros    uint64
-	ClientReceiveMicros uint64
-}
-
-// MarshalClockSync returns a clock synchronization frame.
-func MarshalClockSync(sync ClockSync) (Frame, error) {
-	if sync.ClientReceiveMicros < sync.ClientSendMicros || sync.ServerSendMicros < sync.ServerReceiveMicros {
-		return Frame{}, ErrInvalidControlFrame
-	}
-	payload := integerPayload(0, sync.ClientSendMicros, sync.ServerReceiveMicros, sync.ServerSendMicros, sync.ClientReceiveMicros)
-	return Frame{Type: FrameClockSync, Payload: payload}, nil
-}
-
-// ParseClockSync parses a clock synchronization frame.
-func ParseClockSync(frame Frame) (ClockSync, error) {
-	if frame.Type != FrameClockSync {
-		return ClockSync{}, ErrInvalidControlFrame
-	}
-	var sync ClockSync
-	remaining, err := parseIntegers(frame.Payload, &sync.ClientSendMicros, &sync.ServerReceiveMicros, &sync.ServerSendMicros, &sync.ClientReceiveMicros)
-	if err != nil || len(remaining) != 0 {
-		return ClockSync{}, ErrInvalidControlFrame
-	}
-	if sync.ClientReceiveMicros < sync.ClientSendMicros || sync.ServerSendMicros < sync.ServerReceiveMicros {
-		return ClockSync{}, ErrInvalidControlFrame
-	}
-	return sync, nil
-}
-
-// DeliveryReport reports cumulative parsing progress for one lane generation and direction.
-type DeliveryReport struct {
-	LaneID      LaneID
-	Generation  uint64
-	DataPackets uint64
-	PingID      uint64
-	// DelayMicros is the time from the newest reported parse progress to report construction by the carrier writer.
-	DelayMicros uint64
-}
-
-// MarshalDeliveryReport returns a cumulative delivery report frame.
-func MarshalDeliveryReport(report DeliveryReport) (Frame, error) {
-	if report.LaneID.IsZero() || report.Generation == 0 {
-		return Frame{}, ErrInvalidControlFrame
-	}
-	payload := integerPayload(0, uint64(report.LaneID), report.Generation, report.DataPackets, report.PingID, report.DelayMicros)
-	return Frame{Type: FrameDeliveryReport, Payload: payload}, nil
-}
-
-// ParseDeliveryReport parses a cumulative delivery report frame.
-func ParseDeliveryReport(frame Frame) (DeliveryReport, error) {
-	if frame.Type != FrameDeliveryReport {
-		return DeliveryReport{}, ErrInvalidControlFrame
-	}
-	var report DeliveryReport
-	remaining, err := parseIntegers(frame.Payload, (*uint64)(&report.LaneID), &report.Generation, &report.DataPackets, &report.PingID, &report.DelayMicros)
-	if err != nil || len(remaining) != 0 || report.LaneID.IsZero() || report.Generation == 0 {
-		return DeliveryReport{}, ErrInvalidControlFrame
-	}
-	return report, nil
-}
-
 // SessionCreated carries session credentials and clock-bootstrap timestamps.
 type SessionCreated struct {
 	SessionID     SessionID
@@ -212,37 +85,136 @@ func ParseLaneAccepted(frame Frame) (LaneAccepted, error) {
 	return accepted, nil
 }
 
-// CloseReason identifies an intentional session-close cause.
-type CloseReason uint8
+// DeliveryReport reports cumulative parsing progress for one lane generation and direction.
+type DeliveryReport struct {
+	LaneID     LaneID
+	Generation uint64
 
-const (
-	// CloseClientShutdown identifies an intentional client process shutdown.
-	CloseClientShutdown CloseReason = 1
-)
+	// DataFrames counts parsed Data frames, including capacity probes.
+	DataFrames uint64
 
-// Valid reports whether the close reason is defined by this protocol version.
-func (r CloseReason) Valid() bool {
-	return r == CloseClientShutdown
+	// PingID is the latest parsed Ping ID on the reported generation.
+	PingID uint64
+
+	// DelayMicros is the time from the newest reported parse progress to report construction by the carrier writer.
+	DelayMicros uint64
 }
 
-// MarshalSessionClose returns an explicit session-close control frame.
-func MarshalSessionClose(reason CloseReason) (Frame, error) {
-	if !reason.Valid() {
+// MarshalDeliveryReport returns a cumulative delivery report frame.
+func MarshalDeliveryReport(report DeliveryReport) (Frame, error) {
+	if report.LaneID.IsZero() || report.Generation == 0 {
 		return Frame{}, ErrInvalidControlFrame
 	}
-	return Frame{Type: FrameSessionClose, Payload: []byte{byte(reason)}}, nil
+	payload := integerPayload(0, uint64(report.LaneID), report.Generation, report.DataFrames, report.PingID, report.DelayMicros)
+	return Frame{Type: FrameDeliveryReport, Payload: payload}, nil
 }
 
-// ParseSessionClose parses an explicit session-close control frame.
-func ParseSessionClose(frame Frame) (CloseReason, error) {
-	if frame.Type != FrameSessionClose || len(frame.Payload) != 1 {
-		return 0, ErrInvalidControlFrame
+// ParseDeliveryReport parses a cumulative delivery report frame.
+func ParseDeliveryReport(frame Frame) (DeliveryReport, error) {
+	if frame.Type != FrameDeliveryReport {
+		return DeliveryReport{}, ErrInvalidControlFrame
 	}
-	reason := CloseReason(frame.Payload[0])
-	if !reason.Valid() {
-		return 0, ErrInvalidControlFrame
+	var report DeliveryReport
+	remaining, err := parseIntegers(frame.Payload, (*uint64)(&report.LaneID), &report.Generation, &report.DataFrames, &report.PingID, &report.DelayMicros)
+	if err != nil || len(remaining) != 0 || report.LaneID.IsZero() || report.Generation == 0 {
+		return DeliveryReport{}, ErrInvalidControlFrame
 	}
-	return reason, nil
+	return report, nil
+}
+
+// ClockSync carries one complete four-timestamp clock sample.
+type ClockSync struct {
+	ClientSendMicros    uint64
+	ServerReceiveMicros uint64
+	ServerSendMicros    uint64
+	ClientReceiveMicros uint64
+}
+
+// MarshalClockSync returns a clock synchronization frame.
+func MarshalClockSync(sync ClockSync) (Frame, error) {
+	if sync.ClientReceiveMicros < sync.ClientSendMicros || sync.ServerSendMicros < sync.ServerReceiveMicros {
+		return Frame{}, ErrInvalidControlFrame
+	}
+	payload := integerPayload(0, sync.ClientSendMicros, sync.ServerReceiveMicros, sync.ServerSendMicros, sync.ClientReceiveMicros)
+	return Frame{Type: FrameClockSync, Payload: payload}, nil
+}
+
+// ParseClockSync parses a clock synchronization frame.
+func ParseClockSync(frame Frame) (ClockSync, error) {
+	if frame.Type != FrameClockSync {
+		return ClockSync{}, ErrInvalidControlFrame
+	}
+	var sync ClockSync
+	remaining, err := parseIntegers(frame.Payload, &sync.ClientSendMicros, &sync.ServerReceiveMicros, &sync.ServerSendMicros, &sync.ClientReceiveMicros)
+	if err != nil || len(remaining) != 0 {
+		return ClockSync{}, ErrInvalidControlFrame
+	}
+	if sync.ClientReceiveMicros < sync.ClientSendMicros || sync.ServerSendMicros < sync.ServerReceiveMicros {
+		return ClockSync{}, ErrInvalidControlFrame
+	}
+	return sync, nil
+}
+
+// TimingPing requests one lane-local timing observation.
+type TimingPing struct {
+	ID uint64
+}
+
+// MarshalTimingPing returns a timing ping frame.
+func MarshalTimingPing(ping TimingPing) (Frame, error) {
+	if ping.ID == 0 {
+		return Frame{}, ErrInvalidControlFrame
+	}
+	payload := integerPayload(0, ping.ID)
+	return Frame{Type: FramePing, Payload: payload}, nil
+}
+
+// ParseTimingPing parses a timing ping frame.
+func ParseTimingPing(frame Frame) (TimingPing, error) {
+	if frame.Type != FramePing {
+		return TimingPing{}, ErrInvalidControlFrame
+	}
+	var ping TimingPing
+	remaining, err := parseIntegers(frame.Payload, &ping.ID)
+	if err != nil || len(remaining) != 0 {
+		return TimingPing{}, ErrInvalidControlFrame
+	}
+	if ping.ID == 0 {
+		return TimingPing{}, ErrInvalidControlFrame
+	}
+	return ping, nil
+}
+
+// TimingPong responds with receiver timing for a prior ping.
+type TimingPong struct {
+	ID            uint64
+	ReceiveMicros uint64
+	SendMicros    uint64
+}
+
+// MarshalTimingPong returns a timing pong frame.
+func MarshalTimingPong(pong TimingPong) (Frame, error) {
+	if pong.ID == 0 || pong.ReceiveMicros > pong.SendMicros {
+		return Frame{}, ErrInvalidControlFrame
+	}
+	payload := integerPayload(0, pong.ID, pong.ReceiveMicros, pong.SendMicros)
+	return Frame{Type: FramePong, Payload: payload}, nil
+}
+
+// ParseTimingPong parses a timing pong frame.
+func ParseTimingPong(frame Frame) (TimingPong, error) {
+	if frame.Type != FramePong {
+		return TimingPong{}, ErrInvalidControlFrame
+	}
+	var pong TimingPong
+	remaining, err := parseIntegers(frame.Payload, &pong.ID, &pong.ReceiveMicros, &pong.SendMicros)
+	if err != nil || len(remaining) != 0 {
+		return TimingPong{}, ErrInvalidControlFrame
+	}
+	if pong.ID == 0 || pong.ReceiveMicros > pong.SendMicros {
+		return TimingPong{}, ErrInvalidControlFrame
+	}
+	return pong, nil
 }
 
 // LaneGeneration identifies one stable lane and exact connection generation.
@@ -274,6 +246,39 @@ func ParseLaneAbandon(frame Frame) (LaneGeneration, error) {
 		return LaneGeneration{}, ErrInvalidControlFrame
 	}
 	return lane, nil
+}
+
+// CloseReason identifies an intentional session-close cause.
+type CloseReason uint8
+
+const (
+	// CloseClientShutdown identifies an intentional client process shutdown.
+	CloseClientShutdown CloseReason = 1
+)
+
+// Valid reports whether the close reason is defined by this protocol version.
+func (r CloseReason) Valid() bool {
+	return r == CloseClientShutdown
+}
+
+// MarshalSessionClose returns an explicit session-close control frame.
+func MarshalSessionClose(reason CloseReason) (Frame, error) {
+	if !reason.Valid() {
+		return Frame{}, ErrInvalidControlFrame
+	}
+	return Frame{Type: FrameSessionClose, Payload: []byte{byte(reason)}}, nil
+}
+
+// ParseSessionClose parses an explicit session-close control frame.
+func ParseSessionClose(frame Frame) (CloseReason, error) {
+	if frame.Type != FrameSessionClose || len(frame.Payload) != 1 {
+		return 0, ErrInvalidControlFrame
+	}
+	reason := CloseReason(frame.Payload[0])
+	if !reason.Valid() {
+		return 0, ErrInvalidControlFrame
+	}
+	return reason, nil
 }
 
 // ErrorFrame carries a stable in-session error and bounded diagnostic.

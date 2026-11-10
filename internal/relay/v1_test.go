@@ -21,7 +21,7 @@ func TestLaneSendDeliveryReport(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		lane := newTestLane(t, newTestCarrier(), newTestEndpoint())
 		parsedAt := time.Now()
-		report := protocol.DeliveryReport{LaneID: 2, Generation: 3, DataPackets: 4, PingID: 5}
+		report := protocol.DeliveryReport{LaneID: 2, Generation: 3, DataFrames: 4, PingID: 5}
 		synctest.Sleep(10 * time.Millisecond)
 		called := false
 		if !lane.SendDeliveryReport(report, parsedAt, func() { called = true }) {

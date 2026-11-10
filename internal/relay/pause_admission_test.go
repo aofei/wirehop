@@ -142,7 +142,7 @@ func TestSchedulerRunTimingPauseKeepsControlProgress(t *testing.T) {
 		if packets, _ := store.backlog(); packets != 3 {
 			t.Fatal("pause did not retain pending ingress behind the committed prefix")
 		}
-		if err := scheduler.ObserveDeliveryReport(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: 1}, uint64(time.Now().UnixMicro())+1, make(chan error, 1)); err != nil {
+		if err := scheduler.ObserveDeliveryReport(ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1}, protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: 1}, uint64(time.Now().UnixMicro())+1, make(chan error, 1)); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()

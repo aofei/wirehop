@@ -31,7 +31,7 @@ func TestScheduledLaneReportIgnoresLaterQueuePressure(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now)
+			progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(now.UnixMicro()), now)
 			if err != nil || !progressed {
 				t.Fatalf("applyReport() = %t, %v", progressed, err)
 			}
@@ -168,7 +168,7 @@ func TestScheduledLanePartialBurstPreservesCapacity(t *testing.T) {
 			}
 			now = now.Add(300 * time.Millisecond)
 			for packets := uint64(2); packets <= 8; packets += 2 {
-				progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: packets}, uint64(now.UnixMicro()), now)
+				progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: packets}, uint64(now.UnixMicro()), now)
 				if err != nil || !progressed {
 					t.Fatalf("report %d = %t, %v", packets, progressed, err)
 				}
@@ -241,7 +241,7 @@ func TestScheduledLaneTimingResumePreservesCapacity(t *testing.T) {
 			report := func(packets uint64) {
 				t.Helper()
 				now = now.Add(time.Millisecond)
-				progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: packets}, uint64(now.UnixMicro()), now)
+				progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: packets}, uint64(now.UnixMicro()), now)
 				if err != nil || !progressed {
 					t.Fatalf("report %d = %t, %v", packets, progressed, err)
 				}
@@ -407,14 +407,14 @@ func TestScheduledLaneTimingPausePreservesCapacity(t *testing.T) {
 				store.endMeasurementPause()
 			}
 			now = now.Add(tt.delay)
-			progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 2}, uint64(now.UnixMicro()), now)
+			progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 2}, uint64(now.UnixMicro()), now)
 			if err != nil || !progressed {
 				t.Fatalf("paused prefix report = %t, %v", progressed, err)
 			}
 			if lane.deliveryRate != tt.want {
 				t.Fatalf("delivery rate = %d B/s, want %d B/s", lane.deliveryRate, tt.want)
 			}
-			if !store.sentEmpty() || lane.lastDataPackets != 2 || store.measurementDrain.Load() != (tt.paused && !tt.resumed) {
+			if !store.sentEmpty() || lane.lastDataFrames != 2 || store.measurementDrain.Load() != (tt.paused && !tt.resumed) {
 				t.Fatal("capacity protection lost parsing progress or changed the Data gate")
 			}
 		})

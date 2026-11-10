@@ -135,7 +135,7 @@ func TestSchedulerProbeCapacityDivertsBeforeProvenRecovery(t *testing.T) {
 	}
 	takeOneTransmission(t, alternate.registration.Store)
 	now = now.Add(10 * time.Millisecond)
-	if _, err := alternate.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil {
+	if _, err := alternate.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(now.UnixMicro()), now); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.checkAbandonment(lanes, &rescuePreferred, now)
@@ -525,7 +525,7 @@ func TestSchedulerMigrateTransmissionsChecksCurrentProgress(t *testing.T) {
 			now = now.Add(tt.checkAt)
 			if tt.recentReport {
 				received := now.Add(-10 * time.Millisecond)
-				if _, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(received.UnixMicro()), received); err != nil {
+				if _, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(received.UnixMicro()), received); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -48,7 +48,7 @@ func TestScheduledLaneApplyReportCredit(t *testing.T) {
 			}
 			consumeFlightCreditReady(store)
 			now = now.Add(test.elapsed)
-			progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: test.reported}, uint64(now.UnixMicro()), now)
+			progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: test.reported}, uint64(now.UnixMicro()), now)
 			if err != nil || !progressed {
 				t.Fatalf("applyReport() = %t, %v", progressed, err)
 			}
@@ -69,7 +69,7 @@ func TestScheduledLaneApplyReportCredit(t *testing.T) {
 				assertFlightCreditTake(t, store)
 				assertFlightCreditSilent(t, store)
 				now = now.Add(test.elapsed)
-				if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: test.committed}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+				if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: test.committed}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 					t.Fatalf("remaining prefix report = %t, %v", progressed, err)
 				}
 				assertFlightCreditReady(t, store)
@@ -112,7 +112,7 @@ func TestScheduledLaneApplyReportCreditUnchanged(t *testing.T) {
 				takeOneTransmission(t, store)
 			}
 			now = now.Add(10 * time.Millisecond)
-			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1, PingID: 1, DelayMicros: 1234}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 1, PingID: 1, DelayMicros: 1234}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 				t.Fatalf("initial report = %t, %v", progressed, err)
 			}
 			if test.closed {
@@ -125,7 +125,7 @@ func TestScheduledLaneApplyReportCreditUnchanged(t *testing.T) {
 			usage := store.budget.Usage()
 			consumeFlightCreditReady(store)
 			progressed, err := lane.applyReport(protocol.DeliveryReport{
-				DataPackets: test.data, PingID: test.ping, DelayMicros: math.MaxUint64,
+				DataFrames: test.data, PingID: test.ping, DelayMicros: math.MaxUint64,
 			}, uint64(now.Add(time.Second).UnixMicro()), now.Add(time.Second))
 			if progressed || !errors.Is(err, test.want) {
 				t.Fatalf("nonadvancing report = %t, %v, want false, %v", progressed, err, test.want)

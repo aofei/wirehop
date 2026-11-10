@@ -733,7 +733,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		}
 		if err := scheduler.ObserveDeliveryReport(ctx, source, protocol.DeliveryReport{
 			LaneID: registration.LaneID, Generation: registration.Generation,
-			DataPackets: 1,
+			DataFrames: 1,
 		}, 1000, make(chan error, 1)); err != nil {
 			t.Fatal(err)
 		}
@@ -744,7 +744,7 @@ func TestSchedulerPreemptsHeldTransport(t *testing.T) {
 		}
 		if err := scheduler.ObserveDeliveryReport(ctx, source, protocol.DeliveryReport{
 			LaneID: registration.LaneID, Generation: registration.Generation,
-			DataPackets: 2,
+			DataFrames: 2,
 		}, 2000, make(chan error, 1)); err != nil {
 			t.Fatal(err)
 		}
@@ -910,7 +910,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 	}
 	releaseBatchOwnership(ownership[:count])
 	report := protocol.DeliveryReport{
-		LaneID: registration.LaneID, Generation: registration.Generation, DataPackets: 1,
+		LaneID: registration.LaneID, Generation: registration.Generation, DataFrames: 1,
 	}
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 1000, make(chan error, 1)); err != nil {
 		t.Fatal(err)
@@ -919,7 +919,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatalf("backlog packets = %d, want 1", packets)
 	}
 
-	report.DataPackets = 3
+	report.DataFrames = 3
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 2000, make(chan error, 1)); !errors.Is(err, ErrInvalidDeliveryReport) {
 		t.Fatalf("invalid report error = %v, want %v", err, ErrInvalidDeliveryReport)
 	}
@@ -927,7 +927,7 @@ func TestSchedulerDeliveryReportValidation(t *testing.T) {
 		t.Fatalf("invalid report changed backlog to %d packets", packets)
 	}
 
-	report.DataPackets = 2
+	report.DataFrames = 2
 	if err := scheduler.ObserveDeliveryReport(ctx, source, report, 3000, make(chan error, 1)); err != nil {
 		t.Fatal(err)
 	}
@@ -992,10 +992,10 @@ func TestSchedulerDeliveryReportUsesFeedbackCarrierDelay(t *testing.T) {
 			}
 			takeOneTransmission(t, store)
 			report := protocol.DeliveryReport{
-				LaneID: target.registration.LaneID, Generation: 1, DataPackets: 1,
+				LaneID: target.registration.LaneID, Generation: 1, DataFrames: 1,
 			}
 			if test.invalidReport {
-				report.DataPackets++
+				report.DataFrames++
 			}
 			if test.changedTarget {
 				report.Generation++
@@ -1130,7 +1130,7 @@ func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 		old := schedulerLane(t, 1, 1, 1234, 9_000_000)
 		old.minimumRTTMicros = 1000
 		old.feedbackDelayMicros = 500
-		old.lastDataPackets = 99
+		old.lastDataFrames = 99
 		lanes := map[protocol.LaneID]*scheduledLane{old.registration.LaneID: old}
 		registration := schedulerRegistration(1, 1, schedulerStore(t, packetqueue.Limits{Packets: 1, Bytes: 4096}))
 		registration.Generation = 2
@@ -1145,7 +1145,7 @@ func TestSchedulerApplyEventInitialTiming(t *testing.T) {
 		}
 		lane := lanes[registration.LaneID]
 		if lane.rttMicros != 12_000 || lane.minimumRTTMicros != 12_000 || !lane.rttObserved ||
-			lane.feedbackDelayMicros != 0 || lane.lastDataPackets != 0 ||
+			lane.feedbackDelayMicros != 0 || lane.lastDataFrames != 0 ||
 			lane.deliveryRate != defaultInitialRateBytesPerSecond {
 			t.Fatal("replacement inherited prediction or feedback from the previous generation")
 		}
@@ -1196,12 +1196,12 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 			event := schedulerEvent{
 				kind: schedulerReport, laneID: fast.registration.LaneID, generation: 1,
 				report: protocol.DeliveryReport{
-					LaneID: target.registration.LaneID, Generation: 1, DataPackets: 2,
+					LaneID: target.registration.LaneID, Generation: 1, DataFrames: 2,
 				},
 				receiveMicros: 2000, result: result,
 			}
 			if test.ping {
-				event.report.DataPackets = 0
+				event.report.DataFrames = 0
 				event.report.PingID = 1
 			}
 			if test.slowFirst {
@@ -1221,7 +1221,7 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 			}
 			event.receiveMicros = 9000
 			if test.stale {
-				event.report.DataPackets = 0
+				event.report.DataFrames = 0
 				event.report.PingID = 0
 			}
 			scheduler.applyEvent(lanes, &preferred, event, time.Unix(9, 0), false)
@@ -1243,7 +1243,7 @@ func TestSchedulerApplyEventIgnoresRepeatedFeedback(t *testing.T) {
 func TestScheduledLaneApplyReport(t *testing.T) {
 	for _, test := range []struct {
 		name           string
-		dataPackets    uint64
+		dataFrames     uint64
 		pingID         uint64
 		invalidPackets bool
 		closedStore    bool
@@ -1252,16 +1252,16 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 	}{
 		{name: "StaleBoth"},
 		{name: "StaleData", pingID: 1},
-		{name: "StalePing", dataPackets: 1},
-		{name: "Duplicate", dataPackets: 1, pingID: 1},
-		{name: "AdvanceData", dataPackets: 2, pingID: 1, progressed: true},
-		{name: "AdvancePing", dataPackets: 1, pingID: 2, progressed: true},
-		{name: "AdvanceBoth", dataPackets: 2, pingID: 2, progressed: true},
-		{name: "AdvanceDataStalePing", dataPackets: 2, err: ErrInvalidDeliveryReport},
+		{name: "StalePing", dataFrames: 1},
+		{name: "Duplicate", dataFrames: 1, pingID: 1},
+		{name: "AdvanceData", dataFrames: 2, pingID: 1, progressed: true},
+		{name: "AdvancePing", dataFrames: 1, pingID: 2, progressed: true},
+		{name: "AdvanceBoth", dataFrames: 2, pingID: 2, progressed: true},
+		{name: "AdvanceDataStalePing", dataFrames: 2, err: ErrInvalidDeliveryReport},
 		{name: "StaleDataAdvancePing", pingID: 2, err: ErrInvalidDeliveryReport},
-		{name: "InvalidPrefixCount", dataPackets: 2, pingID: 1, invalidPackets: true,
+		{name: "InvalidPrefixCount", dataFrames: 2, pingID: 1, invalidPackets: true,
 			err: ErrInvalidDeliveryReport},
-		{name: "ClosedStore", dataPackets: 2, pingID: 2, closedStore: true},
+		{name: "ClosedStore", dataFrames: 2, pingID: 2, closedStore: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			lane := schedulerLane(t, 1, 1, 20_000, 1_000_000)
@@ -1276,7 +1276,7 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 				takeOneTransmission(t, store)
 				prefixBytes[index] = prefixBytes[index-1] + uint64(transmission.size)
 			}
-			report := protocol.DeliveryReport{DataPackets: 1, PingID: 1}
+			report := protocol.DeliveryReport{DataFrames: 1, PingID: 1}
 			if progressed, err := lane.applyReport(report, 2000, time.Unix(2, 0)); err != nil || !progressed {
 				t.Fatalf("initial report = %t, %v", progressed, err)
 			}
@@ -1286,17 +1286,17 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 			lane.degraded = true
 			before := *lane
 			packets, bytes := store.backlog()
-			report.DataPackets = test.dataPackets
+			report.DataFrames = test.dataFrames
 			report.PingID = test.pingID
 			if test.invalidPackets {
-				report.DataPackets = 3
+				report.DataFrames = 3
 			}
 			progressed, err := lane.applyReport(report, 9000, time.Unix(9, 0))
 			if progressed != test.progressed || !errors.Is(err, test.err) {
 				t.Fatalf("applyReport() = %t, %v, want %t, %v", progressed, err, test.progressed, test.err)
 			}
 			if !progressed {
-				if lane.lastDataPackets != before.lastDataPackets || lane.lastPingID != before.lastPingID ||
+				if lane.lastDataFrames != before.lastDataFrames || lane.lastPingID != before.lastPingID ||
 					lane.deliveryRate != before.deliveryRate || lane.lastProgressAt != before.lastProgressAt ||
 					lane.degraded != before.degraded {
 					t.Fatal("nonadvancing report changed lane state")
@@ -1305,7 +1305,7 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 					t.Fatal("nonadvancing report released retained data")
 				}
 			} else if lane.lastProgressAt != time.Unix(9, 0) || lane.degraded ||
-				lane.lastDataPackets != report.DataPackets || lane.lastPingID != report.PingID {
+				lane.lastDataFrames != report.DataFrames || lane.lastPingID != report.PingID {
 				t.Fatal("advancing report did not update cumulative progress")
 			}
 		})
@@ -1314,22 +1314,22 @@ func TestScheduledLaneApplyReport(t *testing.T) {
 
 func TestScheduledLaneReportIgnoresStaleCounters(t *testing.T) {
 	lane := schedulerLane(t, 1, 1, 1000, 1_000_000)
-	lane.lastDataPackets = 2
+	lane.lastDataFrames = 2
 	lane.lastPingID = 1
-	if _, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, 2000, time.Unix(2, 0)); err != nil {
+	if _, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 1}, 2000, time.Unix(2, 0)); err != nil {
 		t.Fatal(err)
 	}
-	if lane.lastDataPackets != 2 || lane.lastPingID != 1 {
+	if lane.lastDataFrames != 2 || lane.lastPingID != 1 {
 		t.Fatal("stale report changed cumulative state")
 	}
 	lane.registration.Store.deliveredMicros = 1000
-	if _, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 2, PingID: 1}, 9000, time.Unix(9, 0)); err != nil {
+	if _, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 2, PingID: 1}, 9000, time.Unix(9, 0)); err != nil {
 		t.Fatal(err)
 	}
 	if lane.registration.Store.deliveredMicros != 1000 {
 		t.Fatal("duplicate report changed the sample baseline")
 	}
-	for _, report := range []protocol.DeliveryReport{{DataPackets: 1, PingID: 2}, {DataPackets: 3}} {
+	for _, report := range []protocol.DeliveryReport{{DataFrames: 1, PingID: 2}, {DataFrames: 3}} {
 		if _, err := lane.applyReport(report, 3000, time.Unix(3, 0)); !errors.Is(err, ErrInvalidDeliveryReport) {
 			t.Fatal(err)
 		}
@@ -1356,7 +1356,7 @@ func TestScheduledLaneDeliveryRateRejectsCompressedFeedback(t *testing.T) {
 	for packetID := uint64(1); packetID <= 2; packetID++ {
 		report := protocol.DeliveryReport{
 			LaneID: lane.registration.LaneID, Generation: lane.registration.Generation,
-			DataPackets: packetID,
+			DataFrames: packetID,
 		}
 		if _, err := lane.applyReport(report, uint64(now.UnixMicro()), now); err != nil {
 			t.Fatal(err)
@@ -1421,7 +1421,7 @@ func TestScheduledLaneDeliveryRateUsesPressureBeforeAcknowledgement(t *testing.T
 	releaseBatchOwnership(ownership[:count])
 	report := protocol.DeliveryReport{
 		LaneID: lane.registration.LaneID, Generation: lane.registration.Generation,
-		DataPackets: transmissionCount,
+		DataFrames: transmissionCount,
 	}
 	if _, err := lane.applyReport(report, 31_000, time.Unix(1, 0)); err != nil {
 		t.Fatal(err)
@@ -1855,7 +1855,7 @@ func TestSchedulerRetainsExpiredSentPrefixUntilReport(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, err := source.applyReport(protocol.DeliveryReport{
-				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1,
+				LaneID: source.registration.LaneID, Generation: 1, DataFrames: 1,
 			}, 1_200_000, now.Add(1200*time.Millisecond)); err != nil {
 				t.Fatal(err)
 			}
@@ -1909,7 +1909,7 @@ func TestSchedulerReportsOverDegradedLanes(t *testing.T) {
 			}
 			completed := 0
 			scheduler.routeReport(lanes, protocol.DeliveryReport{
-				LaneID: source.registration.LaneID, Generation: 1, DataPackets: 1,
+				LaneID: source.registration.LaneID, Generation: 1, DataFrames: 1,
 			}, time.Now(), func(ok bool) {
 				if ok {
 					completed++
@@ -1954,7 +1954,7 @@ func TestSchedulerDoesNotCountIdleTimeAsProgressStall(t *testing.T) {
 			t.Fatal("fresh burst was degraded before one report could return")
 		}
 		if _, err := source.applyReport(protocol.DeliveryReport{
-			LaneID: source.registration.LaneID, Generation: 1, DataPackets: uint64((burst + 1) * 2),
+			LaneID: source.registration.LaneID, Generation: 1, DataFrames: uint64((burst + 1) * 2),
 		}, uint64(burst+1)*1_000_000, now.Add(100*time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}

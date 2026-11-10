@@ -26,7 +26,7 @@ var (
 
 // maximumRetainedDequeCapacity preserves a report batch plus in-flight progress without repeatedly growing and shrinking
 // steady feedback windows. Larger lane high-water marks still shrink when occupancy falls.
-const maximumRetainedDequeCapacity = 2 * reportPacketThreshold
+const maximumRetainedDequeCapacity = 2 * reportFrameThreshold
 
 // retainedTransmission is one assigned packet retained until parsing is reported or its generation is drained.
 type retainedTransmission struct {

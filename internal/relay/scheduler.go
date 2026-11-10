@@ -166,7 +166,7 @@ type scheduledLane struct {
 	ambiguousTimingSince time.Time
 	feedbackDelayMicros  uint64
 	deliveryRate         uint64
-	lastDataPackets      uint64
+	lastDataFrames       uint64
 	lastPingID           uint64
 	rateHistory          [5]rateObservation
 	rateHistoryCount     int
@@ -1217,7 +1217,7 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	if !l.registration.ValidatePingProgress(report.PingID) {
 		return false, ErrInvalidDeliveryReport
 	}
-	dataDirection := cmp.Compare(report.DataPackets, l.lastDataPackets)
+	dataDirection := cmp.Compare(report.DataFrames, l.lastDataFrames)
 	pingDirection := cmp.Compare(report.PingID, l.lastPingID)
 	if dataDirection < 0 || pingDirection < 0 {
 		if dataDirection > 0 || pingDirection > 0 {
@@ -1231,7 +1231,7 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	store := l.registration.Store
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	sample, stale, err := store.acknowledgeLocked(report.DataPackets, receiveMicros)
+	sample, stale, err := store.acknowledgeLocked(report.DataFrames, receiveMicros)
 	if err != nil || stale {
 		return false, err
 	}
@@ -1247,7 +1247,7 @@ func (l *scheduledLane) applyReport(report protocol.DeliveryReport, receiveMicro
 	store.writeBudget.Store(quantum)
 	l.feedbackDelayMicros = report.DelayMicros
 	store.setDeliveryWindowsLocked(l.deliveryWindowBytes(), l.probeWindowBytes(0), l.drainWindowBytes())
-	l.lastDataPackets = report.DataPackets
+	l.lastDataFrames = report.DataFrames
 	l.lastPingID = report.PingID
 	l.lastProgressAt = receiveTime
 	l.degraded = false

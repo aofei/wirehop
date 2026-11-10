@@ -222,7 +222,7 @@ func (f *freshTimingFixture) report(t *testing.T, packets, delay uint64) {
 	result := make(chan error, 1)
 	f.scheduler.applyEvent(f.lanes, &f.preferred, schedulerEvent{
 		kind: schedulerReport, laneID: 1, generation: 1, receiveMicros: uint64(f.now.UnixMicro()), result: result,
-		report: protocol.DeliveryReport{LaneID: 1, Generation: 1, PingID: f.lane.lastPingID + 1, DataPackets: packets, DelayMicros: delay},
+		report: protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: packets, PingID: f.lane.lastPingID + 1, DelayMicros: delay},
 	}, f.now, false)
 	if err := <-result; err != nil {
 		t.Fatal(err)

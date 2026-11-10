@@ -1283,10 +1283,10 @@ func TestTransmissionDequeFeedbackWindowReusesStorage(t *testing.T) {
 		deque.push(retainedTransmission{})
 	}
 	allocations := testing.AllocsPerRun(100, func() {
-		for range reportPacketThreshold {
+		for range reportFrameThreshold {
 			deque.push(retainedTransmission{})
 		}
-		deque.discardPrefix(reportPacketThreshold)
+		deque.discardPrefix(reportFrameThreshold)
 	})
 	if allocations != 0 {
 		t.Fatalf("steady feedback window allocated %.1f times per report", allocations)

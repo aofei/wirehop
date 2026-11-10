@@ -294,10 +294,10 @@ func TestLaneReadPreservesPayloadDuringCarrierTeardown(t *testing.T) {
 						t.Fatal("lane read remained blocked after carrier teardown")
 					}
 					count := len(endpoint.writes)
-					parsed := lane.progress.dataPackets
+					parsed := lane.progress.dataFrames
 					if count == 0 || count > len(expected) || parsed >= uint64(len(prefixDatagrams)) ||
 						prefixDatagrams[parsed] != count || prefixBytes[parsed] != lane.progress.dataBytes {
-						t.Fatalf("delivered %d packets with %d parsing acknowledgements", count, lane.progress.dataPackets)
+						t.Fatalf("delivered %d packets with %d parsing acknowledgements", count, lane.progress.dataFrames)
 					}
 					for index := range count {
 						if payload := <-endpoint.writes; !bytes.Equal(payload, expected[index]) {

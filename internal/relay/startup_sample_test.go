@@ -31,7 +31,7 @@ func TestScheduledLaneInitialSampleQualification(t *testing.T) {
 			}
 			assertFlightCreditTake(t, store, 1)
 			now = now.Add(100 * time.Millisecond)
-			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 				t.Fatalf("isolated report = %t, %v", progressed, err)
 			}
 			if lane.rateObserved || lane.deliveryRate != defaultInitialRateBytesPerSecond || store.deliveryWindow != initialDeliveryWindow || lane.rateHistoryCount != 0 {
@@ -43,7 +43,7 @@ func TestScheduledLaneInitialSampleQualification(t *testing.T) {
 			}
 			assertFlightCreditTake(t, store, 2, 3, 4)
 			now = now.Add(time.Second)
-			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 4}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 4}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 				t.Fatalf("qualifying report = %t, %v", progressed, err)
 			}
 			if !lane.rateObserved || lane.deliveryRate != 4374 || lane.rateHistoryCount != 1 || store.transportReported.Load() != minimumTransportProofBytes {
@@ -53,7 +53,7 @@ func TestScheduledLaneInitialSampleQualification(t *testing.T) {
 			pushRateRecoveryFrame(t, store, 5, 1458, now.Add(time.Second))
 			assertFlightCreditTake(t, store, 5)
 			now = now.Add(100 * time.Millisecond)
-			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 5}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 5}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 				t.Fatalf("small measured report = %t, %v", progressed, err)
 			}
 			if lane.deliveryRate != 14580 || lane.rateHistoryCount != 2 {
@@ -81,7 +81,7 @@ func TestScheduledLaneIsolatedReverseFramesDoNotRequestTiming(t *testing.T) {
 		}
 		assertFlightCreditTake(t, store, id)
 		now = now.Add(800 * time.Millisecond)
-		if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: id}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+		if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: id}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 			t.Fatalf("report %d = %t, %v", id, progressed, err)
 		}
 		if store.sent.len() != 0 {

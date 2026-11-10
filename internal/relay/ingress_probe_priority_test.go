@@ -205,7 +205,7 @@ func (f *ingressProbeFixture) register(t *testing.T, id byte, limits packetqueue
 func (f *ingressProbeFixture) report(t *testing.T, packets uint64) {
 	t.Helper()
 	err := f.scheduler.ObserveDeliveryReport(f.ctx, protocol.LaneGeneration{LaneID: 1, Generation: 1},
-		protocol.DeliveryReport{LaneID: 1, Generation: 1, DataPackets: packets}, uint64(time.Now().UnixMicro()), make(chan error, 1))
+		protocol.DeliveryReport{LaneID: 1, Generation: 1, DataFrames: packets}, uint64(time.Now().UnixMicro()), make(chan error, 1))
 	select {
 	case callbackErr := <-f.callbackErr:
 		t.Fatalf("report callback: %v", callbackErr)

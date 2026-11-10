@@ -33,7 +33,7 @@ func TestScheduledLaneDeliveryRateRecoversSmallFlights(t *testing.T) {
 			seedBytes := store.sentBytes
 			// Even a late parse report measures carrier progress after payload eligibility expires.
 			now = now.Add(8192 * time.Millisecond)
-			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+			if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: 1}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 				t.Fatalf("seed report = %t, %v", progressed, err)
 			}
 			wantRate := seedBytes * 1_000_000 / 8_192_000
@@ -82,7 +82,7 @@ func TestScheduledLaneDeliveryRateRecoversSmallFlights(t *testing.T) {
 				}
 				// Complete flights model 1 MB/s serialization plus fixed 35 ms feedback latency.
 				now = now.Add(time.Duration(bytes+35_000) * time.Microsecond)
-				if progressed, err := lane.applyReport(protocol.DeliveryReport{DataPackets: acknowledged}, uint64(now.UnixMicro()), now); err != nil || !progressed {
+				if progressed, err := lane.applyReport(protocol.DeliveryReport{DataFrames: acknowledged}, uint64(now.UnixMicro()), now); err != nil || !progressed {
 					t.Fatalf("round %d report = %t, %v", round, progressed, err)
 				}
 				if !test.pairedACK && store.sent.len() != 0 {

@@ -262,7 +262,7 @@ func (m *measurementCoordinator) queueReadyLocked(a *measurementAttempt) {
 			return protocol.Measurement{}, false
 		}
 		a.stage = protocol.MeasurementReady
-		return protocol.Measurement{Kind: protocol.MeasurementReady, ID: a.id, Valid: true}, true
+		return protocol.Measurement{Kind: protocol.MeasurementReady, ID: a.id, Accepted: true}, true
 	}}) {
 		m.finishLocked(a)
 	}
@@ -331,8 +331,10 @@ func (m *measurementCoordinator) budgetLocked(a *measurementAttempt) uint64 {
 	return min(protocol.MaxMeasurementHoldMicros, uint64(max(0, time.Until(deadline)/time.Microsecond)))
 }
 
-// ObserveMeasurement dispatches a parsed phase on its actual carrier generation.
-// Delayed operations are harmless. A current operation in the wrong direction or phase is a protocol error.
+// ObserveMeasurement dispatches a parsed message on its actual carrier generation.
+// Retired generations are ignored. Current generations check direction before ignoring nonmatching operations or inactive
+// targets.
+// Repeated Begin is idempotent. Other transaction phases must match an unfinished target's expected phase.
 func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value protocol.Measurement, now uint64) error {
 	if s.measurements == nil {
 		return nil
@@ -344,8 +346,8 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 	if !ok || peer.Generation != source.Generation || m.closed {
 		return nil
 	}
-	clientPhase := value.Kind == protocol.MeasurementRequest || value.Kind == protocol.MeasurementReady || value.Kind == protocol.MeasurementReply
-	if peer.MeasurementInitiator != clientPhase {
+	fromServer := value.Kind == protocol.MeasurementRequest || value.Kind == protocol.MeasurementReady || value.Kind == protocol.MeasurementReply
+	if peer.MeasurementInitiator != fromServer {
 		return ErrUnexpectedFrame
 	}
 	if value.Kind == protocol.MeasurementRequest {
@@ -391,7 +393,7 @@ func (s *Scheduler) ObserveMeasurement(source protocol.LaneGeneration, value pro
 		if a.stage != protocol.MeasurementBegin || a.peerReady {
 			return ErrUnexpectedFrame
 		}
-		if !value.Valid {
+		if !value.Accepted {
 			m.finishLocked(a)
 			m.probePreparedLocked()
 			return nil

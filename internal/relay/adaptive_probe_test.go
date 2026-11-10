@@ -111,7 +111,7 @@ func TestSchedulerHighBDPTransportProbe(t *testing.T) {
 				}
 				// Serialize each flight before returning its cumulative report over a 300 ms feedback path.
 				now = now.Add(300*time.Millisecond + time.Duration(flightBytes*1_000_000/tt.capacity)*time.Microsecond)
-				if progressed, err := candidate.applyReport(protocol.DeliveryReport{DataPackets: sentPackets},
+				if progressed, err := candidate.applyReport(protocol.DeliveryReport{DataFrames: sentPackets},
 					uint64(now.UnixMicro()), now); err != nil || !progressed {
 					t.Fatalf("capacity report = %t, %v", progressed, err)
 				}
@@ -188,7 +188,7 @@ func TestSchedulerHighBDPMultiLaneProbe(t *testing.T) {
 					if flights[index] == 0 {
 						continue
 					}
-					if progressed, err := candidate.applyReport(protocol.DeliveryReport{DataPackets: candidate.registration.Store.sentPackets},
+					if progressed, err := candidate.applyReport(protocol.DeliveryReport{DataFrames: candidate.registration.Store.sentPackets},
 						uint64(now.UnixMicro()), now); err != nil || !progressed {
 						t.Fatalf("capacity report = %t, %v", progressed, err)
 					}

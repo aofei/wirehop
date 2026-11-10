@@ -16,7 +16,8 @@ func TestMeasurementWireLayout(t *testing.T) {
 	}{
 		{name: "Request", value: Measurement{Kind: MeasurementRequest}, encoded: "180001"},
 		{name: "Begin", value: Measurement{Kind: MeasurementBegin, ID: 128}, encoded: "3800028001"},
-		{name: "Ready", value: Measurement{Kind: MeasurementReady, ID: 1, Valid: true}, encoded: "3800030101"},
+		{name: "Ready", value: Measurement{Kind: MeasurementReady, ID: 1, Accepted: true}, encoded: "3800030101"},
+		{name: "RejectedReady", value: Measurement{Kind: MeasurementReady, ID: 1}, encoded: "3800030100"},
 		{name: "Probe", value: Measurement{Kind: MeasurementProbe, ID: 1, ProbeMicros: 127, HoldMicros: 128}, encoded: "580004017f8001"},
 		{name: "Reply", value: Measurement{Kind: MeasurementReply, ID: 1, ReceiveMicros: 128,
 			ReplyMicros: 16384, HoldMicros: 16384}, encoded: "a80005018001808001808001"},
@@ -24,8 +25,9 @@ func TestMeasurementWireLayout(t *testing.T) {
 			ReplyMicros: 16384}, encoded: "88000501800180800100"},
 		{name: "ZeroReplyTimestamps", value: Measurement{Kind: MeasurementReply, ID: 1, HoldMicros: 1},
 			encoded: "58000501000001"},
-		{name: "Result", value: Measurement{Kind: MeasurementResult, ID: 128, Valid: true, ReceiveMicros: 16384}, encoded: "780006800101808001"},
-		{name: "Rejected", value: Measurement{Kind: MeasurementResult, ID: 1}, encoded: "480006010000"},
+		{name: "Result", value: Measurement{Kind: MeasurementResult, ID: 128, ReceiveMicros: 16384, Valid: true}, encoded: "780006800101808001"},
+		{name: "ZeroResultTimestamp", value: Measurement{Kind: MeasurementResult, ID: 1, Valid: true}, encoded: "480006010100"},
+		{name: "RejectedResult", value: Measurement{Kind: MeasurementResult, ID: 1}, encoded: "480006010000"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			literal, err := hex.DecodeString(test.encoded)
@@ -69,16 +71,27 @@ func TestMeasurementValidation(t *testing.T) {
 		{Kind: MeasurementResult, ID: 1, ReceiveMicros: 1},
 		{Kind: MeasurementBegin, ID: 1, HoldMicros: 1},
 		{Kind: MeasurementRequest, ProbeMicros: 1},
+		{Kind: MeasurementRequest, Accepted: true},
+		{Kind: MeasurementRequest, Valid: true},
+		{Kind: MeasurementBegin, ID: 1, Accepted: true},
+		{Kind: MeasurementBegin, ID: 1, Valid: true},
+		{Kind: MeasurementReady, ID: 1, Valid: true},
+		{Kind: MeasurementReady, ID: 1, Accepted: true, Valid: true},
 		{Kind: MeasurementProbe, ID: 1, HoldMicros: 1, Valid: true},
+		{Kind: MeasurementProbe, ID: 1, HoldMicros: 1, Accepted: true},
 		{Kind: MeasurementReply, ID: 1, Valid: true},
+		{Kind: MeasurementReply, ID: 1, Accepted: true},
 		{Kind: MeasurementReply, ID: 1, ProbeMicros: 1},
+		{Kind: MeasurementResult, ID: 1, Accepted: true},
+		{Kind: MeasurementResult, ID: 1, Accepted: true, Valid: true},
 	} {
 		if _, err := MarshalMeasurement(value); !errors.Is(err, ErrInvalidControlFrame) {
 			t.Fatalf("accepted invalid measurement %+v: %v", value, err)
 		}
 	}
 	for _, payload := range [][]byte{
-		{0}, {7}, {2, 0}, {2, 0x81, 0}, {2, 0x80}, {6, 1, 2, 0}, {6, 1, 0, 1},
+		{0}, {7}, {2, 0}, {2, 0x81, 0}, {2, 0x80}, {3, 1, 2}, {3, 1, 0x81, 0},
+		{6, 1, 2, 0}, {6, 1, 0x81, 0, 0}, {6, 1, 0, 1},
 		{4, 1, 0, 0}, {5, 1, 2, 1, 1}, {5, 1, 0, 2, 1, 1}, {0x81, 0}, {2, 1, 1, 1, 1},
 	} {
 		if _, err := ParseMeasurement(Frame{Type: FrameMeasurement, Payload: payload}); !errors.Is(err, ErrInvalidControlFrame) {
@@ -98,13 +111,13 @@ func TestMeasurementContentBounds(t *testing.T) {
 	}{
 		{name: "Request", value: Measurement{Kind: MeasurementRequest}, size: 1},
 		{name: "Begin", value: Measurement{Kind: MeasurementBegin, ID: math.MaxUint64}, size: 11},
-		{name: "Ready", value: Measurement{Kind: MeasurementReady, ID: math.MaxUint64, Valid: true}, size: 12},
+		{name: "Ready", value: Measurement{Kind: MeasurementReady, ID: math.MaxUint64, Accepted: true}, size: 12},
 		{name: "Probe", value: Measurement{Kind: MeasurementProbe, ID: math.MaxUint64,
 			ProbeMicros: math.MaxUint64, HoldMicros: MaxMeasurementHoldMicros}, size: 25},
 		{name: "Reply", value: Measurement{Kind: MeasurementReply, ID: math.MaxUint64,
 			ReceiveMicros: math.MaxUint64, ReplyMicros: math.MaxUint64, HoldMicros: MaxMeasurementHoldMicros}, size: 35},
 		{name: "Result", value: Measurement{Kind: MeasurementResult, ID: math.MaxUint64,
-			Valid: true, ReceiveMicros: math.MaxUint64}, size: 22},
+			ReceiveMicros: math.MaxUint64, Valid: true}, size: 22},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			frame, err := MarshalMeasurement(tt.value)
@@ -137,7 +150,7 @@ func TestMeasurementContentBounds(t *testing.T) {
 
 func FuzzParseMeasurement(f *testing.F) {
 	for _, payload := range [][]byte{
-		{1}, {2, 1}, {3, 1, 1}, {4, 1, 0, 1}, {5, 1, 0, 0, 1}, {5, 1, 0, 0, 0}, {6, 1, 1, 0}, {6, 1, 0, 0},
+		{1}, {2, 1}, {3, 1, 1}, {3, 1, 0}, {4, 1, 0, 1}, {5, 1, 0, 0, 1}, {5, 1, 0, 0, 0}, {6, 1, 1, 0}, {6, 1, 0, 0},
 	} {
 		f.Add(payload)
 	}
